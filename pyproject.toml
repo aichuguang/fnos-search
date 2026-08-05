@@ -1,0 +1,8 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = [".venv", ".codex", "codex_tmp", "docs/cmcc"]
+
+[tool.ruff.lint]
+# 先建立不会被历史风格问题淹没的正确性基线，后续再逐步开启 E/W/I/B。
+select = ["E9", "F63", "F7", "F82"]

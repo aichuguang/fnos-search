@@ -1,0 +1,1071 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>管理员后台 - {{ app_name }}</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260805-notifications-v008">
+    <link rel="stylesheet" href="/static/product.css?v=20260805-rclone-webdav-v003">
+    {% if site_logo_url %}<style>:root { --site-logo-bg: url("{{ site_logo_url }}"); }</style>{% endif %}
+</head>
+<body class="ui-dark" data-page="admin">
+    <main class="product-shell wide admin-shell">
+        <div class="product-frame admin-layout">
+            <aside class="admin-sidebar">
+                <a class="brand admin-brand" href="/admin" aria-label="影视资源入库管理后台">
+                    <span class="brand-mark">
+                        <span class="icon-slot icon-bull brand-logo" aria-hidden="true"></span>
+                    </span>
+                    <span class="brand-title">影视资源入库</span>
+                </a>
+                <nav class="admin-tabs" aria-label="后台导航" role="tablist" aria-orientation="vertical">
+                    <div class="admin-nav-group-title" role="presentation">总览</div>
+                    <button class="tab active" id="adminTabOverview" type="button" role="tab" aria-selected="true" aria-controls="tab-overview" tabindex="0" data-tab="overview">
+                        <span class="icon-slot icon-aria2" aria-hidden="true"></span>
+                        <span>概览</span>
+                    </button>
+                    <div class="admin-nav-group-title" role="presentation">任务中心</div>
+                    <button class="tab" id="adminTabRequests" type="button" role="tab" aria-selected="false" aria-controls="tab-requests" tabindex="-1" data-tab="requests">
+                        <span class="icon-slot icon-audit" aria-hidden="true"></span>
+                        <span>访客提交</span>
+                        <span class="tab-badge" id="pendingRequestBadge">0</span>
+                    </button>
+                    <button class="tab" id="adminTabJobs" type="button" role="tab" aria-selected="false" aria-controls="tab-jobs" tabindex="-1" data-tab="jobs">
+                        <span class="icon-slot icon-shell" aria-hidden="true"></span>
+                        <span>正式任务</span>
+                    </button>
+                    <button class="tab" id="adminTabUpdates" type="button" role="tab" aria-selected="false" aria-controls="tab-updates" tabindex="-1" data-tab="updates">
+                        <span class="icon-slot icon-refresh" aria-hidden="true"></span>
+                        <span>定时追更</span>
+                    </button>
+                    <button class="tab" id="adminTabTrending" type="button" role="tab" aria-selected="false" aria-controls="tab-trending" tabindex="-1" data-tab="trending">
+                        <span class="icon-slot icon-search" aria-hidden="true"></span>
+                        <span>每日热榜</span>
+                        <span class="tab-badge" id="trendingCandidateBadge">0</span>
+                    </button>
+                    <div class="admin-nav-group-title" role="presentation">媒体与整理</div>
+                    <button class="tab" id="adminTabMedia" type="button" role="tab" aria-selected="false" aria-controls="tab-media" tabindex="-1" data-tab="media">
+                        <span class="icon-slot icon-other" aria-hidden="true"></span>
+                        <span>媒体库</span>
+                    </button>
+                    <button class="tab" id="adminTabOrganizer" type="button" role="tab" aria-selected="false" aria-controls="tab-organizer" tabindex="-1" data-tab="organizer">
+                        <span class="icon-slot icon-openlist" aria-hidden="true"></span>
+                        <span>OpenList 标准化</span>
+                    </button>
+                    <div class="admin-nav-group-title" role="presentation">日志与运行</div>
+                    <button class="tab" id="adminTabRclone" type="button" role="tab" aria-selected="false" aria-controls="tab-rclone" tabindex="-1" data-tab="rclone">
+                        <span class="icon-slot icon-pansou" aria-hidden="true"></span>
+                        <span>日志中心</span>
+                    </button>
+                    <div class="admin-nav-group-title" role="presentation">系统配置</div>
+                    <button class="tab" id="adminTabAdapters" type="button" role="tab" aria-selected="false" aria-controls="tab-adapters" tabindex="-1" data-tab="adapters">
+                        <span class="icon-slot icon-settings" aria-hidden="true"></span>
+                        <span>系统设置</span>
+                    </button>
+                </nav>
+                <div class="nas-card">
+                    <span class="icon-slot icon-server" aria-hidden="true"></span>
+                    <div>
+                        <strong>飞牛 NAS</strong>
+                        <small>让数据管理更简单</small>
+                    </div>
+                </div>
+            </aside>
+
+            <section class="admin-main">
+                <header class="admin-topbar">
+                    <div>
+                        <h1>影视入库管理系统</h1>
+                        <p class="muted">状态跟踪与流程可视化</p>
+                    </div>
+                    <div class="admin-user-actions">
+                        <a class="button secondary mini" href="/submit" target="_blank" rel="noreferrer">访客入口</a>
+                        <a class="button secondary mini" href="/swagger" target="_blank" rel="noreferrer">API 文档</a>
+                        <button class="admin-user" type="button" id="adminLogoutBtn" title="退出登录" aria-label="退出登录">
+                            <span class="avatar" id="adminTopAvatar">{% if admin_profile.avatar_url %}<img src="{{ admin_profile.avatar_url }}" alt="">{% else %}<span class="icon-slot icon-user" aria-hidden="true"></span>{% endif %}</span>
+                            <span id="adminTopUsername">{{ admin_profile.username or "管理员" }}</span>
+                        </button>
+                    </div>
+                </header>
+
+                <div class="admin-security-banner" id="adminDefaultPasswordBanner" role="alert" hidden>
+                    <span class="icon-slot icon-warning" aria-hidden="true"></span>
+                    <strong>当前仍使用默认管理员账号密码</strong>
+                    <button class="secondary mini" type="button" id="adminDefaultPasswordAction">立即修改</button>
+                </div>
+
+                <section class="admin-tab-panel active" id="tab-overview" role="tabpanel" aria-labelledby="adminTabOverview">
+                    <div class="dashboard-welcome">
+                        <div>
+                            <h2 id="adminOverviewGreeting">正在加载工作台</h2>
+                            <p id="adminOverviewMessage">正在汇总任务与服务运行状态。</p>
+                        </div>
+                        <button class="secondary mini dashboard-refresh" type="button" id="adminRefreshBtn">
+                            <span class="icon-slot icon-refresh" aria-hidden="true"></span>
+                            <span>刷新</span>
+                        </button>
+                    </div>
+                    <div id="adminOverview" class="metric-grid admin-metric-grid"></div>
+                    <div class="dashboard-work-grid">
+                        <article class="glass-panel dashboard-panel dashboard-task-panel">
+                            <div class="dashboard-panel-head">
+                                <div>
+                                    <h2>最近入库任务</h2>
+                                    <p>按更新时间排序</p>
+                                </div>
+                                <span class="dashboard-panel-count" id="adminOverviewJobsCount">0 项</span>
+                            </div>
+                            <div class="dashboard-task-list" id="adminOverviewJobsList">
+                                <div class="dashboard-empty">正在加载最近任务。</div>
+                            </div>
+                            <button class="dashboard-show-all" type="button" id="adminOverviewShowJobs">查看全部任务</button>
+                        </article>
+                        <aside class="glass-panel dashboard-panel dashboard-pipeline-panel">
+                            <div class="dashboard-panel-head">
+                                <div>
+                                    <h2>任务进度</h2>
+                                    <p>当前入库任务</p>
+                                </div>
+                            </div>
+                            <div id="adminOverviewPipeline" class="dashboard-pipeline">
+                                <div class="dashboard-empty">暂无进行中的任务。</div>
+                            </div>
+                        </aside>
+                    </div>
+                    <div class="dashboard-bottom-grid">
+                        <article class="glass-panel dashboard-panel">
+                            <div class="dashboard-panel-head">
+                                <div>
+                                    <h2>系统运行</h2>
+                                    <p id="adminOverviewHealthSummary">正在检查核心链路</p>
+                                </div>
+                            </div>
+                            <div id="adminOverviewServices" class="dashboard-service-list"></div>
+                        </article>
+                        <article class="glass-panel dashboard-panel">
+                            <div class="dashboard-panel-head">
+                                <div>
+                                    <h2>最近动态</h2>
+                                    <p>任务状态与更新时间</p>
+                                </div>
+                            </div>
+                            <div id="adminOverviewActivity" class="dashboard-activity-list">
+                                <div class="dashboard-empty">暂无系统动态。</div>
+                            </div>
+                        </article>
+                    </div>
+                </section>
+
+                <section class="glass-panel pad admin-tab-panel" id="tab-requests" role="tabpanel" aria-labelledby="adminTabRequests" hidden>
+                    <div class="section-title">
+                        <div>
+                            <h2>访客提交</h2>
+                            <p>默认展示全部访客提交；待审核、处理中、已完成都可按状态筛选。</p>
+                        </div>
+                        <div class="filter-row">
+                            <select id="requestStatusFilter">
+                                <option value="">全部状态</option>
+                                <option value="pending_review">待审核</option>
+                                <option value="provider_submitting">网盘提交待确认</option>
+                                <option value="submitted">已提交</option>
+                                <option value="waiting_transfer">待搬运</option>
+                                <option value="transferring">搬运中</option>
+                                <option value="waiting_openlist">等待 OpenList</option>
+                                <option value="waiting_organizer">等待整理</option>
+                                <option value="organizing">整理中</option>
+                                <option value="confirming">确认标准目录</option>
+                                <option value="review">人工确认</option>
+                                <option value="done">入库完成</option>
+                                <option value="rejected">已拒绝</option>
+                                <option value="cancelled">已取消</option>
+                                <option value="failed">失败</option>
+                            </select>
+                            <button class="secondary" type="button" id="loadRequestsBtn">刷新</button>
+                        </div>
+                    </div>
+                    <div id="requestsPagerTop" class="pager-bar pager-bar-top"></div>
+                    <div class="table-wrap">
+                        <table class="data-table table-requests">
+                            <thead>
+                                <tr>
+                                    <th>请求编号</th>
+                                    <th>资源名称</th>
+                                    <th>分类</th>
+                                    <th>来源类型</th>
+                                    <th>提交时间</th>
+                                    <th>状态</th>
+                                    <th>风险等级</th>
+                                    <th>当前建议</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="adminRequestsBody"></tbody>
+                        </table>
+                    </div>
+                    <div id="requestsPager" class="pager-bar"></div>
+                </section>
+
+                <section class="glass-panel pad admin-tab-panel" id="tab-jobs" role="tabpanel" aria-labelledby="adminTabJobs" hidden>
+                    <div class="section-title">
+                        <div>
+                            <h2>正式任务</h2>
+                            <p>按状态、分类、来源和关键词定位问题。</p>
+                        </div>
+                        <div class="filter-row">
+                            <input id="jobKeywordFilter" type="search" placeholder="搜索提交编号 / 任务编号 / 资源名称">
+                            <select id="jobStatusFilter">
+                                <option value="">全部状态</option>
+                                <option value="created">已创建</option>
+                                <option value="provider_submitting">网盘提交待确认</option>
+                                <option value="submitted">已提交</option>
+                                <option value="waiting_transfer">待搬运</option>
+                                <option value="waiting_openlist">等待 OpenList</option>
+                                <option value="waiting_organizer">等待整理</option>
+                                <option value="organizing">整理中</option>
+                                <option value="confirming">确认标准目录</option>
+                                <option value="review">人工确认</option>
+                                <option value="failed">失败</option>
+                                <option value="cancelled">已取消</option>
+                                <option value="done">入库完成</option>
+                            </select>
+                            <select id="jobCategoryFilter">
+                                <option value="">全部分类</option>
+                                {% for key, item in categories.items() %}
+                                <option value="{{ key }}">{{ item.label }}</option>
+                                {% endfor %}
+                            </select>
+                            <button class="secondary" type="button" id="loadJobsBtn">查询</button>
+                        </div>
+                    </div>
+                    <div id="jobsPagerTop" class="pager-bar pager-bar-top"></div>
+                    <div class="table-wrap">
+                        <table class="data-table table-jobs">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>标题</th>
+                                    <th>分类</th>
+                                    <th>状态</th>
+                                    <th>来源</th>
+                                    <th>更新时间</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="adminJobsBody"></tbody>
+                        </table>
+                    </div>
+                    <div id="jobsPager" class="pager-bar"></div>
+                    <div id="jobDetailBox" class="detail-box hidden"></div>
+                </section>
+
+                <section class="glass-panel pad admin-tab-panel" id="tab-updates" role="tabpanel" aria-labelledby="adminTabUpdates" hidden>
+                    <div class="section-title">
+                        <div>
+                            <h2>定时追更</h2>
+                            <p>自动检查新集，命中后直接入库。</p>
+                        </div>
+                        <div class="filter-row">
+                            <select id="updateStatusFilter">
+                                <option value="">全部状态</option>
+                                <option value="enabled">启用</option>
+                                <option value="paused">暂停</option>
+                                <option value="archived">归档</option>
+                            </select>
+                            <button class="secondary" type="button" id="loadUpdatesBtn">刷新</button>
+                            <button class="secondary" type="button" id="runDueUpdatesBtn">运行到期</button>
+                            <button type="button" id="newUpdateSubscriptionBtn">新建追更</button>
+                        </div>
+                    </div>
+                    <div class="notice-box" id="updateSchedulerStatus">等待加载追更调度状态。</div>
+                    <div id="updateMetrics" class="metric-grid admin-metric-grid" style="margin-top: 16px;"></div>
+                    <div class="table-wrap" style="margin-top: 16px;">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>标题</th>
+                                    <th>分类 / 季</th>
+                                    <th>下次运行</th>
+                                    <th>集数状态</th>
+                                    <th>候选</th>
+                                    <th>状态</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="updateSubscriptionsBody">
+                                <tr><td colspan="8" class="empty-cell">等待加载追更订阅。</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div id="updatesPager" class="pager-bar"></div>
+                </section>
+
+                <section class="glass-panel pad admin-tab-panel" id="tab-trending" role="tabpanel" aria-labelledby="adminTabTrending" hidden>
+                    <div class="section-title">
+                        <div>
+                            <h2>每日热榜</h2>
+                            <p>平台热榜候选。</p>
+                        </div>
+                        <div class="filter-row">
+                            <select id="trendingSourceFilter" aria-label="热榜来源筛选">
+                                <option value="">全部来源</option>
+                                <option value="tencent">腾讯视频</option>
+                                <option value="iqiyi">爱奇艺</option>
+                                <option value="youku">优酷</option>
+                            </select>
+                            <select id="trendingTypeFilter" aria-label="热榜类型筛选">
+                                <option value="">全部类型</option>
+                                <option value="tv">电视剧</option>
+                                <option value="movie">电影</option>
+                                <option value="anime">动漫</option>
+                                <option value="variety">综艺</option>
+                            </select>
+                            <select id="trendingStatusFilter" aria-label="热榜状态筛选">
+                                <option value="">全部状态</option>
+                                <option value="discovered">待审核</option>
+                                <option value="already_exists">媒体库已有</option>
+                                <option value="task_exists">已有入库/追更任务</option>
+                                <option value="importing">首入库中</option>
+                                <option value="imported">首入库完成</option>
+                                <option value="import_failed">首入库失败</option>
+                                <option value="ignored">已忽略</option>
+                            </select>
+                            <button class="secondary" type="button" id="loadTrendingBtn">刷新</button>
+                            <button class="secondary" type="button" id="openTrendingSchedulerBtn">自动调度</button>
+                            <button type="button" id="runTrendingBtn">立即发现</button>
+                        </div>
+                    </div>
+                    <div id="trendingMetrics" class="metric-grid admin-metric-grid" style="margin-top: 16px;"></div>
+                    <div id="trendingCategoryBoards" class="trending-category-boards" style="margin-top: 16px;">
+                        <div class="empty glass-panel soft">等待加载每日热榜。</div>
+                    </div>
+                    <div id="trendingPager" class="pager-bar"></div>
+                </section>
+
+                <section class="admin-tab-panel" id="tab-media" role="tabpanel" aria-labelledby="adminTabMedia" hidden>
+                    <div class="admin-page-head">
+                            <h2>媒体库管理</h2>
+                        <p>查看媒体库数量和刷新状态。</p>
+                    </div>
+                    <div class="notice-box" id="mediaStatusBox">正在加载飞牛媒体库信息。</div>
+                    <div class="media-stat-grid" id="mediaStatGrid">
+                        {% for key, item in categories.items() %}
+                        <article class="media-stat-card tone-{{ key }}">
+                            <span class="media-card-title">{{ item.label }}</span>
+                            <strong>待统计</strong>
+                            <small>刷新目标：{{ item.fnos_lib or item.label }}</small>
+                        </article>
+                        {% endfor %}
+                    </div>
+                    <div class="media-layout-grid">
+                        <section class="glass-panel pad">
+                            <div class="section-title">
+                                <div>
+                                    <h2>媒体库列表</h2>
+                                    <p>按分类刷新媒体库。</p>
+                                </div>
+                                <div class="filter-row">
+                                    <button class="secondary" type="button" id="mediaLoadBtn">刷新列表</button>
+                                    <button class="secondary" type="button" id="mediaRefreshAllBtn">&#21047;&#26032;&#20840;&#37096;&#20998;&#31867;</button>
+                                </div>
+                            </div>
+                            <div class="table-wrap">
+                                <table class="data-table table-media">
+                                    <thead>
+                                        <tr>
+                                            <th>媒体库</th>
+                                            <th>飞牛类型</th>
+                                            <th>资源数</th>
+                                            <th>入库分类 / 目录</th>
+                                            <th>状态 / 操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="mediaLibraryBody">
+                                        <tr><td colspan="5" class="empty-cell">正在加载媒体库。</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </section>
+                        <aside class="glass-panel pad">
+                            <h3>路径映射</h3>
+                            <div class="mapping-list" id="mediaMappingList">
+                                {% for key, item in categories.items() %}
+                                <div><span>{{ item.label }}</span><code>{{ item.cloud139_target_path }} → {{ item.cloud139_fnos_target_path }}</code></div>
+                                {% endfor %}
+                            </div>
+                        </aside>
+                    </div>
+                </section>
+
+                <section class="glass-panel pad admin-tab-panel" id="tab-rclone" role="tabpanel" aria-labelledby="adminTabRclone" hidden>
+                    <div class="section-title">
+                        <div>
+                            <h2>日志中心 / 服务状态</h2>
+                            <p>查看系统运行状态和关键记录。</p>
+                        </div>
+                        <div class="filter-row">
+                            <button type="button" id="adminRcloneStartBtn">启动搬运</button>
+                            <button class="danger" type="button" id="adminRcloneStopBtn">停止搬运</button>
+                            <button class="secondary" type="button" id="adminRcloneCheckBtn">环境检查</button>
+                            <button class="secondary" type="button" id="loadRcloneBtn">刷新记录</button>
+                        </div>
+                    </div>
+                    <div id="adminRcloneStatus" class="notice-box">等待刷新。</div>
+                    <div class="task-log-section">
+                        <div class="task-log-head">
+                            <div>
+                                <h3>任务日志</h3>
+                                <p>按任务编号归档，打开后可查看从创建到结束的完整原始记录。</p>
+                            </div>
+                            <div class="filter-row task-log-filter">
+                                <input id="taskLogKeyword" type="search" placeholder="任务编号或标题" autocomplete="off">
+                                <select id="taskLogStatus" class="fn-select" aria-label="任务状态">
+                                    <option value="">全部状态</option>
+                                    <option value="created">已创建</option>
+                                    <option value="provider_submitting">网盘提交待确认</option>
+                                    <option value="submitted">已提交</option>
+                                    <option value="waiting_transfer">等待搬运</option>
+                                    <option value="transferring">搬运中</option>
+                                    <option value="waiting_openlist">等待 OpenList</option>
+                                    <option value="waiting_organizer">等待整理</option>
+                                    <option value="organizing">整理中</option>
+                                    <option value="confirming">确认标准目录</option>
+                                    <option value="review">人工确认</option>
+                                    <option value="refreshing">刷新媒体库</option>
+                                    <option value="retry_requested">等待重试</option>
+                                    <option value="done">已完成</option>
+                                    <option value="failed">失败</option>
+                                    <option value="cancelled">已取消</option>
+                                </select>
+                                <div class="date-range-control" aria-label="日志日期范围">
+                                    <div class="date-picker" data-date-picker data-date-role="start" data-date-label="开始日期">
+                                        <input id="taskLogDateFrom" type="hidden" value="">
+                                        <button class="date-picker-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
+                                            <span class="date-picker-caption">开始日期</span>
+                                            <span class="date-picker-value" data-date-value>不限</span>
+                                            <span class="date-picker-chevron" aria-hidden="true">⌄</span>
+                                        </button>
+                                        <div class="date-picker-popover" role="dialog" aria-label="选择开始日期" hidden>
+                                            <div class="date-picker-head">
+                                                <button class="date-picker-nav" type="button" data-date-prev aria-label="上个月">‹</button>
+                                                <strong data-date-month></strong>
+                                                <button class="date-picker-nav" type="button" data-date-next aria-label="下个月">›</button>
+                                            </div>
+                                            <div class="date-picker-weekdays" aria-hidden="true"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
+                                            <div class="date-picker-days" data-date-days></div>
+                                            <div class="date-picker-actions">
+                                                <button class="secondary mini" type="button" data-date-clear>清空</button>
+                                                <button class="secondary mini" type="button" data-date-today>今天</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <span class="date-range-separator" aria-hidden="true">至</span>
+                                    <div class="date-picker date-picker-end" data-date-picker data-date-role="end" data-date-label="结束日期">
+                                        <input id="taskLogDateTo" type="hidden" value="">
+                                        <button class="date-picker-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
+                                            <span class="date-picker-caption">结束日期</span>
+                                            <span class="date-picker-value" data-date-value>不限</span>
+                                            <span class="date-picker-chevron" aria-hidden="true">⌄</span>
+                                        </button>
+                                        <div class="date-picker-popover" role="dialog" aria-label="选择结束日期" hidden>
+                                            <div class="date-picker-head">
+                                                <button class="date-picker-nav" type="button" data-date-prev aria-label="上个月">‹</button>
+                                                <strong data-date-month></strong>
+                                                <button class="date-picker-nav" type="button" data-date-next aria-label="下个月">›</button>
+                                            </div>
+                                            <div class="date-picker-weekdays" aria-hidden="true"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
+                                            <div class="date-picker-days" data-date-days></div>
+                                            <div class="date-picker-actions">
+                                                <button class="secondary mini" type="button" data-date-clear>清空</button>
+                                                <button class="secondary mini" type="button" data-date-today>今天</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button class="secondary" type="button" id="taskLogSearchBtn">查询</button>
+                            </div>
+                        </div>
+                        <div id="adminTaskLogs" class="list-box task-log-list"></div>
+                        <div id="taskLogsPager" class="pager-bar compact"></div>
+                    </div>
+                    <div class="split-grid">
+                        <div class="rclone-live-log">
+                            <div class="rclone-live-log-head">
+                                <h3>系统实时日志</h3>
+                                <small>系统关键日志。</small>
+                            </div>
+                            <pre id="adminSystemLogs">等待刷新。</pre>
+                        </div>
+                        <div class="rclone-live-log">
+                            <div class="rclone-live-log-head">
+                                <h3>rclone 实时日志</h3>
+                                <small>搬运服务日志。</small>
+                            </div>
+                            <pre id="adminRcloneLogs">等待刷新。</pre>
+                        </div>
+                    </div>
+                    <details class="advanced-details log-advanced-troubleshooting">
+                        <summary>高级排障 · rclone 运行批次</summary>
+                        <p class="muted">用于排查搬运进程启动、退出码和批次级故障；日常查看任务请使用上方任务日志。</p>
+                        <div>
+                            <div id="adminRcloneRuns" class="list-box"></div>
+                            <div id="rcloneRunsPager" class="pager-bar compact"></div>
+                        </div>
+                    </details>
+                </section>
+
+                <section class="glass-panel pad admin-tab-panel" id="tab-organizer" role="tabpanel" aria-labelledby="adminTabOrganizer" hidden>
+                    <div class="section-title">
+                        <div>
+                            <h2>OpenList 标准化</h2>
+                            <p>入库后自动整理文件名和目录。</p>
+                        </div>
+                        <div class="filter-row">
+                            <select id="organizerStatusFilter">
+                                <option value="">全部状态</option>
+                                <option value="stabilizing">等待稳定</option>
+                                <option value="waiting_review">需审核</option>
+                                <option value="auto_approved">自动通过</option>
+                                <option value="manual_confirmed">人工确认</option>
+                                <option value="executing">执行中</option>
+                                <option value="done">已完成</option>
+                                <option value="failed">失败</option>
+                                <option value="skipped">已跳过</option>
+                            </select>
+                            <button class="secondary" type="button" id="loadOrganizerBtn">刷新</button>
+                            <button class="secondary" type="button" id="openOrganizerScanBtn">手动扫描</button>
+                            <button class="secondary" type="button" id="openOrganizerRunsBtn">执行记录/回滚</button>
+                        </div>
+                    </div>
+                    <div class="notice-box" id="organizerStatusBox">等待加载标准化任务。</div>
+                    <div class="table-wrap" style="margin-top: 16px;">
+                        <table class="data-table table-organizer">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>资源</th>
+                                    <th>目录</th>
+                                    <th>匹配</th>
+                                    <th>状态</th>
+                                    <th>更新时间</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="organizerTasksBody">
+                                <tr><td colspan="7" class="empty-cell">暂无标准化任务</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div id="organizerTasksPager" class="pager-bar"></div>
+                </section>
+
+                <section class="glass-panel pad admin-tab-panel" id="tab-adapters" role="tabpanel" aria-labelledby="adminTabAdapters" hidden>
+                    <div class="section-title">
+                        <div>
+                            <h2>系统设置</h2>
+                            <p>维护账号、路径和自动化开关。</p>
+                        </div>
+                        <div class="filter-row">
+                            <button class="secondary" type="button" id="loadAdaptersBtn">刷新</button>
+                            <button type="button" id="saveSettingsBtn">保存全部</button>
+                        </div>
+                    </div>
+                    <nav class="settings-subnav" aria-label="系统设置分区">
+                        <button class="active" type="button" data-settings-section-target="search" data-no-auto-loading="true">搜索与线路</button>
+                        <button type="button" data-settings-section-target="clouds" data-no-auto-loading="true">网盘服务</button>
+                        <button type="button" data-settings-section-target="intelligence" data-no-auto-loading="true">OpenList/TMDB/AI</button>
+                        <button type="button" data-settings-section-target="transport" data-no-auto-loading="true">飞牛与 rclone</button>
+                        <button type="button" data-settings-section-target="categories" data-no-auto-loading="true">分类路径</button>
+                        <button type="button" data-settings-section-target="security" data-no-auto-loading="true">安全</button>
+                        <button type="button" data-settings-section-target="notifications" data-no-auto-loading="true">通知</button>
+                        <button type="button" data-settings-section-target="maintenance" data-no-auto-loading="true">系统维护</button>
+                        <button type="button" data-settings-section-target="profile" data-no-auto-loading="true">个人设置</button>
+                    </nav>
+                    <div class="settings-grid settings-section-block" data-settings-section="search">
+                        <section class="settings-card">
+                            <h3>访客提交设置</h3>
+                            <label class="settings-row">
+                                <span>允许匿名搜索</span>
+                                <input id="settingAllowAnonymousSearch" type="checkbox">
+                            </label>
+                            <label class="settings-row">
+                                <span>提交结果可查询</span>
+                                <input id="settingRequestQueryEnabled" type="checkbox">
+                            </label>
+                            <label class="settings-row">
+                                <span>隐藏完整链接</span>
+                                <input id="settingHideFullLinks" type="checkbox">
+                            </label>
+                        </section>
+                        <section class="settings-card">
+                            <h3>处理模式</h3>
+                            <select id="settingSubmitMode">
+                                <option value="auto">自动模式：支持资源直接入库</option>
+                                <option value="review">审核模式：全部进入待审核</option>
+                                <option value="mixed">混合模式：支持资源自动，异常进入审核</option>
+                            </select>
+                        </section>
+                    </div>
+                    <section class="notification-console settings-section-block" data-settings-section="notifications">
+                        <header class="notification-console-head">
+                            <div class="notification-console-title">
+                                <div>
+                                    <h3>通知中心</h3>
+                                    <span id="notificationMasterStatus" class="notification-master-status is-off">已停用</span>
+                                </div>
+                                <label class="notification-master-switch">
+                                    <span>启用通知</span>
+                                    <input id="notificationEnabled" type="checkbox">
+                                </label>
+                            </div>
+                            <button type="button" id="notificationSaveBtn">保存设置</button>
+                        </header>
+
+                        <nav class="notification-tabs" aria-label="通知设置分区" role="tablist">
+                            <button class="active" type="button" role="tab" aria-selected="true" data-notification-tab-target="channels" data-no-auto-loading="true">渠道配置</button>
+                            <button type="button" role="tab" aria-selected="false" data-notification-tab-target="rules" data-no-auto-loading="true">事件规则</button>
+                            <button type="button" role="tab" aria-selected="false" data-notification-tab-target="deliveries" data-no-auto-loading="true">投递记录</button>
+                        </nav>
+
+                        <div class="notification-tab-panel active" role="tabpanel" data-notification-tab="channels">
+                            <div class="notification-channel-grid">
+                                <section class="notification-pane notification-global-pane">
+                                    <div class="notification-pane-head">
+                                        <h3>运行设置</h3>
+                                    </div>
+                                    <label class="advanced-field notification-explained-field">
+                                        <span>每日汇总发送时间</span>
+                                        <select id="notificationDigestHour" aria-describedby="notificationDigestHourHelp">
+                                            {% for hour in range(24) %}<option value="{{ hour }}">{{ "%02d:00"|format(hour) }}</option>{% endfor %}
+                                        </select>
+                                        <small id="notificationDigestHourHelp">按所选时区每天汇总发送一次，不控制事件通知。</small>
+                                    </label>
+                                    <div class="advanced-field notification-number-field notification-explained-field">
+                                        <span>投递记录保留期限</span>
+                                        <div class="notification-number-control">
+                                            <button class="secondary" type="button" title="减少一天" aria-label="投递记录保留期限减少一天" data-notification-step-target="notificationRetentionDays" data-notification-step="-1" data-no-auto-loading="true">-</button>
+                                            <input id="notificationRetentionDays" type="number" min="7" max="3650" aria-label="投递记录保留天数">
+                                            <button class="secondary" type="button" title="增加一天" aria-label="投递记录保留期限增加一天" data-notification-step-target="notificationRetentionDays" data-notification-step="1" data-no-auto-loading="true">+</button>
+                                            <span class="notification-number-unit">天</span>
+                                        </div>
+                                        <small>超过期限的投递记录会自动清理。</small>
+                                    </div>
+                                    <label class="advanced-field notification-explained-field">
+                                        <span>摘要时区</span>
+                                        <input id="notificationDigestTimezone" type="text" placeholder="Asia/Shanghai" aria-describedby="notificationDigestTimezoneHelp">
+                                        <small id="notificationDigestTimezoneHelp">Asia/Shanghai 表示中国标准时间。</small>
+                                    </label>
+                                    <label class="settings-row notification-option-row">
+                                        <span class="notification-option-copy"><strong>访客邮件</strong><small>向已验证邮箱发送申请进度</small></span>
+                                        <input id="notificationGuestEnabled" type="checkbox">
+                                    </label>
+                                </section>
+
+                                <section class="notification-pane">
+                                    <div class="notification-pane-head">
+                                        <div>
+                                            <h3>SMTP 邮件</h3>
+                                            <span id="notificationSmtpStatus" class="notification-channel-status is-off">未启用</span>
+                                        </div>
+                                        <button class="secondary mini" type="button" id="notificationTestEmailBtn">测试</button>
+                                    </div>
+                                    <label class="settings-row notification-option-row"><span>启用 SMTP</span><input id="notificationSmtpEnabled" type="checkbox"></label>
+                                    <label class="advanced-field"><span>服务器</span><input id="notificationSmtpHost" type="text" placeholder="smtp.example.com"></label>
+                                    <div class="notification-inline-fields notification-smtp-connection">
+                                        <label class="advanced-field"><span>端口</span><input id="notificationSmtpPort" type="number" min="1" max="65535"></label>
+                                        <label class="advanced-field"><span>连接安全</span><select id="notificationSmtpSecurity"><option value="ssl">SSL</option><option value="starttls">STARTTLS</option><option value="none">无</option></select></label>
+                                    </div>
+                                    <div class="notification-inline-fields notification-smtp-credentials">
+                                        <label class="advanced-field"><span>用户名</span><input id="notificationSmtpUsername" type="text" autocomplete="off"></label>
+                                        <label class="advanced-field"><span>密码 / env 引用</span><input id="notificationSmtpPassword" type="password" autocomplete="new-password"></label>
+                                    </div>
+                                    <div class="notification-inline-fields">
+                                        <label class="advanced-field"><span>发件人名称</span><input id="notificationSmtpFromName" type="text"></label>
+                                        <label class="advanced-field"><span>发件邮箱</span><input id="notificationSmtpFromEmail" type="email"></label>
+                                    </div>
+                                    <label class="advanced-field"><span>管理员收件人</span><textarea id="notificationAdminRecipients" rows="2" placeholder="每行一个邮箱"></textarea></label>
+                                </section>
+
+                                <section class="notification-pane notification-webhook-pane">
+                                    <div class="notification-pane-head">
+                                        <div>
+                                            <h3>Webhook</h3>
+                                            <span id="notificationWebhookStatus" class="notification-channel-status is-off">未启用</span>
+                                        </div>
+                                        <button class="secondary mini" type="button" id="notificationTestWebhookBtn">测试</button>
+                                    </div>
+                                    <label class="settings-row notification-option-row"><span>启用 Webhook</span><input id="notificationWebhookEnabled" type="checkbox"></label>
+                                    <label class="advanced-field"><span>URL / env 引用</span><input id="notificationWebhookUrl" type="password" autocomplete="new-password"></label>
+                                    <label class="advanced-field"><span>签名密钥 / env 引用</span><input id="notificationWebhookSecret" type="password" autocomplete="new-password"></label>
+                                    <label class="settings-row notification-risk-toggle"><span>允许私有地址及 HTTP</span><input id="notificationWebhookAllowPrivate" type="checkbox"></label>
+                                </section>
+                            </div>
+                        </div>
+
+                        <div class="notification-tab-panel" role="tabpanel" data-notification-tab="rules" hidden>
+                            <section class="notification-pane notification-rules-pane">
+                                <div class="notification-rule-head" aria-hidden="true">
+                                    <span>事件</span>
+                                    <span>管理员邮件</span>
+                                    <span>Webhook</span>
+                                    <span>访客邮件</span>
+                                </div>
+                                <div id="notificationRules" class="notification-rule-grid"></div>
+                            </section>
+                        </div>
+
+                        <div class="notification-tab-panel" role="tabpanel" data-notification-tab="deliveries" hidden>
+                            <section class="notification-pane notification-deliveries-pane">
+                                <div class="notification-pane-head">
+                                    <h3>投递记录</h3>
+                                    <button class="secondary mini" type="button" id="notificationRefreshDeliveriesBtn">刷新</button>
+                                </div>
+                                <div id="notificationDeliverySummary" class="notification-delivery-summary"></div>
+                                <div id="notificationDeliveryList" class="notification-delivery-list"></div>
+                            </section>
+                        </div>
+                    </section>
+                    <div class="section-title compact settings-section-block" style="margin-top: 18px;" data-settings-section="search">
+                        <div>
+                            <h3>搜索源管理</h3>
+                        </div>
+                    </div>
+                    <div id="adminSearchProviders" class="list-box settings-section-block" data-settings-section="search"></div>
+                    <div class="section-title compact advanced-config-title settings-section-block" data-settings-section="search clouds intelligence transport categories security">
+                        <div>
+                            <h3>服务配置</h3>
+                        </div>
+                        <div class="filter-row">
+                            <button class="secondary" type="button" id="loadAdvancedConfigBtn">重新加载</button>
+                            <button class="secondary" type="button" id="exportAdvancedConfigBtn">导出配置</button>
+                            <button class="secondary" type="button" id="importAdvancedConfigBtn">导入配置</button>
+                            <input type="file" id="importAdvancedConfigFile" accept=".json,application/json" style="display:none;">
+                        </div>
+                    </div>
+                    <div class="notice-box settings-section-block" id="advancedConfigStatus" data-settings-section="search clouds intelligence transport categories security">配置尚未加载。</div>
+                    <div class="advanced-config-grid settings-section-block" data-settings-section="search clouds intelligence transport security">
+                        <section class="settings-card advanced-config-card" data-settings-section="search">
+                            <h3>搜索 / PanSou</h3>
+                            <label class="advanced-field"><span>服务地址</span><input id="advPansouBaseUrl" type="text" placeholder="http://127.0.0.1:8055"></label>
+                            <label class="advanced-field"><span>用户名</span><input id="advPansouUsername" type="text" autocomplete="off"></label>
+                            <label class="advanced-field"><span>密码</span><input id="advPansouPassword" type="password" autocomplete="new-password"></label>
+                            <label class="advanced-field"><span>默认 Token</span><input id="advPansouDefaultToken" type="password" autocomplete="new-password"></label>
+                            <div class="advanced-check-list" id="advPansouCloudTypes"></div>
+                            <details class="advanced-details">
+                                <summary>搜索优化参数</summary>
+                                <div class="advanced-inline-checks">
+                                    <label class="mini-check"><input id="advPansouAsyncPollEnabled" type="checkbox">等待异步结果补齐</label>
+                                    <label class="mini-check"><input id="advPansouRefresh" type="checkbox">强制刷新缓存</label>
+                                </div>
+                                <label class="advanced-field"><span>结果类型 res</span><input id="advPansouRes" type="text" placeholder="merge / results / all"></label>
+                                <label class="advanced-field"><span>数据来源 src</span><input id="advPansouSrc" type="text" placeholder="all / tg / plugin"></label>
+                                <label class="advanced-field"><span>并发 conc</span><input id="advPansouConc" type="number" min="0" max="100" placeholder="默认 10；0 表示自动"></label>
+                                <label class="advanced-field"><span>请求超时秒</span><input id="advPansouTimeout" type="number" min="1" max="300"></label>
+                                <label class="advanced-field"><span>补拉轮数</span><input id="advPansouPollMaxRounds" type="number" min="0" max="30"></label>
+                                <label class="advanced-field"><span>补拉间隔秒</span><input id="advPansouPollInterval" type="number" min="0.2" max="10" step="0.1"></label>
+                                <label class="advanced-field"><span>稳定停止轮数</span><input id="advPansouPollStableRounds" type="number" min="1" max="10"></label>
+                                <label class="advanced-field multiline"><span>频道 channels</span><textarea id="advPansouChannels" rows="2" placeholder="每行一个，可留空"></textarea></label>
+                                <label class="advanced-field multiline"><span>插件 plugins</span><textarea id="advPansouPlugins" rows="2" placeholder="每行一个，可留空"></textarea></label>
+                                <label class="advanced-field multiline"><span>包含关键词</span><textarea id="advPansouFilterInclude" rows="2" placeholder="例如：高码&#10;HDR"></textarea></label>
+                                <label class="advanced-field multiline"><span>排除关键词</span><textarea id="advPansouFilterExclude" rows="2" placeholder="例如：预告&#10;抢先"></textarea></label>
+                            </details>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="search">
+                            <h3>线路开关</h3>
+                            <div class="advanced-check-list route-checks" id="advancedRouteChecks"></div>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="search">
+                            <h3>定时追更调度</h3>
+                            <label class="mini-check"><input id="advUpdateSchedulerEnabled" type="checkbox">启用后台定时追更</label>
+                            <label class="advanced-field"><span>TMDB 播出前探测分钟</span><input id="advUpdateSchedulerTmdbProbeLeadMinutes" type="number" min="0" max="10080"></label>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="search">
+                            <h3>BTBTLA 磁链搜索</h3>
+                            <label class="advanced-field"><span>站点地址</span><input id="advBtbtlaBaseUrl" type="text" placeholder="https://www.btbtla.com"></label>
+                            <label class="advanced-field"><span>超时秒数</span><input id="advBtbtlaTimeout" type="number" min="1" max="120"></label>
+                            <label class="advanced-field"><span>搜索最多结果</span><input id="advBtbtlaMaxResults" type="number" min="1" max="100"></label>
+                            <label class="advanced-field"><span>详情最多资源</span><input id="advBtbtlaMaxDetailResources" type="number" min="1" max="300"></label>
+                            <label class="advanced-field"><span>独立代理地址</span><input id="advBtbtlaProxyUrl" type="password" autocomplete="new-password" placeholder="http://host.docker.internal:7890 或 socks5h://host:7891"></label>
+                            <div class="advanced-inline-checks">
+                                <label class="mini-check"><input id="advBtbtlaVerifyTls" type="checkbox">校验 TLS</label>
+                                <label class="mini-check"><input id="advBtbtlaProxyEnabled" type="checkbox">仅为 BT 搜索启用独立代理</label>
+                            </div>
+                            <div class="table-actions">
+                                <button class="secondary mini" type="button" id="btbtlaProxyTestBtn">检测代理是否生效</button>
+                            </div>
+                            <div id="btbtlaProxyTestResult" class="notice-box" role="status" aria-live="polite" hidden></div>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="intelligence">
+                            <h3>OpenList API</h3>
+                            <label class="advanced-field"><span>服务地址</span><input id="advOpenlistBaseUrl" type="text" placeholder="http://127.0.0.1:5244"></label>
+                            <label class="advanced-field"><span>Token</span><input id="advOpenlistToken" type="password" autocomplete="new-password"></label>
+                            <label class="advanced-field"><span>超时秒数</span><input id="advOpenlistTimeout" type="number" min="1" max="300"></label>
+                            <div class="advanced-inline-checks">
+                                <label class="mini-check"><input id="advOpenlistListRefreshDefault" type="checkbox">列表强制刷新</label>
+                                <label class="mini-check"><input id="advOpenlistVerifyTls" type="checkbox">校验 TLS</label>
+                                <label class="mini-check"><input id="advOpenlistUseEnvProxy" type="checkbox">使用系统代理</label>
+                            </div>
+                            <button class="secondary mini" type="button" id="openlistTestBtn">连接测试</button>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="intelligence">
+                            <h3>TMDB</h3>
+                            <label class="advanced-field"><span>Token</span><input id="advTmdbToken" type="password" autocomplete="new-password"></label>
+                            <label class="advanced-field"><span>语言</span><input id="advTmdbLanguage" type="text" placeholder="zh-CN"></label>
+                            <label class="advanced-field"><span>独立代理地址</span><input id="advTmdbProxyUrl" type="password" autocomplete="new-password" placeholder="http://host.docker.internal:7890 或 socks5h://host:7891"></label>
+                            <div class="advanced-inline-checks">
+                                <label class="mini-check"><input id="advTmdbProxyEnabled" type="checkbox">仅为 TMDB 启用独立代理</label>
+                            </div>
+                            <button class="secondary mini" type="button" id="tmdbTestBtn">连接测试</button>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="intelligence">
+                            <h3>AI 校准</h3>
+                            <label class="mini-check"><input id="advAiEnabled" type="checkbox">启用低置信/冲突 AI 校准</label>
+                            <div class="config-dependent-fields" data-config-dependency="advAiEnabled">
+                                <label class="advanced-field"><span>接口风格</span>
+                                    <select id="advAiApiStyle">
+                                        <option value="auto">自动匹配</option>
+                                        <option value="chat">Chat Completions</option>
+                                        <option value="responses">Responses API</option>
+                                    </select>
+                                </label>
+                                <label class="advanced-field"><span>Base URL</span><input id="advAiBaseUrl" type="text" placeholder="https://api.openai.com/v1"></label>
+                                <label class="advanced-field"><span>API Key</span><input id="advAiApiKey" type="password" autocomplete="new-password"></label>
+                                <label class="advanced-field"><span>模型</span><input id="advAiModel" type="text" placeholder="gpt-4.1-mini"></label>
+                                <label class="advanced-field"><span>超时秒数</span><input id="advAiTimeout" type="number" min="1" max="300"></label>
+                                <button class="secondary mini" type="button" id="aiTestBtn">连接测试</button>
+                            </div>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="intelligence">
+                            <h3>Organizer</h3>
+                            <label class="mini-check"><input id="advOrganizerEnabled" type="checkbox">启用入库后 OpenList 标准化</label>
+                            <div class="config-dependent-fields" data-config-dependency="advOrganizerEnabled">
+                                <label class="advanced-field"><span>自动执行置信度</span><input id="advOrganizerAutoApplyConfidence" type="number" min="0" max="100"></label>
+                                <div class="advanced-inline-checks">
+                                    <label class="mini-check"><input id="advOrganizerRefreshFnosAfterApply" type="checkbox">整理后刷新飞牛</label>
+                                    <label class="advanced-field" data-config-dependency="advOrganizerRefreshFnosAfterApply"><span>延迟秒数</span><input id="advOrganizerRefreshDelaySeconds" type="number" min="0" max="3600"></label>
+                                </div>
+                                <label class="advanced-field"><span>电影 STRM 前缀</span><input id="advOrganizerStrmRefreshPrefixMovie" type="text" placeholder="/飞牛NAS/电影"></label>
+                                <label class="advanced-field"><span>剧集 STRM 前缀</span><input id="advOrganizerStrmRefreshPrefixTv" type="text" placeholder="/飞牛NAS/电视剧"></label>
+                                <label class="advanced-field"><span>动漫 STRM 前缀</span><input id="advOrganizerStrmRefreshPrefixAnime" type="text" placeholder="/飞牛NAS/动漫"></label>
+                                <label class="advanced-field"><span>综艺 STRM 前缀</span><input id="advOrganizerStrmRefreshPrefixVariety" type="text" placeholder="/飞牛NAS/综艺"></label>
+                                <label class="advanced-field"><span>本地 STRM 根目录</span><input id="advOrganizerLocalStrmRoot" type="text" placeholder="/localStrm"></label>
+                                <details class="advanced-details">
+                                    <summary>识别参数</summary>
+                                    <label class="advanced-field"><span>稳定等待秒</span><input id="advOrganizerStableWindowSeconds" type="number" min="0" max="3600"></label>
+                                    <label class="advanced-field"><span>最大扫描层级</span><input id="advOrganizerMaxScanDepth" type="number" min="1" max="30"></label>
+                                    <label class="advanced-field"><span>单任务最多文件</span><input id="advOrganizerMaxFilesPerTask" type="number" min="1" max="5000"></label>
+                                </details>
+                            </div>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="clouds">
+                            <h3>Quark 自动转存</h3>
+                            <label class="advanced-field"><span>服务地址</span><input id="advQuarkAutoSaveUrl" type="text" placeholder="http://127.0.0.1:8015"></label>
+                            <label class="advanced-field"><span>Token</span><input id="advQuarkToken" type="password" autocomplete="new-password"></label>
+                            <label class="mini-check"><input id="advQuarkCheckBeforeSave" type="checkbox">提交前检测链接有效性</label>
+                            <label class="mini-check"><input id="advQuarkRunImmediately" type="checkbox">提交后立即执行</label>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="clouds">
+                            <h3>6盘离线下载</h3>
+                            <label class="advanced-field"><span>OpenAPI Host</span><input id="advSixpanHost" type="text" placeholder="openapi.2dland.cn"></label>
+                            <label class="advanced-field"><span>ClientID</span><input id="advSixpanClientId" type="text" autocomplete="off" placeholder="puc_xxx 或你的应用 ClientID"></label>
+                            <label class="advanced-field"><span>ClientSecret</span><input id="advSixpanClientSecret" type="password" autocomplete="new-password"></label>
+                            <div class="notice-box compact" id="sixpanAuthStatus">未授权</div>
+                            <div class="filter-row">
+                                <button class="secondary mini" type="button" id="sixpanStartAuthBtn">开始授权</button>
+                                <button class="secondary mini" type="button" id="sixpanCheckAuthBtn">我已授权，检查</button>
+                                <button class="secondary mini" type="button" id="sixpanProbeBtn">账号检测</button>
+                            </div>
+                            <div class="advanced-inline-checks">
+                                <label class="mini-check"><input id="advSixpanParseBeforeAdd" type="checkbox">提交前解析</label>
+                                <label class="mini-check"><input id="advSixpanPollEnabled" type="checkbox">后台轮询任务</label>
+                                <label class="mini-check" data-config-dependency="advSixpanParseBeforeAdd"><input id="advSixpanParseRequired" type="checkbox">解析失败即停止</label>
+                            </div>
+                            <details class="advanced-details">
+                                <summary>高级参数：通常不用改</summary>
+                                <label class="advanced-field"><span>超时秒数</span><input id="advSixpanTimeout" type="number" min="5" max="120"></label>
+                                <label class="advanced-field"><span>轮询间隔秒</span><input id="advSixpanPollInterval" type="number" min="10" max="3600"></label>
+                                <label class="advanced-field"><span>任务查询数量</span><input id="advSixpanTaskPollLimit" type="number" min="1" max="1000"></label>
+                                <label class="mini-check"><input id="advSixpanVerifyTls" type="checkbox">校验 TLS 证书</label>
+                            </details>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="clouds">
+                            <h3>移动云官方上传</h3>
+                            <label class="advanced-field"><span>上传模式</span>
+                                <select id="advCmccMode">
+                                    <option value="rapid_first">秒传优先，未命中再真实上传</option>
+                                    <option value="rapid_only">只尝试秒传，未命中直接失败</option>
+                                    <option value="api_put">直接上传</option>
+                                </select>
+                            </label>
+                            <label class="advanced-field"><span>网页授权凭据</span><input id="advCmccAccessToken" type="password" autocomplete="new-password"></label>
+                            <label class="advanced-field"><span>手机号</span><input id="advCmccPhone" type="text" autocomplete="off"></label>
+                            <details class="advanced-details">
+                                <summary>高级参数：一般不要改</summary>
+                                <label class="advanced-field"><span>同名策略</span>
+                                    <select id="advCmccRenameMode">
+                                        <option value="refuse">拒绝覆盖</option>
+                                        <option value="force_rename">云端重命名</option>
+                                        <option value="auto_rename">自动重命名</option>
+                                    </select>
+                                </label>
+                                <label class="advanced-field"><span>接口地址</span><input id="advCmccHost" type="text" placeholder="https://personal-kd-njs.yun.139.com/hcy"></label>
+                            </details>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="transport">
+                            <h3>飞牛媒体刷新</h3>
+                            <label class="advanced-field"><span>飞牛地址</span><input id="advFnosServerUrl" type="text" placeholder="http://127.0.0.1:5668"></label>
+                            <label class="advanced-field"><span>用户名</span><input id="advFnosUsername" type="text" autocomplete="off"></label>
+                            <label class="advanced-field"><span>密码</span><input id="advFnosPassword" type="password" autocomplete="new-password"></label>
+                            <label class="advanced-field"><span>API Key</span><input id="advFnosApiKey" type="password" autocomplete="new-password"></label>
+                            <label class="advanced-field"><span>Secret</span><input id="advFnosSecret" type="password" autocomplete="new-password"></label>
+                            <label class="advanced-field"><span>Token</span><input id="advFnosToken" type="password" autocomplete="new-password"></label>
+                        </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="transport">
+                            <h3>rclone 搬运</h3>
+                            <label class="mini-check"><input id="advRcloneEnabled" type="checkbox">启用 rclone 集成</label>
+                            <div class="config-dependent-fields" data-config-dependency="advRcloneEnabled">
+                                <label class="advanced-field"><span>Remote 名称</span><input id="advRcloneRemoteName" type="text" value="MP" autocomplete="off"></label>
+                                <label class="advanced-field"><span>OpenList WebDAV URL</span><input id="rcloneWebdavUrl" type="url" placeholder="http://host.docker.internal:5244/dav" autocomplete="url"></label>
+                                <label class="advanced-field"><span>WebDAV 用户名</span><input id="rcloneWebdavUsername" type="text" autocomplete="username"></label>
+                                <label class="advanced-field"><span>WebDAV 密码</span><input id="rcloneWebdavPassword" type="password" autocomplete="new-password" placeholder="首次配置时填写"></label>
+                                <div id="rcloneWebdavStatus" class="notice-box compact" role="status" aria-live="polite">正在读取 WebDAV 配置。</div>
+                                <div class="filter-row">
+                                    <button id="saveRcloneWebdavBtn" type="button">保存并检测</button>
+                                    <button id="testRcloneWebdavBtn" class="secondary" type="button">检测连接</button>
+                                </div>
+                            </div>
+                        </section>
+                        <section class="settings-card advanced-config-card security-status-card" data-settings-section="security">
+                            <div class="security-status-head">
+                                <div>
+                                    <h3>安全状态</h3>
+                                    <p class="muted">查看后台基础安全项。</p>
+                                </div>
+                                <div class="filter-row">
+                                    <button class="secondary mini" type="button" id="manageAdvancedSecretsBtn">凭据管理</button>
+                                    <button class="secondary mini" type="button" id="securityStatusRefreshBtn">重新检测</button>
+                                </div>
+                            </div>
+                            <div id="adminSecurityStatus" class="security-status-list">
+                                <div class="security-status-item level-warn">
+                                    <strong>等待检测</strong>
+                                    <p>加载后台配置后会自动显示安全状态。</p>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                    <div class="settings-grid settings-section-block" data-settings-section="profile">
+                        <section class="settings-card">
+                            <h3>用户信息</h3>
+                            <label class="advanced-field"><span>用户名</span><input id="profileUsername" type="text" autocomplete="username"></label>
+                            <label class="advanced-field"><span>当前密码</span><input id="profileCurrentPassword" type="password" autocomplete="current-password" placeholder="改用户名或密码时必填"></label>
+                            <label class="advanced-field"><span>新密码</span><input id="profileNewPassword" type="password" autocomplete="new-password" placeholder="不修改请留空"></label>
+                            <div class="profile-preview-row">
+                                <span class="avatar profile-avatar-preview" id="profileAvatarPreview"><span class="icon-slot icon-user" aria-hidden="true"></span></span>
+                                <label class="advanced-field file-field"><span>头像</span><input id="profileAvatarFile" type="file" accept="image/*"></label>
+                            </div>
+                            <button type="button" id="saveProfileBtn">保存用户信息</button>
+                            <p class="muted">修改密码或用户名必须输入当前密码校验；头像会显示在后台右上角。</p>
+                        </section>
+                        <section class="settings-card">
+                            <h3>网站 Logo</h3>
+                            <div class="site-logo-preview"><span class="brand-mark" id="siteLogoPreview"></span></div>
+                            <label class="advanced-field file-field"><span>Logo 图片</span><input id="siteLogoFile" type="file" accept="image/*"></label>
+                            <button type="button" id="saveSiteLogoBtn">上传网站 Logo</button>
+                            <p class="muted">用于网页左上角 Logo；支持 png/jpg/webp/gif/svg，最大 5MB。</p>
+                        </section>
+                    </div>
+                    <div class="settings-grid settings-section-block" data-settings-section="maintenance">
+                        <section class="settings-card">
+                            <h3>历史记录清理</h3>
+                            <p class="muted">清理旧任务和日志，保留追更订阅。</p>
+                            <div id="adminHistorySummary" class="notice-box">等待加载历史记录统计。</div>
+                            <div class="filter-row">
+                                <button class="secondary mini" type="button" id="historySummaryRefreshBtn">刷新统计</button>
+                                <button class="danger mini" type="button" id="cleanupHistoryBtn">清理历史记录</button>
+                            </div>
+                            <div id="adminHistoryCleanupTables" class="list-box" style="margin-top: 12px;"></div>
+                        </section>
+                        <section class="settings-card">
+                            <h3>保留项</h3>
+                            <p class="muted">追更订阅和来源链接会保留。</p>
+                            <div id="adminHistoryPreserved" class="list-box"></div>
+                        </section>
+                    </div>
+                    <section class="settings-card advanced-category-card" data-settings-section="categories">
+                        <div>
+                            <h3>分类路径</h3>
+                            <p class="muted">维护根目录和分类目录名即可。</p>
+                        </div>
+                        <div class="category-template-box">
+                            <div class="category-template-head">
+                                <div>
+                                    <strong>路径模板</strong>
+                                    <p>系统会按来源自动选择对应目录。</p>
+                                </div>
+                                <div class="filter-row">
+                                    <button class="secondary mini" type="button" id="applyCategoryTemplateBtn">刷新预览</button>
+                                </div>
+                            </div>
+                            <div class="category-template-grid">
+                                <label class="advanced-field"><span>夸克离线目标目录</span><input id="categoryTemplateQuarkRoot" type="text" value="/离线下载" placeholder="/离线下载"></label>
+                                <label class="advanced-field"><span>移动云官方目录（直转/API 上传）</span><input id="categoryTemplateCloud139Root" type="text" value="博客" placeholder="移动云官方目录，例如：webDAV"></label>
+                                <label class="advanced-field"><span>移动云 OpenList 挂载目录</span><input id="categoryTemplateCloud139FnosRoot" type="text" value="移动云2" placeholder="官方目录在 OpenList 中的挂载名，例如：移动云2"></label>
+                                <label class="advanced-field"><span>6盘云端根目录</span><input id="categoryTemplateSixpanRoot" type="text" value="/" placeholder="/"></label>
+                                <label class="advanced-field"><span>6盘 OpenList 挂载目录</span><input id="categoryTemplateSixpanFnosRoot" type="text" value="清云" placeholder="例如：清云"></label>
+                            </div>
+                            <div id="categoryTemplatePreview" class="category-template-preview">模板预览会显示在这里。</div>
+                        </div>
+                        <div id="advancedCategoryRows" class="advanced-category-rules"></div>
+                    </section>
+                </section>
+            </section>
+        </div>
+    </main>
+
+    <div class="drawer-mask" id="adminDrawer" tabindex="-1">
+        <aside class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="adminDrawerTitle">
+            <header class="drawer-header">
+                <h3 id="adminDrawerTitle">任务详情</h3>
+                <button class="secondary mini icon-only" type="button" id="adminDrawerClose" aria-label="关闭">
+                    <span class="icon-slot icon-close" aria-hidden="true"></span>
+                </button>
+            </header>
+            <div class="drawer-body" id="adminDrawerBody"></div>
+        </aside>
+    </div>
+
+    <div class="raw-log-mask" id="adminRawLogModal" tabindex="-1">
+        <section class="raw-log-modal" role="dialog" aria-modal="true" aria-labelledby="adminRawLogTitle">
+            <header class="raw-log-header">
+                <div>
+                    <h3 id="adminRawLogTitle">原始日志</h3>
+                    <p>按真实日志行展示，便于直接排查 rclone 当前执行到哪里。</p>
+                </div>
+                <button class="secondary mini icon-only" type="button" id="adminRawLogClose" aria-label="关闭">
+                    <span class="icon-slot icon-close" aria-hidden="true"></span>
+                </button>
+            </header>
+            <pre class="raw-log-body" id="adminRawLogBody">暂无日志</pre>
+        </section>
+    </div>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+    <script src="/static/ui-core.js?v=20260711-admin-bootstrap-v013"></script>
+    <script src="/static/resource-search-workbench.js?v=20260716-shared-search-v001"></script>
+    <script src="/static/admin-system.js?v=20260805-rclone-webdav-v003"></script>
+    <script src="/static/admin-jobs.js?v=20260805-rclone-webdav-v003"></script>
+    <script src="/static/admin-media.js?v=20260805-rclone-webdav-v003"></script>
+    <script src="/static/admin-rclone.js?v=20260804-task-log-date-v015"></script>
+    <script src="/static/admin-organizer.js?v=20260805-rclone-webdav-v003"></script>
+    <script src="/static/admin-updates.js?v=20260805-rclone-webdav-v003"></script>
+    <script src="/static/admin-trending.js?v=20260805-rclone-webdav-v003"></script>
+    <script src="/static/admin-settings.js?v=20260805-rclone-webdav-v003"></script>
+    <script src="/static/admin-notifications.js?v=20260805-notifications-v006"></script>
+    <script src="/static/admin-adapters.js?v=20260805-rclone-webdav-v003"></script>
+    <script src="/static/admin-bootstrap.js?v=20260805-rclone-webdav-v003"></script>
+    <script src="/static/ui-select.js?v=20260716-trending-controls-v014"></script>
+    <script src="/static/ui-dialog.js?v=20260615-v001"></script>
+    <script src="/static/admin.js?v=20260805-rclone-webdav-v003"></script>
+</body>
+</html>

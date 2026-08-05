@@ -1,0 +1,303 @@
+{
+  "source": "assets/icon/new.png",
+  "count": 27,
+  "icons": [
+    {
+      "name": "movie",
+      "file": "/static/icons/movie.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        140,
+        140,
+        430,
+        430
+      ]
+    },
+    {
+      "name": "tv",
+      "file": "/static/icons/tv.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        625,
+        140,
+        925,
+        420
+      ]
+    },
+    {
+      "name": "anime",
+      "file": "/static/icons/anime.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        1085,
+        125,
+        1450,
+        445
+      ]
+    },
+    {
+      "name": "variety",
+      "file": "/static/icons/variety.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        1565,
+        130,
+        1885,
+        445
+      ]
+    },
+    {
+      "name": "other",
+      "file": "/static/icons/other.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        2035,
+        150,
+        2325,
+        430
+      ]
+    },
+    {
+      "name": "cloud139",
+      "file": "/static/icons/cloud139.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        125,
+        670,
+        450,
+        930
+      ]
+    },
+    {
+      "name": "quark",
+      "file": "/static/icons/quark.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        610,
+        675,
+        930,
+        935
+      ]
+    },
+    {
+      "name": "cloud189",
+      "file": "/static/icons/cloud189.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        1100,
+        675,
+        1465,
+        935
+      ]
+    },
+    {
+      "name": "bt",
+      "file": "/static/icons/bt.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        1585,
+        675,
+        1865,
+        940
+      ]
+    },
+    {
+      "name": "upload",
+      "file": "/static/icons/upload.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        135,
+        1140,
+        435,
+        1380
+      ]
+    },
+    {
+      "name": "download",
+      "file": "/static/icons/download.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        560,
+        1140,
+        820,
+        1380
+      ]
+    },
+    {
+      "name": "transfer",
+      "file": "/static/icons/transfer.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        960,
+        1140,
+        1245,
+        1380
+      ]
+    },
+    {
+      "name": "success",
+      "file": "/static/icons/success.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        1380,
+        1140,
+        1665,
+        1380
+      ]
+    },
+    {
+      "name": "failed",
+      "file": "/static/icons/failed.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        1795,
+        1140,
+        2075,
+        1380
+      ]
+    },
+    {
+      "name": "refresh",
+      "file": "/static/icons/refresh.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        2205,
+        1140,
+        2485,
+        1380
+      ]
+    },
+    {
+      "name": "info",
+      "file": "/static/icons/info.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        2630,
+        1140,
+        2925,
+        1380
+      ]
+    },
+    {
+      "name": "warning",
+      "file": "/static/icons/warning.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        3025,
+        1140,
+        3335,
+        1380
+      ]
+    },
+    {
+      "name": "audit",
+      "file": "/static/icons/audit.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        3445,
+        1140,
+        3725,
+        1380
+      ]
+    },
+    {
+      "name": "rclone",
+      "file": "/static/icons/rclone.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        125,
+        1645,
+        430,
+        1935
+      ]
+    },
+    {
+      "name": "pansou",
+      "file": "/static/icons/pansou.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        560,
+        1645,
+        835,
+        1935
+      ]
+    },
+    {
+      "name": "openlist",
+      "file": "/static/icons/openlist.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        970,
+        1645,
+        1245,
+        1935
+      ]
+    },
+    {
+      "name": "alist",
+      "file": "/static/icons/alist.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        1390,
+        1645,
+        1655,
+        1935
+      ]
+    },
+    {
+      "name": "clouddrive",
+      "file": "/static/icons/clouddrive.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        1810,
+        1645,
+        2070,
+        1935
+      ]
+    },
+    {
+      "name": "aria2",
+      "file": "/static/icons/aria2.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        2235,
+        1645,
+        2535,
+        1935
+      ]
+    },
+    {
+      "name": "pikpak",
+      "file": "/static/icons/pikpak.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        2635,
+        1645,
+        2945,
+        1935
+      ]
+    },
+    {
+      "name": "motrix",
+      "file": "/static/icons/motrix.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        3040,
+        1645,
+        3345,
+        1935
+      ]
+    },
+    {
+      "name": "shell",
+      "file": "/static/icons/shell.png",
+      "source": "assets/icon/new.png",
+      "crop_bbox": [
+        3435,
+        1645,
+        3735,
+        1935
+      ]
+    }
+  ]
+}

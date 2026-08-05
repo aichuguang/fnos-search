@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="referrer" content="no-referrer">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260805-notifications-v006">
+</head>
+<body class="public-page notification-action-page">
+    <main class="notification-action-main">
+        <section class="glass-panel pad notification-action-panel">
+            <h1>{{ title }}</h1>
+            <form method="post">
+                <button type="submit" class="{% if action_kind == 'unsubscribe' %}danger{% endif %}">{{ action_label }}</button>
+                <a class="button secondary" href="/submit">返回提交页</a>
+            </form>
+        </section>
+    </main>
+</body>
+</html>

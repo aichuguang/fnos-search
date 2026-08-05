@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>管理员登录 - {{ app_name }}</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260805-notifications-v006">
+    <link rel="stylesheet" href="/static/product.css?v=20260804-config-center-v011">
+    {% if site_logo_url %}<style>:root { --site-logo-bg: url("{{ site_logo_url }}"); }</style>{% endif %}
+</head>
+<body class="ui-dark" data-page="admin-login">
+    <main class="product-shell narrow">
+        <div class="product-frame">
+            <nav class="product-nav">
+                <a class="brand" href="/admin/login" aria-label="影视资源入库管理后台">
+                    <span class="brand-mark">
+                        <span class="icon-slot icon-bull brand-logo" aria-hidden="true"></span>
+                    </span>
+                    <span class="brand-title">影视资源入库</span>
+                </a>
+            </nav>
+            <section class="product-content">
+                <div class="hero-center">
+                    <h1 class="hero-title">管理员认证</h1>
+                    <p class="hero-subtitle">登录后管理审核、任务与搬运</p>
+                </div>
+                <form class="form-card glass-panel login-card" id="adminLoginForm">
+                    <div class="form-row icon-row">
+                        <label class="field-label" for="adminUsername">
+                            <span class="icon-slot icon-user" aria-hidden="true"></span>
+                            用户名
+                        </label>
+                        <input id="adminUsername" type="text" autocomplete="username" placeholder="admin">
+                    </div>
+                    <div class="form-row icon-row">
+                        <label class="field-label" for="adminPassword">
+                            <span class="icon-slot icon-lock" aria-hidden="true"></span>
+                            密码
+                        </label>
+                        <input id="adminPassword" type="password" autocomplete="current-password" placeholder="请输入管理员密码">
+                    </div>
+                    <div class="form-actions">
+                        <button class="primary-wide" id="adminLoginBtn" type="submit">进入管理后台</button>
+                    </div>
+                    <div id="adminLoginStatus" class="notice-box" role="status" aria-live="polite">未登录。</div>
+                </form>
+            </section>
+        </div>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+    <script src="/static/ui-core.js?v=20260711-frontend-core-v002"></script>
+    <script src="/static/ui-select.js?v=20260711-frontend-core-v002"></script>
+    <script src="/static/admin_login.js?v=20260711-frontend-core-v002"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+# 仅供源码开发和自行构建使用。
+# 普通部署不要加载本文件，直接运行：docker compose up -d
+services:
+  fnos-media-import:
+    image: ${APP_IMAGE:-fnos-search-local}:${APP_VERSION:-dev}
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11-slim}
+        DOCKER_CLI_IMAGE: ${DOCKER_CLI_IMAGE:-docker:27-cli}
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+        APP_VERSION: ${APP_VERSION:-dev}
+        VCS_REF: ${VCS_REF:-unknown}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PIP_EXTRA_INDEX_URLS: ${PIP_EXTRA_INDEX_URLS:-https://mirrors.aliyun.com/pypi/simple https://mirrors.cloud.tencent.com/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple}

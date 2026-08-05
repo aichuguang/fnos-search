@@ -1,0 +1,156 @@
+# 飞牛影视统一入库维护系统 - 最小 config.yaml 模板
+#
+# 正常部署可以让这个文件保持很小：
+# - 启动级配置优先放 .env / 部署环境。
+# - PanSou、Quark、139 移动云、飞牛刷新、分类路径、rclone 运行参数
+#   请在后台“系统设置 -> 高级配置”保存到数据库。
+# - 旧版完整业务配置仍然兼容，但不建议继续堆在 config.yaml 里。
+# - 详细说明见 docs/env-config-guide.md。
+
+app:
+  name: "飞牛影视统一入库维护系统"
+  host: "0.0.0.0"
+  port: 5251
+  debug: false
+  database_path: "data/app.db"
+  secret_key: "change-me-to-a-long-random-string"
+
+admin:
+  username: "admin"
+  password: "admin"
+
+rclone: {}
+
+submission:
+  # auto=支持自动入库；review=全部进入审核；mixed=异常资源进入审核
+  mode: "auto"
+
+# 可选：PanSou 搜索并发。0 表示不传 conc，交给 PanSou 自动设置。
+# pansou:
+#   conc: 10
+
+# 可选：BTBTLA 搜索源配置，默认使用内置服务地址。
+# btbtla:
+#   base_url: "https://www.btbtla.com"
+#   timeout: 15
+#   max_results: 20
+#   max_detail_resources: 80
+#   verify_tls: false
+#   use_env_proxy: false
+#   proxy_enabled: false
+#   proxy_url: "http://host.docker.internal:7890"  # 或 socks5h://host.docker.internal:7891
+#   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+
+# 可选：OpenList 标准化 / STRM 深度融合（默认关闭）
+# OpenList 自带 STRM 负责镜像标准化后的目录，本系统只做真实目录整理。
+# openlist:
+#   base_url: "http://127.0.0.1:5244"
+#   token: ""
+#   timeout: 30
+#   batch_timeout: 600
+#   list_refresh_default: false
+#   verify_tls: true
+#   # 默认不读取 HTTP_PROXY / HTTPS_PROXY，避免内网 OpenList 误走 127.0.0.1:7890 等本机代理。
+#   use_env_proxy: false
+#   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+# tmdb:
+#   token: ""
+#   language: "zh-CN"
+#   # 国内网络直连 TMDB 常被屏蔽，可填独立代理（仅作用于 TMDB，不影响 PanSou/OpenList）。
+#   proxy_enabled: false
+#   proxy_url: "http://host.docker.internal:7890"  # 或 socks5h://host.docker.internal:7891
+#   # 默认开启：不启用独立代理时兼容读取容器 HTTP(S)_PROXY / 系统代理（保持 TMDB 旧行为）。
+#   use_env_proxy: true
+# ai:
+#   enabled: false
+#   api_style: "auto"   # auto / chat / responses
+#   base_url: "https://api.openai.com/v1"
+#   api_key: ""
+#   model: "gpt-4.1-mini"
+#   timeout: 45
+# content_review:
+#   enabled: true
+#   # 搜索/预览不拦截；真正提交入库时才执行。
+#   keyword_enabled: true
+#   # 词库一行一个词；支持：词、标签:词、词|标签|分数、re:正则。
+#   keyword_file: "data/sensitive_words.txt"
+#   keywords: []
+#   # BT/磁链：词库未命中后继续调用上面的 AI 配置打安全分。
+#   bt_ai_enabled: true
+#   bt_ai_pass_score: 75
+#   bt_ai_retries: 2
+#   # 磁链/种子解析失败一律进入后台审核，不直接离线。
+#   bt_parse_failure_review: true
+#   # AI 审核调用失败时转人工审核，避免在无法确认内容时直接放行。
+#   bt_ai_failure_review: true
+# organizer:
+#   enabled: false
+#   # Organizer 启用后，新任务默认写入 _入库暂存/<分类>/job-<id>；目录由现有网盘接口按需创建。
+#   staging_enabled: true
+#   staging_dir_name: "_入库暂存"
+#   stable_window_seconds: 90
+#   auto_apply_confidence: 85
+#   max_scan_depth: 8
+#   max_files_per_task: 500
+#   bulk_operations_enabled: true
+#   regex_rename_min_items: 10
+#   bulk_reconcile_timeout_seconds: 120
+#   # 同分类或重叠路径的任务会串行排队，不再立即失败。
+#   lock_wait_seconds: 900
+#   lock_poll_seconds: 2
+#   cleanup_empty_dirs: false
+#   # 最终文件复扫确认成功后调用 OpenList /api/admin/scan/start；接口接受刷新后 Organizer 任务即完成。
+#   # STRM 的生成、同步和旧目录维护都由 OpenList 后台负责，Organizer 不等待也不检查 STRM。
+#   strm_refresh_after_apply: true
+#   # 兼容旧配置保留，当前流程不再执行旧 STRM 目录清理。
+#   strm_cleanup_old_before_refresh: false
+#   strm_refresh_prefix_movie: "/飞牛NAS/电影"
+#   strm_refresh_prefix_tv: "/飞牛NAS/电视剧"
+#   strm_refresh_prefix_anime: "/飞牛NAS/动漫"
+#   strm_refresh_prefix_variety: "/飞牛NAS/综艺"
+#   # 每个实际使用的分类都必须有刷新前缀；缺失时安全进入审核，不会刷新 /<影视名>。
+#   # 兼容旧配置保留；Organizer 不再读取本地 STRM 来判定任务完成。
+#   local_strm_root: "/localStrm"
+
+# 可选：BT / 磁链入站走 6盘离线下载时，只需要在后台高级配置填写 ClientID / ClientSecret，
+# 然后点击“保存并开始授权”，系统会通过六盘 device_code 自动保存 token。
+# sixpan:
+#   host: "openapi.2dland.cn"
+#   fnos_mount_name: "清云"
+#   openlist_mount_name: "清云"
+#   client_id: ""
+#   client_secret: ""
+
+# Durable worker dispatch remains disabled for legacy single-process deployments.
+# Enable it after starting the dedicated worker process/container.
+worker:
+  durable_dispatch_enabled: false
+  poll_seconds: 1
+  lease_seconds: 120
+  retry_delay_seconds: 30
+  retention_days: 7
+  cleanup_interval_seconds: 3600
+
+security:
+  max_request_body_bytes: 8388608
+  max_public_json_bytes: 262144
+  max_title_length: 300
+
+update_scheduler:
+  run_lease_seconds: 120
+
+hot_discovery:
+  enabled: false
+  run_at: "08:30"
+  timezone: "Asia/Shanghai"
+  timeout: 20
+  max_items_per_source: 20  # 每个来源、每个分类最多 20 条，四分类合计最多 80 条
+  tencent_enabled: true
+  tencent_endpoint: "https://pbaccess.video.qq.com/trpc.videosearch.hot_rank.HotRankServantHttp/HotRankHttp"
+  tencent_data_version: "25081802"
+  iqiyi_enabled: true
+  iqiyi_endpoint: "https://mesh.if.iqiyi.com/portal/lw/search/keywords/hotList"
+  iqiyi_device_id: ""
+  iqiyi_version: "17.072.25808"
+  youku_enabled: true
+  youku_url: "https://www.youku.com/ku/webhome"

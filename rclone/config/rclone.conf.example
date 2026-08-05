@@ -1,0 +1,21 @@
+# rclone remote 示例。
+#
+# 生产部署时复制为：
+#   rclone/config/rclone.conf
+#
+# remote 名称默认必须叫 MP；如果你改成其他名称，需要同步修改：
+#   RCLONE_REMOTE_NAME=你的remote名
+#
+# WebDAV 示例：
+# [MP]
+# type = webdav
+# url = http://openlist:5244/dav
+# vendor = other
+# user = your-user
+# pass = your-obscured-password
+#
+# 注意：
+# - pass 建议使用 `rclone obscure` 生成。
+# - 不要把真实 rclone.conf 提交到仓库。
+# - rclone.conf 必须通过 docker-compose 挂载到 rclone-server 的 /config/rclone。
+

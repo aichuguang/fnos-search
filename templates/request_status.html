@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>提交进度 - {{ app_name }}</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260805-notifications-v006">
+    <link rel="stylesheet" href="/static/product.css?v=20260804-config-center-v011">
+    {% if site_logo_url %}<style>:root { --site-logo-bg: url("{{ site_logo_url }}"); }</style>{% endif %}
+</head>
+<body class="ui-dark" data-page="request-status" data-request-token="{{ request_token }}">
+    <main class="product-shell public-shell">
+        <div class="product-frame public-frame">
+            <nav class="product-nav">
+                <a class="brand" href="/submit" aria-label="影视资源入库">
+                    <span class="brand-mark">
+                        <span class="icon-slot icon-bull brand-logo" aria-hidden="true"></span>
+                    </span>
+                    <span class="brand-title">影视资源入库</span>
+                </a>
+                <div class="nav-links">
+                    <a href="/submit#search">搜索资源</a>
+                    <a href="/submit#link">链接提交</a>
+                    <a class="active" href="/submit#query">提交查询</a>
+                </div>
+                <div class="nav-actions">
+                    <button class="secondary mini" type="button" id="requestRefreshBtn">刷新</button>
+                </div>
+            </nav>
+
+            <section class="product-content">
+                <div class="query-card glass-panel pad">
+                    <form class="query-row query-hero-row" id="requestStatusRefreshForm">
+                        <strong>提交编号查询</strong>
+                        <input value="{{ request_token }}" aria-label="提交编号" readonly>
+                        <button type="submit" id="requestRefreshMirrorBtn">查询</button>
+                    </form>
+                </div>
+                <div id="requestStatusBox" class="glass-panel status-result-panel" role="status" aria-live="polite">正在查询提交进度...</div>
+                <p class="page-footnote">提交后可根据编号查询进度</p>
+            </section>
+        </div>
+    </main>
+
+    <div id="globalLoading" class="global-loading hidden" role="status" aria-live="polite" aria-label="正在处理">
+        <div class="global-loading-card glass-panel">
+            <div class="global-loading-orbit" aria-hidden="true">
+                <span></span><span></span><span></span>
+            </div>
+            <div class="global-loading-copy">
+                <strong>正在处理</strong>
+                <p id="globalLoadingMessage">正在处理，请稍候...</p>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+    <script src="/static/ui-core.js?v=20260711-public-bootstrap-v014"></script>
+    <script src="/static/resource-search-workbench.js?v=20260716-shared-search-v001"></script>
+    <script src="/static/public-search.js?v=20260716-public-workbench-v015"></script>
+    <script src="/static/public-submit.js?v=20260804-config-center-v018"></script>
+    <script src="/static/public-bootstrap.js?v=20260711-public-bootstrap-v014"></script>
+    <script src="/static/ui-select.js?v=20260711-public-bootstrap-v014"></script>
+    <script src="/static/ui-dialog.js?v=20260615-v001"></script>
+    <script src="/static/public.js?v=20260711-public-bootstrap-v014"></script>
+</body>
+</html>

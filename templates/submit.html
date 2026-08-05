@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>访客提交 - {{ app_name }}</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260805-notifications-v006">
+    <link rel="stylesheet" href="/static/product.css?v=20260804-config-center-v011">
+    <link rel="stylesheet" href="/static/public-mobile.css?v=20260728-public-h5-v006">
+    {% if site_logo_url %}<style>:root { --site-logo-bg: url("{{ site_logo_url }}"); }</style>{% endif %}
+</head>
+<body class="ui-dark" data-page="submit">
+    <main class="product-shell public-shell">
+        <div class="product-frame public-frame">
+            <nav class="product-nav">
+                <a class="brand" href="/submit" aria-label="影视资源入库">
+                    <span class="brand-mark">
+                        <span class="icon-slot icon-bull brand-logo" aria-hidden="true"></span>
+                    </span>
+                    <span class="brand-title">影视资源入库</span>
+                </a>
+                <div class="nav-links public-nav-tabs" role="tablist" aria-label="访客功能切换">
+                    <button class="active" id="publicTabSearch" type="button" role="tab" aria-selected="true" aria-controls="tab-search" tabindex="0" data-public-tab="search">搜索资源</button>
+                    <button id="publicTabLink" type="button" role="tab" aria-selected="false" aria-controls="tab-link" tabindex="-1" data-public-tab="link">链接提交</button>
+                    <button id="publicTabTrending" type="button" role="tab" aria-selected="false" aria-controls="tab-trending" tabindex="-1" data-public-tab="trending">每日热播</button>
+                    <button id="publicTabQuery" type="button" role="tab" aria-selected="false" aria-controls="tab-query" tabindex="-1" data-public-tab="query">提交查询</button>
+                </div>
+                <div class="nav-actions">
+                    <a class="button secondary mini" href="/admin/login">管理员</a>
+                </div>
+            </nav>
+
+            <section class="product-content public-tab-panel active" id="tab-search" data-public-panel="search" role="tabpanel" aria-labelledby="publicTabSearch">
+                <div class="hero-center public-hero">
+                    <h1 class="hero-title">
+                        <span class="hero-title-desktop">海量资源 · 快速搜索 · 一键提交</span>
+                        <span class="hero-title-mobile">海量资源 · 一键提交</span>
+                    </h1>
+                    <p class="hero-subtitle">
+                        <span class="hero-subtitle-desktop">支持 4K / HDR / 多种格式资源，自动检测与入库</span>
+                        <span class="hero-subtitle-mobile">支持网盘、磁链搜索，自动检测并提交入库</span>
+                    </p>
+                </div>
+
+                <div class="search-hero">
+                    <form class="search-box enhanced-search" id="publicSearchForm" role="search">
+                        <span class="search-leading-icon">
+                            <span class="icon-slot icon-search" aria-hidden="true"></span>
+                        </span>
+                        <input id="publicKeywordInput" type="search" maxlength="80" enterkeyhint="search" autocomplete="off" aria-label="影视资源关键词" placeholder="输入影视名称，例如：让子弹飞">
+                        <button id="publicSearchBtn" type="submit">搜索</button>
+                    </form>
+                    <div class="search-source-panel" data-search-source-panel>
+                        <div class="search-source-title">搜索模式</div>
+                        <div class="search-source-toggle" role="radiogroup" aria-label="搜索源">
+                            <label class="source-option active" data-search-source-option="pansou">
+                                <input type="radio" name="publicSearchSource" value="pansou" checked>
+                                <span class="source-option-icon"><span class="icon-slot icon-pansou" aria-hidden="true"></span></span>
+                                <span class="source-option-body">
+                                    <span class="source-option-title">综合资源 <small>推荐</small></span>
+                                    <span class="source-option-desc">适合夸克、移动云等网盘分享资源</span>
+                                </span>
+                            </label>
+                            <label class="source-option" data-search-source-option="btbtla">
+                                <input type="radio" name="publicSearchSource" value="btbtla">
+                                <span class="source-option-icon"><span class="icon-slot icon-bt" aria-hidden="true"></span></span>
+                                <span class="source-option-body">
+                                    <span class="source-option-title">磁链资源</span>
+                                    <span class="source-option-desc">适合磁链离线下载资源</span>
+                                </span>
+                            </label>
+                        </div>
+                    </div>
+                    <div id="publicSearchStatus" class="notice-box search-primary-status hidden" role="status" aria-live="polite"></div>
+                    <div id="publicSearchSupplementStatus" class="search-supplement-status hidden" role="status" aria-live="polite">正在补充搜索资源中...</div>
+                    <div class="category-chips search-filter-chips" aria-label="资源分类" hidden>
+                        <!-- <button class="chip active" type="button" data-category-chip="movie">
+                            <span class="icon-slot icon-film" aria-hidden="true"></span>
+                            <span>电影</span>
+                        </button>
+                        <button class="chip" type="button" data-category-chip="tv">
+                            <span class="icon-slot icon-tv" aria-hidden="true"></span>
+                            <span>电视剧</span>
+                        </button>
+                        <button class="chip" type="button" data-category-chip="anime">
+                            <span class="icon-slot icon-anime" aria-hidden="true"></span>
+                            <span>动漫</span>
+                        </button>
+                        <button class="chip" type="button" data-category-chip="variety">
+                            <span class="icon-slot icon-star" aria-hidden="true"></span>
+                            <span>综艺</span>
+                        </button>
+                        <button class="chip" type="button" data-category-chip="other">
+                            <span class="icon-slot icon-grid" aria-hidden="true"></span>
+                            <span>其他</span>
+                        </button> -->
+                    </div>
+                    <div id="publicResults" class="resource-list"></div>
+                </div>
+            </section>
+
+            <section class="product-content public-tab-panel" id="tab-link" data-public-panel="link" role="tabpanel" aria-labelledby="publicTabLink" hidden>
+                <form class="form-card glass-panel link-submit-card" id="manualPublicForm">
+                    <div class="form-row icon-row">
+                        <label class="field-label" for="manualPublicUrl">
+                            <span class="icon-slot icon-link" aria-hidden="true"></span>
+                            分享链接
+                        </label>
+                        <input id="manualPublicUrl" type="text" inputmode="url" enterkeyhint="next" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="2048" required placeholder="请输入夸克/移动网盘/磁链 分享链接，例如：https://pan.quark.cn/s/xxxx">
+                    </div>
+                    <div class="form-row icon-row">
+                        <label class="field-label" for="manualPublicPassword">
+                            <span class="icon-slot icon-lock" aria-hidden="true"></span>
+                            提取码 <small>可选</small>
+                        </label>
+                        <input id="manualPublicPassword" type="text" inputmode="text" enterkeyhint="next" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="32" placeholder="请输入提取码">
+                    </div>
+                    <div class="form-row icon-row">
+                        <label class="field-label" for="manualPublicTitle">
+                            <span class="icon-slot icon-file" aria-hidden="true"></span>
+                            资源名称
+                        </label>
+                        <input id="manualPublicTitle" type="text" enterkeyhint="next" autocomplete="off" maxlength="300" required placeholder="例如：让子弹飞 2010 4K HDR">
+                    </div>
+                    <div class="form-row icon-row category-form-row">
+                        <label class="field-label" for="manualPublicCategory">
+                            <span class="icon-slot icon-grid" aria-hidden="true"></span>
+                            资源分类
+                        </label>
+                        <div>
+                            <select id="manualPublicCategory" class="sr-only-select" aria-label="资源分类" required>
+                                {% for key, item in categories.items() %}
+                                <option value="{{ key }}">{{ item.label }}</option>
+                                {% endfor %}
+                            </select>
+                            <div class="category-chips form-category-chips" aria-label="资源分类快捷选择">
+                                <button class="chip active" type="button" data-category-chip="movie">
+                                    <span class="icon-slot icon-film" aria-hidden="true"></span>
+                                    <span>电影</span>
+                                </button>
+                                <button class="chip" type="button" data-category-chip="tv">
+                                    <span class="icon-slot icon-tv" aria-hidden="true"></span>
+                                    <span>电视剧</span>
+                                </button>
+                                <button class="chip" type="button" data-category-chip="anime">
+                                    <span class="icon-slot icon-anime" aria-hidden="true"></span>
+                                    <span>动漫</span>
+                                </button>
+                                <button class="chip" type="button" data-category-chip="variety">
+                                    <span class="icon-slot icon-star" aria-hidden="true"></span>
+                                    <span>综艺</span>
+                                </button>
+                                <button class="chip" type="button" data-category-chip="other">
+                                    <span class="icon-slot icon-grid" aria-hidden="true"></span>
+                                    <span>其他</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-row icon-row">
+                        <label class="field-label" for="manualPublicNote">
+                            <span class="icon-slot icon-note" aria-hidden="true"></span>
+                            备注 <small>可选</small>
+                        </label>
+                        <textarea id="manualPublicNote" rows="3" maxlength="500" enterkeyhint="done" placeholder="补充说明，例如：导演剪辑版、国配中字等（最多 500 字）"></textarea>
+                    </div>
+
+                    <section class="glass-panel soft pad hidden" id="captchaPanel">
+                        <div class="section-title">
+                            <div>
+                                <h3>人机验证</h3>
+                            </div>
+                            <button class="secondary mini" type="button" id="refreshCaptchaBtn">刷新</button>
+                        </div>
+                        <div id="captchaBox">正在加载验证码...</div>
+                    </section>
+
+                    <div class="form-actions">
+                        <button class="primary-wide icon-button" type="submit" id="manualPublicSubmitBtn">
+                            <span class="icon-slot icon-send" aria-hidden="true"></span>
+                            预览并提交
+                        </button>
+                    </div>
+                    <div id="manualPublicStatus" class="notice-box info-strip" role="status" aria-live="polite">
+                        <span class="icon-slot icon-info" aria-hidden="true"></span>
+                        <span>系统会自动检测链接有效性与资源类型。</span>
+                    </div>
+                </form>
+            </section>
+
+            <section class="product-content public-tab-panel" id="tab-trending" data-public-panel="trending" role="tabpanel" aria-labelledby="publicTabTrending" hidden>
+                <div class="public-trending-shell">
+                    <header class="public-trending-hero" id="publicTrendingHero" data-day="--">
+                        <div class="public-trending-hero-copy">
+                            <span class="public-trending-eyebrow">DAILY HOT</span>
+                            <h1>每日热播</h1>
+                            <p>聚合爱奇艺、腾讯视频和优酷热度榜，发现今天值得看的电影与剧集。</p>
+                        </div>
+                        <div class="public-trending-hero-actions">
+                            <span id="publicTrendingUpdatedAt">每日更新</span>
+                        </div>
+                    </header>
+
+                    <div class="public-trending-category-tabs" role="tablist" aria-label="每日热播分类">
+                        <button class="active" type="button" role="tab" aria-selected="true" data-trending-category="tv">
+                            <span class="icon-slot icon-tv" aria-hidden="true"></span><span>电视剧</span>
+                        </button>
+                        <button type="button" role="tab" aria-selected="false" data-trending-category="movie">
+                            <span class="icon-slot icon-film" aria-hidden="true"></span><span>电影</span>
+                        </button>
+                        <button type="button" role="tab" aria-selected="false" data-trending-category="variety">
+                            <span class="icon-slot icon-star" aria-hidden="true"></span><span>综艺</span>
+                        </button>
+                        <button type="button" role="tab" aria-selected="false" data-trending-category="anime">
+                            <span class="icon-slot icon-anime" aria-hidden="true"></span><span>动漫</span>
+                        </button>
+                    </div>
+
+                    <div id="publicTrendingStatus" class="notice-box public-trending-status" role="status" aria-live="polite">正在加载今日热播榜单...</div>
+                    <div id="publicTrendingContent" class="public-trending-content" aria-live="polite"></div>
+                </div>
+            </section>
+
+            <section class="product-content public-tab-panel" id="tab-query" data-public-panel="query" role="tabpanel" aria-labelledby="publicTabQuery" hidden>
+                <div class="query-card glass-panel pad">
+                    <form class="query-row query-hero-row" id="requestQueryForm">
+                        <strong>提交编号查询</strong>
+                        <input id="requestTokenInput" type="text" inputmode="text" enterkeyhint="search" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="80" aria-label="提交编号" placeholder="RQ-260611-8K3P">
+                        <button id="requestQueryBtn" type="submit">查询</button>
+                    </form>
+                    <div id="requestRecentSection" class="request-recent" hidden>
+                        <div class="request-recent-heading">最近提交</div>
+                        <div id="requestRecentList" class="request-recent-list"></div>
+                    </div>
+                </div>
+                <div id="requestStatusBox" class="glass-panel status-result-panel" role="status" aria-live="polite">输入提交编号后查询。</div>
+                <p class="page-footnote">提交后可根据编号查询进度</p>
+            </section>
+        </div>
+    </main>
+
+    <div id="publicSubmitConfirm" class="public-confirm-mask hidden" role="dialog" aria-modal="true" aria-labelledby="publicConfirmTitle" tabindex="-1">
+        <div class="public-confirm-dialog glass-panel">
+            <div class="public-confirm-head">
+                <div>
+                    <!-- <span class="eyebrow">入库确认</span> -->
+                    <h2 id="publicConfirmTitle">确认入库？</h2>
+                </div>
+                <button class="icon-btn secondary" type="button" id="publicConfirmClose" aria-label="关闭">×</button>
+            </div>
+            <div class="public-confirm-body">
+                <div class="confirm-resource-name">
+                    <span>资源名称：</span>
+                    <strong id="publicConfirmResourceName">-</strong>
+                </div>
+                <div class="confirm-category-row">
+                    <label for="publicConfirmCategory">类别：</label>
+                    <select id="publicConfirmCategory">
+                        {% for key, item in categories.items() %}
+                        <option value="{{ key }}">{{ item.label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="notice-box warning confirm-warning" id="publicConfirmWarning">
+                    提示：请再次确认分类后入库资源，分类错误将影响入库！
+                </div>
+                <div class="confirm-notification hidden" id="publicNotificationPanel">
+                    <label class="mini-check"><input id="publicNotificationEnabled" type="checkbox">邮件接收进度</label>
+                    <input id="publicNotificationEmail" type="email" autocomplete="email" maxlength="254" placeholder="name@example.com" disabled>
+                </div>
+                <div id="publicConfirmSixpanParseBox"></div>
+                <div class="notice-box status-error confirm-error hidden" id="publicConfirmError" role="alert" aria-live="assertive"></div>
+            </div>
+            <div class="public-confirm-actions">
+                <button class="secondary" type="button" id="publicConfirmCancel">取消</button>
+                <button type="button" id="publicConfirmSubmit">确认入库</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="sixpanSlowSubmitConfirm" class="public-confirm-mask hidden" role="dialog" aria-modal="true" aria-labelledby="sixpanSlowTitle" tabindex="-1">
+        <div class="public-confirm-dialog glass-panel slow-submit-dialog">
+            <div class="public-confirm-head">
+                <div>
+                    <h2 id="sixpanSlowTitle">此资源将按慢速入库处理</h2>
+                </div>
+                <button class="icon-btn secondary" type="button" id="sixpanSlowClose" aria-label="关闭">×</button>
+            </div>
+            <div class="public-confirm-body">
+                <div class="confirm-resource-name">
+                    <span>资源名称：</span>
+                    <strong id="sixpanSlowResourceName">-</strong>
+                </div>
+                <div class="notice-box warning slow-submit-warning">
+                    <strong>此资源暂未确认可快速入库，我们会在后台尽快搬运。</strong>
+                    <p>你可以选择其他资源，或者耐心等待；但慢速入库不保证成功。</p>
+                    <p id="sixpanSlowReason"></p>
+                </div>
+            </div>
+            <div class="public-confirm-actions">
+                <button type="button" id="sixpanSlowCancel">取消，换一个资源</button>
+                <button class="secondary" type="button" id="sixpanSlowContinue">继续慢速入库</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="globalLoading" class="global-loading hidden" role="status" aria-live="polite" aria-label="正在处理">
+        <div class="global-loading-card glass-panel">
+            <div class="global-loading-orbit" aria-hidden="true">
+                <span></span><span></span><span></span>
+            </div>
+            <div class="global-loading-copy">
+                <strong>正在处理</strong>
+                <p id="globalLoadingMessage">正在处理，请稍候...</p>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+    <script src="/static/ui-core.js?v=20260711-public-bootstrap-v014"></script>
+    <script src="/static/resource-search-workbench.js?v=20260716-shared-search-v001"></script>
+    <script src="/static/public-search.js?v=20260716-public-workbench-v015"></script>
+    <script src="/static/public-submit.js?v=20260805-selection-v001"></script>
+    <script src="/static/public-trending.js?v=20260804-config-center-v004"></script>
+    <script src="/static/public-bootstrap.js?v=20260804-notifications-v018"></script>
+    <script src="/static/ui-select.js?v=20260711-public-bootstrap-v014"></script>
+    <script src="/static/ui-dialog.js?v=20260615-v001"></script>
+    <script src="/static/public.js?v=20260728-public-recent-v017"></script>
+</body>
+</html>
