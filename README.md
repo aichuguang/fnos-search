@@ -77,8 +77,9 @@
 
 ### 磁盘空间
 
-数据库和配置占用空间很小，但 `rclone/temp` 可能临时保存完整视频文件。
-如果系统盘空间有限，部署后可在 `.env` 中把 `RCLONE_TEMP_HOST_PATH` 改到容量较大的存储盘。
+数据库、自动生成的密钥和后台配置默认保存在 `data`，日志默认保存在 `logs`。
+`rclone/temp` 可能临时保存完整视频文件，如果系统盘空间有限，应在 `.env` 中把
+`RCLONE_TEMP_HOST_PATH` 改到容量较大的存储盘。
 
 ## 3. 如何部署
 
@@ -112,9 +113,10 @@ docker compose logs -f fnos-media-import
 
 1. 打开 NAS 的 Docker 管理页面。
 2. 新建 Compose 或“项目”。
-3. 粘贴项目根目录的 `docker-compose.yml`。
-4. 启动项目。
-5. 浏览器打开 `http://NAS-IP:5251/admin/login`。
+3. 上传项目目录，或把 `docker-compose.yml` 和需要的宿主机目录放在同一个项目目录。
+4. 需要自定义存储位置时，根据 `.env.example` 创建 `.env`，建议在 NAS 上填写绝对路径。
+5. 启动项目。
+6. 浏览器打开 `http://NAS-IP:5251/admin/login`。
 
 默认登录信息：
 
@@ -177,27 +179,54 @@ docker exec rclone-server rclone lsd "MP:"
 
 配置完成后，建议先提交一个小资源测试完整流程，再开始批量使用。
 
-### 可选修改
+### 编排目录设置
 
-默认配置已经可以启动，不需要填写环境变量。只有需要修改版本、端口、时区或大文件暂存目录时，
-才复制环境变量模板：
+`docker-compose.yml` 不需要手工修改。默认会在编排文件所在目录创建 `config`、`data`、`logs`
+和 `rclone` 子目录。
+
+飞牛、群晖等 Docker 面板可以直接在 Compose 项目或编排的“环境变量”区域添加下表变量，
+不需要创建 `.env` 文件。命令行部署需要自定义时，才复制环境变量模板：
 
 ```bash
 cp .env.example .env
 ```
 
-常用配置：
+#### 正式部署变量
+
+以下是 `docker-compose.yml` 支持的全部用户配置变量。所有变量都有默认值，不填写也能启动。
+
+| 变量 | 默认值 | 是否建议配置 | 说明 |
+| --- | --- | --- | --- |
+| `APP_VERSION` | `latest` | 正式环境建议 | 应用镜像标签。固定为具体版本可避免重新编排时意外升级。 |
+| `APP_PORT` | `5251` | 按需 | Web 页面映射到宿主机的端口。只填写端口数字，例如 `5251`。 |
+| `TZ` | `Asia/Shanghai` | 按需 | 应用和 rclone 容器使用的时区。 |
+| `APP_CONFIG_HOST_PATH` | `./config` | 按需 | 可选 `config.yaml` 所在的宿主机目录。 |
+| `APP_DATA_HOST_PATH` | `./data` | 强烈建议确认 | SQLite 数据库、后台设置、数据库备份和自动生成密钥的持久化目录。重新编排必须继续使用原目录。 |
+| `APP_LOGS_HOST_PATH` | `./logs` | 按需 | 应用运行日志目录。 |
+| `RCLONE_CONFIG_HOST_PATH` | `./rclone/config` | 强烈建议确认 | `rclone.conf` 持久化目录，保存 OpenList WebDAV Remote 配置。 |
+| `RCLONE_CACHE_HOST_PATH` | `./rclone/cache` | 按需 | rclone 缓存目录，可清理，但运行中不要删除。 |
+| `RCLONE_TEMP_HOST_PATH` | `./rclone/temp` | 建议配置 | 搬运完整媒体文件的临时目录，应放在空间充足的磁盘。 |
+| `APP_SECRET_KEY` | 空，自动生成 | 新部署不要填写 | Flask 会话签名密钥。留空时首次启动自动生成并保存到 `app.db`；旧部署显式配置过时必须保持原值。 |
+| `NOTIFICATION_ENCRYPTION_KEY` | 空，自动生成 | 新部署不要填写 | SMTP、Webhook 等通知凭据的加密密钥。留空时生成并保存到数据目录的 `.secrets`；旧部署显式配置过时必须保持原值。 |
+
+NAS 面板示例：
 
 ```env
-# 固定镜像版本，避免自动跨版本更新
 APP_VERSION=latest
-
-# Web 端口
 APP_PORT=5251
+TZ=Asia/Shanghai
 
-# 把临时视频放到大容量磁盘
+APP_CONFIG_HOST_PATH=/你的目录/fnos-search/config
+APP_DATA_HOST_PATH=/你的目录/fnos-search/data
+APP_LOGS_HOST_PATH=/你的目录/fnos-search/logs
+RCLONE_CONFIG_HOST_PATH=/你的目录/fnos-search/rclone/config
+RCLONE_CACHE_HOST_PATH=/你的目录/fnos-search/rclone/cache
 RCLONE_TEMP_HOST_PATH=/你的大容量目录/fnos-search/temp
 ```
+
+面板中只添加需要覆盖的变量即可，不必逐项填写。相对路径以 Compose 项目目录为基准；NAS
+面板的项目目录不直观时，建议六个目录变量全部填写绝对路径。最重要的是
+`APP_DATA_HOST_PATH`，重新编排时不能把它改到新的空目录。
 
 管理员初始账号固定为 `admin/admin`，首次登录后直接在管理后台修改。PanSou、OpenList、网盘、
 TMDB、通知和分类目录也全部在管理后台配置，不放进 `.env`。
@@ -205,20 +234,42 @@ TMDB、通知和分类目录也全部在管理后台配置，不放进 `.env`。
 
 ### 更新版本
 
-更新前建议先备份 `data` 目录，然后执行：
+拉取新镜像不会覆盖宿主机上的 `app.db`。更新前仍建议备份 `APP_DATA_HOST_PATH`，然后执行：
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-数据库会自动升级。发生数据库迁移时，程序会在 `data/backups` 中自动创建迁移前备份。
+数据库会在原文件上自动升级。发生数据库迁移时，程序会在
+`APP_DATA_HOST_PATH/backups` 中自动创建迁移前备份。
+
+应用签名密钥首次启动时生成并保存到 `app.db`；通知加密密钥保存到
+`APP_DATA_HOST_PATH/.secrets`。正常的 `pull`、`up -d`、删除容器或重新编排不会改变它们。
+只有删除/更换 `APP_DATA_HOST_PATH`，或显式修改 `APP_SECRET_KEY`、
+`NOTIFICATION_ENCRYPTION_KEY` 时，才会造成密钥变化。
 
 如果需要从源码构建：
 
 ```bash
 docker compose -f docker-compose.yml -f compose.dev.yaml up -d --build
 ```
+
+#### 源码构建变量
+
+以下变量只用于 `compose.dev.yaml` 自行构建镜像，使用正式镜像的普通部署无需设置：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `APP_IMAGE` | `fnos-search-local` | 本地构建后的镜像名称。 |
+| `APP_VERSION` | `dev` | 本地镜像标签，同时写入镜像版本元数据。 |
+| `PYTHON_IMAGE` | `python:3.11-slim` | 构建应用镜像使用的 Python 基础镜像。 |
+| `DOCKER_CLI_IMAGE` | `docker:27-cli` | 提取 Docker CLI 使用的基础镜像。 |
+| `APP_UID` | `10001` | 镜像内应用用户 UID。当前 rclone 共享目录也使用 `10001`，不要单独修改。 |
+| `APP_GID` | `10001` | 镜像内应用用户 GID。当前 rclone 共享目录也使用 `10001`，不要单独修改。 |
+| `VCS_REF` | `unknown` | 写入镜像 OCI 标签的源码提交标识。 |
+| `PIP_INDEX_URL` | `https://pypi.org/simple` | 首选 Python 包索引。 |
+| `PIP_EXTRA_INDEX_URLS` | 阿里云、腾讯云、清华镜像 | 首选索引失败后依次尝试的备用索引，多个地址用空格分隔。 |
 
 ## 4. 注意事项
 
@@ -306,4 +357,4 @@ docker compose logs --tail=200 fnos-media-import
 docker compose logs --tail=200 rclone-server
 ```
 
-更多部署细节见 [docs/compose-deploy.md](docs/compose-deploy.md)。
+部署目录和更新规则见上面的“编排目录设置”和“更新版本”。

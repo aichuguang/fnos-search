@@ -1,6 +1,6 @@
+# 日常部署只需修改 .env，宿主机目录和端口都不必在本文件中改动。
 services:
   fnos-media-import:
-    # 不创建 .env 也能直接启动；通常只需按需修改版本、端口或暂存目录。
     image: aichuguang/fnos-search:${APP_VERSION:-latest}
     container_name: fnos-media-import
     restart: unless-stopped
@@ -15,36 +15,27 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       APP_ENV: production
       SECURITY_STRICT: "true"
-      # 仅兼容曾显式设置密钥的旧部署；新部署留空后会自动生成并持久化。
+      # 兼容旧部署；留空时密钥会自动生成并保存到 APP_DATA_HOST_PATH。
       APP_SECRET_KEY: "${APP_SECRET_KEY:-}"
       NOTIFICATION_ENCRYPTION_KEY: "${NOTIFICATION_ENCRYPTION_KEY:-}"
     extra_hosts:
-      # Linux/NAS 容器可通过该名称访问宿主机上的 OpenList、PanSou 等服务。
       - "host.docker.internal:host-gateway"
     volumes:
-      # 相对目录会自动创建；暂存视频较大时只需覆盖 RCLONE_TEMP_HOST_PATH。
-      - ./config:/app/config
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp
+      - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
+      - "${APP_DATA_HOST_PATH:-./data}:/app/data"
+      - "${APP_LOGS_HOST_PATH:-./logs}:/app/logs"
+      - "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp"
       - /var/run/docker.sock:/var/run/docker.sock
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     cap_add:
-      # 入口程序只在启动时修复挂载目录权限并降权，业务进程不保留 root。
       - CHOWN
       - DAC_OVERRIDE
       - FOWNER
       - SETGID
       - SETUID
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5251/health', timeout=5).read()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
 
   rclone-server:
     image: rclone/rclone:1.70.3
@@ -76,9 +67,9 @@ services:
       - CHOWN
       - FOWNER
     volumes:
-      - ./rclone/config:/config/rclone
-      - ${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp
-      - ./rclone/cache:/cache
+      - "${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone"
+      - "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp"
+      - "${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache"
     healthcheck:
       test: ["CMD-SHELL", "rclone version >/dev/null"]
       interval: 30s

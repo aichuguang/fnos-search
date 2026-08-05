@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import yaml
@@ -29,15 +30,20 @@ def test_compose_supports_release_image_and_source_build() -> None:
     assert development_app["build"]["context"] == "."
 
     app_volumes = {str(value) for value in app["volumes"]}
-    assert any(value.endswith(":/app/config") for value in app_volumes)
-    assert any(value.endswith(":/app/data") for value in app_volumes)
-    assert any(value.endswith(":/app/logs") for value in app_volumes)
-    assert any(value.endswith(":/temp") for value in app_volumes)
+    assert "${APP_CONFIG_HOST_PATH:-./config}:/app/config" in app_volumes
+    assert "${APP_DATA_HOST_PATH:-./data}:/app/data" in app_volumes
+    assert "${APP_LOGS_HOST_PATH:-./logs}:/app/logs" in app_volumes
+    assert "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp" in app_volumes
     assert any(value.endswith(":/var/run/docker.sock") for value in app_volumes)
 
     rclone = services["rclone-server"]
     assert rclone["container_name"] == "rclone-server"
     assert rclone["image"] == "rclone/rclone:1.70.3"
+    assert {
+        "${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone",
+        "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp",
+        "${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache",
+    } <= {str(value) for value in rclone["volumes"]}
 
 
 def test_release_workflow_validates_before_multi_arch_publish() -> None:
@@ -63,7 +69,40 @@ def test_optional_env_example_only_exposes_common_user_settings() -> None:
         for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#") and "=" in line
     }
-    assert assignments == {"APP_VERSION", "APP_PORT", "TZ", "RCLONE_TEMP_HOST_PATH"}
+    assert assignments == {
+        "APP_VERSION",
+        "APP_PORT",
+        "TZ",
+        "APP_CONFIG_HOST_PATH",
+        "APP_DATA_HOST_PATH",
+        "APP_LOGS_HOST_PATH",
+        "RCLONE_CONFIG_HOST_PATH",
+        "RCLONE_CACHE_HOST_PATH",
+        "RCLONE_TEMP_HOST_PATH",
+    }
+
+
+def test_readme_documents_every_compose_variable() -> None:
+    variable_pattern = re.compile(r"\$\{([A-Z][A-Z0-9_]*)(?::-[^}]*)?\}")
+    compose_sources = "\n".join(
+        (ROOT / name).read_text(encoding="utf-8")
+        for name in ("docker-compose.yml", "compose.dev.yaml")
+    )
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    variables = set(variable_pattern.findall(compose_sources))
+
+    undocumented = sorted(name for name in variables if f"`{name}`" not in readme)
+    assert undocumented == []
+
+
+def test_data_mount_persists_database_and_generated_secrets() -> None:
+    config_source = (ROOT / "fnos_media_import" / "config.py").read_text(encoding="utf-8")
+    entrypoint_source = (ROOT / "scripts" / "container_entrypoint.py").read_text(encoding="utf-8")
+    app_source = (ROOT / "fnos_media_import" / "app.py").read_text(encoding="utf-8")
+
+    assert '"database_path": "data/app.db"' in config_source
+    assert '"/app/data/.secrets/notification_encryption_key"' in entrypoint_source
+    assert 'db.set_app_settings({"app.secret_key": generated})' in app_source
 
 
 def test_docker_build_context_excludes_runtime_data_and_secrets() -> None:

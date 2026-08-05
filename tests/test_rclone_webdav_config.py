@@ -78,7 +78,11 @@ class FakeDockerRunner:
 class RcloneWebdavConfigServiceTests(unittest.TestCase):
     def service(self, runner: FakeDockerRunner) -> RcloneWebdavConfigService:
         return RcloneWebdavConfigService(
-            lambda: {"container_name": "rclone-server", "remote_name": "MP"},
+            lambda: {
+                "container_name": "rclone-server",
+                "exec_user": "10001:10001",
+                "remote_name": "MP",
+            },
             runner=runner,
         )
 
@@ -112,7 +116,17 @@ class RcloneWebdavConfigServiceTests(unittest.TestCase):
         self.assertTrue(any(password in str(call["input"] or "") for call in runner.calls))
         self.assertTrue(all(password not in " ".join(call["command"]) for call in runner.calls))
         save_call = next(call for call in runner.calls if call["command"][-1] == RcloneWebdavConfigService._SAVE_SCRIPT)
-        self.assertEqual(save_call["command"][:4], ["docker", "exec", "-i", "rclone-server"])
+        self.assertEqual(
+            save_call["command"][:6],
+            ["docker", "exec", "-i", "--user", "10001:10001", "rclone-server"],
+        )
+        self.assertTrue(
+            all(
+                call["command"][:4] == ["docker", "exec", "--user", "10001:10001"]
+                or call["command"][:5] == ["docker", "exec", "-i", "--user", "10001:10001"]
+                for call in runner.calls
+            )
+        )
         self.assertTrue(any("lsd" in call["command"] for call in runner.calls))
 
     def test_empty_password_keeps_existing_password(self) -> None:
@@ -208,6 +222,33 @@ class RcloneWebdavConfigServiceTests(unittest.TestCase):
         for payload in invalid_payloads:
             with self.subTest(payload=payload), self.assertRaises(RcloneWebdavConfigError):
                 service.save(payload)
+
+    def test_invalid_exec_user_is_rejected_before_docker_call(self) -> None:
+        runner = FakeDockerRunner()
+        service = RcloneWebdavConfigService(
+            lambda: {"container_name": "rclone-server", "exec_user": "root;id", "remote_name": "MP"},
+            runner=runner,
+        )
+
+        with self.assertRaisesRegex(RcloneWebdavConfigError, "执行用户配置不合法"):
+            service.status()
+
+        self.assertEqual(runner.calls, [])
+
+    def test_backup_failure_returns_safe_docker_detail(self) -> None:
+        class BackupFailureRunner(FakeDockerRunner):
+            def __call__(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                if command[-1] == RcloneWebdavConfigService._BACKUP_SCRIPT:
+                    self.calls.append({"command": list(command), "input": kwargs.get("input")})
+                    return self._result(command, returncode=1, stderr="cp: Permission denied")
+                return super().__call__(command, **kwargs)
+
+        service = self.service(BackupFailureRunner())
+
+        with self.assertRaisesRegex(RcloneWebdavConfigError, "Permission denied"):
+            service.save(
+                {"remote_name": "MP", "url": "http://openlist:5244/dav", "username": "admin", "password": "secret"}
+            )
 
     def test_test_endpoint_logic_checks_saved_remote(self) -> None:
         runner = FakeDockerRunner(
