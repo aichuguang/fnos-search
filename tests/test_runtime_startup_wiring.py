@@ -149,11 +149,25 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
         old_build = build("old")
         candidate = build("new")
         old_config = SimpleNamespace(
-            raw={"update_scheduler": {}, "hot_discovery": {}, "rclone": {}, "fnos": {}},
+            raw={
+                "app": {"secret_key": "persisted-runtime-secret"},
+                "security": {"ip_hash_salt": "persisted-ip-salt"},
+                "update_scheduler": {},
+                "hot_discovery": {},
+                "rclone": {},
+                "fnos": {},
+            },
             categories={},
         )
         new_config = SimpleNamespace(
-            raw={"update_scheduler": {}, "hot_discovery": {}, "rclone": {}, "fnos": {}, "security": {}},
+            raw={
+                "app": {"secret_key": "change-me-in-production"},
+                "update_scheduler": {},
+                "hot_discovery": {},
+                "rclone": {},
+                "fnos": {},
+                "security": {"ip_hash_salt": ""},
+            },
             categories={},
         )
 
@@ -199,6 +213,8 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
         self.assertNotIn("suspend", events)
         self.assertNotIn("activate", events)
         self.assertNotIn("retire", events)
+        self.assertEqual(result.config.raw["app"]["secret_key"], "persisted-runtime-secret")
+        self.assertEqual(result.config.raw["security"]["ip_hash_salt"], "persisted-ip-salt")
 
 
 if __name__ == "__main__":

@@ -83,6 +83,7 @@ class RuntimeReloadService:
 
     def reload(self, current_config: Any, current_build: Any) -> RuntimeReloadResult:
         reloaded_config = self.load_config()
+        _preserve_runtime_secrets(current_config, reloaded_config)
         candidate = self.builder.build(reloaded_config, recover_background=False)
         try:
             self._apply_mutable_runtime(reloaded_config, candidate)
@@ -160,3 +161,19 @@ class RuntimeReloadService:
             config.raw.get("cmcc_upload", {}),
             config.raw.get("cloud139", {}),
         )
+
+
+def _preserve_runtime_secrets(current_config: Any, reloaded_config: Any) -> None:
+    """Keep process-scoped secrets that are resolved after the base config loads."""
+    current_raw = current_config.raw if isinstance(getattr(current_config, "raw", None), dict) else {}
+    reloaded_raw = reloaded_config.raw if isinstance(getattr(reloaded_config, "raw", None), dict) else {}
+
+    current_app = current_raw.get("app") if isinstance(current_raw.get("app"), dict) else {}
+    secret_key = str(current_app.get("secret_key") or "").strip()
+    if secret_key:
+        reloaded_raw.setdefault("app", {})["secret_key"] = secret_key
+
+    current_security = current_raw.get("security") if isinstance(current_raw.get("security"), dict) else {}
+    ip_hash_salt = str(current_security.get("ip_hash_salt") or "").strip()
+    if ip_hash_salt:
+        reloaded_raw.setdefault("security", {})["ip_hash_salt"] = ip_hash_salt
