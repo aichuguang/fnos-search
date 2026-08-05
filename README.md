@@ -78,7 +78,7 @@
 ### 磁盘空间
 
 数据库和配置占用空间很小，但 `rclone/temp` 可能临时保存完整视频文件。
-如果系统盘空间有限，部署后应把 `RCLONE_TEMP_HOST_PATH` 改到容量较大的存储盘。
+如果系统盘空间有限，部署后可在 `.env` 中把 `RCLONE_TEMP_HOST_PATH` 改到容量较大的存储盘。
 
 ## 3. 如何部署
 
@@ -179,7 +179,8 @@ docker exec rclone-server rclone lsd "MP:"
 
 ### 可选修改
 
-默认配置已经可以启动。需要修改端口、版本或目录时，再复制环境变量模板：
+默认配置已经可以启动，不需要填写环境变量。只有需要修改版本、端口、时区或大文件暂存目录时，
+才复制环境变量模板：
 
 ```bash
 cp .env.example .env
@@ -188,19 +189,18 @@ cp .env.example .env
 常用配置：
 
 ```env
-# Web 端口
-APP_PORT=5251
-
 # 固定镜像版本，避免自动跨版本更新
 APP_VERSION=latest
 
-# 默认管理员账号，也可以登录后在页面修改
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=admin
+# Web 端口
+APP_PORT=5251
 
 # 把临时视频放到大容量磁盘
 RCLONE_TEMP_HOST_PATH=/你的大容量目录/fnos-search/temp
 ```
+
+管理员初始账号固定为 `admin/admin`，首次登录后直接在管理后台修改。PanSou、OpenList、网盘、
+TMDB、通知和分类目录也全部在管理后台配置，不放进 `.env`。
 
 
 ### 更新版本
@@ -256,8 +256,8 @@ Docker 管理权限，因此：
 - 管理后台只开放给可信网络。
 - 不要公开 `/admin`、`/swagger` 和 Docker API。
 
-Rootless Docker 的 Socket 不在默认位置时，需要在 `.env` 中修改
-`DOCKER_SOCKET_HOST_PATH`。
+标准编排使用 `/var/run/docker.sock`。Rootless Docker、Podman 等非标准 Socket 环境当前需要自行
+调整编排文件，暂不属于默认支持范围。
 
 ### OpenList 路径必须对应
 
@@ -272,17 +272,10 @@ Rootless Docker 的 Socket 不在默认位置时，需要在 `.env` 中修改
 遇到电影合集、错误标题或无法确定的文件，建议进入 Organizer 人工审核并选择“跳过整理”。
 系统会保留原文件名，只把内容移动到正确分类目录，后续交给 OpenList 或媒体库自行刮削。
 
-### 不要随意修改加密密钥
+### 密钥由系统自动管理
 
-默认部署会自动生成并保存密钥。一般不需要在 `.env` 中填写：
-
-```text
-APP_SECRET_KEY
-NOTIFICATION_ENCRYPTION_KEY
-```
-
-如果旧部署已经手工设置过，应继续使用原值。修改通知加密密钥后，已经保存的 SMTP 密码和
-Webhook 凭据需要重新输入。
+新部署会在持久化数据目录中自动生成应用签名密钥和通知加密密钥，用户无需填写。迁移或重装时
+必须完整保留 `data/`，否则已经加密保存的 SMTP 密码和 Webhook 凭据将无法解密。
 
 ### 固定版本更适合长期使用
 

@@ -1,8 +1,8 @@
 services:
   fnos-media-import:
-    # 默认从 Docker Hub 拉取正式镜像；高级用户可在可选 .env 中覆盖镜像和版本。
-    image: ${APP_IMAGE:-aichuguang/fnos-search}:${APP_VERSION:-latest}
-    container_name: ${APP_CONTAINER_NAME:-fnos-media-import}
+    # 不创建 .env 也能直接启动；通常只需按需修改版本、端口或暂存目录。
+    image: aichuguang/fnos-search:${APP_VERSION:-latest}
+    container_name: fnos-media-import
     restart: unless-stopped
     init: true
     stop_grace_period: 2m
@@ -12,28 +12,22 @@ services:
     ports:
       - "${APP_PORT:-5251}:5251"
     environment:
-      # 所有值都有可启动默认值，不创建 .env 也可以直接启动。
       TZ: ${TZ:-Asia/Shanghai}
-      APP_ENV: ${APP_ENV:-production}
-      SECURITY_STRICT: ${SECURITY_STRICT:-true}
-      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
-      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"
+      APP_ENV: production
+      SECURITY_STRICT: "true"
+      # 仅兼容曾显式设置密钥的旧部署；新部署留空后会自动生成并持久化。
       APP_SECRET_KEY: "${APP_SECRET_KEY:-}"
       NOTIFICATION_ENCRYPTION_KEY: "${NOTIFICATION_ENCRYPTION_KEY:-}"
-      APP_UID: "${APP_UID:-10001}"
-      APP_GID: "${APP_GID:-10001}"
-      RCLONE_CONTAINER_NAME: ${RCLONE_CONTAINER_NAME:-rclone-server}
     extra_hosts:
       # Linux/NAS 容器可通过该名称访问宿主机上的 OpenList、PanSou 等服务。
       - "host.docker.internal:host-gateway"
     volumes:
-      # 相对路径位于 Compose 项目目录，首次启动会自动创建，无需预先选择 NAS 目录。
-      - ${APP_CONFIG_HOST_PATH:-./config}:/app/config
-      - ${APP_DATA_HOST_PATH:-./data}:/app/data
-      - ${APP_LOG_HOST_PATH:-./logs}:/app/logs
+      # 相对目录会自动创建；暂存视频较大时只需覆盖 RCLONE_TEMP_HOST_PATH。
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
       - ${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp
-      # 当前搬运器通过 docker exec 调用 rclone-server；仅在可信环境开放后台。
-      - ${DOCKER_SOCKET_HOST_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -53,9 +47,8 @@ services:
       start_period: 60s
 
   rclone-server:
-    # rclone 是内部搬运执行环境，用户不需要单独进入或配置启动命令。
-    image: ${RCLONE_IMAGE:-rclone/rclone:1.70.3}
-    container_name: ${RCLONE_CONTAINER_NAME:-rclone-server}
+    image: rclone/rclone:1.70.3
+    container_name: rclone-server
     restart: unless-stopped
     init: true
     stop_grace_period: 2m
@@ -65,17 +58,15 @@ services:
         set -eu
         for path in /config/rclone /cache /temp /temp/fnos-media-import; do
           mkdir -p "$${path}"
-          chown -R "$${APP_UID}:$${APP_GID}" "$${path}"
+          chown -R 10001:10001 "$${path}"
           chmod -R u+rwX,g+rwX "$${path}"
         done
         touch /config/rclone/rclone.conf
-        chown "$${APP_UID}:$${APP_GID}" /config/rclone/rclone.conf
+        chown 10001:10001 /config/rclone/rclone.conf
         chmod 660 /config/rclone/rclone.conf
         exec tail -f /dev/null
     environment:
       TZ: ${TZ:-Asia/Shanghai}
-      APP_UID: "${APP_UID:-10001}"
-      APP_GID: "${APP_GID:-10001}"
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -85,9 +76,9 @@ services:
       - CHOWN
       - FOWNER
     volumes:
-      - ${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone
+      - ./rclone/config:/config/rclone
       - ${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp
-      - ${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache
+      - ./rclone/cache:/cache
     healthcheck:
       test: ["CMD-SHELL", "rclone version >/dev/null"]
       interval: 30s
