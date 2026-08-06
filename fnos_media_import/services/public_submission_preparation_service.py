@@ -41,6 +41,10 @@ class PublicSubmissionPreparationService:
         config_int: Callable[[dict[str, Any], str, int], int],
         validate_destination: Callable[..., str | None] | None = None,
     ) -> None:
+        # ``validate_destination`` is deprecated in v4: the guest no longer
+        # selects a destination.  It is kept in the constructor only for
+        # callers that still pass it (app.py); the preparation service ignores
+        # it and the server resolves the target from source_destination_rules.
         self.search_cache = search_cache
         self.categories = categories
         self.category = category
@@ -79,10 +83,14 @@ class PublicSubmissionPreparationService:
         )
         cached = self.search_cache(public_id) if public_id else None
         prepared = dict(payload)
-        # Public callers select only a server-side destination profile.  Any
-        # path, driver or credential-shaped fields must be ignored before the
-        # payload can reach legacy provider adapters.
+        # 访客不选择保存位置：payload 不得携带目标或任何基础设施字段。
+        # 目标由服务端按来源 + 分类从 source_destination_rules 解析。
         for field in (
+            "destination_id",
+            "account_id",
+            "provider_kind",
+            "mount_id",
+            "options_revision",
             "driver",
             "backend",
             "remote",
@@ -144,22 +152,6 @@ class PublicSubmissionPreparationService:
             raise PublicSubmissionPreparationError("资源分类不能为空")
         if category_key not in self.categories():
             raise PublicSubmissionPreparationError("资源分类不存在")
-        requested_destination = str(prepared.get("destination_id") or "").strip()
-        if self.validate_destination is not None:
-            try:
-                prepared["destination_id"] = self.validate_destination(
-                    requested=requested_destination,
-                    route=link.route,
-                    source_kind=link.source_type,
-                    category_key=category_key,
-                    category=self.category(category_key),
-                )
-            except ValueError as exc:
-                raise PublicSubmissionPreparationError(str(exc), 400) from exc
-        elif requested_destination:
-            prepared["destination_id"] = requested_destination
-        else:
-            prepared["destination_id"] = None
         return PreparedPublicSubmission(
             public_id=public_id,
             payload=prepared,

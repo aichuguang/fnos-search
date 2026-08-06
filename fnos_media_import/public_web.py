@@ -1145,12 +1145,15 @@ def _public_request_response(guest_request: dict[str, Any] | None) -> dict[str, 
     status = str(item.get("status") or "")
     raw_data = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
     request_data = raw_data.get("request") if isinstance(raw_data.get("request"), dict) else {}
+    # 访客不提交 destination_id；展示服务端解析并绑定到正式任务的目标。
+    job_result = raw_data.get("job_result") if isinstance(raw_data.get("job_result"), dict) else {}
+    resolved_destination = str(job_result.get("destination_id") or "").strip() or None
     return {
         "token": item.get("request_token"),
         "title": item.get("title"),
         "category": item.get("category"),
         "category_label": item.get("category_label"),
-        "destination_id": str(request_data.get("destination_id") or "").strip() or None,
+        "destination_id": resolved_destination,
         "status": item.get("public_status") or _public_status(status),
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
@@ -1162,7 +1165,10 @@ def _public_submit_message(result: dict[str, Any]) -> str:
     job = result.get("job") if isinstance(result.get("job"), dict) else {}
     status = str(job.get("status") or "").lower()
     if not result.get("success", True):
-        return _public_request_message_for_status(status or "failed")
+        # 失败关闭时优先展示具体原因（如“没有可用保存位置”），
+        # 不使用笼统的失败文案。
+        explicit = str(result.get("message") or "").strip()
+        return explicit or _public_request_message_for_status(status or "failed")
     if status in {"done", "success"}:
         return "提交成功，系统已完成处理。"
     return "提交成功，系统已收到请求，请保存提交编号。"
@@ -1243,9 +1249,7 @@ def _public_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
         }
     quark_selection = _safe_public_quark_selection(payload.get("quark_selection"))
     cloud139_selection = _safe_public_cloud139_selection(payload.get("cloud139_selection"))
-    destination_id = str(payload.get("destination_id") or "").strip()
-    if destination_id and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", destination_id):
-        destination_id = ""
+    # v4: 访客不选择保存位置，payload 不携带 destination_id。
     return {
         "public_id": payload.get("public_id") or payload.get("resource_id") or "",
         "category": payload.get("category") or "",
@@ -1256,7 +1260,6 @@ def _public_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "sixpan_selection": sixpan_selection,
         "quark_selection": quark_selection,
         "cloud139_selection": cloud139_selection,
-        "destination_id": destination_id or None,
     }
 
 
@@ -1269,6 +1272,8 @@ def _guest_safe_job_result(result: dict[str, Any]) -> dict[str, Any]:
         "job_id": job.get("id"),
         "job_status": job.get("status"),
         "target_path": job.get("target_path"),
+        # 服务端解析的保存目标，不是访客提交的字段。
+        "destination_id": job.get("destination_id"),
     }
 
 

@@ -69,11 +69,11 @@ class SchemaUpgradeCompatibilityTests(unittest.TestCase):
                         applied_at TEXT NOT NULL
                     );
                     INSERT INTO schema_migrations(version, name, applied_at)
-                    VALUES (22, 'future_schema', '2026-01-01T00:00:00Z');
+                    VALUES (23, 'future_schema', '2026-01-01T00:00:00Z');
                     """
                 )
 
-            with self.assertRaisesRegex(RuntimeError, "v22.*v21"):
+            with self.assertRaisesRegex(RuntimeError, "v23.*v22"):
                 Database(database_path).init_schema()
 
             with closing(sqlite3.connect(database_path)) as connection:

@@ -1,9 +1,30 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .import_planner import destination_scoped_idempotency_key
+from .import_job_service import V4PlanningError
+
+
+def _v4_guest_idempotency_base(payload: dict[str, Any]) -> str:
+    """Derive the guest idempotency base from the resource + category.
+
+    v4 has no guest-chosen destination suffix.  The creation service refines
+    this base with the server-resolved canonical source, selection hash,
+    destination and account revisions to form the durable job identity.
+    """
+
+    identity_source = str(
+        payload.get("public_id")
+        or payload.get("resource_id")
+        or payload.get("url")
+        or payload.get("source_url")
+        or ""
+    ).strip()
+    category = str(payload.get("category") or "").strip()
+    digest = hashlib.sha256(f"v4|{identity_source}|{category}".encode("utf-8", "ignore")).hexdigest()
+    return f"v4:{digest}"
 
 
 @dataclass(frozen=True)
@@ -99,9 +120,11 @@ class PublicImportJobCoordinator:
         except (TypeError, ValueError):
             compensation_retry_job_id = 0
         payload = dict(submit_payload)
-        payload["idempotency_key"] = destination_scoped_idempotency_key(
-            f"guest-request:{request_token}", payload.get("destination_id")
-        )
+        # v4 idempotency identity derives from canonical source + category
+        # (no guest destination suffix).  The creation service refines the
+        # base with the resolved destination/accounts and returns the durable
+        # key on the result.
+        payload["idempotency_key"] = _v4_guest_idempotency_base(payload)
         payload["config_revision"] = payload.get("config_revision") or self.runtime_revision()
         payload["executor_id"] = payload.get("executor_id") or self.executor_id()
         submissions = self.submission_service()
@@ -129,6 +152,9 @@ class PublicImportJobCoordinator:
                     )
                 if not compensation_retry_job_id:
                     try:
+                        # v4 下任务的持久化键是 create 服务细化后的资源身份键；
+                        # 这里用基键做尽力而为的查找（已绑定请求在
+                        # ``_request_job_id`` 分支提前返回），找不到时按取消处理。
                         existing_job = self._existing_idempotent_job(
                             str(payload["idempotency_key"])
                         )
@@ -165,9 +191,15 @@ class PublicImportJobCoordinator:
             imports = self.import_service()
             result = imports.create_import_job(payload)
             job = result.get("job") if isinstance(result.get("job"), dict) else {}
-            expected_idempotency_key = str(payload["idempotency_key"])
+            # The creation service returns the durable v4 identity key (canonical
+            # source + category + destination + account revisions).  Ownership is
+            # proven by that returned key, not by a guest-sent destination.
+            expected_idempotency_key = str(
+                result.get("idempotency_key") or job.get("idempotency_key") or ""
+            )
             owned_by_request = (
-                str(job.get("idempotency_key") or "") == expected_idempotency_key
+                bool(expected_idempotency_key)
+                and str(job.get("idempotency_key") or "") == expected_idempotency_key
             )
             newly_created = result.get("created") is True and owned_by_request
             idempotent_retry = result.get("created") is False and owned_by_request
@@ -395,6 +427,16 @@ class PublicImportJobCoordinator:
                 bind_outcome=bind_outcome,
                 rclone_start=rclone_start,
             )
+        except V4PlanningError as exc:
+            # Fail closed: no job was created (e.g. no admin-assigned
+            # destination).  The guest request is marked failed with the
+            # planning reason; there is no default-drive fallback.
+            return self._planning_failed_result(
+                guest_request_id=guest_request_id,
+                request_item=None,
+                error=exc,
+                mark_failure=mark_failure,
+            )
         except Exception as exc:
             if mark_failure:
                 failed_request = submissions.mark_import_failed(guest_request_id, error=str(exc))
@@ -416,6 +458,35 @@ class PublicImportJobCoordinator:
         if str(job.get("idempotency_key") or "") != str(idempotency_key or ""):
             return None
         return job
+
+    def _planning_failed_result(
+        self,
+        *,
+        guest_request_id: int,
+        request_item: dict[str, Any] | None,
+        error: V4PlanningError,
+        mark_failure: bool,
+    ) -> PublicImportJobResult:
+        failed_request = request_item
+        if mark_failure:
+            failed_request = self.submission_service().mark_import_failed(
+                guest_request_id, error=str(error)
+            )
+        return PublicImportJobResult(
+            result={
+                "success": False,
+                "created": False,
+                "terminal": True,
+                "retryable": False,
+                "error_code": str(getattr(error, "code", "PLANNING_FAILED") or "PLANNING_FAILED"),
+                "message": str(error),
+            },
+            job={},
+            public_status="处理失败",
+            bound_request=failed_request,
+            bind_outcome="failed",
+            rclone_start=None,
+        )
 
     def _cancelled_request_existing_job(
         self,

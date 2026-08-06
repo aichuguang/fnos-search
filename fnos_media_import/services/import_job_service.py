@@ -1,5 +1,22 @@
+"""公共流程 v4 接入：访客不选择保存路径。
+
+`ImportJobCreationService.create` 在服务端解析来源（SourceDescriptor）与
+管理员通过 source_destination_rules 分配的目标，解析激活账号，调用 v4
+Planner 冻结执行计划并持久化。访客提交的任何目标/账号/路径字段都在进入
+业务层前被忽略；没有任何可用目标时任务失败关闭，绝不回退默认盘。
+
+`ImportJobRetryService.retry` 只接受 v4 计划；旧版本一律返回
+UNSUPPORTED_PLAN_VERSION，且不从当前配置重建计划。
+
+v4 规划依赖（SourceResolver / DestinationResolver / plan_import /
+validate_v4_plan）由并行 Agent 提供的 planning 包实现。这里以构造函数注入
+为主，未注入时通过受控的惰性导入加载；planning 尚未就绪时错误会清晰暴露，
+不会被静默吞掉。
+"""
+
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -23,23 +40,41 @@ from ..constants import (
     JOB_WAITING_OPENLIST,
     JOB_WAITING_ORGANIZER,
     JOB_WAITING_TRANSFER,
-    ROUTE_CLOUD139_DIRECT,
-    ROUTE_CLOUD189_DIRECT,
-    ROUTE_QUARK_TO_MOBILE,
-    ROUTE_SIXPAN_OFFLINE,
 )
-from .import_planner import (
-    build_execution_plan,
-    destination_scoped_idempotency_key,
-    destination_strategy,
-    execution_plan_from_job,
-    provider_target_from_plan,
-    resolve_destination_id,
-    StoragePlanError,
-    validated_execution_plan_from_job,
-)
-from .import_staging_service import staging_plan_from_job, validated_staging_plan_from_job
+from ..domain.models import EXECUTION_PLAN_VERSION, DestinationDescriptor, SourceDescriptor
 
+
+class V4PlanningError(ValueError):
+    """v4 规划失败且必须失败关闭（不生成任务、不回退默认盘）。"""
+
+    def __init__(self, message: str, code: str = "PLANNING_FAILED") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# 访客/调用方提交时不允许携带的“基础设施”字段。进入业务层前被忽略，
+# 绝不参与来源识别、目标解析或执行计划。
+GUEST_FORBIDDEN_FIELDS = frozenset(
+    {
+        "destination_id",
+        "account_id",
+        "provider_kind",
+        "driver",
+        "backend",
+        "remote",
+        "mount_id",
+        "root",
+        "absolute_path",
+        "target_path",
+        "target_path_override",
+        "cloud139_target_path_override",
+        "options_revision",
+        "context",
+        "update_context",
+        "organizer_context",
+        "target_root_is_resource",
+    }
+)
 
 PROVIDER_SUBMISSION_FENCE_KEY = "provider_submission_fence"
 PROVIDER_SUBMISSION_FENCE_VERSION = 1
@@ -61,373 +96,505 @@ PROVIDER_POST_SUBMISSION_JOB_STATUSES = frozenset(
 )
 
 
+def _load_planning_dependency(name: str) -> Any:
+    """Lazily import a v4 planning dependency.
+
+    The planning package is owned by the parallel v4 build.  If a module is
+    not yet present, the ImportError is surfaced as a clear
+    ``V4PlanningError`` instead of being swallowed or silently falling back.
+    """
+    try:
+        if name == "source_resolver":
+            from ..planning.source_resolver import SourceResolver
+
+            return SourceResolver
+        if name == "destination_resolver":
+            from ..planning.destination_resolver import DestinationResolver
+
+            return DestinationResolver
+        if name == "plan_import":
+            from ..planning.planner import plan_import
+
+            return plan_import
+        if name == "validate_v4_plan":
+            from ..planning.plan_validator import validate_v4_plan
+
+            return validate_v4_plan
+    except ImportError as exc:
+        raise V4PlanningError(
+            f"v4 规划依赖 planning.{name} 尚未就绪：{exc}",
+            code="PLANNING_UNAVAILABLE",
+        ) from exc
+    raise V4PlanningError(f"未知的 v4 规划依赖：{name}", code="PLANNING_UNAVAILABLE")
+
+
+def _account_id(account: Any) -> str:
+    if isinstance(account, (tuple, list)) and len(account) >= 1:
+        return str(account[0] or "").strip()
+    return str((account or {}).get("account_id") or "").strip()
+
+
+def _account_revision(account: Any) -> int:
+    if isinstance(account, (tuple, list)) and len(account) >= 2:
+        return _to_nonneg_int(account[1])
+    return _to_nonneg_int((account or {}).get("account_revision"))
+
+
+def _selection_revision(account: Any) -> int:
+    if isinstance(account, (tuple, list)) and len(account) >= 3:
+        return _to_nonneg_int(account[2])
+    return _to_nonneg_int((account or {}).get("selection_revision"))
+
+
+def _to_nonneg_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _account_dict(account: Any) -> dict[str, Any]:
+    if not account:
+        return {}
+    return {
+        "account_id": _account_id(account),
+        "account_revision": _account_revision(account),
+        "selection_revision": _selection_revision(account),
+    }
+
+
+def _plan_target_path(plan: dict[str, Any]) -> str:
+    paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
+    for key in ("destination_final", "final"):
+        ref = paths.get(key) if isinstance(paths.get(key), dict) else {}
+        path = str(ref.get("path") or "").strip()
+        if path:
+            return path
+    return ""
+
+
 class ImportJobCreationService:
-    """Creates the durable import record and dispatches its provider route."""
+    """Creates the durable v4 import record from a server-resolved plan.
+
+    The guest never selects a save path.  The source is resolved from the
+    trusted search-cache record (or re-detected from the validated URL), the
+    destination is resolved from admin ``source_destination_rules``, the
+    active accounts are frozen, and the v4 Planner produces an immutable
+    execution plan that is validated and persisted with the job.
+    """
 
     def __init__(
         self,
         *,
         database: Any,
         config: Any,
-        detect_link: Callable[..., Any],
-        job_source_url: Callable[[str, dict[str, Any]], str],
-        target_path: Callable[..., str],
-        staging_plan: Callable[..., dict[str, Any]] | None,
-        submit_quark: Callable[..., dict[str, Any]],
-        submit_cloud139: Callable[..., dict[str, Any]],
-        submit_generic: Callable[..., dict[str, Any]],
+        detect_link: Callable[..., Any] | None = None,
+        job_source_url: Callable[[str, dict[str, Any]], str] | None = None,
+        target_path: Callable[..., str] | None = None,
+        staging_plan: Callable[..., dict[str, Any]] | None = None,
+        submit_quark: Callable[..., dict[str, Any]] | None = None,
+        submit_cloud139: Callable[..., dict[str, Any]] | None = None,
+        submit_generic: Callable[..., dict[str, Any]] | None = None,
+        source_resolver: Any | None = None,
+        destination_resolver: Any | None = None,
+        plan_import: Callable[..., dict[str, Any]] | None = None,
+        validate_v4_plan: Callable[..., Any] | None = None,
+        plan_validation_deps: Any | None = None,
     ) -> None:
         self.database = database
         self.config = config
         self.detect_link = detect_link
-        self.job_source_url = job_source_url
+        self.job_source_url = job_source_url or (lambda url, _payload: url)
         self.target_path = target_path
         self.staging_plan = staging_plan
         self.submit_quark = submit_quark
         self.submit_cloud139 = submit_cloud139
         self.submit_generic = submit_generic
+        # v4 planning dependencies.  Injected by tests / the integration layer;
+        # defaults are lazily imported from the planning package.
+        self.source_resolver = source_resolver
+        self.destination_resolver = destination_resolver
+        self.plan_import = plan_import
+        self.validate_v4_plan = validate_v4_plan
+        self.plan_validation_deps = plan_validation_deps
 
     def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(payload or {})
+        # 访客提交不体现、不选择保存位置：任何目标/账号/路径/凭证形状字段
+        # 都在进入业务层前被丢弃，绝不影响来源识别或目标解析。
+        for field in GUEST_FORBIDDEN_FIELDS:
+            payload.pop(field, None)
+
         title = str(payload.get("title") or "未命名资源").strip()
         url = str(payload.get("url") or payload.get("source_url") or "").strip()
         if not url:
             raise ValueError("资源链接不能为空")
-        password = payload.get("password") or ""
+        password = str(payload.get("password") or "")
         category_key = str(payload.get("category") or "movie")
         category = self.config.category(category_key)
         category_label = category.get("label", category_key)
-        link = self.detect_link(url, self.config.raw.get("routes", {}), password=password)
-        source_url = self.job_source_url(link.url, payload)
-        raw_config = self._raw_config()
-        requested_destination = str(payload.get("destination_id") or "").strip()
-        explicit_destination = bool(requested_destination)
-        resolved_destination = resolve_destination_id(raw_config, requested_destination)
-        if explicit_destination and not resolved_destination:
-            raise ValueError(f"存储目标不存在、已禁用或当前不可用：{requested_destination}")
 
-        # Legacy ingress remains version-2 until its source/target adapter is
-        # implemented.  For Quark and Cloud139, however, an enabled default is
-        # an actual user intent and an unsupported matrix entry must fail closed.
-        legacy_ingress = link.route in {ROUTE_SIXPAN_OFFLINE, ROUTE_CLOUD189_DIRECT}
-        destination_id: str | None = None
-        plan_version: int | None = None
-        selected_strategy = ""
-        if resolved_destination and link.supported:
-            try:
-                _driver_kind, selected_strategy = destination_strategy(
-                    raw_config=raw_config,
-                    route=link.route,
-                    source_kind=link.source_type,
-                    category_key=category_key,
-                    category=category,
-                    destination_id=resolved_destination,
-                )
-            except StoragePlanError as exc:
-                if explicit_destination or not legacy_ingress:
-                    raise ValueError(str(exc)) from exc
-                selected_strategy = ""
-            if selected_strategy == "manual_review":
-                if explicit_destination or not legacy_ingress:
-                    raise ValueError("当前来源与所选存储目标没有已验证的传输策略")
-            elif selected_strategy:
-                destination_id = resolved_destination
-                plan_version = 3
+        # (1) 服务端识别来源，不信任客户端 provider 字段。
+        source = self._resolve_source(record=self._build_source_record(payload))
+        # (2) 管理员通过 source_destination_rules 分配目标；0 个可用目标
+        #     必须失败关闭，绝不为空目标回退默认盘。
+        destination = self._resolve_destination(source, category_key)
+        if destination is None:
+            raise V4PlanningError(
+                "该资源当前没有可用的保存位置，请联系管理员为该来源配置入库目标",
+                code="SOURCE_DESTINATION_NOT_CONFIGURED",
+            )
+        # (3) 解析并冻结来源与目标激活账号。
+        source_account = self._resolve_source_account(source)
+        destination_account = self._resolve_destination_account(destination)
+        selected_items_hash = str(source.selected_items_hash or "")
 
-        target_path = self.target_path(link.route, category, request_payload=payload)
-        job_id, created = self.database.create_job({
-            "title": title,
-            "category": category_key,
-            "category_label": category_label,
-            "source_type": link.source_type,
-            "source_url": source_url,
-            "password": link.password,
-            "target_route": link.route,
-            "target_path": target_path,
-            "status": JOB_CREATED,
-            "raw_data": {
-                "request": payload,
-                "link_info": link.to_dict(),
-                PROVIDER_SUBMISSION_FENCE_KEY: {
-                    "version": PROVIDER_SUBMISSION_FENCE_VERSION,
-                    "state": "not_started",
-                    "attempt": 0,
-                },
+        idempotency_key = self._v4_idempotency_key(
+            payload,
+            source=source,
+            destination=destination,
+            source_account=source_account,
+            destination_account=destination_account,
+            selected_items_hash=selected_items_hash,
+        )
+        source_url = self.job_source_url(url, payload)
+        raw_data = {
+            "request": payload,
+            "source": self._source_dict(source),
+            "destination": self._destination_dict(destination),
+            "source_account": _account_dict(source_account),
+            "destination_account": _account_dict(destination_account),
+            "selected_items_hash": selected_items_hash,
+            "idempotency_identity": idempotency_key,
+            PROVIDER_SUBMISSION_FENCE_KEY: {
+                "version": PROVIDER_SUBMISSION_FENCE_VERSION,
+                "state": "not_started",
+                "attempt": 0,
             },
-            "idempotency_key": destination_scoped_idempotency_key(
-                payload.get("idempotency_key"), destination_id
-            ) or None,
-            "idempotency_payload": {
-                "url": source_url,
+        }
+        job_id, created = self.database.create_job(
+            {
+                "title": title,
                 "category": category_key,
-                "destination_id": destination_id,
-                "quark_selection": payload.get("quark_selection"),
-                "cloud139_selection": payload.get("cloud139_selection"),
-                "sixpan_selection": payload.get("sixpan_selection"),
-            },
-            "config_revision": payload.get("config_revision") or 1,
-            "executor_id": payload.get("executor_id") or "web",
-            "destination_id": destination_id,
-            "plan_version": plan_version,
-        })
+                "category_label": category_label,
+                "source_type": source.provider_kind,
+                "source_url": source_url,
+                "password": password,
+                "target_route": _source_route(source),
+                "target_path": "",
+                "status": JOB_CREATED,
+                "raw_data": raw_data,
+                "idempotency_key": idempotency_key,
+                "config_revision": payload.get("config_revision") or 1,
+                "executor_id": payload.get("executor_id") or "web",
+                "destination_id": destination.destination_id,
+                "plan_version": EXECUTION_PLAN_VERSION,
+            }
+        )
         if not created:
+            job = self.database.get_job(job_id) or {}
             return {
-                "job": self.database.get_job(job_id),
+                "job": job,
                 "created": False,
                 "message": "该资源和分类已存在入库任务",
+                "idempotency_key": str(job.get("idempotency_key") or ""),
             }
-        self.database.add_event(job_id, EVENT_INFO, f"创建入库任务：{title}")
-        if not link.supported:
-            changed = _update_created_job(
+        try:
+            # (4) v4 Planner 冻结唯一执行策略。
+            plan = self._plan_import(
+                source=source,
+                destination=destination,
+                category_key=category_key,
+                category=category,
+                job_id=job_id,
+                request_payload=payload,
+            )
+            # (5) 校验器与生成器执行相同约束。
+            self._validate_v4_plan(plan, job_record=self.database.get_job(job_id) or {})
+            # (6) 固化 v4 计划与 destination_id / plan_version。
+            target_path = _plan_target_path(plan)
+            if not _update_created_job(
                 self.database,
                 job_id,
-                status=JOB_UNSUPPORTED,
-                error_message=link.reason,
-            )
-            self.database.add_event(job_id, EVENT_WARN, link.reason, link.to_dict())
-            return {
-                "job": self.database.get_job(job_id),
-                "created": True,
-                "message": link.reason if changed else "任务状态已变化，未写入暂不支持状态",
-                "success": False,
-            }
-        execution_plan: dict[str, Any] | None = None
-        if plan_version == 3:
-            try:
-                execution_plan = self._persist_execution_plan(
-                    job_id,
-                    route=link.route,
-                    source_kind=link.source_type,
-                    category_key=category_key,
-                    category=category,
-                    destination_id=destination_id,
+                target_path=target_path,
+                raw_data={**raw_data, "execution_plan": plan},
+            ):
+                raise V4PlanningError(
+                    "任务状态已变化，未固化 v4 执行计划", code="PLANNING_CONFLICT"
                 )
-                planned_target = provider_target_from_plan(execution_plan, link.route)
-                if not planned_target:
-                    raise StoragePlanError("执行计划缺少来源/Provider 目标路径")
-                target_path = planned_target
-                current = self.database.get_job(job_id) or {}
-                raw_data = current.get("raw_data") if isinstance(current.get("raw_data"), dict) else {}
-                if not _update_created_job(
-                    self.database,
-                    job_id,
-                    target_path=target_path,
-                    raw_data={**raw_data, "execution_plan": execution_plan},
-                ):
-                    raise StoragePlanError("任务状态已变化，未固化 v3 执行计划")
-            except Exception as exc:  # noqa: BLE001
-                message = f"新任务 v3 执行计划失败：{exc}"
-                _mark_creation_failed(self.database, job_id, message)
-                self.database.add_event(job_id, EVENT_ERROR, message)
-                return {
-                    "job": self.database.get_job(job_id),
-                    "created": True,
-                    "message": message,
-                    "success": False,
-                    "plan_error": True,
-                }
-        elif self.staging_plan:
-            try:
-                plan = self.staging_plan(
-                    job_id=job_id,
-                    route=link.route,
-                    category_key=category_key,
-                    category=category,
-                )
-            except Exception as exc:  # noqa: BLE001
-                message = f"新任务暂存路径规划失败：{exc}"
-                current = self.database.get_job(job_id) or {}
-                raw_data = current.get("raw_data") if isinstance(current.get("raw_data"), dict) else {}
-                changed = _update_created_job(
-                    self.database,
-                    job_id,
-                    status=JOB_FAILED,
-                    error_message=message,
-                    raw_data={
-                        **raw_data,
-                        "staging_plan_required": True,
-                        "staging_plan_error": message,
-                    },
-                )
-                self.database.add_event(job_id, EVENT_ERROR, message)
-                return {
-                    "job": self.database.get_job(job_id),
-                    "created": True,
-                    "message": message if changed else "任务状态已变化，暂存规划失败未覆盖当前状态",
-                    "success": False,
-                }
-            if isinstance(plan, dict) and plan.get("enabled"):
-                provider_target = str(plan.get("provider_target_path") or "").strip()
-                if not provider_target:
-                    message = "新任务暂存路径规划失败：缺少导入目标目录"
-                    current = self.database.get_job(job_id) or {}
-                    raw_data = current.get("raw_data") if isinstance(current.get("raw_data"), dict) else {}
-                    changed = _update_created_job(
-                        self.database,
-                        job_id,
-                        status=JOB_FAILED,
-                        error_message=message,
-                        raw_data={
-                            **raw_data,
-                            "staging_plan_required": True,
-                            "staging_plan_error": message,
-                        },
-                    )
-                    self.database.add_event(job_id, EVENT_ERROR, message, {"staging_plan": plan})
-                    return {
-                        "job": self.database.get_job(job_id),
-                        "created": True,
-                        "message": message if changed else "任务状态已变化，暂存规划失败未覆盖当前状态",
-                        "success": False,
-                    }
-                current = self.database.get_job(job_id) or {}
-                raw_data = current.get("raw_data") if isinstance(current.get("raw_data"), dict) else {}
-                target_path = provider_target
-                changed = _update_created_job(
-                    self.database,
-                    job_id,
-                    target_path=target_path,
-                    raw_data={
-                        **raw_data,
-                        "staging_plan_required": True,
-                        "staging_plan": plan,
-                    },
-                )
-                if not changed:
-                    message = "任务状态已变化，未固化暂存计划，也未调用网盘接口"
-                    self.database.add_event(job_id, EVENT_WARN, message, {"staging_plan": plan})
-                    return {
-                        "job": self.database.get_job(job_id),
-                        "created": True,
-                        "message": message,
-                        "success": False,
-                        "provider_submission_claim_failed": True,
-                        "retryable": True,
-                    }
-                self.database.add_event(
-                    job_id,
-                    EVENT_INFO,
-                    f"已分配任务级暂存目录：{provider_target}",
-                    {"staging_plan": plan},
-                )
-        if selected_strategy == "manual_review":
-            message = "当前来源与所选存储目标需要人工处理，未调用网盘接口"
-            _mark_creation_failed(self.database, job_id, message, status=JOB_UNSUPPORTED)
-            self.database.add_event(job_id, EVENT_WARN, message)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc) if isinstance(exc, V4PlanningError) else f"v4 执行计划失败：{exc}"
+            _mark_creation_failed(self.database, job_id, message)
+            self.database.add_event(job_id, EVENT_ERROR, message)
             return {
                 "job": self.database.get_job(job_id),
                 "created": True,
                 "message": message,
                 "success": False,
-                "manual_review": True,
+                "plan_error": True,
+                "idempotency_key": idempotency_key,
             }
-        if link.route in {
-            ROUTE_QUARK_TO_MOBILE,
-            ROUTE_CLOUD139_DIRECT,
-            ROUTE_CLOUD189_DIRECT,
-            ROUTE_SIXPAN_OFFLINE,
-        }:
-            claimed, claimed_job, claim_message = _claim_provider_submission(
-                self.database,
-                job_id=job_id,
-                expected_status=JOB_CREATED,
-                provider=str(link.source_type or link.route),
-                require_not_started_fence=True,
-            )
-            if not claimed:
-                return {
-                    "job": claimed_job,
-                    "created": True,
-                    "message": claim_message,
-                    "success": False,
-                    "provider_submission_claim_failed": True,
-                    "retryable": True,
-                }
-        if link.route == ROUTE_QUARK_TO_MOBILE:
-            return self.submit_quark(job_id, title, link.url, target_path, category_key, category, request_payload=payload)
-        if link.route == ROUTE_CLOUD139_DIRECT:
-            return self.submit_cloud139(job_id, title, link.url, target_path, link.password, category, category_key, request_payload=payload)
-        if link.route in {ROUTE_CLOUD189_DIRECT, ROUTE_SIXPAN_OFFLINE}:
-            return self.submit_generic(
-                job_id,
-                title,
-                link.url,
-                target_path,
-                category,
-                link.source_type,
-                link.password,
-                request_payload=payload,
-            )
-        message = f"已识别线路 {link.route}，但第一版暂未实现提交适配器"
-        changed = _update_created_job(
-            self.database,
+
+        self.database.add_event(job_id, EVENT_INFO, f"创建入库任务：{title}")
+        self.database.add_event(
             job_id,
-            status=JOB_UNSUPPORTED,
-            error_message=message,
+            EVENT_INFO,
+            f"已解析保存目标：{destination.destination_id}（{destination.provider_kind}）",
+            self._destination_dict(destination),
         )
-        self.database.add_event(job_id, EVENT_WARN, message)
         return {
             "job": self.database.get_job(job_id),
             "created": True,
-            "message": message if changed else "任务状态已变化，未写入暂不支持状态",
-            "success": False,
+            "message": "已创建入库任务",
+            "success": True,
+            "idempotency_key": idempotency_key,
         }
 
     def _raw_config(self) -> dict[str, Any]:
         return getattr(self.config, "raw", {}) if self.config is not None else {}
 
-    def _staging_enabled(self) -> bool:
+    def _organizer_enabled(self) -> bool:
         raw = self._raw_config()
         organizer = raw.get("organizer") if isinstance(raw.get("organizer"), dict) else {}
-        return bool(organizer.get("enabled", False) and organizer.get("staging_enabled", True))
+        return bool(organizer.get("enabled", False))
 
-    def _staging_dir_name(self) -> str:
-        raw = self._raw_config()
-        organizer = raw.get("organizer") if isinstance(raw.get("organizer"), dict) else {}
-        return str(organizer.get("staging_dir_name") or "_入库暂存")
+    def _build_source_record(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Build the trusted source record for the v4 SourceResolver.
 
-    def _persist_execution_plan(
+        Prefers the search-cache record (server-trusted).  For manual URL
+        submissions without a cache entry, a minimal record is synthesized
+        from the validated payload; the resolver never trusts client provider
+        fields.
+        """
+        cached = self._cached_record(payload)
+        if cached:
+            return cached
+        return {
+            "url": str(payload.get("url") or payload.get("source_url") or "").strip(),
+            "password": str(payload.get("password") or ""),
+            "raw_data": payload,
+        }
+
+    def _cached_record(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        public_id = str(payload.get("public_id") or payload.get("resource_id") or "").strip()
+        if not public_id:
+            return None
+        getter = getattr(self.database, "get_search_cache", None)
+        if not callable(getter):
+            return None
+        try:
+            record = getter(public_id)
+        except Exception:  # noqa: BLE001
+            return None
+        return record if isinstance(record, dict) else None
+
+    def _source_resolver(self) -> Any:
+        if self.source_resolver is not None:
+            return self.source_resolver
+        resolver_cls = _load_planning_dependency("source_resolver")
+        detect_link = self.detect_link
+        if detect_link is None:
+            from ..classifiers.link_classifier import detect_link
+        return resolver_cls(
+            detect_link=detect_link,
+            config=self._raw_config(),
+        )
+
+    def _destination_resolver(self) -> Any:
+        if self.destination_resolver is not None:
+            return self.destination_resolver
+        resolver_cls = _load_planning_dependency("destination_resolver")
+        # DestinationResolver 需要 rules/target/accounts 服务，必须由集成层注入；
+        # 这里只加载类以清晰暴露依赖缺口。
+        raise V4PlanningError(
+            "v4 目标解析器 DestinationResolver 必须由集成层注入"
+            "（rules_service / target_service / accounts_service）",
+            code="PLANNING_UNAVAILABLE",
+        )
+
+    def _resolve_source(self, *, record: dict[str, Any]) -> SourceDescriptor:
+        resolver = self._source_resolver()
+        try:
+            source = resolver.resolve(record)
+        except V4PlanningError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise V4PlanningError(
+                f"无法解析入库来源：{exc}", code="SOURCE_UNRESOLVABLE"
+            ) from exc
+        if not isinstance(source, SourceDescriptor):
+            raise V4PlanningError(
+                "来源解析器返回了无效的来源描述", code="SOURCE_UNRESOLVABLE"
+            )
+        return source
+
+    def _resolve_destination(
+        self, source: SourceDescriptor, category_key: str
+    ) -> DestinationDescriptor | None:
+        resolver = self._destination_resolver()
+        try:
+            destination = resolver.resolve(source, category_key, audience="guest")
+        except V4PlanningError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise V4PlanningError(
+                f"解析保存目标失败：{exc}", code="SOURCE_DESTINATION_NOT_CONFIGURED"
+            ) from exc
+        if destination is None:
+            return None
+        if not isinstance(destination, DestinationDescriptor):
+            raise V4PlanningError(
+                "目标解析器返回了无效的目标描述", code="PLANNING_FAILED"
+            )
+        return destination
+
+    def _resolve_source_account(self, source: SourceDescriptor) -> Any:
+        resolver = self._destination_resolver()
+        try:
+            return resolver.resolve_account(
+                source.provider_kind, source.account_scope or "default", role="source"
+            )
+        except V4PlanningError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise V4PlanningError(
+                f"当前来源账号不可用：{exc}", code="SOURCE_ACCOUNT_UNAVAILABLE"
+            ) from exc
+
+    def _resolve_destination_account(self, destination: DestinationDescriptor) -> Any:
+        if not destination.account_scope:
+            # 本地/无账号目标不需要账号。
+            return None
+        resolver = self._destination_resolver()
+        try:
+            return resolver.resolve_account(
+                destination.provider_kind, destination.account_scope, role="destination"
+            )
+        except V4PlanningError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise V4PlanningError(
+                f"保存位置暂不可用：{exc}", code="DESTINATION_ACCOUNT_UNAVAILABLE"
+            ) from exc
+
+    def _v4_idempotency_key(
         self,
-        job_id: int,
+        payload: dict[str, Any],
         *,
-        route: str,
-        source_kind: str,
+        source: SourceDescriptor,
+        destination: DestinationDescriptor,
+        source_account: dict[str, Any] | None,
+        destination_account: dict[str, Any] | None,
+        selected_items_hash: str,
+    ) -> str:
+        base = str(payload.get("idempotency_key") or "").strip()
+        if not base:
+            raw = f"v4|{source.canonical_source_id}|{str(payload.get('category') or '').strip()}"
+            base = "v4:" + hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
+        parts = [
+            f"src={source.canonical_source_id}",
+            f"cat={str(payload.get('category') or '').strip()}",
+            f"sel={selected_items_hash}",
+            f"dest={destination.destination_id}",
+            f"drev={int(destination.target_revision or 1)}",
+        ]
+        if source_account:
+            parts.append(f"sa={_account_id(source_account)}@{_account_revision(source_account)}")
+        if destination_account:
+            parts.append(f"da={_account_id(destination_account)}@{_account_revision(destination_account)}")
+        return f"{base}:{':'.join(parts)}"
+
+    def _plan_import(
+        self,
+        *,
+        source: SourceDescriptor,
+        destination: DestinationDescriptor,
         category_key: str,
         category: dict[str, Any],
-        destination_id: str | None,
+        job_id: int,
+        request_payload: dict[str, Any],
     ) -> dict[str, Any]:
-        plan = build_execution_plan(
-            raw_config=self._raw_config(),
-            route=route,
-            source_kind=source_kind,
-            category_key=category_key,
-            category=category,
-            job_id=job_id,
-            destination_id=destination_id,
-            staging_enabled=self._staging_enabled(),
-            staging_dir_name=self._staging_dir_name(),
-        )
-        if not plan:
-            raise StoragePlanError("未生成执行计划")
+        planner = self.plan_import or _load_planning_dependency("plan_import")
+        try:
+            plan = planner(
+                source=source,
+                category_key=category_key,
+                job_id=int(job_id),
+                destination_id=destination.destination_id,
+                audience="guest",
+                organizer_enabled=self._organizer_enabled(),
+                media_refresh_enabled=False,
+            )
+        except V4PlanningError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise V4PlanningError(f"v4 计划生成失败：{exc}", code="PLANNING_FAILED") from exc
+        if not isinstance(plan, dict) or not plan:
+            raise V4PlanningError("v4 Planner 未返回执行计划", code="PLANNING_FAILED")
         return plan
+
+    def _validate_v4_plan(
+        self, plan: dict[str, Any], job_record: dict[str, Any]
+    ) -> None:
+        validator = self.validate_v4_plan or _load_planning_dependency("validate_v4_plan")
+        try:
+            if self.plan_validation_deps is not None:
+                validator(plan, job_record, deps=self.plan_validation_deps)
+            else:
+                validator(plan, job_record)
+        except V4PlanningError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise V4PlanningError(
+                f"v4 执行计划校验失败：{exc}", code="PLANNING_VALIDATION_FAILED"
+            ) from exc
+
+    @staticmethod
+    def _source_dict(source: SourceDescriptor) -> dict[str, Any]:
+        return {
+            "provider_kind": source.provider_kind,
+            "source_form": source.source_form,
+            "canonical_source_id": source.canonical_source_id,
+            "account_scope": source.account_scope,
+            "selected_items_hash": source.selected_items_hash,
+        }
+
+    @staticmethod
+    def _destination_dict(destination: DestinationDescriptor) -> dict[str, Any]:
+        return {
+            "destination_id": destination.destination_id,
+            "provider_kind": destination.provider_kind,
+            "account_scope": destination.account_scope,
+            "target_revision": destination.target_revision,
+        }
 
 
 class ImportJobRetryService:
-    """Rebuilds provider submission arguments from a persisted import job."""
+    """Only retries frozen v4 plans.
+
+    Older plan versions are rejected with ``UNSUPPORTED_PLAN_VERSION``; the
+    plan is never rebuilt from current configuration.  A v4 plan is validated
+    before the durable submission fence is re-established for the executor.
+    """
 
     def __init__(
         self,
         *,
         database: Any,
         config: Any,
-        submit_quark: Callable[..., dict[str, Any]],
-        submit_cloud139: Callable[..., dict[str, Any]],
-        submit_generic: Callable[..., dict[str, Any]],
+        submit_quark: Callable[..., dict[str, Any]] | None = None,
+        submit_cloud139: Callable[..., dict[str, Any]] | None = None,
+        submit_generic: Callable[..., dict[str, Any]] | None = None,
+        validate_v4_plan: Callable[..., Any] | None = None,
+        plan_validation_deps: Any | None = None,
     ) -> None:
         self.database = database
         self.config = config
         self.submit_quark = submit_quark
         self.submit_cloud139 = submit_cloud139
         self.submit_generic = submit_generic
+        self.validate_v4_plan = validate_v4_plan
+        self.plan_validation_deps = plan_validation_deps
 
     def retry(self, job_id: int) -> dict[str, Any]:
         job = self.database.get_job(job_id)
@@ -438,20 +605,55 @@ class ImportJobRetryService:
         except (TypeError, ValueError) as exc:
             message = f"任务 plan_version 无效，已停止重试：{exc}"
             self.database.add_event(job_id, EVENT_WARN, message)
-            return {"job": job, "created": False, "message": message, "success": False, "manual_review": True}
-        v3_plan: dict[str, Any] = {}
-        if persisted_plan_version >= 3:
-            try:
-                v3_plan = validated_execution_plan_from_job(job)
-            except (ValueError, StoragePlanError) as exc:
-                message = f"持久化 v3 执行计划无效，已拒绝重试：{exc}"
-                self.database.add_event(job_id, EVENT_WARN, message)
-                return {"job": job, "created": False, "message": message, "success": False, "manual_review": True}
-            strategy = str((v3_plan.get("transfer") or {}).get("strategy") or "").strip().lower()
-            if strategy == "manual_review":
-                message = "该 v3 任务没有可自动执行的传输策略，已保留人工处理"
-                self.database.add_event(job_id, EVENT_WARN, message)
-                return {"job": job, "created": False, "message": message, "success": False, "manual_review": True}
+            return {
+                "job": job,
+                "created": False,
+                "message": message,
+                "success": False,
+                "manual_review": True,
+            }
+        if persisted_plan_version != EXECUTION_PLAN_VERSION:
+            message = (
+                f"任务计划版本为 {persisted_plan_version or '未知'}，"
+                f"仅支持执行 v{EXECUTION_PLAN_VERSION} 计划；"
+                f"已拒绝重试，请按当前配置重新提交为新任务"
+            )
+            self.database.add_event(job_id, EVENT_WARN, message)
+            return {
+                "job": job,
+                "created": False,
+                "message": message,
+                "success": False,
+                "manual_review": True,
+                "unsupported_plan_version": True,
+                "error_code": "UNSUPPORTED_PLAN_VERSION",
+            }
+
+        plan = self._persisted_plan(job)
+        if not plan:
+            message = "任务标记为 v4，但没有固化 execution_plan，已拒绝重试"
+            self.database.add_event(job_id, EVENT_WARN, message)
+            return {
+                "job": job,
+                "created": False,
+                "message": message,
+                "success": False,
+                "manual_review": True,
+            }
+        try:
+            self._validate_v4_plan(plan, job_record=job)
+        except V4PlanningError as exc:
+            message = f"持久化 v4 执行计划无效，已拒绝重试：{exc}"
+            self.database.add_event(job_id, EVENT_WARN, message)
+            return {
+                "job": job,
+                "created": False,
+                "message": message,
+                "success": False,
+                "manual_review": True,
+                "error_code": str(getattr(exc, "code", "PLANNING_VALIDATION_FAILED")),
+            }
+
         current_status = str(job.get("status") or "").strip().lower()
         if current_status == JOB_CANCELLED:
             message = "任务已取消，如需重新入库请重新提交资源"
@@ -460,7 +662,7 @@ class ImportJobRetryService:
         if current_status == JOB_PROVIDER_SUBMITTING or _provider_submission_is_ambiguous(job):
             message = (
                 "任务已进入网盘提交栅栏，但尚未确认外部接口是否成功；"
-                "为避免重复转存或重复离线下载，禁止自动重提，请先到对应网盘核对任务后人工处理"
+                "为避免重复转存或重复离线下载，禁止自动重提，请人工核对"
             )
             self.database.add_event(job_id, EVENT_WARN, message)
             return {
@@ -474,7 +676,7 @@ class ImportJobRetryService:
         if current_status == JOB_CREATED and not _has_not_started_provider_fence(job):
             message = (
                 "该历史任务停留在已创建状态，但没有可证明尚未调用网盘接口的提交栅栏；"
-                "为避免升级后重复提交，已转为人工核对"
+                "为避免重复提交，已转为人工核对"
             )
             self.database.add_event(job_id, EVENT_WARN, message)
             return {
@@ -485,55 +687,11 @@ class ImportJobRetryService:
                 "manual_review": True,
                 "provider_submission_ambiguous": True,
             }
-        if self._sixpan_completed_provider_requires_media_refresh_only(job):
-            message = (
-                "六盘离线任务已经完成，当前仅媒体库刷新失败；为避免重复下载，已拒绝重新提交六盘。"
-                "请从媒体库刷新入口仅重试刷新，或完成后人工确认任务"
-            )
-            self.database.add_event(job_id, EVENT_WARN, message)
-            return {
-                "job": job,
-                "created": False,
-                "message": message,
-                "success": False,
-                "manual_review": True,
-                "provider_completed": True,
-                "media_refresh_only": True,
-            }
-        if self._rclone_staging_retry_requires_manual_review(job):
-            message = (
-                "任务级 rclone 自动补跑已经耗尽；为避免重复转存或离线下载，已拒绝重提网盘任务。"
-                "请先检查任务暂存目录和搬运日志，再从 rclone 搬运入口手动补跑或重新提交为新任务"
-            )
-            self.database.add_event(job_id, EVENT_WARN, message)
-            return {"job": job, "created": False, "message": message, "success": False}
-        if self._organizer_handoff_requires_manual_review(job):
-            message = (
-                "真实文件已进入任务暂存目录，但 Organizer 未完成接管；"
-                "为避免重复转存或离线下载，已拒绝重提网盘任务，请在 Organizer 后台重试或人工创建整理任务"
-            )
-            self.database.add_event(job_id, EVENT_WARN, message)
-            return {"job": job, "created": False, "message": message, "success": False}
-        if _provider_submission_finished_successfully(job):
-            message = (
-                "网盘接口已经成功受理过该任务；当前失败或人工审核发生在后续搬运、整理或确认阶段。"
-                "为避免重复转存或重复离线下载，已拒绝重新提交 Provider，请改用对应阶段的重试入口"
-            )
-            self.database.add_event(job_id, EVENT_WARN, message)
-            return {
-                "job": job,
-                "created": False,
-                "message": message,
-                "success": False,
-                "manual_review": True,
-                "provider_completed": True,
-                "provider_retry_blocked": True,
-            }
         if current_status not in PROVIDER_RETRYABLE_JOB_STATUSES:
             stage_label = "已完成" if current_status == JOB_DONE else "已进入网盘提交后的处理阶段"
             message = (
-                f"任务{stage_label}（当前状态：{current_status or '未知'}），通用重试不会再次调用网盘接口。"
-                "请等待当前阶段完成，或从 rclone、Organizer、媒体库刷新等对应入口重试"
+                f"任务{stage_label}（当前状态：{current_status or '未知'}），"
+                "通用重试不会再次调用网盘接口，请使用对应阶段的重试入口"
             )
             self.database.add_event(job_id, EVENT_WARN, message)
             return {
@@ -545,73 +703,12 @@ class ImportJobRetryService:
                 "provider_retry_blocked": True,
             }
 
-        self.database.add_event(job_id, EVENT_INFO, "手动重试任务")
-        route = job["target_route"]
-        if not v3_plan and staging_plan_from_job(job):
-            try:
-                validated_staging_plan_from_job(job)
-            except ValueError as exc:
-                message = f"持久化 staging_plan 不完整，已拒绝重复提交网盘任务：{exc}"
-                self.database.add_event(job_id, EVENT_WARN, message)
-                return {
-                    "job": job,
-                    "created": False,
-                    "message": message,
-                    "success": False,
-                }
-        if not v3_plan and execution_plan_from_job(job):
-            try:
-                validated_execution_plan_from_job(job)
-            except ValueError as exc:
-                message = f"持久化执行计划不完整，已拒绝重试：{exc}"
-                self.database.add_event(job_id, EVENT_WARN, message)
-                return {
-                    "job": job,
-                    "created": False,
-                    "message": message,
-                    "success": False,
-                }
-        if not v3_plan and self._requires_persisted_staging_plan(job, route):
-            message = (
-                "当前已启用新任务级暂存，但该任务没有固化 staging_plan；"
-                "为避免重新写入旧目录，已拒绝重试，请重新提交为新任务"
-            )
-            self.database.add_event(job_id, EVENT_WARN, message)
-            return {
-                "job": job,
-                "created": False,
-                "message": message,
-                "success": False,
-            }
-        category_key = str(job.get("category") or "")
-        category = self.config.category(job["category"])
-
-        if route not in {
-            ROUTE_QUARK_TO_MOBILE,
-            ROUTE_CLOUD139_DIRECT,
-            ROUTE_CLOUD189_DIRECT,
-            ROUTE_SIXPAN_OFFLINE,
-        }:
-            message = "该任务线路当前不支持重试"
-            updater = getattr(self.database, "update_job_if_status", None)
-            changed = bool(
-                callable(updater)
-                and updater(job_id, {current_status}, status=JOB_UNSUPPORTED, error_message=message)
-            )
-            latest = self.database.get_job(job_id) or job
-            self.database.add_event(job_id, EVENT_WARN, message)
-            return {
-                "job": latest,
-                "created": False,
-                "message": message if changed else "任务状态已变化，未写入暂不支持状态",
-                "success": False,
-            }
-
+        self.database.add_event(job_id, EVENT_INFO, "手动重试 v4 任务")
         claimed, claimed_job, claim_message = _claim_provider_submission(
             self.database,
             job_id=job_id,
             expected_status=current_status,
-            provider=str(job.get("source_type") or route),
+            provider=str(job.get("source_type") or job.get("target_route") or "unknown"),
             require_not_started_fence=current_status == JOB_CREATED,
         )
         if not claimed:
@@ -623,148 +720,47 @@ class ImportJobRetryService:
                 "provider_submission_claim_failed": True,
                 "retryable": True,
             }
-
-        if route == ROUTE_QUARK_TO_MOBILE:
-            request_payload = self._request_payload(job, use_raw_fallback=True)
-            target_path = self._provider_target_path(job)
-            return self.submit_quark(
-                job_id,
-                job["title"],
-                self._retry_url(job, request_payload),
-                target_path,
-                category_key,
-                category,
-                request_payload=request_payload,
-            )
-        if route == ROUTE_CLOUD139_DIRECT:
-            request_payload = self._request_payload(job)
-            target_path = self._provider_target_path(job)
-            return self.submit_cloud139(
-                job_id,
-                job["title"],
-                self._retry_url(job, request_payload),
-                target_path,
-                job.get("password") or "",
-                category,
-                category_key,
-                request_payload=request_payload,
-            )
-        if route in {ROUTE_CLOUD189_DIRECT, ROUTE_SIXPAN_OFFLINE}:
-            request_payload = self._request_payload(job)
-            return self.submit_generic(
-                job_id,
-                job["title"],
-                # ``source_url`` may contain the internal selection fingerprint
-                # used for durable deduplication.  Providers must always receive
-                # the original persisted request URL instead.
-                self._retry_url(job, request_payload),
-                self._provider_target_path(job),
-                category,
-                job["source_type"],
-                job.get("password") or "",
-                request_payload=request_payload,
-            )
-
-        raise AssertionError("provider route dispatch fell through after validation")
-
-    @staticmethod
-    def _request_payload(job: dict[str, Any], *, use_raw_fallback: bool = False) -> dict[str, Any]:
-        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        request = raw_data.get("request")
-        if isinstance(request, dict):
-            return request
-        return raw_data if use_raw_fallback else {}
-
-    @staticmethod
-    def _retry_url(job: dict[str, Any], payload: dict[str, Any]) -> str:
-        return str(payload.get("url") or payload.get("source_url") or job["source_url"])
-
-    @staticmethod
-    def _provider_target_path(job: dict[str, Any]) -> str:
-        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        if plan.get("enabled"):
-            planned = str(plan.get("provider_target_path") or "").strip()
-            if planned:
-                return planned
-        execution = execution_plan_from_job(job)
-        if execution:
-            derived = provider_target_from_plan(execution, str(job.get("target_route") or ""))
-            if derived:
-                return derived
-        return str(job.get("target_path") or "")
-
-    def _requires_persisted_staging_plan(self, job: dict[str, Any], route: str) -> bool:
-        if str(route or "").strip().lower() not in {
-            ROUTE_QUARK_TO_MOBILE,
-            ROUTE_CLOUD139_DIRECT,
-            ROUTE_SIXPAN_OFFLINE,
-        }:
-            return False
-        raw = getattr(self.config, "raw", {}) if self.config is not None else {}
-        organizer = raw.get("organizer") if isinstance(raw, dict) and isinstance(raw.get("organizer"), dict) else {}
-        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        if plan.get("enabled"):
-            return False
-        if raw_data.get("staging_plan_required"):
-            return True
-        openlist = raw.get("openlist") if isinstance(raw, dict) and isinstance(raw.get("openlist"), dict) else {}
-        return bool(
-            organizer.get("enabled", False)
-            and organizer.get("staging_enabled", True)
-            and str(openlist.get("base_url") or "").strip()
+        # v4 计划已冻结，执行器按计划恢复，不再从配置重建。
+        self.database.add_event(
+            job_id,
+            EVENT_INFO,
+            "v4 计划校验通过，已建立提交栅栏，等待 v4 执行器接管",
+            {"execution_plan_version": EXECUTION_PLAN_VERSION},
         )
+        return {
+            "job": claimed_job,
+            "created": False,
+            "message": "v4 计划已校验并重新建立提交栅栏，等待执行器接管",
+            "success": True,
+            "v4_plan_ready": True,
+            "idempotency_key": str(claimed_job.get("idempotency_key") or ""),
+        }
 
     @staticmethod
-    def _rclone_staging_retry_requires_manual_review(job: dict[str, Any]) -> bool:
+    def _persisted_plan(job: dict[str, Any]) -> dict[str, Any]:
         raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        completion = raw_data.get("completion") if isinstance(raw_data.get("completion"), dict) else {}
-        return bool(completion.get("staging_retry_exhausted"))
+        plan = raw_data.get("execution_plan") if isinstance(raw_data.get("execution_plan"), dict) else {}
+        return plan
 
-    @staticmethod
-    def _sixpan_completed_provider_requires_media_refresh_only(job: dict[str, Any]) -> bool:
-        if str(job.get("target_route") or "").strip().lower() != ROUTE_SIXPAN_OFFLINE:
-            return False
-        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        completion = raw_data.get("completion") if isinstance(raw_data.get("completion"), dict) else {}
-        legacy_refresh = (
-            raw_data.get("sixpan_legacy_refresh")
-            if isinstance(raw_data.get("sixpan_legacy_refresh"), dict)
-            else {}
-        )
-        if bool(completion.get("provider_completed")) and str(completion.get("retry_action") or "") == "media_refresh_only":
-            return True
-        if bool(legacy_refresh.get("provider_completed")) and str(legacy_refresh.get("retry_action") or "") == "media_refresh_only":
-            return True
+    def _validate_v4_plan(
+        self, plan: dict[str, Any], job_record: dict[str, Any]
+    ) -> None:
+        validator = self.validate_v4_plan or _load_planning_dependency("validate_v4_plan")
+        try:
+            if self.plan_validation_deps is not None:
+                validator(plan, job_record, deps=self.plan_validation_deps)
+            else:
+                validator(plan, job_record)
+        except V4PlanningError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise V4PlanningError(
+                f"v4 执行计划校验失败：{exc}", code="PLANNING_VALIDATION_FAILED"
+            ) from exc
 
-        # 兼容修复前已经落库的旧状态：当任务没有 staging plan、六盘轮询已记录
-        # 完成且 completion 明确停在刷新 review 时，也禁止把 failed/review 当成
-        # Provider 可重提状态。
-        message = str(completion.get("message") or job.get("error_message") or "").strip()
-        stage = str(completion.get("stage") or "").strip().lower()
-        return bool(
-            not staging_plan_from_job(job)
-            and isinstance(raw_data.get("sixpan_poll"), dict)
-            and stage == "review"
-            and "刷新" in message
-        )
 
-    @staticmethod
-    def _organizer_handoff_requires_manual_review(job: dict[str, Any]) -> bool:
-        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        completion = raw_data.get("completion") if isinstance(raw_data.get("completion"), dict) else {}
-        if not plan.get("enabled") or str(completion.get("stage") or "").strip().lower() != "review":
-            return False
-        message = str(completion.get("message") or job.get("error_message") or "").strip().lower()
-        return bool(
-            raw_data.get("sixpan_organizer_enqueue")
-            or completion.get("organizer_scan_path")
-            or completion.get("openlist_visible_path")
-            or "organizer" in message
-            or "标准化" in message
-        )
+def _source_route(source: SourceDescriptor) -> str:
+    return f"{source.provider_kind}:{source.source_form}"
 
 
 def _claim_provider_submission(
@@ -868,26 +864,6 @@ def _has_not_started_provider_fence(job: dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         version = 0
     return version == PROVIDER_SUBMISSION_FENCE_VERSION and str(fence.get("state") or "") == "not_started"
-
-
-def _provider_submission_finished_successfully(job: dict[str, Any]) -> bool:
-    raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-    fence = (
-        raw_data.get(PROVIDER_SUBMISSION_FENCE_KEY)
-        if isinstance(raw_data.get(PROVIDER_SUBMISSION_FENCE_KEY), dict)
-        else {}
-    )
-    try:
-        version = int(fence.get("version") or 0)
-    except (TypeError, ValueError):
-        version = 0
-    success = fence.get("success")
-    success_flag = success is True or str(success or "").strip().lower() in {"1", "true", "yes", "on"}
-    return bool(
-        version == PROVIDER_SUBMISSION_FENCE_VERSION
-        and str(fence.get("state") or "").strip().lower() == "finished"
-        and success_flag
-    )
 
 
 def _provider_submission_is_ambiguous(job: dict[str, Any]) -> bool:
