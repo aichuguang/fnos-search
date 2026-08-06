@@ -16,12 +16,10 @@ class RcloneWebdavConfigError(RuntimeError):
 
 
 class RcloneWebdavConfigService:
-    """Manage one OpenList WebDAV remote inside the compose rclone container."""
+    """Manage one OpenList WebDAV remote with the worker-local rclone binary."""
 
     CONFIG_PATH = "/config/rclone/rclone.conf"
     BACKUP_PATH = "/config/rclone/rclone.conf.webui.bak"
-    _CONTAINER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-    _EXEC_USER_PATTERN = re.compile(r"^[0-9]+(?::[0-9]+)?$")
     _CONTROL_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
     _BACKUP_SCRIPT = """set -eu
 config=/config/rclone/rclone.conf
@@ -129,7 +127,7 @@ fi
             secret_values = [password] if password else []
             try:
                 result = self._run(
-                    self._docker_exec_command("sh", "-c", self._SAVE_SCRIPT, interactive=True),
+                    ["sh", "-c", self._SAVE_SCRIPT],
                     input_text="\n".join((operation, remote, url, username, password)) + "\n",
                 )
                 if result.returncode != 0:
@@ -164,10 +162,10 @@ fi
         return state
 
     def _config_dump(self) -> dict[str, Any]:
-        result = self._run(self._docker_exec_command("rclone", "config", "dump", "--config", self.CONFIG_PATH))
+        result = self._run(["rclone", "config", "dump", "--config", self.CONFIG_PATH])
         if result.returncode != 0:
             detail = self._safe_process_message(result, [])
-            message = "无法读取 rclone 配置，请确认 Docker、容器名称和配置目录权限"
+            message = "无法读取 rclone 配置，请确认 rclone 可用且配置目录权限正常"
             raise RcloneWebdavConfigError(f"{message}：{detail}" if detail else message, 503)
         try:
             data = json.loads(result.stdout or "{}")
@@ -179,7 +177,7 @@ fi
 
     def _test_remote(self, remote: str, *, secret_values: list[str] | None = None) -> None:
         result = self._run(
-            self._docker_exec_command("rclone", "lsd", f"{remote}:", "--config", self.CONFIG_PATH)
+            ["rclone", "lsd", f"{remote}:", "--config", self.CONFIG_PATH]
         )
         if result.returncode == 0:
             return
@@ -190,7 +188,7 @@ fi
         raise RcloneWebdavConfigError(message, 502)
 
     def _backup(self) -> None:
-        result = self._run(self._docker_exec_command("sh", "-c", self._BACKUP_SCRIPT))
+        result = self._run(["sh", "-c", self._BACKUP_SCRIPT])
         if result.returncode != 0:
             detail = self._safe_process_message(result, [])
             message = "无法备份 rclone 配置，已停止保存"
@@ -198,7 +196,7 @@ fi
 
     def _restore(self) -> bool:
         try:
-            result = self._run(self._docker_exec_command("sh", "-c", self._RESTORE_SCRIPT))
+            result = self._run(["sh", "-c", self._RESTORE_SCRIPT])
         except RcloneWebdavConfigError:
             return False
         return result.returncode == 0
@@ -215,30 +213,11 @@ fi
                 errors="replace",
             )
         except FileNotFoundError as exc:
-            raise RcloneWebdavConfigError("Docker 命令不可用，无法管理 rclone 配置", 503) from exc
+            raise RcloneWebdavConfigError("rclone 管理命令不可用", 503) from exc
         except subprocess.TimeoutExpired as exc:
-            raise RcloneWebdavConfigError("rclone 操作超时，请检查容器和 OpenList 连接", 504) from exc
+            raise RcloneWebdavConfigError("rclone 操作超时，请检查 Worker 和 OpenList 连接", 504) from exc
         except OSError as exc:
-            raise RcloneWebdavConfigError("无法调用 Docker 管理 rclone 配置", 503) from exc
-
-    def _container_name(self) -> str:
-        value = str(self._current_config().get("container_name") or "rclone-server").strip()
-        if not self._CONTAINER_PATTERN.fullmatch(value):
-            raise RcloneWebdavConfigError("rclone 容器名称配置不合法", 500)
-        return value
-
-    def _exec_user(self) -> str:
-        value = str(self._current_config().get("exec_user") or "10001:10001").strip()
-        if not self._EXEC_USER_PATTERN.fullmatch(value):
-            raise RcloneWebdavConfigError("rclone 执行用户配置不合法", 500)
-        return value
-
-    def _docker_exec_command(self, *arguments: str, interactive: bool = False) -> list[str]:
-        command = ["docker", "exec"]
-        if interactive:
-            command.append("-i")
-        command.extend(("--user", self._exec_user(), self._container_name(), *arguments))
-        return command
+            raise RcloneWebdavConfigError("无法调用 rclone 管理配置", 503) from exc
 
     def _default_remote_name(self) -> str:
         return str(self._current_config().get("remote_name") or "MP")

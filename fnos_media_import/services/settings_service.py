@@ -160,7 +160,7 @@ class SettingsService:
 
             try:
                 reload_result = self.deps.reload_runtime()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.exception("advanced config runtime reload failed; attempting database rollback")
                 rollback = self._rollback_advanced_config(
                     expected=normalized,
@@ -169,12 +169,12 @@ class SettingsService:
                 )
                 return {
                     "success": False,
-                    "message": rollback["message"],
+                    "message": f"{rollback['message']}；{exc}",
                     "mode": mode,
                     "rolled_back": rollback["rolled_back"],
                     "superseded": rollback["superseded"],
                     "runtime_restored": rollback["runtime_restored"],
-                }, 500
+                }, int(getattr(exc, "status_code", 500) or 500)
 
             warnings: list[str] = []
             config_payload = payload.get("config") if isinstance(payload, dict) else None
@@ -368,16 +368,16 @@ class SettingsService:
             if advanced_changed:
                 try:
                     reload_result = self.deps.reload_runtime()
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
                     logger.exception("unified settings runtime reload failed; attempting rollback")
                     rollback = self._rollback_all_settings(expected=written, previous=previous)
                     return {
                         "success": False,
-                        "message": rollback["message"],
+                        "message": f"{rollback['message']}；{exc}",
                         "rolled_back": rollback["rolled_back"],
                         "superseded": rollback["superseded"],
                         "runtime_restored": rollback["runtime_restored"],
-                    }, 500
+                    }, int(getattr(exc, "status_code", 500) or 500)
 
         response = {
             "success": True,

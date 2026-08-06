@@ -1,6 +1,6 @@
 # rclone 编排目录
 
-本目录用于一体化 Docker Compose 部署时给 `rclone-server` 容器使用。
+本目录用于独立 `fnos-rclone-worker` 保存 rclone 配置、缓存和搬运临时文件。
 
 ## 配置文件
 
@@ -10,7 +10,7 @@ Docker Compose 首次启动会自动创建空文件：
 rclone/config/rclone.conf
 ```
 
-使用夸克到移动云等 rclone 搬运线路前，优先在管理后台“系统设置 → 飞牛与 rclone”中配置并检测连接。页面会自动写入 `[MP]`，密码不回显，连接失败时会恢复原配置。
+使用夸克到移动云等 rclone 搬运线路前，优先在管理后台“系统设置 → 飞牛与 rclone”中配置并检测连接。页面会通过 Worker 自动写入 `[MP]`，密码不回显，连接失败时会恢复原配置。
 
 如果是源码调试或页面无法使用，也可以复制示例后手工编辑：
 
@@ -80,8 +80,8 @@ RCLONE_DST_OTHER_DIR=移动云/影视/其他
 自检：
 
 ```bash
-docker exec rclone-server rclone lsf "MP:你的源目录" --max-depth 1
-docker exec rclone-server rclone lsf "MP:你的目标目录" --max-depth 1
+docker exec fnos-rclone-worker rclone lsf "MP:你的源目录" --max-depth 1 --config /config/rclone/rclone.conf --cache-dir /cache
+docker exec fnos-rclone-worker rclone lsf "MP:你的目标目录" --max-depth 1 --config /config/rclone/rclone.conf --cache-dir /cache
 ```
 
 ## 密码处理
@@ -89,7 +89,7 @@ docker exec rclone-server rclone lsf "MP:你的目标目录" --max-depth 1
 rclone 的 `pass` 字段需要使用 obscure 后的值：
 
 ```bash
-docker run --rm -it rclone/rclone obscure '你的明文密码'
+docker exec fnos-rclone-worker rclone obscure '你的明文密码'
 ```
 
 把输出结果填入：

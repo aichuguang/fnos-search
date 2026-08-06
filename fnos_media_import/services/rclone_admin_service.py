@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 class RcloneQueries(Protocol):
     def status(self) -> dict[str, Any]: ...
-    def get_logs(self, *, limit: int) -> list[Any]: ...
+    def get_logs(self, *, limit: int) -> list[Any] | dict[str, Any]: ...
     def list_runs(self, *, limit: int, offset: int) -> list[dict[str, Any]]: ...
     def list_events(self, *, run_id: int | None, limit: int) -> list[dict[str, Any]]: ...
     def list_file_events(self, **filters: Any) -> list[dict[str, Any]]: ...
@@ -28,10 +28,24 @@ class RcloneAdminQueryService:
         self._deps = dependencies
 
     def status(self) -> dict[str, Any]:
-        return {"success": True, "status": self._deps.rclone.status()}
+        status = dict(self._deps.rclone.status())
+        http_status = int(status.pop("_http_status", 200) or 200)
+        response = {"success": http_status < 400, "status": status, "_http_status": http_status}
+        if http_status >= 400:
+            error_code = str(status.get("error_code") or status.get("status") or "worker_unavailable")
+            response.update(
+                {
+                    "error_code": error_code,
+                    "message": str(status.get("last_error") or "rclone Worker 不可用"),
+                }
+            )
+        return response
 
     def logs(self, limit: int) -> dict[str, Any]:
-        return {"success": True, "items": self._deps.rclone.get_logs(limit=limit)}
+        result = self._deps.rclone.get_logs(limit=limit)
+        if isinstance(result, dict):
+            return result
+        return {"success": True, "items": result}
 
     def runs(self, *, limit: int, offset: int) -> dict[str, Any]:
         return {"items": self._deps.rclone.list_runs(limit=limit, offset=offset), "total": self._deps.counts.count_rclone_runs()}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import threading
 from typing import Any, Callable
 
@@ -65,6 +66,14 @@ def organizer_defer_media_refresh(config: Any) -> bool:
 
 def rclone_runtime_config(config: Any) -> dict[str, Any]:
     runtime = dict(config.raw.get("rclone", {}) or {})
+    for legacy_key in ("execution_mode", "container_name", "exec_user"):
+        runtime.pop(legacy_key, None)
+    runtime["config_path"] = str(
+        os.getenv("RCLONE_CONFIG_PATH") or runtime.get("config_path") or "/config/rclone/rclone.conf"
+    ).strip()
+    runtime["cache_dir"] = str(
+        os.getenv("RCLONE_CACHE_DIR") or runtime.get("cache_dir") or "/cache"
+    ).strip()
     defer_refresh = organizer_defer_media_refresh(config)
     runtime["defer_media_refresh_to_organizer"] = defer_refresh
     if defer_refresh:

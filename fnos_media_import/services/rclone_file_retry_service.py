@@ -32,6 +32,7 @@ class RcloneFileRetryService:
         if status not in {"failed", "error"} and not force:
             return {"success": False, "message": "只有失败文件默认允许单独重试，如需强制重试请传 force=true"}, 400
         result = self._deps.runner.start_file_retry(file_event)
+        http_status = int(result.pop("_http_status", 200) or 200)
         if result.get("success"):
             message = f"已请求单文件重试：{file_event.get('filename') or ''}"
             retry_event_id = self._deps.database.add_rclone_file_event(
@@ -49,4 +50,8 @@ class RcloneFileRetryService:
             if file_event.get("job_id"):
                 self._deps.database.add_event(int(file_event["job_id"]), "info", message, {"source_file_event_id": event_id, "retry_file_event_id": retry_event_id})
             result["retry_file_event_id"] = retry_event_id
-        return {"success": bool(result.get("success")), **result, "source_event": file_event}, 200
+        return {
+            "success": bool(result.get("success")),
+            **result,
+            "source_event": file_event,
+        }, http_status

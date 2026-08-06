@@ -11,7 +11,7 @@ def test_compose_supports_release_image_and_source_build() -> None:
     compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
     development = yaml.safe_load((ROOT / "compose.dev.yaml").read_text(encoding="utf-8"))
     services = compose["services"]
-    assert set(services) == {"fnos-media-import", "rclone-server"}
+    assert set(services) == {"fnos-media-import", "fnos-rclone-worker"}
 
     app = services["fnos-media-import"]
     assert app["image"] == "aichuguang/fnos-search:${APP_VERSION:-latest}"
@@ -23,6 +23,10 @@ def test_compose_supports_release_image_and_source_build() -> None:
         "SECURITY_STRICT": "true",
         "APP_SECRET_KEY": "${APP_SECRET_KEY:-}",
         "NOTIFICATION_ENCRYPTION_KEY": "${NOTIFICATION_ENCRYPTION_KEY:-}",
+        "RCLONE_WORKER_CONTROL_TOKEN": "${RCLONE_WORKER_CONTROL_TOKEN:-}",
+        "FNOS_PROCESS_ROLE": "web",
+        "RCLONE_WORKER_URL": "http://fnos-rclone-worker:5251",
+        "LOG_FILE": "/app/logs/web.log",
     }
 
     development_app = development["services"]["fnos-media-import"]
@@ -33,17 +37,26 @@ def test_compose_supports_release_image_and_source_build() -> None:
     assert "${APP_CONFIG_HOST_PATH:-./config}:/app/config" in app_volumes
     assert "${APP_DATA_HOST_PATH:-./data}:/app/data" in app_volumes
     assert "${APP_LOGS_HOST_PATH:-./logs}:/app/logs" in app_volumes
-    assert "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp" in app_volumes
-    assert any(value.endswith(":/var/run/docker.sock") for value in app_volumes)
+    assert "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp" not in app_volumes
+    assert not any("docker.sock" in value for value in app_volumes)
 
-    rclone = services["rclone-server"]
-    assert rclone["container_name"] == "rclone-server"
-    assert rclone["image"] == "rclone/rclone:1.70.3"
+    rclone = services["fnos-rclone-worker"]
+    assert rclone["container_name"] == "fnos-rclone-worker"
+    assert rclone["image"] == "aichuguang/fnos-search:${APP_VERSION:-latest}"
+    assert "ports" not in rclone
+    assert rclone["environment"]["FNOS_PROCESS_ROLE"] == "all"
+    assert rclone["environment"]["RCLONE_CONFIG_PATH"] == "/config/rclone/rclone.conf"
+    assert rclone["environment"]["LOG_FILE"] == "/app/logs/worker.log"
     assert {
         "${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone",
         "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp",
         "${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache",
     } <= {str(value) for value in rclone["volumes"]}
+    assert all(
+        "docker.sock" not in str(volume)
+        for service in services.values()
+        for volume in service.get("volumes", [])
+    )
 
 
 def test_release_workflow_validates_before_multi_arch_publish() -> None:
@@ -79,6 +92,7 @@ def test_optional_env_example_only_exposes_common_user_settings() -> None:
         "RCLONE_CONFIG_HOST_PATH",
         "RCLONE_CACHE_HOST_PATH",
         "RCLONE_TEMP_HOST_PATH",
+        "RCLONE_WORKER_CONTROL_TOKEN",
     }
 
 
@@ -102,7 +116,35 @@ def test_data_mount_persists_database_and_generated_secrets() -> None:
 
     assert '"database_path": "data/app.db"' in config_source
     assert '"/app/data/.secrets/notification_encryption_key"' in entrypoint_source
+    assert '"/app/data/.secrets/rclone_worker_control_token"' in entrypoint_source
     assert 'db.set_app_settings({"app.secret_key": generated})' in app_source
+
+
+def test_runtime_image_contains_rclone_without_docker_cli() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    entrypoint = (ROOT / "scripts" / "container_entrypoint.py").read_text(encoding="utf-8")
+    worker_script = (ROOT / "scripts" / "fnos_rclone_worker.sh").read_text(encoding="utf-8")
+
+    assert "ARG RCLONE_IMAGE=rclone/rclone:1.70.3" in dockerfile
+    assert "COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone" in dockerfile
+    assert "DOCKER_CLI_IMAGE" not in dockerfile
+    assert "/var/run/docker.sock" not in compose
+    assert "/var/run/docker.sock" not in entrypoint
+    assert "RCLONE_EXECUTION_MODE" not in worker_script
+    assert "docker exec" not in worker_script
+    assert 'rclone "$@" --config "$RCLONE_CONFIG_PATH" --cache-dir "$RCLONE_CACHE_DIR"' in worker_script
+    assert "127.0.0.1:5251/readyz" in dockerfile
+
+
+def test_upgrade_and_sqlite_constraints_are_explicit() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "必须同时替换 `docker-compose.yml`" in readme
+    assert "只有在新编排已经生效后" in readme
+    assert "SMB、NFS、CIFS" in readme
+    assert "web.log" in readme
+    assert "worker.log" in readme
 
 
 def test_docker_build_context_excludes_runtime_data_and_secrets() -> None:

@@ -69,6 +69,7 @@ class RcloneService:
         cmcc_upload_config: dict[str, Any] | None = None,
         cloud139_config: dict[str, Any] | None = None,
         owner_id: str = "",
+        scheduler_allowed: bool = True,
     ):
         self.config = config
         self.base_dir = base_dir
@@ -105,6 +106,7 @@ class RcloneService:
         self._stop_requested_job_ids: set[int] = set()
         self._shutdown_requested = False
         self.owner_id = str(owner_id or f"rclone-scheduler-{os.getpid()}-{id(self)}")
+        self.scheduler_allowed = bool(scheduler_allowed)
         self.scheduler = RcloneScheduler(
             database=self.db,
             owner_id=self.owner_id,
@@ -907,7 +909,7 @@ class RcloneService:
         self.worker_command.apply_config(config)
         self.log_sink.resize(config.get("log_lines", 500))
 
-        if old_interval == new_interval:
+        if old_interval == new_interval or not self.scheduler_allowed:
             return
         self.scheduler.restart(new_interval)
 
@@ -1426,7 +1428,7 @@ class RcloneService:
         remote = self._remote_path(remote_dir)
         item = self._run_cleanup_command(
             "列出远端源目录",
-            ["docker", "exec", str(self.config.get("container_name", "rclone-server")), "rclone", "lsf", remote, "-R", "--files-only"],
+            self._cleanup_rclone_command("lsf", remote, "-R", "--files-only"),
             timeout=30,
             path=remote,
         )
@@ -1439,7 +1441,7 @@ class RcloneService:
         remote = self._remote_path(remote_file)
         return self._run_cleanup_command(
             "删除远端文件",
-            ["docker", "exec", str(self.config.get("container_name", "rclone-server")), "rclone", "deletefile", remote],
+            self._cleanup_rclone_command("deletefile", remote),
             timeout=60,
             path=remote,
             item_type=item_type,
@@ -1452,15 +1454,7 @@ class RcloneService:
                 continue
             item = self._run_cleanup_command(
                 "清理远端空目录",
-                [
-                    "docker",
-                    "exec",
-                    str(self.config.get("container_name", "rclone-server")),
-                    "rclone",
-                    "rmdirs",
-                    self._remote_path(directory),
-                    "--leave-root",
-                ],
+                self._cleanup_rclone_command("rmdirs", self._remote_path(directory), "--leave-root"),
                 timeout=30,
                 path=self._remote_path(directory),
                 item_type=item_type,
@@ -1486,15 +1480,7 @@ class RcloneService:
             }
         return self._run_cleanup_command(
             "删除本地临时缓存",
-            [
-                "docker",
-                "exec",
-                str(self.config.get("container_name", "rclone-server")),
-                "rm",
-                "-f",
-                "--",
-                exact_path,
-            ],
+            self._cleanup_container_command("rm", "-f", "--", exact_path),
             timeout=60,
             path=exact_path,
             item_type="local_temp",
@@ -1576,23 +1562,27 @@ class RcloneService:
         for job_root in sorted(job_roots):
             item = self._run_cleanup_command(
                 "清理任务级本地临时空目录",
-                [
-                    "docker",
-                    "exec",
-                    str(self.config.get("container_name", "rclone-server")),
-                    "find",
-                    job_root,
-                    "-depth",
-                    "-type",
-                    "d",
-                    "-empty",
-                    "-delete",
-                ],
+                self._cleanup_container_command(
+                    "find", job_root, "-depth", "-type", "d", "-empty", "-delete"
+                ),
                 timeout=30,
                 path=job_root,
                 item_type="local_temp_rmdirs",
             )
             result["items"].append(item)
+
+    def _cleanup_rclone_command(self, *arguments: str) -> list[str]:
+        return [
+            "rclone",
+            *arguments,
+            "--config",
+            str(self.config.get("config_path") or "/config/rclone/rclone.conf"),
+            "--cache-dir",
+            str(self.config.get("cache_dir") or "/cache"),
+        ]
+
+    def _cleanup_container_command(self, *arguments: str) -> list[str]:
+        return list(arguments)
 
     def _run_cleanup_command(
         self,
@@ -1669,6 +1659,8 @@ class RcloneService:
         return len(normalized_stem) >= 4 and normalized_stem in normalized_title
 
     def start_scheduler(self) -> None:
+        if not self.scheduler_allowed:
+            return
         with self.lock:
             self._shutdown_requested = False
         self.scheduler.start(int(self.config.get("auto_interval_minutes", 0) or 0))
@@ -2829,8 +2821,8 @@ class RcloneService:
         if persisted_staging_run:
             only_category = persisted_staging_run["category"]
         values = {
-            "CONTAINER_NAME": self.config.get("container_name", "rclone-server"),
-            "RCLONE_EXEC_USER": self.config.get("exec_user", "10001:10001"),
+            "RCLONE_CONFIG_PATH": self.config.get("config_path", "/config/rclone/rclone.conf"),
+            "RCLONE_CACHE_DIR": self.config.get("cache_dir", "/cache"),
             "REMOTE_NAME": self.config.get("remote_name", "MP"),
             "RCLONE_UPLOAD_BACKEND": (
                 persisted_staging_run.get("storage_backend")

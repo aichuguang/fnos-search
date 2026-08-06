@@ -96,11 +96,10 @@ docker compose up -d
 第一次启动会自动完成以下工作：
 
 - 拉取 `aichuguang/fnos-search:latest`。
-- 拉取官方 `rclone` 镜像。
+- 启动 Web 容器和独立的 rclone Worker 容器。
 - 创建数据库和全部表结构。
 - 创建默认持久化目录。
-- 生成应用签名密钥和通知加密密钥。
-- 创建空的 `rclone/config/rclone.conf`。
+- 生成应用签名密钥、通知加密密钥和 Worker 控制令牌。
 
 查看运行状态：
 
@@ -153,14 +152,14 @@ pass = rclone处理后的密码
 `MP` 是默认 remote 名称，不要随意修改。手工配置时，密码可以这样处理：
 
 ```bash
-docker exec rclone-server rclone obscure '你的OpenList密码'
+docker exec fnos-rclone-worker rclone obscure '你的OpenList密码'
 ```
 
 把输出内容填到 `pass`。然后检查是否连接成功：
 
 ```bash
-docker exec rclone-server rclone listremotes
-docker exec rclone-server rclone lsd "MP:"
+docker exec fnos-rclone-worker rclone listremotes --config /config/rclone/rclone.conf
+docker exec fnos-rclone-worker rclone lsd "MP:" --config /config/rclone/rclone.conf
 ```
 
 更详细的说明见 [rclone 配置](rclone/README.md)。
@@ -201,13 +200,14 @@ cp .env.example .env
 | `APP_PORT` | `5251` | 按需 | Web 页面映射到宿主机的端口。只填写端口数字，例如 `5251`。 |
 | `TZ` | `Asia/Shanghai` | 按需 | 应用和 rclone 容器使用的时区。 |
 | `APP_CONFIG_HOST_PATH` | `./config` | 按需 | 可选 `config.yaml` 所在的宿主机目录。 |
-| `APP_DATA_HOST_PATH` | `./data` | 强烈建议确认 | SQLite 数据库、后台设置、数据库备份和自动生成密钥的持久化目录。重新编排必须继续使用原目录。 |
-| `APP_LOGS_HOST_PATH` | `./logs` | 按需 | 应用运行日志目录。 |
+| `APP_DATA_HOST_PATH` | `./data` | 强烈建议确认 | SQLite 数据库、后台设置、数据库备份和自动生成密钥的持久化目录。必须是当前 NAS 的本地文件系统，重新编排必须继续使用原目录。 |
+| `APP_LOGS_HOST_PATH` | `./logs` | 按需 | 应用运行日志目录，分别保存 `web.log` 和 `worker.log`。 |
 | `RCLONE_CONFIG_HOST_PATH` | `./rclone/config` | 强烈建议确认 | `rclone.conf` 持久化目录，保存 OpenList WebDAV Remote 配置。 |
 | `RCLONE_CACHE_HOST_PATH` | `./rclone/cache` | 按需 | rclone 缓存目录，可清理，但运行中不要删除。 |
 | `RCLONE_TEMP_HOST_PATH` | `./rclone/temp` | 建议配置 | 搬运完整媒体文件的临时目录，应放在空间充足的磁盘。 |
 | `APP_SECRET_KEY` | 空，自动生成 | 新部署不要填写 | Flask 会话签名密钥。留空时首次启动自动生成并保存到 `app.db`；旧部署显式配置过时必须保持原值。 |
 | `NOTIFICATION_ENCRYPTION_KEY` | 空，自动生成 | 新部署不要填写 | SMTP、Webhook 等通知凭据的加密密钥。留空时生成并保存到数据目录的 `.secrets`；旧部署显式配置过时必须保持原值。 |
+| `RCLONE_WORKER_CONTROL_TOKEN` | 空，自动生成 | 新部署不要填写 | Web 与独立 rclone Worker 之间的内部 Bearer Token。留空时生成并保存到 `APP_DATA_HOST_PATH/.secrets/rclone_worker_control_token`，重新编排会继续使用原值。 |
 
 NAS 面板示例：
 
@@ -234,20 +234,32 @@ TMDB、通知和分类目录也全部在管理后台配置，不放进 `.env`。
 
 ### 更新版本
 
-拉取新镜像不会覆盖宿主机上的 `app.db`。更新前仍建议备份 `APP_DATA_HOST_PATH`，然后执行：
+拉取新镜像不会覆盖宿主机上的 `app.db`。但从旧版单容器/辅助 rclone 容器架构升级时，
+**必须同时替换 `docker-compose.yml`，不能只拉取新镜像**。完整顺序如下：
+
+1. 备份当前 `APP_DATA_HOST_PATH`。
+2. 从当前发布版本下载新的 `docker-compose.yml`，覆盖面板或项目中的旧编排内容。
+3. 确认新旧编排使用相同的 `APP_DATA_HOST_PATH`。
+4. 执行：
 
 ```bash
 docker compose pull
-docker compose up -d
+docker compose up -d --remove-orphans
+docker compose ps
+curl -fsS "http://127.0.0.1:${APP_PORT:-5251}/readyz"
 ```
+
+`--remove-orphans` 只有在新编排已经生效后，才能识别并删除旧版辅助容器。若仍使用旧编排，
+新镜像会以 Web-only 安全降级模式启动，管理页面可访问，但 rclone 和后台调度不可用，
+`/readyz` 会返回 503 并提示替换编排。
 
 数据库会在原文件上自动升级。发生数据库迁移时，程序会在
 `APP_DATA_HOST_PATH/backups` 中自动创建迁移前备份。
 
-应用签名密钥首次启动时生成并保存到 `app.db`；通知加密密钥保存到
+应用签名密钥首次启动时生成并保存到 `app.db`；通知加密密钥和 Worker 控制令牌保存到
 `APP_DATA_HOST_PATH/.secrets`。正常的 `pull`、`up -d`、删除容器或重新编排不会改变它们。
 只有删除/更换 `APP_DATA_HOST_PATH`，或显式修改 `APP_SECRET_KEY`、
-`NOTIFICATION_ENCRYPTION_KEY` 时，才会造成密钥变化。
+`NOTIFICATION_ENCRYPTION_KEY`、`RCLONE_WORKER_CONTROL_TOKEN` 时，才会造成对应密钥变化。
 
 如果需要从源码构建：
 
@@ -264,7 +276,7 @@ docker compose -f docker-compose.yml -f compose.dev.yaml up -d --build
 | `APP_IMAGE` | `fnos-search-local` | 本地构建后的镜像名称。 |
 | `APP_VERSION` | `dev` | 本地镜像标签，同时写入镜像版本元数据。 |
 | `PYTHON_IMAGE` | `python:3.11-slim` | 构建应用镜像使用的 Python 基础镜像。 |
-| `DOCKER_CLI_IMAGE` | `docker:27-cli` | 提取 Docker CLI 使用的基础镜像。 |
+| `RCLONE_IMAGE` | `rclone/rclone:1.70.3` | 构建时提取 rclone 可执行文件使用的官方基础镜像。 |
 | `APP_UID` | `10001` | 镜像内应用用户 UID。当前 rclone 共享目录也使用 `10001`，不要单独修改。 |
 | `APP_GID` | `10001` | 镜像内应用用户 GID。当前 rclone 共享目录也使用 `10001`，不要单独修改。 |
 | `VCS_REF` | `unknown` | 写入镜像 OCI 标签的源码提交标识。 |
@@ -298,17 +310,29 @@ rclone/cache/
 
 更新或重建容器不会删除这些目录。迁移机器、重装系统或删除 Compose 项目前必须先备份。
 
-### Docker Socket 权限较高
+`APP_DATA_HOST_PATH` 中的 SQLite 数据库由 Web 和 Worker 共同访问，必须放在同一台 NAS 的
+ext4、Btrfs、XFS、ZFS 等本地文件系统。不要放在 SMB、NFS、CIFS 或其他网络共享中；
+SQLite 的 WAL 和文件锁在网络文件系统上无法提供可靠的一致性保证。
 
-当前主容器通过 `/var/run/docker.sock` 调用 `rclone-server`。这相当于给主容器较高的
-Docker 管理权限，因此：
+### 独立 rclone Worker
 
-- 只使用可信镜像。
-- 管理后台只开放给可信网络。
-- 不要公开 `/admin`、`/swagger` 和 Docker API。
+标准编排由两个同镜像容器组成：`fnos-media-import` 只提供 Web 和任务生产入口，
+`fnos-rclone-worker` 负责调度、后台任务和直接执行 rclone。Worker 不映射宿主机端口，
+Web 通过 Compose 内部网络和自动生成的 Bearer Token 调用它。
 
-标准编排使用 `/var/run/docker.sock`。Rootless Docker、Podman 等非标准 Socket 环境当前需要自行
-调整编排文件，暂不属于默认支持范围。
+两个容器都不挂载 `/var/run/docker.sock`，镜像中也不包含 Docker CLI。rclone 仅能访问分配给
+Worker 的配置、缓存、临时目录以及应用共享数据目录，不能管理宿主机上的其他容器。
+
+### 日志与健康检查
+
+- `APP_LOGS_HOST_PATH/web.log`：Web 请求、设置保存和 Worker 调用日志。
+- `APP_LOGS_HOST_PATH/worker.log`：调度、后台队列、Organizer 和 rclone 执行日志。
+- `/health`、`/livez`：只表示当前 HTTP 进程存活。
+- `/readyz`：同时检查数据库、部署安全状态和 Worker 核心运行时；返回 503 时优先查看上述两个日志。
+
+Worker 核心线程持续异常时会主动退出当前应用进程，由 Gunicorn 重建；若整个容器退出，则由
+Docker 重启策略恢复。短暂重启期间，Web 查询会自动进行有限重试；启动、停止、取消等有副作用
+命令不会自动重试，以免重复执行。
 
 ### OpenList 路径必须对应
 
@@ -325,7 +349,7 @@ Docker 管理权限，因此：
 
 ### 密钥由系统自动管理
 
-新部署会在持久化数据目录中自动生成应用签名密钥和通知加密密钥，用户无需填写。迁移或重装时
+新部署会在持久化数据目录中自动生成应用签名密钥、通知加密密钥和 Worker 控制令牌，用户无需填写。迁移或重装时
 必须完整保留 `data/`，否则已经加密保存的 SMTP 密码和 Webhook 凭据将无法解密。
 
 ### 固定版本更适合长期使用
@@ -354,7 +378,7 @@ APP_VERSION=1.2.0
 ```bash
 docker compose ps
 docker compose logs --tail=200 fnos-media-import
-docker compose logs --tail=200 rclone-server
+docker compose logs --tail=200 fnos-rclone-worker
 ```
 
 部署目录和更新规则见上面的“编排目录设置”和“更新版本”。

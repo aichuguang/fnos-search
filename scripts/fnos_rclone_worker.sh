@@ -3,13 +3,12 @@
 # 飞牛影视入库 rclone 搬运脚本
 # 用途：
 #   1. 扫描夸克自动转存目录。
-#   2. 通过 rclone-server 容器把文件搬运到移动云盘任务暂存目录。
+#   2. 在独立 Worker 内直接执行 rclone，把文件搬运到移动云盘任务暂存目录。
 #   3. 新流程把完成事件交给 Organizer；兼容模式仍可按旧配置刷新媒体库。
 #   4. 可选回调本系统，便于后续任务中心自动更新。
 #
 # 说明：
-#   为了加快 Docker 构建，本脚本只依赖 /bin/sh、python 和 docker CLI，
-#   不再要求 Web 容器额外安装 bash、curl、flock。
+#   Worker 镜像内置 rclone，所有命令都在 Worker 内直接执行，不需要 Docker Socket。
 #
 # 使用：
 #   chmod +x scripts/fnos_rclone_worker.sh
@@ -23,8 +22,8 @@ set -eu
 SCRIPT_VERSION="v0.9"
 STOP_REQUESTED=0
 
-CONTAINER_NAME="${CONTAINER_NAME:-rclone-server}"
-RCLONE_EXEC_USER="${RCLONE_EXEC_USER:-10001:10001}"
+RCLONE_CONFIG_PATH="${RCLONE_CONFIG_PATH:-/config/rclone/rclone.conf}"
+RCLONE_CACHE_DIR="${RCLONE_CACHE_DIR:-/cache}"
 REMOTE_NAME="${REMOTE_NAME:-MP}"
 LOCAL_TEMP="${LOCAL_TEMP:-/temp/fnos-media-import}"
 BUFFER_SIZE="${BUFFER_SIZE:-128M}"
@@ -182,11 +181,11 @@ is_manual_trigger() {
 trap 'request_stop' INT TERM
 
 rclone_cmd() {
-  docker exec --user "$RCLONE_EXEC_USER" "$CONTAINER_NAME" rclone "$@"
+  rclone "$@" --config "$RCLONE_CONFIG_PATH" --cache-dir "$RCLONE_CACHE_DIR"
 }
 
 container_exec() {
-  docker exec --user "$RCLONE_EXEC_USER" "$CONTAINER_NAME" "$@"
+  "$@"
 }
 
 container_exec_limited() {
@@ -196,49 +195,31 @@ container_exec_limited() {
     ''|*[!0-9]*) seconds=0 ;;
   esac
   if [ "$seconds" -gt 0 ] && command -v timeout >/dev/null 2>&1; then
-    timeout "${seconds}s" docker exec --user "$RCLONE_EXEC_USER" "$CONTAINER_NAME" "$@"
+    timeout "${seconds}s" "$@"
     return $?
   fi
   if [ "$seconds" -gt 0 ]; then
-    CLEANUP_TIMEOUT="$seconds" CLEANUP_CONTAINER_NAME="$CONTAINER_NAME" "$PYTHON_BIN" - "$@" <<'PY'
+    CLEANUP_TIMEOUT="$seconds" "$PYTHON_BIN" - "$@" <<'PY'
 import os
 import subprocess
 import sys
 
-timeout = int(os.environ.get("CLEANUP_TIMEOUT", "0") or "0")
-container = os.environ["CLEANUP_CONTAINER_NAME"]
-exec_user = os.environ.get("RCLONE_EXEC_USER", "10001:10001")
-cmd = ["docker", "exec", "--user", exec_user, container, *sys.argv[1:]]
 try:
-    completed = subprocess.run(cmd, timeout=timeout)
+    completed = subprocess.run(sys.argv[1:], timeout=int(os.environ.get("CLEANUP_TIMEOUT", "0") or "0"))
     sys.exit(completed.returncode)
 except subprocess.TimeoutExpired:
     sys.exit(124)
 PY
     return $?
   fi
-  docker exec --user "$RCLONE_EXEC_USER" "$CONTAINER_NAME" "$@"
+  "$@"
 }
 
-ensure_container_running() {
-  if docker ps -q -f "name=^/${CONTAINER_NAME}$" | grep -q .; then
+ensure_rclone_available() {
+  if rclone version >/dev/null 2>&1; then
     return 0
   fi
-
-  log "检测到容器 ${CONTAINER_NAME} 未运行，尝试启动"
-  docker start "$CONTAINER_NAME" >/dev/null
-
-  attempt=1
-  while [ "$attempt" -le 15 ]; do
-    if docker ps -q -f "name=^/${CONTAINER_NAME}$" | grep -q .; then
-      sleep 2
-      return 0
-    fi
-    attempt=$((attempt + 1))
-    sleep 1
-  done
-
-  log "容器 ${CONTAINER_NAME} 启动失败"
+  log "Worker 内的 rclone 命令不可用"
   exit 1
 }
 
@@ -382,7 +363,8 @@ upload_file() {
   target_file="$2"
   RCLONE_UPLOAD_SOURCE="$source" \
   RCLONE_UPLOAD_TARGET="$target_file" \
-  RCLONE_CONTAINER_NAME="$CONTAINER_NAME" \
+  RCLONE_CONFIG_PATH="$RCLONE_CONFIG_PATH" \
+  RCLONE_CACHE_DIR="$RCLONE_CACHE_DIR" \
   RCLONE_UPLOAD_MULTI_THREAD_VALUE="$UPLOAD_MULTI_THREAD" \
   RCLONE_BUFFER_SIZE_VALUE="$BUFFER_SIZE" \
   RCLONE_UPLOAD_RETRIES_VALUE="$RCLONE_UPLOAD_RETRIES" \
@@ -436,8 +418,6 @@ def to_bytes(number: str, unit: str) -> int:
     return int(float(number) * UNIT_MAP.get(unit, 1))
 
 
-container = os.environ["RCLONE_CONTAINER_NAME"]
-exec_user = os.environ.get("RCLONE_EXEC_USER", "10001:10001")
 source = os.environ["RCLONE_UPLOAD_SOURCE"]
 target = os.environ["RCLONE_UPLOAD_TARGET"]
 max_duration = str(os.environ.get("RCLONE_UPLOAD_MAX_DURATION_VALUE", "") or "").strip()
@@ -472,8 +452,14 @@ if max_duration and max_duration != "0":
     rclone_args.extend(["--max-duration", max_duration])
 rclone_args.extend(["--stats", "5s", "--stats-log-level", "NOTICE"])
 
-runner = 'rclone "$@" & pid=$!; echo "__FNOS_RCLONE_PID:${pid}"; wait "$pid"'
-cmd = ["docker", "exec", "--user", exec_user, container, "sh", "-c", runner, "fnos-rclone-upload", *rclone_args]
+cmd = [
+    "rclone",
+    *rclone_args,
+    "--config",
+    os.environ.get("RCLONE_CONFIG_PATH", "/config/rclone/rclone.conf"),
+    "--cache-dir",
+    os.environ.get("RCLONE_CACHE_DIR", "/cache"),
+]
 
 proc = subprocess.Popen(
     cmd,
@@ -485,7 +471,6 @@ proc = subprocess.Popen(
     bufsize=1,
 )
 
-container_pid = ""
 last_progress_at = time.monotonic()
 last_bytes = None
 complete_since = None
@@ -493,26 +478,17 @@ completed_file_count = False
 guard_reason = ""
 
 
-def kill_container_process(signal: str) -> None:
-    if container_pid:
-        subprocess.run(
-            ["docker", "exec", "--user", exec_user, container, "kill", f"-{signal}", container_pid],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
+def kill_upload_process(signal: str) -> None:
+    if signal == "TERM":
+        proc.terminate()
     else:
-        if signal == "TERM":
-            proc.terminate()
-        else:
-            proc.kill()
+        proc.kill()
 
 
 def handle_stop(signum, _frame) -> None:
-    emit_guard(f"上传监控收到停止信号 {signum}，正在终止容器内 rclone")
+    emit_guard(f"上传监控收到停止信号 {signum}，正在终止 rclone")
     try:
-        kill_container_process("TERM")
+        kill_upload_process("TERM")
     finally:
         sys.exit(128 + int(signum))
 
@@ -522,13 +498,9 @@ signal.signal(signal.SIGINT, handle_stop)
 
 
 try:
+    emit_guard(f"上传监控已启动：pid={proc.pid}，100%卡住熔断={complete_stall_timeout}s，无进展熔断={stall_timeout}s")
     assert proc.stdout is not None
     for line in proc.stdout:
-        if line.startswith("__FNOS_RCLONE_PID:"):
-            container_pid = line.split(":", 1)[1].strip()
-            emit_guard(f"上传监控已启动：container_pid={container_pid}，100%卡住熔断={complete_stall_timeout}s，无进展熔断={stall_timeout}s")
-            continue
-
         print(line, end="", flush=True)
         now = time.monotonic()
 
@@ -568,11 +540,11 @@ try:
     if guard_reason:
         emit_guard(f"上传熔断：{guard_reason}；将终止当前 rclone，随后由脚本校验云端文件大小决定成功/失败")
         try:
-            kill_container_process("TERM")
+            kill_upload_process("TERM")
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             emit_guard("上传熔断：TERM 未结束，改用 KILL 强制终止")
-            kill_container_process("KILL")
+            kill_upload_process("KILL")
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -581,12 +553,12 @@ try:
 
     sys.exit(proc.wait())
 except KeyboardInterrupt:
-    kill_container_process("TERM")
+    kill_upload_process("TERM")
     raise
 except Exception as exc:
     emit_guard(f"上传监控异常：{exc}")
     try:
-        kill_container_process("TERM")
+        kill_upload_process("TERM")
     except Exception:
         pass
     sys.exit(89)
@@ -2190,7 +2162,7 @@ main() {
   if [ -n "$RCLONE_ONLY_CATEGORY" ] || [ -n "$RCLONE_ONLY_FILE" ] || [ -n "$RCLONE_ONLY_JOB_DIR" ]; then
     log "搬运过滤：分类=${RCLONE_ONLY_CATEGORY:-不限}，任务目录=${RCLONE_ONLY_JOB_DIR:-不限}，文件=${RCLONE_ONLY_FILE:-不限}"
   fi
-  ensure_container_running
+  ensure_rclone_available
 
   overall_failed=0
   job_index=0

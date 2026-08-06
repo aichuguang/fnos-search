@@ -8,7 +8,7 @@ CommandRunner = Callable[[str, list[str], bool], dict[str, Any]]
 
 
 class RcloneEnvironmentChecker:
-    """Validates the Docker/rclone runtime and configured remote directories."""
+    """Validates the local rclone runtime and configured remote directories."""
 
     DIRECTORY_LABELS = (
         ("电影源目录", "RCLONE_SRC_MOVIE_DIR"),
@@ -31,19 +31,11 @@ class RcloneEnvironmentChecker:
         self.config = config
 
     def check(self, script_path: Path, category_dirs: dict[str, str]) -> dict[str, Any]:
-        container_name = str(self.config.get("container_name", "rclone-server"))
-        checks = [
-            {"name": "rclone 搬运脚本", "ok": script_path.exists(), "message": str(script_path)},
-            self.command_runner("docker", ["docker", "version", "--format", "{{.Server.Version}}"], True),
-            self.command_runner(
-                "rclone 容器",
-                ["docker", "ps", "-q", "-f", f"name=^/{container_name}$"],
-                True,
-            ),
-            self.remote_access_check(container_name),
-        ]
+        checks = [{"name": "rclone 搬运脚本", "ok": script_path.exists(), "message": str(script_path)}]
+        checks.append(self.command_runner("rclone", ["rclone", "version"], False))
+        checks.append(self.remote_access_check())
         for label, env_name in self.DIRECTORY_LABELS:
-            checks.append(self.directory_check(f"rclone {label}", container_name, category_dirs.get(env_name, "")))
+            checks.append(self.directory_check(f"rclone {label}", category_dirs.get(env_name, "")))
         failed = [item for item in checks if not item["ok"]]
         message = "环境检查通过" if not failed else "环境检查失败：" + "、".join(str(item["name"]) for item in failed)
         return {"success": not failed, "message": message, "items": checks}
@@ -73,9 +65,9 @@ class RcloneEnvironmentChecker:
         except subprocess.TimeoutExpired:
             return {"name": name, "ok": False, "message": "检查超时", "exit_code": 124}
 
-    def directory_check(self, name: str, container_name: str, directory: str) -> dict[str, Any]:
+    def directory_check(self, name: str, directory: str) -> dict[str, Any]:
         remote_path = f"{self.config.get('remote_name', 'MP')}:{directory}"
-        stat_command = ["docker", "exec", container_name, "rclone", "lsjson", remote_path, "--stat"]
+        stat_command = self._rclone_command("lsjson", remote_path, "--stat")
         item = self.command_runner(name, stat_command, True)
         if item["ok"]:
             item["message"] = f"{remote_path} 可访问"
@@ -85,7 +77,7 @@ class RcloneEnvironmentChecker:
             return item
         mkdir_item = self.command_runner(
             f"{name} 自动创建",
-            ["docker", "exec", container_name, "rclone", "mkdir", remote_path],
+            self._rclone_command("mkdir", remote_path),
             True,
         )
         if not mkdir_item["ok"]:
@@ -98,13 +90,23 @@ class RcloneEnvironmentChecker:
             verify_item["message"] = f"{remote_path} 已尝试自动创建，但复查失败：{verify_item.get('message') or message}"
         return verify_item
 
-    def remote_access_check(self, container_name: str) -> dict[str, Any]:
+    def remote_access_check(self) -> dict[str, Any]:
         remote = f"{self.config.get('remote_name', 'MP')}:"
         item = self.command_runner(
             "rclone remote",
-            ["docker", "exec", container_name, "rclone", "lsd", remote],
+            self._rclone_command("lsd", remote),
             True,
         )
         if item["ok"]:
             item["message"] = f"{remote} 可访问"
         return item
+
+    def _rclone_command(self, *arguments: str) -> list[str]:
+        return [
+            "rclone",
+            *arguments,
+            "--config",
+            str(self.config.get("config_path") or "/config/rclone/rclone.conf"),
+            "--cache-dir",
+            str(self.config.get("cache_dir") or "/cache"),
+        ]

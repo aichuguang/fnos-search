@@ -174,10 +174,7 @@ class RcloneCleanupScopeTests(unittest.TestCase):
 
     def test_local_temp_cleanup_uses_exact_job_relative_path(self) -> None:
         service = RcloneService.__new__(RcloneService)
-        service.config = {
-            "local_temp": "/temp/fnos-media-import",
-            "container_name": "rclone-server",
-        }
+        service.config = {"local_temp": "/temp/fnos-media-import"}
         service._category_dirs_for_key = lambda _category: {
             "source_dir": "/旧夸克/电视剧",
             "target_dir": "/旧移动云/电视剧",
@@ -213,10 +210,7 @@ class RcloneCleanupScopeTests(unittest.TestCase):
 
     def test_local_temp_cleanup_treats_glob_characters_as_literal_path_text(self) -> None:
         service = RcloneService.__new__(RcloneService)
-        service.config = {
-            "local_temp": "/temp/fnos-media-import",
-            "container_name": "rclone-server",
-        }
+        service.config = {"local_temp": "/temp/fnos-media-import"}
         captured: dict = {}
         service._run_cleanup_command = lambda label, command, **kwargs: (
             captured.update(label=label, command=command, kwargs=kwargs)
@@ -277,10 +271,7 @@ class RcloneCleanupScopeTests(unittest.TestCase):
 
     def test_empty_temp_directory_cleanup_is_scoped_to_confirmed_job_roots(self) -> None:
         service = RcloneService.__new__(RcloneService)
-        service.config = {
-            "local_temp": "/temp/fnos-media-import",
-            "container_name": "rclone-server",
-        }
+        service.config = {"local_temp": "/temp/fnos-media-import"}
         calls: list[tuple[list[str], str]] = []
         service._run_cleanup_command = lambda _label, command, **kwargs: (
             calls.append((command, kwargs["path"]))
@@ -315,12 +306,12 @@ class RcloneCleanupScopeTests(unittest.TestCase):
                 "/temp/fnos-media-import/离线剧集/job-43",
             },
         )
-        self.assertTrue(all(command[3] == "find" for command, _path in calls))
+        self.assertTrue(all(command[0] == "find" for command, _path in calls))
         self.assertNotIn("/temp/fnos-media-import", {path for _command, path in calls})
 
     def test_unsafe_container_temp_root_is_never_used_for_deletion(self) -> None:
         service = RcloneService.__new__(RcloneService)
-        service.config = {"local_temp": "/", "container_name": "rclone-server"}
+        service.config = {"local_temp": "/"}
         service._run_cleanup_command = lambda *_args, **_kwargs: self.fail(
             "容器根目录不能作为任务 temp 删除边界"
         )

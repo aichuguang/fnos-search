@@ -91,12 +91,24 @@ def main() -> None:
 
     uid = _numeric_env("APP_UID", 10001)
     gid = _numeric_env("APP_GID", 10001)
+    configured_role = str(os.getenv("FNOS_PROCESS_ROLE") or "").strip().lower()
+    runtime_role = configured_role or (
+        "web" if str(os.getenv("APP_ENV") or "").strip().lower() == "production" else "all"
+    )
     if _running_as_root():
         # config/data/logs 里保存应用配置和数据，需要修复已有文件。
         for value in ("/app/config", "/app/data", "/app/logs", "/home/app"):
             _prepare_path(Path(value), uid, gid, recursive=True)
-        # /temp 可能存放大量媒体缓存，只修复根目录，避免每次启动全量遍历。
-        _prepare_path(Path("/temp"), uid, gid, recursive=False)
+        if runtime_role in {"all", "worker"}:
+            # rclone 临时文件可能很大，只修复目录根，避免每次启动全量遍历。
+            _prepare_path(Path("/config/rclone"), uid, gid, recursive=True)
+            for value in ("/cache", "/temp"):
+                _prepare_path(Path(value), uid, gid, recursive=False)
+            rclone_config = Path(os.getenv("RCLONE_CONFIG_PATH", "/config/rclone/rclone.conf"))
+            _prepare_path(rclone_config.parent, uid, gid, recursive=True)
+            rclone_config.touch(exist_ok=True)
+            os.chown(rclone_config, uid, gid)
+            os.chmod(rclone_config, stat.S_IMODE(rclone_config.stat().st_mode) | 0o660)
 
     secret_path = Path(
         os.getenv(
@@ -105,11 +117,16 @@ def main() -> None:
         )
     )
     _ensure_runtime_secret("NOTIFICATION_ENCRYPTION_KEY", secret_path, uid, gid)
+    worker_token_path = Path(
+        os.getenv(
+            "RCLONE_WORKER_CONTROL_TOKEN_FILE",
+            "/app/data/.secrets/rclone_worker_control_token",
+        )
+    )
+    _ensure_runtime_secret("RCLONE_WORKER_CONTROL_TOKEN", worker_token_path, uid, gid)
 
     if _running_as_root():
-        socket_path = Path("/var/run/docker.sock")
-        supplementary_gids = [socket_path.stat().st_gid] if socket_path.exists() else []
-        _drop_privileges(uid, gid, supplementary_gids)
+        _drop_privileges(uid, gid)
 
     os.execvp(sys.argv[1], sys.argv[1:])
 

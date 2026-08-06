@@ -20,6 +20,7 @@ from .diagnostics import DiagnosticsRouteContext, create_diagnostics_blueprint
 from .legacy_api import LegacyApiRouteContext, create_legacy_api_blueprint
 from .callbacks import CallbackRouteContext, create_callbacks_blueprint
 from .trending import TrendingRouteContext, create_trending_blueprint
+from .rclone_worker_control import RcloneWorkerControlContext, create_rclone_worker_control_blueprint
 
 
 def preserve_legacy_endpoints(app: Flask, mapping: dict[str, str]) -> None:
@@ -60,6 +61,7 @@ __all__ = [
     "LegacyApiRouteContext",
     "CallbackRouteContext",
     "TrendingRouteContext",
+    "RcloneWorkerControlContext",
     "create_auth_blueprint",
     "create_system_blueprint",
     "create_settings_blueprint",
@@ -78,5 +80,6 @@ __all__ = [
     "create_legacy_api_blueprint",
     "create_callbacks_blueprint",
     "create_trending_blueprint",
+    "create_rclone_worker_control_blueprint",
     "preserve_legacy_endpoints",
 ]

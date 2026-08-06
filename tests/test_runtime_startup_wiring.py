@@ -208,6 +208,9 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
         result = service.reload(old_config, old_build)
 
         self.assertIs(result.build, candidate)
+        self.assertTrue(result.response["success"])
+        self.assertIn("update_scheduler", result.response)
+        self.assertIn("trending_discovery", result.response)
         self.assertIn("swap", events)
         self.assertNotIn("dispatch", events)
         self.assertNotIn("suspend", events)

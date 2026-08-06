@@ -15,6 +15,7 @@ class SecurityStatusService:
         default_secret: Callable[[str], bool],
         docker_socket_mounted: Callable[[], bool],
         admin_profile_key: str,
+        deployment_degraded: Callable[[], bool] | None = None,
     ) -> None:
         self.raw_config = raw_config
         self.settings = settings
@@ -22,6 +23,7 @@ class SecurityStatusService:
         self.default_secret = default_secret
         self.docker_socket_mounted = docker_socket_mounted
         self.admin_profile_key = admin_profile_key
+        self.deployment_degraded = deployment_degraded or (lambda: False)
 
     def build(self) -> dict[str, Any]:
         raw = self.raw_config()
@@ -35,6 +37,7 @@ class SecurityStatusService:
         secret_key = str(app.get("secret_key") or "")
         strict = self.strict_enabled(raw)
         socket_mounted = self.docker_socket_mounted()
+        degraded = bool(self.deployment_degraded())
         issues: list[dict[str, Any]] = []
 
         if username == "admin" and not custom_password and password == "admin":
@@ -44,7 +47,9 @@ class SecurityStatusService:
         if self.default_secret(secret_key):
             _issue(issues, "critical", "应用签名密钥初始化失败", "默认会话签名密钥可能导致登录状态被伪造", "检查 data 目录写权限，或显式配置 APP_SECRET_KEY")
         if socket_mounted:
-            _issue(issues, "warn", "检测到 Docker Socket 挂载", "Web 容器可控制宿主机 Docker，安全边界风险较高", "生产环境使用无 Socket 的默认部署模式")
+            _issue(issues, "critical", "检测到 Docker Socket 挂载", "Web 容器可控制宿主机 Docker，安全边界风险较高", "替换为无 Socket 的当前编排文件")
+        if degraded:
+            _issue(issues, "critical", "检测到旧版部署编排", "正式环境缺少 FNOS_PROCESS_ROLE，已进入安全降级模式", "替换当前版本 docker-compose.yml 后重新编排")
 
         critical_count = sum(item["level"] == "critical" for item in issues)
         warn_count = sum(item["level"] == "warn" for item in issues)
@@ -60,6 +65,7 @@ class SecurityStatusService:
                 "default_secret": self.default_secret(secret_key),
                 "strict_security": strict,
                 "docker_socket_mounted": socket_mounted,
+                "deployment_degraded": degraded,
             },
         }
 

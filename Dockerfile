@@ -1,9 +1,9 @@
 ARG PYTHON_IMAGE=python:3.11-slim
-ARG DOCKER_CLI_IMAGE=docker:27-cli
+ARG RCLONE_IMAGE=rclone/rclone:1.70.3
 ARG APP_UID=10001
 ARG APP_GID=10001
 
-FROM ${DOCKER_CLI_IMAGE} AS docker-cli
+FROM ${RCLONE_IMAGE} AS rclone
 
 FROM ${PYTHON_IMAGE}
 
@@ -25,7 +25,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 
 COPY requirements.txt .
 ARG PIP_INDEX_URL=https://pypi.org/simple
@@ -51,8 +51,8 @@ RUN set -eux; \
 
 RUN addgroup --gid "${APP_GID}" app \
     && adduser --uid "${APP_UID}" --disabled-password --gecos "" --ingroup app --home /home/app app \
-    && mkdir -p /app/config /app/data /app/logs /temp /home/app \
-    && chown -R app:app /app /temp /home/app
+    && mkdir -p /app/config /app/data /app/logs /config/rclone /cache /temp /home/app \
+    && chown -R app:app /app /config/rclone /cache /temp /home/app
 
 COPY --chown=app:app . .
 
@@ -60,7 +60,7 @@ EXPOSE 5251
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5251/health', timeout=5).read()"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5251/readyz', timeout=5).read()"
 
 ENTRYPOINT ["python", "/app/scripts/container_entrypoint.py"]
 CMD ["gunicorn", "--workers", "1", "--threads", "8", "--bind", "0.0.0.0:5251", "--timeout", "180", "--graceful-timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "app:app"]

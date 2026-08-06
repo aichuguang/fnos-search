@@ -1,16 +1,69 @@
-# 仅供源码开发和自行构建使用。
+# 仅供源码开发和自行构建使用，用于本地验证双容器（web + rclone Worker）编排。
 # 普通部署不要加载本文件，直接运行：docker compose up -d
+x-app-common: &app-common
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 2m
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - DAC_OVERRIDE
+    - FOWNER
+    - SETGID
+    - SETUID
+
 services:
   fnos-media-import:
+    <<: *app-common
     image: ${APP_IMAGE:-fnos-search-local}:${APP_VERSION:-dev}
     build:
       context: .
       args:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11-slim}
-        DOCKER_CLI_IMAGE: ${DOCKER_CLI_IMAGE:-docker:27-cli}
+        RCLONE_IMAGE: ${RCLONE_IMAGE:-rclone/rclone:1.70.3}
         APP_UID: ${APP_UID:-10001}
         APP_GID: ${APP_GID:-10001}
         APP_VERSION: ${APP_VERSION:-dev}
         VCS_REF: ${VCS_REF:-unknown}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         PIP_EXTRA_INDEX_URLS: ${PIP_EXTRA_INDEX_URLS:-https://mirrors.aliyun.com/pypi/simple https://mirrors.cloud.tencent.com/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple}
+    container_name: fnos-media-import
+    depends_on:
+      fnos-rclone-worker:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-5251}:5251"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      FNOS_PROCESS_ROLE: web
+      RCLONE_WORKER_URL: http://fnos-rclone-worker:5251
+      RCLONE_WORKER_CONTROL_TOKEN: "${RCLONE_WORKER_CONTROL_TOKEN:-}"
+      LOG_FILE: /app/logs/web.log
+    volumes:
+      - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
+      - "${APP_DATA_HOST_PATH:-./data}:/app/data"
+      - "${APP_LOGS_HOST_PATH:-./logs}:/app/logs"
+
+  fnos-rclone-worker:
+    <<: *app-common
+    image: ${APP_IMAGE:-fnos-search-local}:${APP_VERSION:-dev}
+    container_name: fnos-rclone-worker
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      FNOS_PROCESS_ROLE: all
+      RCLONE_CONFIG_PATH: /config/rclone/rclone.conf
+      RCLONE_CACHE_DIR: /cache
+      RCLONE_WORKER_CONTROL_TOKEN: "${RCLONE_WORKER_CONTROL_TOKEN:-}"
+      LOG_FILE: /app/logs/worker.log
+    volumes:
+      - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
+      - "${APP_DATA_HOST_PATH:-./data}:/app/data"
+      - "${APP_LOGS_HOST_PATH:-./logs}:/app/logs"
+      - "${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone"
+      - "${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache"
+      - "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp"

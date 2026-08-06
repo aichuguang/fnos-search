@@ -17,5 +17,4 @@
 # 注意：
 # - pass 建议使用 `rclone obscure` 生成。
 # - 不要把真实 rclone.conf 提交到仓库。
-# - rclone.conf 必须通过 docker-compose 挂载到 rclone-server 的 /config/rclone。
-
+# - rclone.conf 必须通过 docker-compose 挂载到 fnos-rclone-worker 的 /config/rclone。

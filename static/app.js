@@ -486,7 +486,7 @@ function renderRcloneRuns(items) {
 async function startRclone() {
     if (!(await confirmAction({
         title: "立即执行 rclone 搬运",
-        message: "确认立即执行 rclone 搬运？建议第一次先确保 rclone-server 容器和 MP remote 可用。",
+        message: "确认立即执行 rclone 搬运？建议第一次先确保 rclone Worker 和 MP remote 可用。",
         confirmText: "启动搬运",
         tone: "warning",
     }))) return;

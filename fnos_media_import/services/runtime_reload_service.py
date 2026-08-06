@@ -115,10 +115,14 @@ class RuntimeReloadService:
             )
         )
         response = {
+            "success": True,
+            "message": "运行配置已重载",
             "advanced_config_key": self.advanced_config_key,
             "runtime_revision": revision,
             "rclone": self.rclone_service.status(),
             "organizer": candidate.organizer_service.status(),
+            "update_scheduler": _component_status(self.update_scheduler),
+            "trending_discovery": _component_status(self.trending_scheduler),
             "fnos_configured": bool(candidate.fnos.describe().get("configured"))
             if hasattr(candidate.fnos, "describe")
             else False,
@@ -161,6 +165,14 @@ class RuntimeReloadService:
             config.raw.get("cmcc_upload", {}),
             config.raw.get("cloud139", {}),
         )
+
+
+def _component_status(component: Any) -> dict[str, Any]:
+    status = getattr(component, "status", None)
+    if not callable(status):
+        return {}
+    value = status()
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _preserve_runtime_secrets(current_config: Any, reloaded_config: Any) -> None:

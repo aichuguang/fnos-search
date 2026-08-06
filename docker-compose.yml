@@ -1,78 +1,62 @@
-# 日常部署只需修改 .env，宿主机目录和端口都不必在本文件中改动。
+# 日常部署只需修改 .env；宿主机目录和端口都支持环境变量覆盖。
+x-app-common: &app-common
+  image: aichuguang/fnos-search:${APP_VERSION:-latest}
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 2m
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - DAC_OVERRIDE
+    - FOWNER
+    - SETGID
+    - SETUID
+
+x-app-environment: &app-environment
+  TZ: ${TZ:-Asia/Shanghai}
+  APP_ENV: production
+  SECURITY_STRICT: "true"
+  APP_SECRET_KEY: "${APP_SECRET_KEY:-}"
+  NOTIFICATION_ENCRYPTION_KEY: "${NOTIFICATION_ENCRYPTION_KEY:-}"
+  RCLONE_WORKER_CONTROL_TOKEN: "${RCLONE_WORKER_CONTROL_TOKEN:-}"
+
 services:
   fnos-media-import:
-    image: aichuguang/fnos-search:${APP_VERSION:-latest}
+    <<: *app-common
     container_name: fnos-media-import
-    restart: unless-stopped
-    init: true
-    stop_grace_period: 2m
     depends_on:
-      rclone-server:
+      fnos-rclone-worker:
         condition: service_healthy
     ports:
       - "${APP_PORT:-5251}:5251"
     environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      APP_ENV: production
-      SECURITY_STRICT: "true"
-      # 兼容旧部署；留空时密钥会自动生成并保存到 APP_DATA_HOST_PATH。
-      APP_SECRET_KEY: "${APP_SECRET_KEY:-}"
-      NOTIFICATION_ENCRYPTION_KEY: "${NOTIFICATION_ENCRYPTION_KEY:-}"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      <<: *app-environment
+      FNOS_PROCESS_ROLE: web
+      RCLONE_WORKER_URL: http://fnos-rclone-worker:5251
+      LOG_FILE: /app/logs/web.log
     volumes:
       - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
       - "${APP_DATA_HOST_PATH:-./data}:/app/data"
       - "${APP_LOGS_HOST_PATH:-./logs}:/app/logs"
-      - "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp"
-      - /var/run/docker.sock:/var/run/docker.sock
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - SETGID
-      - SETUID
 
-  rclone-server:
-    image: rclone/rclone:1.70.3
-    container_name: rclone-server
-    restart: unless-stopped
-    init: true
-    stop_grace_period: 2m
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -eu
-        for path in /config/rclone /cache /temp /temp/fnos-media-import; do
-          mkdir -p "$${path}"
-          chown -R 10001:10001 "$${path}"
-          chmod -R u+rwX,g+rwX "$${path}"
-        done
-        touch /config/rclone/rclone.conf
-        chown 10001:10001 /config/rclone/rclone.conf
-        chmod 660 /config/rclone/rclone.conf
-        exec tail -f /dev/null
+  fnos-rclone-worker:
+    <<: *app-common
+    container_name: fnos-rclone-worker
     environment:
-      TZ: ${TZ:-Asia/Shanghai}
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - DAC_OVERRIDE
-      - CHOWN
-      - FOWNER
+      <<: *app-environment
+      FNOS_PROCESS_ROLE: all
+      RCLONE_CONFIG_PATH: /config/rclone/rclone.conf
+      RCLONE_CACHE_DIR: /cache
+      LOG_FILE: /app/logs/worker.log
     volumes:
+      - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
+      - "${APP_DATA_HOST_PATH:-./data}:/app/data"
+      - "${APP_LOGS_HOST_PATH:-./logs}:/app/logs"
       - "${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone"
-      - "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp"
       - "${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache"
-    healthcheck:
-      test: ["CMD-SHELL", "rclone version >/dev/null"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+      - "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp"

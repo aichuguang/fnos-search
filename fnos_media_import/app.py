@@ -59,7 +59,7 @@ from .importers.generic import GenericWebhookImporter
 from .importers.quark import QuarkImporter
 from .importers.sixpan import SixPanOfflineImporter
 from .media.fnos import FnosMediaRefresher
-from .blueprints import AdaptersRouteContext, AdminShellRouteContext, AuthRouteContext, CallbackRouteContext, CloudCompatRouteContext, DiagnosticsRouteContext, JobsRouteContext, LegacyApiRouteContext, MediaRouteContext, OrganizerRouteContext, PublicRouteContext, RcloneRouteContext, RequestsRouteContext, SettingsRouteContext, SixPanRouteContext, SystemRouteContext, UpdatesRouteContext, create_adapters_blueprint, create_admin_shell_blueprint, create_auth_blueprint, create_callbacks_blueprint, create_cloud_compat_blueprint, create_diagnostics_blueprint, create_jobs_blueprint, create_legacy_api_blueprint, create_media_blueprint, create_organizer_blueprint, create_public_blueprint, create_rclone_blueprint, create_requests_blueprint, create_settings_blueprint, create_sixpan_blueprint, create_system_blueprint, create_updates_blueprint, preserve_legacy_endpoints
+from .blueprints import AdaptersRouteContext, AdminShellRouteContext, AuthRouteContext, CallbackRouteContext, CloudCompatRouteContext, DiagnosticsRouteContext, JobsRouteContext, LegacyApiRouteContext, MediaRouteContext, OrganizerRouteContext, PublicRouteContext, RcloneRouteContext, RcloneWorkerControlContext, RequestsRouteContext, SettingsRouteContext, SixPanRouteContext, SystemRouteContext, UpdatesRouteContext, create_adapters_blueprint, create_admin_shell_blueprint, create_auth_blueprint, create_callbacks_blueprint, create_cloud_compat_blueprint, create_diagnostics_blueprint, create_jobs_blueprint, create_legacy_api_blueprint, create_media_blueprint, create_organizer_blueprint, create_public_blueprint, create_rclone_blueprint, create_rclone_worker_control_blueprint, create_requests_blueprint, create_settings_blueprint, create_sixpan_blueprint, create_system_blueprint, create_updates_blueprint, preserve_legacy_endpoints
 from .organizer.openlist_client import VIDEO_EXTENSIONS
 from .organizer.service import OrganizerService
 from .providers.btbtla import BtbtlaClient
@@ -69,6 +69,7 @@ from .services.import_staging_service import map_staging_path_to_openlist, stagi
 from .services.job_service import JobService
 from .services.rclone_service import RcloneService
 from .services.rclone_webdav_config_service import RcloneWebdavConfigError, RcloneWebdavConfigService
+from .services.rclone_worker_client import RcloneWorkerClient, RcloneWorkerRequestError
 from .storage_paths import map_upload_path_to_openlist, openlist_root_for_upload, upload_backend
 from .services.rclone_history_repair_worker import RcloneHistoryRepairWorker
 from .services.rclone_worker_runtime import RcloneWorkerRuntime
@@ -134,6 +135,8 @@ from .services.media_dashboard_service import (
 from .services.durable_worker_runtime import DurableWorkerRuntime
 from .services.worker_task_dispatcher import WorkerTaskDispatcher
 from .services.worker_queue_diagnostics_service import WorkerQueueDiagnosticsService
+from .services.readiness_service import ReadinessService
+from .services.worker_watchdog import WorkerWatchdog
 from .services.notification_settings_service import NotificationSettingsService
 from .notifications import events as notification_events
 from .notifications import config as notification_config
@@ -148,7 +151,7 @@ from .services.public_bt_resolve_service import PublicBtResolveService
 from .services.public_sixpan_preview_service import PublicSixpanPreviewService
 from .services.update_service import UpdateService
 from .runtime import RuntimeServices, RuntimeSnapshot, install_request_runtime
-from .process_role import resolve_process_role, role_runs
+from .process_role import legacy_deployment_layout, resolve_process_role, role_runs
 from .runtime_builder import RuntimeBuilder, RuntimeRetirementQueue, rclone_runtime_config
 from .blueprints.trending import TrendingRouteContext, create_trending_blueprint
 
@@ -627,6 +630,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     app_config = load_config(config_path)
+    deployment_degraded = legacy_deployment_layout(process_role)
     active_process_role = resolve_process_role(process_role)
     process_owner_id = f"{os.getenv('HOSTNAME') or os.getenv('COMPUTERNAME') or 'host'}:{os.getpid()}:{secrets.token_hex(6)}"
     db = Database(app_config.database_path)
@@ -701,7 +705,18 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         cmcc_upload_config=app_config.raw.get("cmcc_upload", {}),
         cloud139_config=app_config.raw.get("cloud139", {}),
         owner_id=process_owner_id,
+        scheduler_allowed=role_runs(active_process_role, "worker"),
     )
+    rclone_worker_client: RcloneWorkerClient | None = None
+    if active_process_role == "web":
+        rclone_worker_client = RcloneWorkerClient(
+            base_url=os.getenv("RCLONE_WORKER_URL", "http://fnos-rclone-worker:5251"),
+            token=os.getenv("RCLONE_WORKER_CONTROL_TOKEN", ""),
+            database=db,
+            timeout_seconds=_safe_int(os.getenv("RCLONE_WORKER_TIMEOUT_SECONDS"), 30, 3, 300),
+        )
+        atexit.register(rclone_worker_client.close)
+    rclone_controller = rclone_worker_client or rclone_service
     rclone_webdav_config_service = RcloneWebdavConfigService(lambda: rclone_service.config)
     update_service = UpdateService(
         db,
@@ -726,6 +741,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         max_subscriptions_per_tick=_config_int(update_scheduler_config, "max_subscriptions_per_tick", 5),
         coalesce_missed_runs=_config_bool(update_scheduler_config, "coalesce_missed_runs", True),
         owner_id=process_owner_id,
+        process_role=active_process_role,
     )
     update_scheduler_runtime = UpdateSchedulerRuntime(update_scheduler)
     atexit.register(update_scheduler_runtime.shutdown)
@@ -1113,7 +1129,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     import_completion_dispatcher = ImportCompletionDispatcher(
         database=db,
-        rclone_service=rclone_service,
+        rclone_service=rclone_controller,
         category=lambda key: app_config.category(key) if key in app_config.categories else {},
         enqueue_organizer=lambda result, reason: _enqueue_organizer_from_completed_import(result, reason),
     )
@@ -1784,6 +1800,15 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     app.config["APP_CONFIG"] = app_config
     app.config["DATABASE"] = db
     app.config["PROCESS_ROLE"] = active_process_role
+    app.config["DEPLOYMENT_DEGRADED"] = deployment_degraded
+    if deployment_degraded:
+        app.logger.critical(
+            "检测到正式环境仍在使用未声明 FNOS_PROCESS_ROLE 的旧编排；已安全降级为 Web-only，请替换当前版本 docker-compose.yml"
+        )
+    if Path("/var/run/docker.sock").exists():
+        app.logger.critical(
+            "检测到 Docker Socket 挂载；当前进程继续启动但 readiness 将保持失败，请替换为无 Socket 的当前编排"
+        )
     security_config = app_config.raw.get("security", {})
     if _default_secret_key(str(security_config.get("ip_hash_salt") or "")):
         security_config["ip_hash_salt"] = app.secret_key
@@ -1895,6 +1920,16 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             retirement=runtime_retirement,
             activate_background=role_runs(active_process_role, "worker"),
         )
+        if rclone_worker_client is not None:
+            worker_reload = rclone_worker_client.reload()
+            outcome.response["rclone_worker_reload"] = worker_reload
+            if not worker_reload.get("success"):
+                status_code = _safe_int_value(worker_reload.get("_http_status"), 503)
+                raise RcloneWorkerRequestError(
+                    f"rclone Worker 重载失败：{worker_reload.get('message') or '未知错误'}",
+                    status_code,
+                    worker_reload,
+                )
         return outcome.response
 
     app.extensions["reload_runtime_config"] = _reload_runtime_config
@@ -1963,6 +1998,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         default_secret=_default_secret_key,
         docker_socket_mounted=lambda: Path("/var/run/docker.sock").exists(),
         admin_profile_key=ADMIN_PROFILE_KEY,
+        deployment_degraded=lambda: deployment_degraded,
     )
 
     def _build_security_status() -> dict[str, Any]:
@@ -2240,18 +2276,141 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         }
         return status
 
+    def _thread_component(thread: Any, *, required: bool = True) -> dict[str, Any]:
+        running = bool(thread and thread.is_alive())
+        return {"required": bool(required), "running": running, "healthy": running or not required}
+
+    def _local_worker_system_status() -> dict[str, Any]:
+        data_status = _admin_data_status()
+        database_healthy = bool((data_status.get("database") or {}).get("healthy"))
+        rclone_status = rclone_service.status()
+        organizer_status = _admin_organizer_status()
+        update_status = update_scheduler.status()
+        trending_status = trending_scheduler.status()
+        queue_status = worker_queue_diagnostics.status()
+        checks: dict[str, dict[str, Any]] = {
+            "database": {"required": True, "running": database_healthy, "healthy": database_healthy}
+        }
+        if role_runs(active_process_role, "worker"):
+            checks.update(
+                {
+                    "durable_worker": {
+                        "required": True,
+                        "running": bool(queue_status.get("runtime_running")),
+                        "healthy": bool(queue_status.get("healthy")),
+                    },
+                    "rclone_history_repair": _thread_component(history_repair_worker.thread),
+                    "search_cache_maintenance": _thread_component(search_cache_maintenance_worker.thread),
+                    "event_retention": _thread_component(event_retention_worker.thread),
+                    "rclone_scheduler": _thread_component(
+                        rclone_service.scheduler.thread,
+                        required=int(rclone_status.get("auto_interval_minutes") or 0) > 0,
+                    ),
+                }
+            )
+        if role_runs(active_process_role, "scheduler"):
+            checks.update(
+                {
+                    "update_scheduler": _thread_component(
+                        update_scheduler.thread,
+                        required=bool(update_status.get("enabled")),
+                    ),
+                    "trending_discovery": _thread_component(
+                        trending_scheduler.thread,
+                        required=bool(trending_status.get("enabled")),
+                    ),
+                    "notification_digest": _thread_component(notification_digest_scheduler.thread),
+                    "sixpan_polling": _thread_component(sixpan_polling_runtime.thread),
+                }
+            )
+        failed_checks = [name for name, item in checks.items() if not item.get("healthy")]
+        healthy = not failed_checks
+        return {
+            "success": True,
+            "healthy": healthy,
+            "status": "ready" if healthy else "unhealthy",
+            "process_role": active_process_role,
+            "failed_checks": failed_checks,
+            "checks": checks,
+            "rclone": rclone_status,
+            "organizer": organizer_status,
+            "update_scheduler": update_status,
+            "trending_discovery": trending_status,
+            "worker_queue": queue_status,
+            "data": data_status,
+            **({"message": "Worker 核心组件异常：" + "、".join(failed_checks)} if failed_checks else {}),
+        }
+
     def _admin_system_status() -> dict[str, Any]:
         data_status = _admin_data_status()
+        database_healthy = bool((data_status.get("database") or {}).get("healthy"))
+        if rclone_worker_client is not None:
+            worker_status = rclone_worker_client.system_status()
+            if worker_status.get("success"):
+                return {
+                    "ok": database_healthy and bool(worker_status.get("healthy")),
+                    "database": "ok" if database_healthy else "error",
+                    "rclone": worker_status.get("rclone") or {},
+                    "organizer": worker_status.get("organizer") or {},
+                    "update_scheduler": worker_status.get("update_scheduler") or {},
+                    "trending_discovery": worker_status.get("trending_discovery") or {},
+                    "worker_queue": worker_status.get("worker_queue") or {},
+                    "worker": worker_status,
+                    "data": data_status,
+                }
+            unavailable = {
+                "healthy": False,
+                "status": str(worker_status.get("status") or "worker_unavailable"),
+                "message": str(worker_status.get("message") or "rclone Worker 不可用"),
+            }
+            return {
+                "ok": False,
+                "database": "ok" if database_healthy else "error",
+                "rclone": {**unavailable, "running": False},
+                "organizer": unavailable,
+                "update_scheduler": unavailable,
+                "trending_discovery": unavailable,
+                "worker_queue": unavailable,
+                "worker": worker_status,
+                "data": data_status,
+            }
+        local_status = _local_worker_system_status()
         return {
-            "ok": bool((data_status.get("database") or {}).get("healthy")),
-            "database": "ok" if (data_status.get("database") or {}).get("healthy") else "error",
-            "rclone": rclone_service.status(),
-            "organizer": _admin_organizer_status(),
-            "update_scheduler": update_scheduler.status(),
-            "trending_discovery": trending_scheduler.status(),
-            "worker_queue": worker_queue_diagnostics.status(),
+            "ok": database_healthy and bool(local_status.get("healthy")),
+            "database": "ok" if database_healthy else "error",
+            "rclone": local_status["rclone"],
+            "organizer": local_status["organizer"],
+            "update_scheduler": local_status["update_scheduler"],
+            "trending_discovery": local_status["trending_discovery"],
+            "worker_queue": local_status["worker_queue"],
+            "worker": local_status,
             "data": data_status,
         }
+
+    readiness_service = ReadinessService(
+        process_role=active_process_role,
+        database_probe=lambda: db.get_app_settings(),
+        deployment_degraded=lambda: deployment_degraded,
+        docker_socket_mounted=lambda: Path("/var/run/docker.sock").exists(),
+        remote_worker_status=(
+            rclone_worker_client.system_status if rclone_worker_client is not None else None
+        ),
+        local_worker_status=_local_worker_system_status,
+    )
+    app.extensions["readiness_service"] = readiness_service
+
+    worker_watchdog: WorkerWatchdog | None = None
+    if (
+        str(os.getenv("APP_ENV") or "").strip().lower() == "production"
+        and role_runs(active_process_role, "worker")
+    ):
+        worker_watchdog = WorkerWatchdog(
+            status=_local_worker_system_status,
+            terminate=lambda: os._exit(1),
+            log_critical=app.logger.critical,
+        )
+        app.extensions["worker_watchdog"] = worker_watchdog
+        atexit.register(worker_watchdog.shutdown)
 
     def api_admin_dashboard():
         service = AdminDashboardService(
@@ -2456,7 +2615,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return JobCancellationService(
             JobCancellationDependencies(
                 jobs=db,
-                cleaner=rclone_service,
+                cleaner=rclone_controller,
                 merge_raw_data=_merge_raw_data,
                 payload_bool=_payload_bool,
                 cancelled_status=JOB_CANCELLED,
@@ -2569,19 +2728,24 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         )
         return jsonify(service.refresh(payload))
 
+    def _rclone_proxy_response(result: dict[str, Any]):
+        payload = dict(result)
+        status_code = _safe_int_value(payload.pop("_http_status", 200), 200)
+        return jsonify(payload), status_code
+
     def api_admin_rclone_status():
-        return jsonify(_rclone_admin_query_application().status())
+        return _rclone_proxy_response(_rclone_admin_query_application().status())
 
     def api_admin_rclone_start():
         payload = request.get_json(silent=True) or {}
-        return jsonify(_rclone_admin_command_application().start(payload))
+        return _rclone_proxy_response(_rclone_admin_command_application().start(payload))
 
     def api_admin_rclone_stop():
-        return jsonify(_rclone_admin_command_application().stop())
+        return _rclone_proxy_response(_rclone_admin_command_application().stop())
 
     def api_admin_rclone_logs():
         limit = _safe_int(request.args.get("limit"), 200, 1, 1000)
-        return jsonify(_rclone_admin_query_application().logs(limit))
+        return _rclone_proxy_response(_rclone_admin_query_application().logs(limit))
 
     def api_admin_rclone_runs():
         page, per_page, offset = _page_args(20, 100)
@@ -2609,22 +2773,26 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         )
 
     def _rclone_admin_query_application() -> RcloneAdminQueryService:
-        return RcloneAdminQueryService(RcloneAdminQueryDependencies(rclone=rclone_service, counts=db))
+        return RcloneAdminQueryService(RcloneAdminQueryDependencies(rclone=rclone_controller, counts=db))
 
     def api_admin_rclone_file_retry(event_id: int):
         payload = request.get_json(silent=True) or {}
-        service = RcloneFileRetryService(RcloneFileRetryDependencies(database=db, runner=rclone_service))
+        service = RcloneFileRetryService(RcloneFileRetryDependencies(database=db, runner=rclone_controller))
         result, status_code = service.retry(event_id, force=bool(payload.get("force")))
         return jsonify(result), status_code
 
     def api_admin_rclone_check():
-        return jsonify(_rclone_admin_command_application().check())
+        return _rclone_proxy_response(_rclone_admin_command_application().check())
 
     def _rclone_webdav_response(action: Callable[[], dict[str, Any]]):
         try:
             result = action()
         except RcloneWebdavConfigError as exc:
             return jsonify({"success": False, "message": str(exc)}), exc.status_code
+        except RcloneWorkerRequestError as exc:
+            payload = dict(exc.payload)
+            payload.pop("_http_status", None)
+            return jsonify(payload or {"success": False, "message": str(exc)}), exc.status_code
         response = jsonify(result)
         response.headers["Cache-Control"] = "no-store, private, max-age=0"
         response.headers["Pragma"] = "no-cache"
@@ -2632,23 +2800,104 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     def api_admin_rclone_webdav_config():
         return _rclone_webdav_response(
-            lambda: rclone_webdav_config_service.status(request.args.get("remote_name"))
+            lambda: (
+                rclone_worker_client.webdav_status(request.args.get("remote_name"))
+                if rclone_worker_client is not None
+                else rclone_webdav_config_service.status(request.args.get("remote_name"))
+            )
         )
 
     def api_admin_rclone_webdav_config_update():
         payload = request.get_json(silent=True)
         return _rclone_webdav_response(
-            lambda: rclone_webdav_config_service.save({} if payload is None else payload)
+            lambda: (
+                rclone_worker_client.webdav_save({} if payload is None else payload)
+                if rclone_worker_client is not None
+                else rclone_webdav_config_service.save({} if payload is None else payload)
+            )
         )
 
     def api_admin_rclone_webdav_config_test():
         payload = request.get_json(silent=True) or {}
         return _rclone_webdav_response(
-            lambda: rclone_webdav_config_service.test(payload.get("remote_name"))
+            lambda: (
+                rclone_worker_client.webdav_test(payload.get("remote_name"))
+                if rclone_worker_client is not None
+                else rclone_webdav_config_service.test(payload.get("remote_name"))
+            )
         )
 
     def _rclone_admin_command_application() -> RcloneAdminCommandService:
-        return RcloneAdminCommandService(RcloneAdminCommandDependencies(rclone=rclone_service))
+        return RcloneAdminCommandService(RcloneAdminCommandDependencies(rclone=rclone_controller))
+
+    def _rclone_worker_payload() -> dict[str, Any]:
+        payload = request.get_json(silent=True)
+        return payload if isinstance(payload, dict) else {}
+
+    def _rclone_worker_webdav_response(action: Callable[[], dict[str, Any]]):
+        try:
+            return jsonify(action())
+        except RcloneWebdavConfigError as exc:
+            return jsonify({"success": False, "message": str(exc)}), exc.status_code
+
+    def _rclone_worker_cancel_job():
+        payload = _rclone_worker_payload()
+        job_id = _safe_int_value(payload.get("job_id"), 0)
+        if job_id <= 0 or job_id > 999999999:
+            return jsonify({"success": False, "message": "缺少有效的 rclone Job ID"}), 400
+        return jsonify(
+            rclone_service.cancel_job(
+                job_id,
+                stop_running=bool(payload.get("stop_running")),
+            )
+        )
+
+    def _rclone_worker_control_handlers() -> dict[str, Callable[..., Any]]:
+        return {
+            "worker_status": lambda: jsonify(_local_worker_system_status()),
+            "status": lambda: jsonify({"success": True, "status": rclone_service.status()}),
+            "logs": lambda: jsonify(
+                {
+                    "success": True,
+                    "items": rclone_service.get_logs(
+                        limit=_safe_int(request.args.get("limit"), 200, 1, 1000)
+                    ),
+                }
+            ),
+            "start": lambda: jsonify(
+                rclone_service.start(
+                    reason=str(_rclone_worker_payload().get("reason") or "remote_control"),
+                    file_retry=_rclone_worker_payload().get("file_retry"),
+                    category_filter=str(_rclone_worker_payload().get("category_filter") or ""),
+                    staging_run=_rclone_worker_payload().get("staging_run"),
+                )
+            ),
+            "stop": lambda: jsonify(rclone_service.stop()),
+            "check": lambda: jsonify(rclone_service.check_environment()),
+            "cancel_job": _rclone_worker_cancel_job,
+            "cleanup_cancelled_task": lambda: jsonify(
+                rclone_service.cleanup_cancelled_task(**_rclone_worker_payload())
+            ),
+            "file_retry": lambda: jsonify(
+                rclone_service.start_file_retry(
+                    _rclone_worker_payload().get("file_event")
+                    if isinstance(_rclone_worker_payload().get("file_event"), dict)
+                    else {}
+                )
+            ),
+            "runtime_reload": lambda: jsonify(_reload_runtime_config()),
+            "webdav_config": lambda: _rclone_worker_webdav_response(
+                lambda: rclone_webdav_config_service.status(request.args.get("remote_name"))
+            ),
+            "webdav_config_update": lambda: _rclone_worker_webdav_response(
+                lambda: rclone_webdav_config_service.save(_rclone_worker_payload())
+            ),
+            "webdav_config_test": lambda: _rclone_worker_webdav_response(
+                lambda: rclone_webdav_config_service.test(
+                    _rclone_worker_payload().get("remote_name")
+                )
+            ),
+        }
 
     def api_admin_organizer_tasks():
         page, per_page, offset = _page_args(50, 200)
@@ -3992,18 +4241,20 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return jsonify(MediaAdminCommandService(MediaAdminCommandDependencies(imports=import_service, client=fnos, directory_required_message=ImportService.FNOS_DIR_REQUIRED_MESSAGE, worker_dispatcher=worker_task_dispatcher)).refresh({"category": category}))
 
     def api_rclone_status():
-        return jsonify(_rclone_admin_query_application().status())
+        return _rclone_proxy_response(_rclone_admin_query_application().status())
 
     def api_rclone_start():
         payload = request.get_json(silent=True) or {}
-        return jsonify(_rclone_admin_command_application().start(payload, default_reason="manual"))
+        return _rclone_proxy_response(
+            _rclone_admin_command_application().start(payload, default_reason="manual")
+        )
 
     def api_rclone_stop():
-        return jsonify(_rclone_admin_command_application().stop())
+        return _rclone_proxy_response(_rclone_admin_command_application().stop())
 
     def api_rclone_logs():
         limit = _safe_int(request.args.get("limit"), 200, 1, 1000)
-        return jsonify(_rclone_admin_query_application().logs(limit))
+        return _rclone_proxy_response(_rclone_admin_query_application().logs(limit))
 
     def api_rclone_runs():
         page, per_page, offset = _page_args(50, 200)
@@ -4031,7 +4282,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         )
 
     def api_rclone_check():
-        return jsonify(_rclone_admin_command_application().check())
+        return _rclone_proxy_response(_rclone_admin_command_application().check())
 
     def api_quark_check():
         payload = request.get_json(silent=True) or {}
@@ -4248,7 +4499,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         create_system_blueprint(
             SystemRouteContext(
                 app_name=lambda: app_config.app_name or APP_NAME,
-                readiness_probe=lambda: db.get_app_settings(),
+                readiness_status=readiness_service.status,
                 dependency_status=_admin_system_status,
                 admin_required=admin_required,
                 log_readiness_error=lambda exc: app.logger.exception("readiness check failed", exc_info=exc),
@@ -4318,6 +4569,15 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             )
         )
     )
+    if role_runs(active_process_role, "worker"):
+        app.register_blueprint(
+            create_rclone_worker_control_blueprint(
+                RcloneWorkerControlContext(
+                    token=lambda: os.getenv("RCLONE_WORKER_CONTROL_TOKEN", ""),
+                    handlers=_rclone_worker_control_handlers(),
+                )
+            )
+        )
     app.register_blueprint(
         create_organizer_blueprint(
             OrganizerRouteContext(
@@ -4626,6 +4886,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         app.extensions["rclone_startup_recovery_timer"] = recovery_timer
         atexit.register(recovery_timer.cancel)
         recovery_timer.start()
+        if worker_watchdog is not None:
+            worker_watchdog.start()
     return app
 
 

@@ -43,7 +43,7 @@ class RcloneProcessRunner:
                 on_line(line.rstrip("\n"))
             exit_code = process.wait()
         except FileNotFoundError as exc:
-            return ProcessResult(127, f"无法启动脚本，请确认 sh、docker 等命令已安装：{exc}")
+            return ProcessResult(127, f"无法启动脚本，请确认 sh 和 rclone 等命令已安装：{exc}")
         except Exception as exc:  # noqa: BLE001
             return ProcessResult(1, f"rclone 搬运任务执行异常：{exc}")
 

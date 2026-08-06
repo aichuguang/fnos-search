@@ -5,6 +5,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from ..database import utc_now
+from ..process_role import role_runs
 
 from .update_values import as_bool
 
@@ -26,6 +27,7 @@ class UpdateScheduler:
         max_subscriptions_per_tick: int = 5,
         coalesce_missed_runs: bool = True,
         owner_id: str = "",
+        process_role: str = "all",
     ) -> None:
         self.service = service
         self.interval_seconds = max(30, int(interval_seconds or 60))
@@ -37,10 +39,11 @@ class UpdateScheduler:
         self.last_run_at = ""
         self.last_error = ""
         self.owner_id = str(owner_id or f"update-scheduler-{id(self)}")
+        self.process_role = str(process_role or "all")
         self.lease_name = "update-subscription-scheduler"
 
     def start(self) -> None:
-        if not self.enabled or (self.thread and self.thread.is_alive()):
+        if not role_runs(self.process_role, "scheduler") or not self.enabled or (self.thread and self.thread.is_alive()):
             return
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._loop, name=self.lease_name, daemon=True)
