@@ -85,6 +85,7 @@ class Database(DatabaseDomainMixin):
                 # 保留空迁移可同时兼容这些历史数据库和全新安装。
                 Migration(20, "reserved_organizer_multi_resource_movies", lambda connection: None),
                 Migration(21, "storage_destination_columns", self._apply_storage_destination_migration),
+                Migration(22, "v1_accounts_openlist_targets_rules", self._apply_v1_accounts_openlist_migration),
             )
         )
 
@@ -131,6 +132,126 @@ class Database(DatabaseDomainMixin):
         self._ensure_column(conn, "import_jobs", "plan_version", "INTEGER")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_destination_id ON import_jobs(destination_id)"
+        )
+
+    def _apply_v1_accounts_openlist_migration(self, conn: sqlite3.Connection) -> None:
+        """V1.0 统一账号体系、OpenList 连接/挂载、存储目标与来源规则表。"""
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS provider_accounts (
+              account_id TEXT PRIMARY KEY,
+              provider_kind TEXT NOT NULL,
+              name TEXT NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              current_revision INTEGER NOT NULL DEFAULT 0,
+              identity_hint TEXT NOT NULL DEFAULT '',
+              last_test_status TEXT NOT NULL DEFAULT 'untested',
+              last_test_message TEXT NOT NULL DEFAULT '',
+              last_tested_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_accounts_kind ON provider_accounts(provider_kind);
+
+            CREATE TABLE IF NOT EXISTS provider_account_revisions (
+              account_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              config_json TEXT NOT NULL,
+              credentials_ciphertext BLOB NOT NULL,
+              credential_key_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (account_id, revision),
+              FOREIGN KEY (account_id) REFERENCES provider_accounts(account_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_account_selections (
+              provider_kind TEXT NOT NULL,
+              scope TEXT NOT NULL DEFAULT 'default',
+              account_id TEXT NOT NULL,
+              account_revision INTEGER NOT NULL,
+              selection_revision INTEGER NOT NULL DEFAULT 1,
+              selected_at TEXT NOT NULL,
+              PRIMARY KEY (provider_kind, scope),
+              FOREIGN KEY (account_id) REFERENCES provider_accounts(account_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS openlist_connections (
+              connection_id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              base_url TEXT NOT NULL,
+              username TEXT NOT NULL,
+              password_ciphertext BLOB NOT NULL,
+              credential_key_id TEXT NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              revision INTEGER NOT NULL DEFAULT 1,
+              last_test_status TEXT NOT NULL DEFAULT 'untested',
+              last_tested_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS openlist_mounts (
+              mount_id TEXT PRIMARY KEY,
+              connection_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              provider_kind TEXT,
+              account_id TEXT,
+              webdav_root TEXT NOT NULL,
+              namespace_id TEXT NOT NULL,
+              readable INTEGER NOT NULL DEFAULT 0,
+              writable INTEGER NOT NULL DEFAULT 0,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              revision INTEGER NOT NULL DEFAULT 1,
+              identity_status TEXT NOT NULL DEFAULT 'unverified',
+              last_tested_at TEXT,
+              FOREIGN KEY (connection_id) REFERENCES openlist_connections(connection_id),
+              FOREIGN KEY (account_id) REFERENCES provider_accounts(account_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_openlist_mounts_connection ON openlist_mounts(connection_id);
+            CREATE INDEX IF NOT EXISTS idx_openlist_mounts_account ON openlist_mounts(account_id);
+
+            CREATE TABLE IF NOT EXISTS storage_targets (
+              destination_id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              provider_kind TEXT NOT NULL,
+              account_scope TEXT,
+              target_kind TEXT NOT NULL DEFAULT 'provider',
+              enabled INTEGER NOT NULL DEFAULT 1,
+              audience TEXT NOT NULL DEFAULT 'admin',
+              current_revision INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS storage_target_revisions (
+              destination_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              categories_json TEXT NOT NULL,
+              display_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (destination_id, revision),
+              FOREIGN KEY (destination_id) REFERENCES storage_targets(destination_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS source_destination_rules (
+              rule_id TEXT PRIMARY KEY,
+              source_provider_kind TEXT NOT NULL,
+              source_form TEXT NOT NULL,
+              category_key TEXT NOT NULL,
+              destination_id TEXT NOT NULL,
+              guest_allowed INTEGER NOT NULL DEFAULT 0,
+              admin_allowed INTEGER NOT NULL DEFAULT 1,
+              is_default INTEGER NOT NULL DEFAULT 0,
+              priority INTEGER NOT NULL DEFAULT 100,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              FOREIGN KEY (destination_id) REFERENCES storage_targets(destination_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_rules_source ON source_destination_rules(source_provider_kind, source_form);
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storage_targets_provider ON storage_targets(provider_kind)"
         )
 
     def _apply_worker_task_migration(self, conn: sqlite3.Connection) -> None:
