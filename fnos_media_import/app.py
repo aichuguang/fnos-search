@@ -3340,6 +3340,37 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             storage_probe=storage_target_probe_service.probe,
         )
     )
+    from .accounts.crypto import MasterKeyMissingError, master_key_from_env
+    from .accounts.service import ProviderAccountService
+    from .accounts.blueprint import accounts_blueprint_for_service
+    from .openlist.connection_service import OpenListConnectionService
+    from .openlist.mount_service import OpenListMountService
+    from .openlist.blueprint import OpenListRouteContext, create_openlist_blueprint, default_handlers
+    from .storage.target_service import StorageTargetService
+    from .storage.rules_service import DestinationRulesService
+    from .storage.blueprint import StorageBlueprintContext, create_storage_blueprint
+
+    def _v1_master_key() -> bytes:
+        try:
+            return master_key_from_env()
+        except MasterKeyMissingError as exc:
+            app.logger.warning("V1.0 账号/OpenList 主密钥未配置：%s", exc)
+            return b""
+
+    v1_accounts_service = ProviderAccountService(db, _v1_master_key)
+    v1_openlist_connections = OpenListConnectionService(db, _v1_master_key)
+    v1_openlist_mounts = OpenListMountService(db, connection_service=v1_openlist_connections)
+    v1_target_service = StorageTargetService(
+        db,
+        openlist_dir_lister=lambda mount_id, path: v1_openlist_mounts.list_mountable_dirs(mount_id, path)
+        if mount_id
+        else [],
+    )
+    v1_rules_service = DestinationRulesService(db, v1_target_service)
+    app.extensions["v1_accounts_service"] = v1_accounts_service
+    app.extensions["v1_openlist_mounts"] = v1_openlist_mounts
+    app.extensions["v1_target_service"] = v1_target_service
+    app.extensions["v1_rules_service"] = v1_rules_service
     notification_settings_service = NotificationSettingsService(
         db=db,
         public_base_url=lambda: request.host_url.rstrip("/"),
@@ -3413,7 +3444,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return _settings_response(settings_service.storage_update(payload))
 
     def api_public_storage_targets():
-        return _settings_response(settings_service.public_storage_targets())
+        # V1.0：访客不选择保存路径（由管理员按搜索源分配），该端点保持空响应。
+        return jsonify({"success": True, "targets": []}), 200
 
     def _notification_response(result: tuple[dict[str, Any], int]):
         body, status_code = result
@@ -4609,6 +4641,24 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 storage_test=api_admin_settings_storage_test,
                 storage_update=api_admin_settings_storage_update,
                 public_storage_targets=api_public_storage_targets,
+            )
+        )
+    )
+    app.register_blueprint(accounts_blueprint_for_service(v1_accounts_service, admin_required))
+    app.register_blueprint(
+        create_openlist_blueprint(
+            OpenListRouteContext(
+                admin_required=admin_required,
+                handlers=default_handlers(v1_openlist_connections, v1_openlist_mounts),
+            )
+        )
+    )
+    app.register_blueprint(
+        create_storage_blueprint(
+            StorageBlueprintContext(
+                admin_required=admin_required,
+                target_service=v1_target_service,
+                rules_service=v1_rules_service,
             )
         )
     )
