@@ -28,6 +28,16 @@ from ..constants import (
     ROUTE_QUARK_TO_MOBILE,
     ROUTE_SIXPAN_OFFLINE,
 )
+from .import_planner import (
+    build_execution_plan,
+    destination_scoped_idempotency_key,
+    destination_strategy,
+    execution_plan_from_job,
+    provider_target_from_plan,
+    resolve_destination_id,
+    StoragePlanError,
+    validated_execution_plan_from_job,
+)
 from .import_staging_service import staging_plan_from_job, validated_staging_plan_from_job
 
 
@@ -88,6 +98,41 @@ class ImportJobCreationService:
         category_label = category.get("label", category_key)
         link = self.detect_link(url, self.config.raw.get("routes", {}), password=password)
         source_url = self.job_source_url(link.url, payload)
+        raw_config = self._raw_config()
+        requested_destination = str(payload.get("destination_id") or "").strip()
+        explicit_destination = bool(requested_destination)
+        resolved_destination = resolve_destination_id(raw_config, requested_destination)
+        if explicit_destination and not resolved_destination:
+            raise ValueError(f"存储目标不存在、已禁用或当前不可用：{requested_destination}")
+
+        # Legacy ingress remains version-2 until its source/target adapter is
+        # implemented.  For Quark and Cloud139, however, an enabled default is
+        # an actual user intent and an unsupported matrix entry must fail closed.
+        legacy_ingress = link.route in {ROUTE_SIXPAN_OFFLINE, ROUTE_CLOUD189_DIRECT}
+        destination_id: str | None = None
+        plan_version: int | None = None
+        selected_strategy = ""
+        if resolved_destination and link.supported:
+            try:
+                _driver_kind, selected_strategy = destination_strategy(
+                    raw_config=raw_config,
+                    route=link.route,
+                    source_kind=link.source_type,
+                    category_key=category_key,
+                    category=category,
+                    destination_id=resolved_destination,
+                )
+            except StoragePlanError as exc:
+                if explicit_destination or not legacy_ingress:
+                    raise ValueError(str(exc)) from exc
+                selected_strategy = ""
+            if selected_strategy == "manual_review":
+                if explicit_destination or not legacy_ingress:
+                    raise ValueError("当前来源与所选存储目标没有已验证的传输策略")
+            elif selected_strategy:
+                destination_id = resolved_destination
+                plan_version = 3
+
         target_path = self.target_path(link.route, category, request_payload=payload)
         job_id, created = self.database.create_job({
             "title": title,
@@ -108,16 +153,21 @@ class ImportJobCreationService:
                     "attempt": 0,
                 },
             },
-            "idempotency_key": payload.get("idempotency_key"),
+            "idempotency_key": destination_scoped_idempotency_key(
+                payload.get("idempotency_key"), destination_id
+            ) or None,
             "idempotency_payload": {
                 "url": source_url,
                 "category": category_key,
+                "destination_id": destination_id,
                 "quark_selection": payload.get("quark_selection"),
                 "cloud139_selection": payload.get("cloud139_selection"),
                 "sixpan_selection": payload.get("sixpan_selection"),
             },
             "config_revision": payload.get("config_revision") or 1,
             "executor_id": payload.get("executor_id") or "web",
+            "destination_id": destination_id,
+            "plan_version": plan_version,
         })
         if not created:
             return {
@@ -140,7 +190,42 @@ class ImportJobCreationService:
                 "message": link.reason if changed else "任务状态已变化，未写入暂不支持状态",
                 "success": False,
             }
-        if self.staging_plan:
+        execution_plan: dict[str, Any] | None = None
+        if plan_version == 3:
+            try:
+                execution_plan = self._persist_execution_plan(
+                    job_id,
+                    route=link.route,
+                    source_kind=link.source_type,
+                    category_key=category_key,
+                    category=category,
+                    destination_id=destination_id,
+                )
+                planned_target = provider_target_from_plan(execution_plan, link.route)
+                if not planned_target:
+                    raise StoragePlanError("执行计划缺少来源/Provider 目标路径")
+                target_path = planned_target
+                current = self.database.get_job(job_id) or {}
+                raw_data = current.get("raw_data") if isinstance(current.get("raw_data"), dict) else {}
+                if not _update_created_job(
+                    self.database,
+                    job_id,
+                    target_path=target_path,
+                    raw_data={**raw_data, "execution_plan": execution_plan},
+                ):
+                    raise StoragePlanError("任务状态已变化，未固化 v3 执行计划")
+            except Exception as exc:  # noqa: BLE001
+                message = f"新任务 v3 执行计划失败：{exc}"
+                _mark_creation_failed(self.database, job_id, message)
+                self.database.add_event(job_id, EVENT_ERROR, message)
+                return {
+                    "job": self.database.get_job(job_id),
+                    "created": True,
+                    "message": message,
+                    "success": False,
+                    "plan_error": True,
+                }
+        elif self.staging_plan:
             try:
                 plan = self.staging_plan(
                     job_id=job_id,
@@ -224,6 +309,17 @@ class ImportJobCreationService:
                     f"已分配任务级暂存目录：{provider_target}",
                     {"staging_plan": plan},
                 )
+        if selected_strategy == "manual_review":
+            message = "当前来源与所选存储目标需要人工处理，未调用网盘接口"
+            _mark_creation_failed(self.database, job_id, message, status=JOB_UNSUPPORTED)
+            self.database.add_event(job_id, EVENT_WARN, message)
+            return {
+                "job": self.database.get_job(job_id),
+                "created": True,
+                "message": message,
+                "success": False,
+                "manual_review": True,
+            }
         if link.route in {
             ROUTE_QUARK_TO_MOBILE,
             ROUTE_CLOUD139_DIRECT,
@@ -276,6 +372,44 @@ class ImportJobCreationService:
             "success": False,
         }
 
+    def _raw_config(self) -> dict[str, Any]:
+        return getattr(self.config, "raw", {}) if self.config is not None else {}
+
+    def _staging_enabled(self) -> bool:
+        raw = self._raw_config()
+        organizer = raw.get("organizer") if isinstance(raw.get("organizer"), dict) else {}
+        return bool(organizer.get("enabled", False) and organizer.get("staging_enabled", True))
+
+    def _staging_dir_name(self) -> str:
+        raw = self._raw_config()
+        organizer = raw.get("organizer") if isinstance(raw.get("organizer"), dict) else {}
+        return str(organizer.get("staging_dir_name") or "_入库暂存")
+
+    def _persist_execution_plan(
+        self,
+        job_id: int,
+        *,
+        route: str,
+        source_kind: str,
+        category_key: str,
+        category: dict[str, Any],
+        destination_id: str | None,
+    ) -> dict[str, Any]:
+        plan = build_execution_plan(
+            raw_config=self._raw_config(),
+            route=route,
+            source_kind=source_kind,
+            category_key=category_key,
+            category=category,
+            job_id=job_id,
+            destination_id=destination_id,
+            staging_enabled=self._staging_enabled(),
+            staging_dir_name=self._staging_dir_name(),
+        )
+        if not plan:
+            raise StoragePlanError("未生成执行计划")
+        return plan
+
 
 class ImportJobRetryService:
     """Rebuilds provider submission arguments from a persisted import job."""
@@ -299,6 +433,25 @@ class ImportJobRetryService:
         job = self.database.get_job(job_id)
         if not job:
             raise ValueError("任务不存在")
+        try:
+            persisted_plan_version = int(job.get("plan_version") or 0)
+        except (TypeError, ValueError) as exc:
+            message = f"任务 plan_version 无效，已停止重试：{exc}"
+            self.database.add_event(job_id, EVENT_WARN, message)
+            return {"job": job, "created": False, "message": message, "success": False, "manual_review": True}
+        v3_plan: dict[str, Any] = {}
+        if persisted_plan_version >= 3:
+            try:
+                v3_plan = validated_execution_plan_from_job(job)
+            except (ValueError, StoragePlanError) as exc:
+                message = f"持久化 v3 执行计划无效，已拒绝重试：{exc}"
+                self.database.add_event(job_id, EVENT_WARN, message)
+                return {"job": job, "created": False, "message": message, "success": False, "manual_review": True}
+            strategy = str((v3_plan.get("transfer") or {}).get("strategy") or "").strip().lower()
+            if strategy == "manual_review":
+                message = "该 v3 任务没有可自动执行的传输策略，已保留人工处理"
+                self.database.add_event(job_id, EVENT_WARN, message)
+                return {"job": job, "created": False, "message": message, "success": False, "manual_review": True}
         current_status = str(job.get("status") or "").strip().lower()
         if current_status == JOB_CANCELLED:
             message = "任务已取消，如需重新入库请重新提交资源"
@@ -394,7 +547,7 @@ class ImportJobRetryService:
 
         self.database.add_event(job_id, EVENT_INFO, "手动重试任务")
         route = job["target_route"]
-        if staging_plan_from_job(job):
+        if not v3_plan and staging_plan_from_job(job):
             try:
                 validated_staging_plan_from_job(job)
             except ValueError as exc:
@@ -406,7 +559,19 @@ class ImportJobRetryService:
                     "message": message,
                     "success": False,
                 }
-        if self._requires_persisted_staging_plan(job, route):
+        if not v3_plan and execution_plan_from_job(job):
+            try:
+                validated_execution_plan_from_job(job)
+            except ValueError as exc:
+                message = f"持久化执行计划不完整，已拒绝重试：{exc}"
+                self.database.add_event(job_id, EVENT_WARN, message)
+                return {
+                    "job": job,
+                    "created": False,
+                    "message": message,
+                    "success": False,
+                }
+        if not v3_plan and self._requires_persisted_staging_plan(job, route):
             message = (
                 "当前已启用新任务级暂存，但该任务没有固化 staging_plan；"
                 "为避免重新写入旧目录，已拒绝重试，请重新提交为新任务"
@@ -522,6 +687,11 @@ class ImportJobRetryService:
             planned = str(plan.get("provider_target_path") or "").strip()
             if planned:
                 return planned
+        execution = execution_plan_from_job(job)
+        if execution:
+            derived = provider_target_from_plan(execution, str(job.get("target_route") or ""))
+            if derived:
+                return derived
         return str(job.get("target_path") or "")
 
     def _requires_persisted_staging_plan(self, job: dict[str, Any], route: str) -> bool:
@@ -666,6 +836,24 @@ def _update_created_job(database: Any, job_id: int, **updates: Any) -> bool:
     if not callable(updater):
         return False
     return bool(updater(job_id, {JOB_CREATED}, **updates))
+
+
+def _mark_creation_failed(
+    database: Any,
+    job_id: int,
+    message: str,
+    *,
+    status: str = JOB_FAILED,
+) -> bool:
+    current = database.get_job(job_id) or {}
+    raw_data = current.get("raw_data") if isinstance(current.get("raw_data"), dict) else {}
+    return _update_created_job(
+        database,
+        job_id,
+        status=status,
+        error_message=message,
+        raw_data={**raw_data, "execution_plan_error": message},
+    )
 
 
 def _has_not_started_provider_fence(job: dict[str, Any]) -> bool:

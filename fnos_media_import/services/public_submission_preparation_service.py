@@ -39,6 +39,7 @@ class PublicSubmissionPreparationService:
         detect_link: Callable[..., Any],
         security_config: Callable[[], dict[str, Any]],
         config_int: Callable[[dict[str, Any], str, int], int],
+        validate_destination: Callable[..., str | None] | None = None,
     ) -> None:
         self.search_cache = search_cache
         self.categories = categories
@@ -52,6 +53,7 @@ class PublicSubmissionPreparationService:
         self.detect_link = detect_link
         self.security_config = security_config
         self.config_int = config_int
+        self.validate_destination = validate_destination
 
     def prepare(self, payload: dict[str, Any]) -> PreparedPublicSubmission:
         security = self.security_config()
@@ -77,6 +79,24 @@ class PublicSubmissionPreparationService:
         )
         cached = self.search_cache(public_id) if public_id else None
         prepared = dict(payload)
+        # Public callers select only a server-side destination profile.  Any
+        # path, driver or credential-shaped fields must be ignored before the
+        # payload can reach legacy provider adapters.
+        for field in (
+            "driver",
+            "backend",
+            "remote",
+            "root",
+            "absolute_path",
+            "target_path",
+            "target_path_override",
+            "cloud139_target_path_override",
+            "context",
+            "update_context",
+            "organizer_context",
+            "target_root_is_resource",
+        ):
+            prepared.pop(field, None)
         if cached:
             self._apply_cached_resource(prepared, cached, manual_title, manual_password)
         elif not prepared.get("url"):
@@ -124,6 +144,22 @@ class PublicSubmissionPreparationService:
             raise PublicSubmissionPreparationError("资源分类不能为空")
         if category_key not in self.categories():
             raise PublicSubmissionPreparationError("资源分类不存在")
+        requested_destination = str(prepared.get("destination_id") or "").strip()
+        if self.validate_destination is not None:
+            try:
+                prepared["destination_id"] = self.validate_destination(
+                    requested=requested_destination,
+                    route=link.route,
+                    source_kind=link.source_type,
+                    category_key=category_key,
+                    category=self.category(category_key),
+                )
+            except ValueError as exc:
+                raise PublicSubmissionPreparationError(str(exc), 400) from exc
+        elif requested_destination:
+            prepared["destination_id"] = requested_destination
+        else:
+            prepared["destination_id"] = None
         return PreparedPublicSubmission(
             public_id=public_id,
             payload=prepared,

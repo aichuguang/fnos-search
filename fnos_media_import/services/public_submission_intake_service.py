@@ -53,6 +53,7 @@ class PublicSubmissionIntakeService:
             within_minutes=self.duplicate_minutes(),
             enabled=self.duplicate_enabled(),
             scoped_selection=prepared.scoped_selection,
+            destination_id=str(prepared.payload.get("destination_id") or "").strip() or None,
         )
         if duplicate:
             return PublicSubmissionIntakeResult(preflight={}, response=duplicate)

@@ -7,7 +7,9 @@ from typing import Any, Callable, Protocol
 class GuestRequestQueries(Protocol):
     def get(self, request_id: int) -> dict[str, Any] | None: ...
     def get_by_token(self, request_token: str) -> dict[str, Any] | None: ...
-    def find_recent_by_url(self, *, source_url: str, category: str, within_minutes: int) -> dict[str, Any] | None: ...
+    def find_recent_by_url(
+        self, *, source_url: str, category: str, within_minutes: int, destination_id: str | None = None
+    ) -> dict[str, Any] | None: ...
 
 
 class GuestRequestCommands(Protocol):
@@ -41,12 +43,21 @@ class PublicSubmissionService:
         within_minutes: int,
         enabled: bool,
         scoped_selection: bool,
+        destination_id: str | None = None,
     ) -> dict[str, Any] | None:
         if not enabled or scoped_selection:
             return None
-        duplicate = self._deps.queries.find_recent_by_url(
-            source_url=source_url, category=category, within_minutes=within_minutes
-        )
+        try:
+            duplicate = self._deps.queries.find_recent_by_url(
+                source_url=source_url,
+                category=category,
+                within_minutes=within_minutes,
+                destination_id=str(destination_id or "").strip() or None,
+            )
+        except TypeError:
+            duplicate = self._deps.queries.find_recent_by_url(
+                source_url=source_url, category=category, within_minutes=within_minutes
+            )
         if not duplicate:
             return None
         duplicate = self._deps.sync_request(duplicate)

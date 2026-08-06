@@ -21,6 +21,44 @@ admin:
 
 rclone: {}
 
+# 可选：存储目标注册表（v3）。首版保留旧 cmcc_upload / cloud139 / 分类路径字段，
+# 旧配置会自动物化为只读 mobile_main 目标。新目标实例可在这里或后台高级配置中添加。
+# storage:
+#   enabled: true
+#   plan_version: 3
+#   default_target: mobile_main
+#   targets:
+#     mobile_main:
+#       name: 移动云主盘
+#       driver: cmcc_api
+#       enabled: true
+#       guest_selectable: true
+#       namespace_id: cmcc:primary
+#       # 声明该目标与 Cloud139 来源适配器使用同一账号，可走原生转存。
+#       native_ingress: cloud139_direct
+#       host: "https://personal-kd-njs.yun.139.com/hcy"
+#       auth_mode: web_basic
+#       access_token: "<secret>"
+#       phone: "<secret>"
+#       upload_mode: rapid_first
+#       rename_mode: auto_rename
+#       categories:
+#         movie:
+#           final_root: 电影
+#           organizer_namespace_id: openlist:main
+#           organizer_root: /移动云盘A/电影
+#     quark_archive:
+#       name: 夸克归档盘
+#       driver: rclone
+#       enabled: true
+#       guest_selectable: false
+#       remote: quark_dst
+#       categories:
+#         movie:
+#           final_root: 影视/电影
+#           organizer_namespace_id: openlist:main
+#           organizer_root: /夸克归档/影视/电影
+
 submission:
   # auto=支持自动入库；review=全部进入审核；mixed=异常资源进入审核
   mode: "auto"

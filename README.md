@@ -205,6 +205,7 @@ cp .env.example .env
 | `RCLONE_CONFIG_HOST_PATH` | `./rclone/config` | 强烈建议确认 | `rclone.conf` 持久化目录，保存 OpenList WebDAV Remote 配置。 |
 | `RCLONE_CACHE_HOST_PATH` | `./rclone/cache` | 按需 | rclone 缓存目录，可清理，但运行中不要删除。 |
 | `RCLONE_TEMP_HOST_PATH` | `./rclone/temp` | 建议配置 | 搬运完整媒体文件的临时目录，应放在空间充足的磁盘。 |
+| `RCLONE_LOCAL_STORAGE_HOST_PATH` | `./rclone/local-storage` | 按需 | 本地存储目标的宿主机挂载目录，挂载到 Worker 的 `/storage-targets`。仅当使用本地文件夹目标时配置，必须指向预先挂载的独立目录，不能复用 `APP_DATA_HOST_PATH`。 |
 | `APP_SECRET_KEY` | 空，自动生成 | 新部署不要填写 | Flask 会话签名密钥。留空时首次启动自动生成并保存到 `app.db`；旧部署显式配置过时必须保持原值。 |
 | `NOTIFICATION_ENCRYPTION_KEY` | 空，自动生成 | 新部署不要填写 | SMTP、Webhook 等通知凭据的加密密钥。留空时生成并保存到数据目录的 `.secrets`；旧部署显式配置过时必须保持原值。 |
 | `RCLONE_WORKER_CONTROL_TOKEN` | 空，自动生成 | 新部署不要填写 | Web 与独立 rclone Worker 之间的内部 Bearer Token。留空时生成并保存到 `APP_DATA_HOST_PATH/.secrets/rclone_worker_control_token`，重新编排会继续使用原值。 |

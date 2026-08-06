@@ -67,7 +67,10 @@ class RcloneCancelledTaskCleanupService:
         events = list(file_events or [])
         if not events and self.database and job and job.get("id"):
             events = self.database.list_rclone_file_events(job_id=int(job["id"]), limit=200)
-        specs = self.specs_from_events(events)
+        try:
+            specs = self.specs_from_events(events, job=job)
+        except TypeError:
+            specs = self.specs_from_events(events)
         if include_title_matches:
             specs.extend(self.specs_from_title(job=job, request_item=request_item, known_specs=specs))
         specs = self.dedupe_specs(specs)

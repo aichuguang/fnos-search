@@ -911,6 +911,15 @@
                                 <label class="advanced-field"><span>接口地址</span><input id="advCmccHost" type="text" placeholder="https://personal-kd-njs.yun.139.com/hcy"></label>
                             </details>
                         </section>
+                        <section class="settings-card advanced-config-card" data-settings-section="clouds">
+                            <h3>存储目标</h3>
+                            <p class="muted">配置的入库目标实例；测试仅校验配置，不做网络检测。</p>
+                            <div class="filter-row">
+                                <button class="secondary mini" type="button" id="storageTargetsRefreshBtn">刷新</button>
+                            </div>
+                            <div id="storageTargetsStatus" class="notice-box compact" role="status" aria-live="polite">正在读取存储目标。</div>
+                            <div id="storageTargetsBody" class="list-box"></div>
+                        </section>
                         <section class="settings-card advanced-config-card" data-settings-section="transport">
                             <h3>飞牛媒体刷新</h3>
                             <label class="advanced-field"><span>飞牛地址</span><input id="advFnosServerUrl" type="text" placeholder="http://127.0.0.1:5668"></label>

@@ -167,6 +167,7 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
                 "rclone": {},
                 "fnos": {},
                 "security": {"ip_hash_salt": ""},
+                "storage": {"targets": {"mobile_backup": {"driver": "cmcc_api"}}},
             },
             categories={},
         )
@@ -183,8 +184,9 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
         update_service = SimpleNamespace(set_runtime=lambda **_kwargs: None)
         update_scheduler = SimpleNamespace(apply_config=lambda **_kwargs: None)
         trending_scheduler = SimpleNamespace(apply_config=lambda **_kwargs: None)
+        rclone_apply_args: list[tuple] = []
         rclone_service = SimpleNamespace(
-            apply_runtime_config=lambda *_args: None,
+            apply_runtime_config=lambda *args: rclone_apply_args.append(args),
             status=lambda: {"enabled": True},
         )
         service = RuntimeReloadService(
@@ -218,6 +220,7 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
         self.assertNotIn("retire", events)
         self.assertEqual(result.config.raw["app"]["secret_key"], "persisted-runtime-secret")
         self.assertEqual(result.config.raw["security"]["ip_hash_salt"], "persisted-ip-salt")
+        self.assertEqual(rclone_apply_args[-1][-1], {"targets": {"mobile_backup": {"driver": "cmcc_api"}}})
 
 
 if __name__ == "__main__":

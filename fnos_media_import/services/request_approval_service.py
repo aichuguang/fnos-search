@@ -72,6 +72,12 @@ class RequestApprovalService:
             "sixpan_selection": sixpan_selection,
             "quark_selection": self._deps.sanitize_quark_selection(original.get("quark_selection")),
             "cloud139_selection": self._deps.sanitize_cloud139_selection(original.get("cloud139_selection")),
+            # Freeze the guest's selected destination through review.  An admin
+            # may override it explicitly in the approval payload, but an empty
+            # override must never re-resolve the mutable default.
+            "destination_id": str(
+                payload.get("destination_id") or original.get("destination_id") or ""
+            ).strip() or None,
             "idempotency_key": f"guest-request:{request_id}",
             "executor_id": "admin",
         }
@@ -83,7 +89,16 @@ class RequestApprovalService:
         }
         approved_raw = self._deps.merge_raw_data(
             item.get("raw_data"),
-            {"approved_by": admin, "approval": {"status": "approved", "title": title, "category": category}},
+            {
+                "approved_by": admin,
+                "approval": {
+                    "status": "approved",
+                    "title": title,
+                    "category": category,
+                    "destination_id": submit_payload.get("destination_id"),
+                },
+                "request": {**original, "destination_id": submit_payload.get("destination_id")},
+            },
         )
 
         def _emit_approved(conn: Any) -> None:

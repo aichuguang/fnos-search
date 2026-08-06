@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 from .update_values import allowed_choice, non_negative_int, positive_int, positive_int_list, unique_string_list
@@ -16,12 +17,14 @@ class UpdateSubscriptionNormalizer:
         tmdb_basic_hint: Callable[[int, str], dict[str, Any]],
         path_health: Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]],
         normalize_source: Callable[[dict[str, Any]], dict[str, Any]],
+        resolve_destination: Callable[[Any], str | None] | None = None,
     ) -> None:
         self.categories = categories
         self.tmdb_schedule_hint = tmdb_schedule_hint
         self.tmdb_basic_hint = tmdb_basic_hint
         self.path_health = path_health
         self.normalize_source = normalize_source
+        self.resolve_destination = resolve_destination
 
     def normalize(self, payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         category_key = str(payload.get("category") or "anime").strip()
@@ -33,6 +36,20 @@ class UpdateSubscriptionNormalizer:
         if media_type not in {"movie", "tv"}:
             media_type = "movie" if category_key == "movie" else "tv"
         raw_data = dict(payload.get("raw_data")) if isinstance(payload.get("raw_data"), dict) else {}
+        requested_destination = str(
+            payload.get("destination_id") or raw_data.get("destination_id") or ""
+        ).strip()
+        if requested_destination and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", requested_destination):
+            raise ValueError("存储目标 ID 格式不正确")
+        resolved_destination = (
+            self.resolve_destination(requested_destination or None)
+            if callable(self.resolve_destination)
+            else requested_destination or None
+        )
+        if requested_destination and not resolved_destination:
+            raise ValueError(f"存储目标不存在、已禁用或当前不可用：{requested_destination}")
+        if resolved_destination:
+            raw_data["destination_id"] = resolved_destination
         tmdb_hint = self.tmdb_schedule_hint(tmdb_id, media_type, payload)
         tmdb_basic = self.tmdb_basic_hint(tmdb_id, media_type) if media_type == "movie" or not tmdb_hint.get("title") or not tmdb_hint.get("year") else {}
         title = str(tmdb_hint.get("title") or tmdb_basic.get("title") or payload.get("title") or "").strip()

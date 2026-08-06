@@ -84,6 +84,7 @@ class Database(DatabaseDomainMixin):
                 # v20 曾随已撤销的电影多资源实验版本发布到部分数据库，不能复用。
                 # 保留空迁移可同时兼容这些历史数据库和全新安装。
                 Migration(20, "reserved_organizer_multi_resource_movies", lambda connection: None),
+                Migration(21, "storage_destination_columns", self._apply_storage_destination_migration),
             )
         )
 
@@ -123,6 +124,13 @@ class Database(DatabaseDomainMixin):
         )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key ON import_jobs(idempotency_key)"
+        )
+
+    def _apply_storage_destination_migration(self, conn: sqlite3.Connection) -> None:
+        self._ensure_column(conn, "import_jobs", "destination_id", "TEXT")
+        self._ensure_column(conn, "import_jobs", "plan_version", "INTEGER")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_destination_id ON import_jobs(destination_id)"
         )
 
     def _apply_worker_task_migration(self, conn: sqlite3.Connection) -> None:
@@ -570,9 +578,13 @@ class Database(DatabaseDomainMixin):
         source_url: str,
         category: str,
         within_minutes: int = 1440,
+        destination_id: str | None = None,
     ) -> dict[str, Any] | None:
         return self.guest_request_queries.find_recent_by_url(
-            source_url=source_url, category=category, within_minutes=within_minutes
+            source_url=source_url,
+            category=category,
+            within_minutes=within_minutes,
+            destination_id=destination_id,
         )
 
     def create_job(self, data: dict[str, Any]) -> tuple[int, bool]:

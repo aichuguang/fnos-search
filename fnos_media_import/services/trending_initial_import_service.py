@@ -44,6 +44,7 @@ class TrendingInitialImportService:
         sanitize_string_list: Callable[[Any], list[str]] | None = None,
         sanitize_quark_selection: Callable[[Any], dict[str, Any]] | None = None,
         sanitize_cloud139_selection: Callable[[Any], dict[str, Any]] | None = None,
+        resolve_destination: Callable[[Any], str | None] | None = None,
     ) -> None:
         self.repository = repository
         self.search_service = search_service
@@ -60,6 +61,7 @@ class TrendingInitialImportService:
         self.sanitize_string_list = sanitize_string_list or self._safe_string_list
         self.sanitize_quark_selection = sanitize_quark_selection or (lambda _value: {})
         self.sanitize_cloud139_selection = sanitize_cloud139_selection or (lambda _value: {})
+        self.resolve_destination = resolve_destination
 
     def search(
         self,
@@ -301,8 +303,18 @@ class TrendingInitialImportService:
         resource_id = int(resource["id"])
         title = str(candidate.get("title") or resource.get("title") or "").strip()
         selections = self._selection_payload(request_payload)
+        requested_destination = str(request_payload.get("destination_id") or "").strip()
+        destination_id = requested_destination
+        if callable(self.resolve_destination):
+            destination_id = str(self.resolve_destination(requested_destination or None) or "").strip()
+            if requested_destination and not destination_id:
+                raise TrendingInitialImportError(
+                    f"\u5b58\u50a8\u76ee\u6807\u4e0d\u5b58\u5728\u3001\u5df2\u7981\u7528\u6216\u5f53\u524d\u4e0d\u53ef\u7528\uff1a{requested_destination}"
+                )
         selection_text = json.dumps(selections, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(f"{url}\n{category}\n{selection_text}".encode("utf-8")).hexdigest()[:24]
+        digest = hashlib.sha256(
+            f"{url}\n{category}\n{destination_id}\n{selection_text}".encode("utf-8")
+        ).hexdigest()[:24]
         result: dict[str, Any] = {
             "title": title,
             "url": url,
@@ -315,6 +327,8 @@ class TrendingInitialImportService:
             "trending_resource_id": resource_id,
             **selections,
         }
+        if destination_id:
+            result["destination_id"] = destination_id
         if public_id:
             result["trending_public_id"] = public_id
         return result

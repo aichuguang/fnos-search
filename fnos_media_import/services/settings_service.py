@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from ..config_persistence import (
@@ -13,6 +13,9 @@ from ..config_persistence import (
     advanced_config_subset,
     sanitize_advanced_config,
 )
+from ..constants import ROUTE_CLOUD139_DIRECT
+from ..storage.registry import UnknownStorageDriver, get_driver, registered_driver_kinds
+from ..storage.types import StorageTarget, TargetCategoryConfig
 from ..time_utils import utc_now_iso
 
 
@@ -77,6 +80,59 @@ def _restore_previous_config_with_token_deltas(
     return restored
 
 
+def _storage_bool(value: Any, default: bool = False) -> bool:
+    """Parse a YAML/JSON/environment storage boolean without trusting truthiness."""
+
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y", "是", "启用"}
+
+
+def _target_mode_label(target_cfg: dict[str, Any]) -> str:
+    """面向用户的传输方式标签：如实描述，不把跨盘搬运描述成秒转。"""
+
+    driver = str(target_cfg.get("driver") or "").strip().lower()
+    native = str(target_cfg.get("native_ingress") or "").strip().lower()
+    if driver == "cmcc_api":
+        return "原生转存" if native == ROUTE_CLOUD139_DIRECT else "云盘上传"
+    if driver == "rclone":
+        return "跨盘搬运" if str(target_cfg.get("remote") or "").strip() else "本地入库"
+    return "通用目标"
+
+
+def _build_storage_target(destination_id: str, target_cfg: dict[str, Any]) -> StorageTarget:
+    """Materialize a StorageTarget from a raw ``storage.targets.<id>`` dict."""
+
+    categories: dict[str, TargetCategoryConfig] = {}
+    raw_categories = target_cfg.get("categories") if isinstance(target_cfg.get("categories"), dict) else {}
+    for key, cfg in raw_categories.items():
+        if not isinstance(cfg, dict):
+            continue
+        categories[key] = TargetCategoryConfig(
+            final_root=str(cfg.get("final_root") or ""),
+            organizer_namespace_id=str(cfg.get("organizer_namespace_id") or ""),
+            organizer_root=str(cfg.get("organizer_root") or ""),
+        )
+    config = {key: value for key, value in target_cfg.items() if key != "categories"}
+    return StorageTarget(
+        destination_id=destination_id,
+        name=str(target_cfg.get("name") or destination_id),
+        driver=str(target_cfg.get("driver") or ""),
+        enabled=_storage_bool(target_cfg.get("enabled"), True),
+        guest_selectable=_storage_bool(target_cfg.get("guest_selectable"), False),
+        config=config,
+        categories=categories,
+    )
+
+
+def _storage_targets(raw_config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    storage = raw_config.get("storage") if isinstance(raw_config.get("storage"), dict) else {}
+    targets = storage.get("targets") if isinstance(storage.get("targets"), dict) else {}
+    return {key: value for key, value in targets.items() if isinstance(value, dict)}
+
+
 @dataclass(frozen=True)
 class SettingsDependencies:
     db: Any
@@ -89,6 +145,7 @@ class SettingsDependencies:
     effective_settings: Callable[[], dict[str, Any]]
     payload_bool: Callable[[dict[str, Any], str, bool], bool]
     search_providers: Callable[[], list[dict[str, Any]]] = lambda: []
+    storage_probe: Callable[[StorageTarget], dict[str, Any]] | None = None
 
 
 class SettingsService:
@@ -388,6 +445,187 @@ class SettingsService:
             **self.deps.advanced_response(self.deps.raw_config(), self.deps.db.get_app_settings()),
         }
         return response, 200
+
+    def storage_status(self) -> tuple[dict[str, Any], int]:
+        """列出存储目标，只返回白名单字段和驱动能力，绝不返回任何连接凭证。"""
+
+        raw = self.deps.raw_config()
+        storage = raw.get("storage") if isinstance(raw.get("storage"), dict) else {}
+        if not _storage_bool(storage.get("enabled"), False):
+            return {"success": True, "enabled": False, "default_target": "", "targets": []}, 200
+        targets = _storage_targets(raw)
+        default_target = str(storage.get("default_target") or "").strip()
+        items: list[dict[str, Any]] = []
+        for destination_id, target_cfg in targets.items():
+            driver_kind = str(target_cfg.get("driver") or "").strip().lower()
+            capabilities: dict[str, Any] = {}
+            driver_error = ""
+            if driver_kind:
+                try:
+                    driver = get_driver(driver_kind)
+                    target = _build_storage_target(destination_id, target_cfg)
+                    validation_errors = driver.validate(target)
+                    capabilities = asdict(driver.capabilities(target))
+                    if validation_errors:
+                        driver_error = "；".join(validation_errors)
+                except UnknownStorageDriver:
+                    driver_error = f"未知存储驱动：{driver_kind}"
+                except Exception as exc:  # noqa: BLE001
+                    driver_error = str(exc)
+            items.append(
+                {
+                    "destination_id": destination_id,
+                    "name": str(target_cfg.get("name") or destination_id),
+                    "driver": driver_kind,
+                    "enabled": _storage_bool(target_cfg.get("enabled"), True),
+                    "guest_selectable": _storage_bool(target_cfg.get("guest_selectable"), False),
+                    "default": destination_id == default_target,
+                    "mode_label": _target_mode_label(target_cfg),
+                    "capabilities": capabilities,
+                    **({"driver_error": driver_error} if driver_error else {}),
+                }
+            )
+        items.sort(key=lambda item: (not item["enabled"], not item["default"], item["destination_id"]))
+        return {
+            "success": True,
+            "enabled": True,
+            "default_target": default_target,
+            "targets": items,
+        }, 200
+
+    def storage_test(self, destination_id: Any) -> tuple[dict[str, Any], int]:
+        """校验目标配置，并在运行时已接入探测器时执行真实连接检测。"""
+
+        destination_id_text = str(destination_id or "").strip()
+        if not destination_id_text:
+            return {"success": False, "message": "缺少 destination_id"}, 400
+        target_cfg = _storage_targets(self.deps.raw_config()).get(destination_id_text)
+        if not isinstance(target_cfg, dict):
+            return {"success": False, "message": f"存储目标不存在：{destination_id_text}"}, 404
+        driver_kind = str(target_cfg.get("driver") or "").strip().lower()
+        target = _build_storage_target(destination_id_text, target_cfg)
+        try:
+            driver = get_driver(driver_kind)
+        except UnknownStorageDriver:
+            errors = [f"未知存储驱动：{driver_kind}"]
+            return {
+                "success": False,
+                "ok": False,
+                "destination_id": destination_id_text,
+                "errors": errors,
+                "message": "目标配置检查未通过",
+            }, 400
+        errors = driver.validate(target)
+        if not errors and callable(self.deps.storage_probe):
+            try:
+                probe = self.deps.storage_probe(target)
+            except Exception as exc:  # noqa: BLE001
+                probe = {
+                    "success": False,
+                    "ok": False,
+                    "destination_id": destination_id_text,
+                    "checks": [],
+                    "errors": [str(exc)],
+                    "message": "目标连接检测异常",
+                }
+            ok = bool(probe.get("ok"))
+            return {
+                **probe,
+                "success": ok,
+                "ok": ok,
+                "destination_id": destination_id_text,
+                "errors": list(probe.get("errors") or []),
+            }, (200 if ok else 400)
+        ok = not errors
+        return {
+            "success": ok,
+            "ok": ok,
+            "destination_id": destination_id_text,
+            "errors": errors,
+            "message": "目标配置检查通过" if ok else "目标配置检查未通过",
+        }, (200 if ok else 400)
+
+    def storage_update(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """最小更新：修改已有目标的 enabled / guest_selectable，复用高级配置持久化路径。"""
+
+        if not isinstance(payload, dict):
+            return {"success": False, "message": "请求格式不正确"}, 400
+        destination_id = str(payload.get("destination_id") or "").strip()
+        if not destination_id:
+            return {"success": False, "message": "缺少 destination_id"}, 400
+        target_cfg = _storage_targets(self.deps.raw_config()).get(destination_id)
+        if not isinstance(target_cfg, dict):
+            return {"success": False, "message": f"存储目标不存在：{destination_id}"}, 404
+        if "enabled" not in payload and "guest_selectable" not in payload:
+            return {"success": False, "message": "没有可保存的修改"}, 400
+
+        settings = self.deps.db.get_app_settings()
+        current_stored = settings.get(self.deps.advanced_key) if isinstance(settings.get(self.deps.advanced_key), dict) else {}
+        merged_storage = copy.deepcopy(current_stored.get("storage"))
+        if not isinstance(merged_storage, dict):
+            merged_storage = copy.deepcopy(self.deps.raw_config().get("storage"))
+        merged_storage = merged_storage if isinstance(merged_storage, dict) else {}
+        targets = merged_storage.setdefault("targets", {})
+        if not isinstance(targets, dict):
+            targets = {}
+            merged_storage["targets"] = targets
+        target_patch = targets.setdefault(destination_id, {})
+        if not isinstance(target_patch, dict):
+            target_patch = {}
+            targets[destination_id] = target_patch
+        if "enabled" in payload:
+            target_patch["enabled"] = _storage_bool(payload.get("enabled"), _storage_bool(target_patch.get("enabled"), True))
+        if "guest_selectable" in payload:
+            target_patch["guest_selectable"] = _storage_bool(
+                payload.get("guest_selectable"),
+                _storage_bool(target_patch.get("guest_selectable"), False),
+            )
+
+        result, status_code = self.update_advanced({"config": {"storage": merged_storage}})
+        if status_code != 200:
+            return result, status_code
+        return {
+            "success": True,
+            "message": f"存储目标 {destination_id} 已更新",
+            "destination_id": destination_id,
+        }, 200
+
+    def public_storage_targets(self) -> tuple[dict[str, Any], int]:
+        """访客可选的存储目标提示：enabled + guest_selectable + 驱动已注册。"""
+
+        raw = self.deps.raw_config()
+        storage = raw.get("storage") if isinstance(raw.get("storage"), dict) else {}
+        if not _storage_bool(storage.get("enabled"), False):
+            return {"success": True, "targets": []}, 200
+        targets = _storage_targets(raw)
+        default_target = str(storage.get("default_target") or "").strip()
+        known_drivers = registered_driver_kinds()
+        items: list[dict[str, Any]] = []
+        for destination_id, target_cfg in targets.items():
+            if not _storage_bool(target_cfg.get("enabled"), True):
+                continue
+            if not _storage_bool(target_cfg.get("guest_selectable"), False):
+                continue
+            driver_kind = str(target_cfg.get("driver") or "").strip().lower()
+            if driver_kind not in known_drivers:
+                continue
+            try:
+                driver = get_driver(driver_kind)
+                target = _build_storage_target(destination_id, target_cfg)
+                if driver.validate(target):
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            items.append(
+                {
+                    "destination_id": destination_id,
+                    "name": str(target_cfg.get("name") or destination_id),
+                    "default": destination_id == default_target,
+                    "mode_label": _target_mode_label(target_cfg),
+                }
+            )
+        items.sort(key=lambda item: (not item["default"], item["destination_id"]))
+        return {"success": True, "targets": items}, 200
 
     def _normalize_basic_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         public_payload, submission_payload = payload.get("public") or {}, payload.get("submission") or {}

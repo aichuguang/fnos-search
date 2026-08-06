@@ -164,6 +164,7 @@ class RuntimeReloadService:
             config.categories,
             config.raw.get("cmcc_upload", {}),
             config.raw.get("cloud139", {}),
+            config.raw.get("storage", {}),
         )
 
 

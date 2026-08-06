@@ -34,12 +34,15 @@ BASE_SCHEMA_SQL = r"""
                     error_message TEXT,
                     raw_data TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    destination_id TEXT,
+                    plan_version INTEGER
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON import_jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_jobs_source_type ON import_jobs(source_type);
                 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON import_jobs(created_at);
+                CREATE INDEX IF NOT EXISTS idx_jobs_destination_id ON import_jobs(destination_id);
                 DROP INDEX IF EXISTS idx_jobs_unique_source_category;
                 CREATE INDEX IF NOT EXISTS idx_jobs_source_category ON import_jobs(source_url, category);
 

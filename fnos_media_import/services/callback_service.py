@@ -35,6 +35,7 @@ from ..constants import (
     JOB_WAITING_ORGANIZER,
 )
 from .import_staging_service import validated_staging_plan_from_job
+from .import_planner import validated_execution_plan_from_job
 
 
 _IRREVERSIBLE_POST_TRANSFER_STATUSES = frozenset(
@@ -301,6 +302,30 @@ class RcloneCallbackService:
         target_path: str,
     ) -> str:
         raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
+        try:
+            plan_version = int(job.get("plan_version") or 0)
+        except (TypeError, ValueError):
+            return "任务 plan_version 无效，已拒绝 rclone 文件回调"
+        if plan_version >= 3:
+            try:
+                execution = validated_execution_plan_from_job(job)
+            except ValueError as exc:
+                return f"持久化 v3 执行计划无效，已拒绝 rclone 文件回调：{exc}"
+            transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
+            if str(transfer.get("strategy") or "").strip() not in {"rclone_copy", "relay_upload"}:
+                return "当前 v3 任务不是 rclone 传输策略，已拒绝文件回调"
+            paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
+            landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
+            staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
+            source_job_root = _normalize_manifest_path(landing.get("path"))
+            target_job_root = _normalize_manifest_path(staging.get("path"))
+            normalized_source = _normalize_manifest_path(source_path)
+            normalized_target = _normalize_manifest_path(target_path)
+            if not normalized_source or not _path_strictly_under(normalized_source, source_job_root):
+                return "rclone 文件回调越出 v3 来源任务目录，已拒绝确认，源文件应保留"
+            if not normalized_target or not _path_strictly_under(normalized_target, target_job_root):
+                return "rclone 文件回调越出 v3 目标暂存目录，已拒绝确认，源文件应保留"
+            return ""
         raw_plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
         if not raw_plan.get("enabled"):
             return ""
@@ -333,13 +358,30 @@ class RcloneCallbackService:
         run_id: int,
     ) -> tuple[dict[str, Any], int]:
         try:
-            plan = validated_staging_plan_from_job(job)
-        except ValueError as exc:
-            return {"success": False, "message": f"持久化暂存计划无效，已拒绝 rclone 文件清单：{exc}"}, 409
-        if str(plan.get("route") or "").strip().lower() != "quark_to_mobile":
-            return {"success": False, "message": "当前任务不是 Quark 任务级 rclone 暂存线路"}, 409
-
-        job_root = _normalize_manifest_path(plan.get("quark_job_root"))
+            plan_version = int(job.get("plan_version") or 0)
+        except (TypeError, ValueError):
+            plan_version = 0
+        if plan_version >= 3:
+            try:
+                execution = validated_execution_plan_from_job(job)
+            except ValueError as exc:
+                return {"success": False, "message": f"持久化 v3 执行计划无效，已拒绝 rclone 文件清单：{exc}"}, 409
+            transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
+            if str(transfer.get("strategy") or "").strip() not in {"rclone_copy", "relay_upload"}:
+                return {"success": False, "message": "当前 v3 任务不是 rclone 传输线路"}, 409
+            paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
+            landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
+            job_root = _normalize_manifest_path(landing.get("path"))
+        else:
+            try:
+                plan = validated_staging_plan_from_job(job)
+            except ValueError as exc:
+                return {"success": False, "message": f"持久化暂存计划无效，已拒绝 rclone 文件清单：{exc}"}, 409
+            if str(plan.get("route") or "").strip().lower() != "quark_to_mobile":
+                return {"success": False, "message": "当前任务不是 Quark 任务级 rclone 暂存线路"}, 409
+            job_root = _normalize_manifest_path(plan.get("quark_job_root"))
+        if not job_root:
+            return {"success": False, "message": "任务来源根目录为空，已拒绝 rclone 文件清单"}, 409
         raw_paths = payload.get("manifest_paths") if isinstance(payload.get("manifest_paths"), list) else []
         incoming: list[str] = []
         incoming_seen: set[str] = set()

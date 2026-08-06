@@ -23,6 +23,10 @@ class SettingsRouteContext:
     notifications_test: Callable[..., Any] = lambda payload: ({}, 200)
     notifications_deliveries: Callable[..., Any] = lambda payload: ({}, 200)
     notifications_retry: Callable[..., Any] = lambda task_id: ({}, 200)
+    storage_status: Callable[..., Any] = lambda: ({}, 200)
+    storage_test: Callable[..., Any] = lambda payload: ({}, 200)
+    storage_update: Callable[..., Any] = lambda payload: ({}, 200)
+    public_storage_targets: Callable[..., Any] = lambda: ({}, 200)
 
 
 def create_settings_blueprint(context: SettingsRouteContext) -> Blueprint:
@@ -72,5 +76,37 @@ def create_settings_blueprint(context: SettingsRouteContext) -> Blueprint:
         endpoint="notifications_retry",
         view_func=protected(context.notifications_retry),
         methods=["POST"],
+    )
+    blueprint.add_url_rule(
+        "/api/admin/settings/storage/status",
+        endpoint="storage_status",
+        view_func=protected(context.storage_status),
+        methods=["GET"],
+    )
+    storage_test = protected(context.storage_test)
+    blueprint.add_url_rule(
+        "/api/admin/settings/storage/test",
+        endpoint="storage_test",
+        view_func=storage_test,
+        methods=["POST"],
+    )
+    storage_update = protected(context.storage_update)
+    blueprint.add_url_rule(
+        "/api/admin/settings/storage",
+        endpoint="storage_update",
+        view_func=storage_update,
+        methods=["POST"],
+    )
+    blueprint.add_url_rule(
+        "/api/admin/settings/storage",
+        endpoint="storage_update",
+        view_func=storage_update,
+        methods=["PUT"],
+    )
+    blueprint.add_url_rule(
+        "/api/public/storage-targets",
+        endpoint="public_storage_targets",
+        view_func=context.public_storage_targets,
+        methods=["GET"],
     )
     return blueprint

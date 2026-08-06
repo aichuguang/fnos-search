@@ -68,6 +68,12 @@ class RcloneReadyItemsCompletionService:
     def _official_save_path(self, job: dict[str, Any]) -> str:
         """暂存任务的最终落盘路径取移动云侧（storage_job_root），而不是夸克临时根。"""
         raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
+        execution = raw_data.get("execution_plan") if isinstance(raw_data.get("execution_plan"), dict) else {}
+        if execution:
+            paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
+            staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
+            final = paths.get("final") if isinstance(paths.get("final"), dict) else {}
+            return str(staging.get("path") or final.get("path") or "").strip()
         plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
         return str(plan.get("storage_job_root") or plan.get("openlist_job_root") or "").strip()
 

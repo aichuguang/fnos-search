@@ -19,6 +19,61 @@
         const RECENT_REQUESTS_STORAGE_KEY = "fnos.public.recentRequests.v1";
         const RECENT_REQUESTS_LIMIT = 5;
 
+        // --- 目标存储选择（阶段 5）：请求级 destination_id，访客只看到管理员允许的目标。 ---
+        let storageTargetsPromise = null;
+
+        function ensureStorageTargets() {
+            if (!storageTargetsPromise) {
+                storageTargetsPromise = api("/api/public/storage-targets", { allowFailure: true })
+                    .then((data) => (Array.isArray(data.targets) ? data.targets : []))
+                    .catch(() => []);
+            }
+            return storageTargetsPromise;
+        }
+
+        function renderPublicDestinationSelect(targets = []) {
+            publicState.pendingDestinationId = "";
+            const previous = $("publicConfirmDestinationRow");
+            if (previous) previous.remove();
+            const modal = $("publicSubmitConfirm");
+            const anchor = modal?.querySelector(".confirm-category-row");
+            if (!anchor) return;
+            const selectable = (Array.isArray(targets) ? targets : []).filter((target) => target && target.destination_id);
+            if (selectable.length < 2) {
+                // 0 或 1 个可用目标：不展示选择器；单个目标时直接冻结该 destination_id。
+                if (selectable.length === 1) publicState.pendingDestinationId = selectable[0].destination_id;
+                return;
+            }
+            const row = document.createElement("div");
+            row.className = "confirm-category-row confirm-destination-row";
+            row.id = "publicConfirmDestinationRow";
+            const label = document.createElement("label");
+            label.htmlFor = "publicConfirmDestination";
+            label.textContent = "存入：";
+            const select = document.createElement("select");
+            select.id = "publicConfirmDestination";
+            select.setAttribute("autocomplete", "off");
+            selectable.forEach((target) => {
+                const option = document.createElement("option");
+                option.value = target.destination_id;
+                const mode = target.mode_label || "";
+                option.textContent = mode
+                    ? `${target.name || target.destination_id}（${mode}）`
+                    : target.name || target.destination_id;
+                if (target.default) option.selected = true;
+                select.appendChild(option);
+            });
+            row.append(label, select);
+            anchor.after(row);
+            window.syncCustomSelect?.(select);
+        }
+
+        function currentDestinationId() {
+            const select = $("publicConfirmDestination");
+            if (select && select.value) return select.value;
+            return publicState.pendingDestinationId || "";
+        }
+
         function loadRecentRequests() {
             try {
                 const value = window.localStorage.getItem(RECENT_REQUESTS_STORAGE_KEY);
@@ -1275,7 +1330,7 @@
             }
         }
 
-        function openPublicSubmitConfirm(publicId, options = {}) {
+        async function openPublicSubmitConfirm(publicId, options = {}) {
             const item = publicResourceById(publicId);
             if (!item) {
                 toast("资源不存在或已过期，请重新搜索", "error");
@@ -1289,6 +1344,8 @@
                 openSixpanSlowWarning(publicId);
                 return;
             }
+            const targets = await ensureStorageTargets();
+            renderPublicDestinationSelect(targets);
             const modal = $("publicSubmitConfirm");
             if (!modal) {
                 confirmPublicResourceSubmit(publicId, recommendedCategoryForItem(item)).catch((error) => toast(error.message, "error"));
@@ -1300,7 +1357,7 @@
                 || (publicState.manualPreview?.publicId === publicId
                 ? ($("manualPublicCategory")?.value || publicState.selectedCategory || recommendedCategoryForItem(item))
                 : recommendedCategoryForItem(item));
-            publicState.pendingSubmit = { publicId, item, category };
+            publicState.pendingSubmit = { publicId, item, category, destination_id: currentDestinationId() };
             if ($("publicConfirmResourceName")) $("publicConfirmResourceName").textContent = item.title || "未命名资源";
             if ($("publicConfirmCategory")) {
                 $("publicConfirmCategory").value = category;
@@ -1370,7 +1427,8 @@
             if (notification === null) return;
             setPublicConfirmError(null);
             if ($("publicConfirmSubmit")) $("publicConfirmSubmit").disabled = true;
-            publicState.pendingSubmit = { ...(publicState.pendingSubmit || {}), publicId, category };
+            const destinationId = currentDestinationId();
+            publicState.pendingSubmit = { ...(publicState.pendingSubmit || {}), publicId, category, destination_id: destinationId };
             try {
                 const quarkPayload = quarkSelectionPayload(publicId);
                 if (quarkPayload.error) {
@@ -1386,9 +1444,11 @@
                     return;
                 }
                 showGlobalLoading("正在提交入库并检测资源有效性...");
+                const submitPayload = { public_id: publicId, category, note, ...sixpanPayload, ...quarkPayload, ...cloud139Payload, ...captcha.data, ...notification };
+                if (destinationId) submitPayload.destination_id = destinationId;
                 const data = await api("/api/public/submit", {
                     method: "POST",
-                    body: JSON.stringify({ public_id: publicId, category, note, ...sixpanPayload, ...quarkPayload, ...cloud139Payload, ...captcha.data, ...notification }),
+                    body: JSON.stringify(submitPayload),
                     allowFailure: true,
                 });
                 closePublicSubmitConfirm();
@@ -1790,6 +1850,9 @@
 
         return Object.freeze({
             isPublicSubmitConfirmOpen,
+            ensureStorageTargets,
+            renderPublicDestinationSelect,
+            currentDestinationId,
             renderPublicResourceDetail,
             renderBtbtlaResourcePreview,
             btbtlaResolveKey,

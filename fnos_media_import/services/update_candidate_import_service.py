@@ -50,6 +50,14 @@ class UpdateCandidateImportService:
         payload.setdefault("url", candidate_row.get("source_url") or "")
         payload.setdefault("password", candidate_row.get("password") or "")
         payload.setdefault("category", subscription.get("category") or "movie")
+        subscription_raw = (
+            subscription.get("raw_data") if isinstance(subscription.get("raw_data"), dict) else {}
+        )
+        frozen_destination = str(subscription_raw.get("destination_id") or "").strip()
+        if frozen_destination:
+            # Subscription identity wins over discovery/cache payloads. A
+            # candidate is not allowed to redirect later episodes elsewhere.
+            payload["destination_id"] = frozen_destination
         payload.setdefault("idempotency_key", f"update-candidate:{candidate_id}")
         payload.setdefault("executor_id", "scheduler" if auto else "admin")
         payload.setdefault("config_revision", 1)

@@ -172,4 +172,215 @@
         collectSearchProviders,
         buildCategoryPatch,
     });
+
+    // --- 存储目标管理（阶段 5）：自包含渲染与测试，复用 window.FnosUI.requestJson。 ---
+    const STORAGE_CAPABILITY_LABELS = {
+        supports_native_save: "原生转存",
+        supports_rclone_dest: "rclone 目标",
+        supports_relay_upload: "自定义上传",
+        supports_quota: "配额",
+        supports_organizer_access: "Organizer 可见",
+        supports_atomic_rename: "原子重命名",
+        supports_server_side_copy: "服务端复制",
+        supports_checksum: "校验和",
+    };
+
+    async function requestJson(path, options = {}) {
+        return window.FnosUI.requestJson(path, options);
+    }
+
+    function storageStatusBox(message, className = "") {
+        const box = document.getElementById("storageTargetsStatus");
+        if (!box) return;
+        box.className = `notice-box compact ${className}`.trim();
+        box.textContent = message;
+    }
+
+    function storageEscape(value) {
+        return window.FnosUI.escapeHtml(value ?? "");
+    }
+
+    function renderStorageTargets(data = {}) {
+        const body = document.getElementById("storageTargetsBody");
+        if (!body) return;
+        const targets = Array.isArray(data.targets) ? data.targets : [];
+        if (data.enabled === false) {
+            body.innerHTML = `<div class="empty-cell">存储目标功能未启用（storage.enabled=false）。</div>`;
+            return;
+        }
+        if (!targets.length) {
+            body.innerHTML = `<div class="empty-cell">尚未配置存储目标。</div>`;
+            return;
+        }
+        body.innerHTML = `
+            <div class="table-wrap">
+                <table class="data-table table-storage-targets">
+                    <thead>
+                        <tr>
+                            <th>目标</th>
+                            <th>驱动</th>
+                            <th>能力</th>
+                            <th>状态</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${targets.map((target) => renderStorageTargetRow(target)).join("")}
+                    </tbody>
+                </table>
+            </div>
+        `;
+    }
+
+    function renderStorageTargetRow(target = {}) {
+        const badges = [];
+        if (target.default) badges.push(`<span class="pill ok">默认</span>`);
+        if (target.guest_selectable) badges.push(`<span class="pill">访客可选</span>`);
+        if (!target.enabled) badges.push(`<span class="pill">已停用</span>`);
+        const statusControls = `
+            <label class="settings-row"><span>启用</span><input type="checkbox" data-storage-enabled ${target.enabled ? "checked" : ""}></label>
+            <label class="settings-row"><span>访客可选</span><input type="checkbox" data-storage-guest ${target.guest_selectable ? "checked" : ""}></label>
+        `;
+        const capabilities = Object.entries(STORAGE_CAPABILITY_LABELS)
+            .filter(([key]) => Boolean(target.capabilities?.[key]))
+            .map(([, label]) => `<span class="storage-capability">${storageEscape(label)}</span>`)
+            .join("");
+        const driverCell = target.driver_error
+            ? `<code>${storageEscape(target.driver || "-")}</code><span class="storage-driver-error">${storageEscape(target.driver_error)}</span>`
+            : `<code>${storageEscape(target.driver || "-")}</code>`;
+        return `
+            <tr data-destination-id="${storageEscape(target.destination_id || "")}">
+                <td>
+                    <strong>${storageEscape(target.name || target.destination_id || "-")}</strong>
+                    <small><code>${storageEscape(target.destination_id || "")}</code> ${badges.join(" ")}</small>
+                </td>
+                <td>${driverCell}</td>
+                <td>${capabilities || `<span class="muted">-</span>`}</td>
+                <td>${statusControls}</td>
+                <td>
+                    <button class="secondary mini" type="button" data-storage-save="${storageEscape(target.destination_id || "")}">保存</button>
+                    <button class="secondary mini" type="button" data-storage-test="${storageEscape(target.destination_id || "")}">连接检测</button>
+                    <div class="storage-test-result" hidden></div>
+                </td>
+            </tr>
+        `;
+    }
+
+    async function loadStorageTargets() {
+        const body = document.getElementById("storageTargetsBody");
+        if (!body) return;
+        storageStatusBox("正在读取存储目标。");
+        try {
+            const data = await requestJson("/api/admin/settings/storage/status", { allowFailure: true });
+            if (data.success === false) throw new Error(data.message || "读取存储目标失败");
+            renderStorageTargets(data);
+            const count = Array.isArray(data.targets) ? data.targets.length : 0;
+            storageStatusBox(data.enabled === false ? "存储目标功能未启用。" : `共 ${count} 个存储目标。`);
+            bindStorageTestButtons();
+            bindStorageSaveButtons();
+        } catch (error) {
+            storageStatusBox(error?.message || "读取存储目标失败", "status-error");
+            body.innerHTML = "";
+        }
+    }
+
+    function bindStorageTestButtons() {
+        document.querySelectorAll("[data-storage-test]").forEach((button) => {
+            button.replaceWith(button.cloneNode(true));
+        });
+        document.querySelectorAll("[data-storage-test]").forEach((button) => {
+            button.addEventListener("click", () => testStorageTarget(button.dataset.storageTest, button).catch((error) => {
+                renderStorageTestResult(button, { ok: false, errors: [error?.message || "测试失败"] });
+            }));
+        });
+    }
+
+    function bindStorageSaveButtons() {
+        document.querySelectorAll("[data-storage-save]").forEach((button) => {
+            button.addEventListener("click", () => saveStorageTarget(button).catch((error) => {
+                storageStatusBox(error?.message || "保存存储目标失败", "status-error");
+            }));
+        });
+    }
+
+    async function saveStorageTarget(button) {
+        const row = button.closest("tr");
+        const destinationId = button.dataset.storageSave || row?.dataset.destinationId || "";
+        if (!destinationId || !row) return;
+        button.disabled = true;
+        try {
+            const data = await requestJson("/api/admin/settings/storage", {
+                method: "PATCH",
+                body: JSON.stringify({
+                    destination_id: destinationId,
+                    enabled: Boolean(row.querySelector("[data-storage-enabled]")?.checked),
+                    guest_selectable: Boolean(row.querySelector("[data-storage-guest]")?.checked),
+                }),
+                allowFailure: true,
+            });
+            if (data.success === false) throw new Error(data.message || "保存存储目标失败");
+            storageStatusBox(data.message || `存储目标 ${destinationId} 已保存`);
+            await loadStorageTargets();
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async function testStorageTarget(destinationId, button) {
+        if (!destinationId) return;
+        button.disabled = true;
+        const originalText = button.textContent;
+        button.textContent = "测试中...";
+        renderStorageTestResult(button, null);
+        try {
+            const data = await requestJson("/api/admin/settings/storage/test", {
+                method: "POST",
+                body: JSON.stringify({ destination_id: destinationId }),
+                allowFailure: true,
+            });
+            renderStorageTestResult(button, data);
+        } finally {
+            button.disabled = false;
+            button.textContent = originalText;
+        }
+    }
+
+    function renderStorageTestResult(button, data) {
+        const row = button.closest("tr");
+        const box = row?.querySelector(".storage-test-result");
+        if (!box) return;
+        if (data === null) {
+            box.hidden = true;
+            box.innerHTML = "";
+            return;
+        }
+        const errors = Array.isArray(data.errors) ? data.errors : [];
+        const checks = Array.isArray(data.checks) ? data.checks : [];
+        const ok = data.ok === true && data.success !== false && !errors.length;
+        box.hidden = false;
+        box.className = `storage-test-result ${ok ? "ok" : "status-error"}`;
+        box.innerHTML = ok
+            ? `<span class="pill ok">通过</span><span>${storageEscape(data.message || "目标连接检测通过")}</span>${
+                checks.length ? `<ul>${checks.map((item) => `<li>${storageEscape(item.name || "检查项")}：${storageEscape(item.message || (item.ok ? "通过" : "未通过"))}</li>`).join("")}</ul>` : ""
+              }`
+            : `<span class="pill">未通过</span><span>${storageEscape(data.message || "目标配置检查未通过")}</span>${
+                errors.length ? `<ul>${errors.map((err) => `<li>${storageEscape(err)}</li>`).join("")}</ul>` : ""
+              }`;
+    }
+
+    function bindStorageTargetsSection() {
+        document.getElementById("storageTargetsRefreshBtn")?.addEventListener("click", () => loadStorageTargets().catch((error) => storageStatusBox(error?.message || "读取存储目标失败", "status-error")));
+    }
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => {
+            if (document.getElementById("storageTargetsBody")) {
+                bindStorageTargetsSection();
+                loadStorageTargets().catch(() => {});
+            }
+        });
+    } else if (document.getElementById("storageTargetsBody")) {
+        bindStorageTargetsSection();
+        loadStorageTargets().catch(() => {});
+    }
 })();

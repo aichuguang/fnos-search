@@ -19,7 +19,12 @@ from .constants import (
     ROUTE_QUARK_TO_MOBILE,
     ROUTE_SIXPAN_OFFLINE,
 )
-from .storage_paths import normalize_sixpan_path_sources
+from .storage_paths import (
+    cmcc_upload_root,
+    normalize_sixpan_path_sources,
+    normalize_storage_path,
+    openlist_root_for_upload,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -29,6 +34,8 @@ CMCC_DEFAULT_APP_NAME = "MClaw空间"
 CMCC_DEFAULT_ACCESS_TOKEN_FILE = ""
 CMCC_DEFAULT_CHANNEL_BASE64 = "J/0voJP3L9EKbQyz0uxQHkBZjjbZrNBJFp9XbT4/b9U="
 CMCC_DEFAULT_TRACE_BASE64 = "7WokJK5IZVhod3UBMECBRA=="
+
+CATEGORY_KEYS = (CATEGORY_MOVIE, CATEGORY_TV, CATEGORY_ANIME, CATEGORY_VARIETY, CATEGORY_OTHER)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -446,6 +453,12 @@ def _default_config() -> dict[str, Any]:
             "auto_interval_minutes": int(os.getenv("RCLONE_AUTO_INTERVAL_MINUTES", "0")),
             "log_lines": 500,
             "app_callback_url": os.getenv("RCLONE_APP_CALLBACK_URL", ""),
+        },
+        "storage": {
+            "enabled": True,
+            "plan_version": 3,
+            "default_target": "mobile_main",
+            "targets": {},
         },
         "categories": {
             CATEGORY_MOVIE: {
@@ -961,6 +974,67 @@ def _clean_remote_dir(value: str | None) -> str:
     return str(value or "").strip().strip("/")
 
 
+def _materialize_mobile_main_target(raw: dict[str, Any]) -> dict[str, Any]:
+    """把旧版 cmcc_upload / cloud139 / categories 配置物化为只读 mobile_main 目标快照。
+
+    该目标作为 storage.targets 的默认兜底，路径语义与旧 storage_paths 函数保持一致，
+    保证启用 v3 前行为零变化。
+    """
+
+    cmcc = raw.get("cmcc_upload") if isinstance(raw.get("cmcc_upload"), dict) else {}
+    cloud139 = raw.get("cloud139") if isinstance(raw.get("cloud139"), dict) else {}
+    categories = raw.get("categories") if isinstance(raw.get("categories"), dict) else {}
+    mount = normalize_storage_path(cloud139.get("fnos_mount_name") or cloud139.get("mount_name"))
+    organizer_namespace = f"openlist:{mount}" if mount else "openlist:main"
+    target: dict[str, Any] = {
+        "name": "移动云主盘",
+        "driver": "cmcc_api",
+        "enabled": True,
+        "guest_selectable": True,
+        "namespace_id": "cmcc:primary",
+        "native_ingress": ROUTE_CLOUD139_DIRECT,
+        "host": str(cmcc.get("host") or CMCC_DEFAULT_HOST),
+        "auth_mode": str(cmcc.get("auth_mode") or "web_basic"),
+        "access_token": str(cmcc.get("access_token") or ""),
+        "phone": str(cmcc.get("phone") or ""),
+        "upload_mode": str(cmcc.get("mode") or "rapid_first"),
+        "rename_mode": str(cmcc.get("rename_mode") or "auto_rename"),
+        "categories": {},
+    }
+    for category_key in CATEGORY_KEYS:
+        category = categories.get(category_key)
+        if not isinstance(category, dict):
+            continue
+        final_root = cmcc_upload_root(category, cloud139)
+        organizer_root = openlist_root_for_upload(category, backend="cmcc_api", cloud139_config=cloud139)
+        target["categories"][category_key] = {
+            "final_root": final_root,
+            "organizer_namespace_id": organizer_namespace,
+            "organizer_root": organizer_root,
+        }
+    return target
+
+
+def _ensure_storage_config(raw: dict[str, Any]) -> None:
+    """确保 raw 里存在合法的 storage 段，并物化默认 mobile_main 目标。"""
+
+    storage = raw.setdefault("storage", {})
+    if not isinstance(storage, dict):
+        storage = {}
+        raw["storage"] = storage
+    targets = storage.setdefault("targets", {})
+    if not isinstance(targets, dict):
+        targets = {}
+        storage["targets"] = targets
+    if "mobile_main" not in targets:
+        targets["mobile_main"] = _materialize_mobile_main_target(raw)
+    default_target = str(storage.get("default_target") or "").strip()
+    if not default_target or default_target not in targets:
+        storage["default_target"] = "mobile_main"
+    storage.setdefault("enabled", True)
+    storage.setdefault("plan_version", 3)
+
+
 @dataclass(frozen=True)
 class AppConfig:
     raw: dict[str, Any] = field(default_factory=dict)
@@ -1028,5 +1102,6 @@ def load_config(config_path: str | os.PathLike[str] | None = None) -> AppConfig:
         merged.setdefault("rclone", {})["app_callback_url"] = f"http://127.0.0.1:{port}/api/callback/rclone"
 
     normalize_sixpan_path_sources(merged, materialize_category_paths=True)
+    _ensure_storage_config(merged)
 
     return AppConfig(raw=merged)

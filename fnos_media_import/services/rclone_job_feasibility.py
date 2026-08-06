@@ -182,6 +182,20 @@ class RcloneJobFeasibilityEvaluator:
     @classmethod
     def requires_staging_manifest(cls, job: dict[str, Any]) -> bool:
         raw = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
+        execution = raw.get("execution_plan") if isinstance(raw.get("execution_plan"), dict) else {}
+        transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
+        try:
+            execution_version = int(execution.get("version") or 0)
+            job_plan_version = int(job.get("plan_version") or 0)
+        except (TypeError, ValueError):
+            execution_version = 0
+            job_plan_version = 0
+        if (
+            job_plan_version >= 3
+            and execution_version == job_plan_version
+            and str(transfer.get("strategy") or "").strip() in {"rclone_copy", "relay_upload"}
+        ):
+            return True
         plan = raw.get("staging_plan") if isinstance(raw.get("staging_plan"), dict) else {}
         try:
             version = int(plan.get("version") or 0)

@@ -62,12 +62,17 @@ class GuestRequestQueryRepository:
         return int(row["total"] if row else 0)
 
     def find_recent_by_url(
-        self, *, source_url: str, category: str, within_minutes: int = 1440
+        self,
+        *,
+        source_url: str,
+        category: str,
+        within_minutes: int = 1440,
+        destination_id: str | None = None,
     ) -> dict[str, Any] | None:
         threshold = utc_now_iso_offset(minutes=-max(1, int(within_minutes)))
         source_hash = hashlib.sha256(str(source_url).encode("utf-8")).hexdigest()
         with self._connection_factory() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
                 SELECT * FROM guest_requests
                 WHERE source_url_hash = ? AND category = ? AND created_at >= ?
@@ -82,11 +87,21 @@ class GuestRequestQueryRepository:
                   AND COALESCE(public_status, '') NOT LIKE '%未通过%'
                   AND COALESCE(public_status, '') NOT LIKE '%失败%'
                   AND COALESCE(public_status, '') NOT LIKE '%暂不支持%'
-                ORDER BY id DESC LIMIT 1
+                ORDER BY id DESC LIMIT 100
                 """,
                 (source_hash, category, threshold),
-            ).fetchone()
-        return self._row_decoder(row)
+            ).fetchall()
+        wanted = str(destination_id or "").strip()
+        for row in rows:
+            item = self._row_decoder(row)
+            if not item:
+                continue
+            raw = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
+            request = raw.get("request") if isinstance(raw.get("request"), dict) else {}
+            current = str(request.get("destination_id") or "").strip()
+            if current == wanted:
+                return item
+        return None
 
     def list_events(self, request_id: int) -> list[dict[str, Any]]:
         return self.list_events_for_requests([request_id]).get(request_id, [])

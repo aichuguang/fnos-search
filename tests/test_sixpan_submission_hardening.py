@@ -36,6 +36,41 @@ class _Config:
 
 
 class PublicSubmissionPreparationHardeningTests(unittest.TestCase):
+    def test_blank_destination_is_still_resolved_by_public_validator(self) -> None:
+        calls: list[dict] = []
+
+        def validate_destination(**kwargs):
+            calls.append(kwargs)
+            return "mobile_main"
+
+        service = PublicSubmissionPreparationService(
+            search_cache=lambda _key: None,
+            categories=lambda: {"movie": {"label": "Movie"}},
+            category=lambda key: {"label": key},
+            routes=lambda: {},
+            limited_text=lambda value, _label, max_length, **_kwargs: str(value or "")[:max_length],
+            validate_url=lambda value, _security: str(value),
+            safe_string_list=lambda value, **_kwargs: list(value or []),
+            safe_quark_selection=lambda value: value if isinstance(value, dict) else {},
+            safe_cloud139_selection=lambda value: value if isinstance(value, dict) else {},
+            detect_link=lambda *_args, **_kwargs: _Link(),
+            security_config=lambda: {
+                "max_title_length": 42,
+                "max_token_length": 80,
+                "max_note_length": 500,
+                "max_password_length": 32,
+            },
+            config_int=lambda config, key, default: int(config.get(key, default)),
+            validate_destination=validate_destination,
+        )
+
+        prepared = service.prepare(
+            {"url": "magnet:?xt=urn:btih:abc", "title": "x", "category": "movie"}
+        )
+
+        self.assertEqual(calls[0]["requested"], "")
+        self.assertEqual(prepared.payload["destination_id"], "mobile_main")
+
     def test_title_bound_and_sixpan_selection_are_scoped(self) -> None:
         seen_limits: list[int] = []
 
@@ -63,6 +98,10 @@ class PublicSubmissionPreparationHardeningTests(unittest.TestCase):
                 "url": "magnet:?xt=urn:btih:abc",
                 "title": "x" * 100,
                 "category": "movie",
+                "driver": "cmcc_api",
+                "remote": "untrusted-remote",
+                "root": "/data/escape",
+                "target_path_override": "/arbitrary/path",
                 "ignore_files": ["sample.mkv"],
                 "sixpan_selection": {"parse_status": "files_ready"},
             }
@@ -70,6 +109,8 @@ class PublicSubmissionPreparationHardeningTests(unittest.TestCase):
         self.assertTrue(prepared.scoped_selection)
         self.assertEqual(len(prepared.payload["title"]), 42)
         self.assertIn(42, seen_limits)
+        for field in ("driver", "remote", "root", "target_path_override"):
+            self.assertNotIn(field, prepared.payload)
 
     def test_nested_ignore_files_and_cached_title_are_normalized(self) -> None:
         def limited(value, _label, max_length, **_kwargs):

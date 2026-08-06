@@ -5,6 +5,8 @@ from typing import Any
 
 from ..constants import ROUTE_CLOUD139_DIRECT, ROUTE_QUARK_TO_MOBILE, ROUTE_SIXPAN_OFFLINE
 from ..storage_paths import cmcc_upload_root, openlist_root_for_upload, rclone_upload_root, upload_backend
+from .import_planner import execution_plan_from_job, validated_execution_plan_from_job
+from .rclone_directory_mapping import RcloneDirectoryMappingValidator
 
 
 DEFAULT_STAGING_DIR_NAME = "_入库暂存"
@@ -163,6 +165,34 @@ def rclone_staging_run_from_job(job: dict[str, Any] | None) -> dict[str, Any]:
     silently falling back to mutable runtime configuration.
     """
 
+    # v3 relay_upload has the same shell execution contract as the historical
+    # staging worker, but its paths live in execution_plan rather than the v2
+    # provider plan.  Derive the immutable run here so restart/retry use the
+    # same target identity as first execution.
+    execution = validated_execution_plan_from_job(job)
+    if execution:
+        transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
+        if str(transfer.get("strategy") or "").strip().lower() == "relay_upload":
+            paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
+            landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
+            staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
+            source_root, job_dir_name = _split_job_dir(str(landing.get("path") or ""))
+            target_root, _ = _split_job_dir(str(staging.get("path") or ""))
+            destination = execution.get("destination") if isinstance(execution.get("destination"), dict) else {}
+            if not source_root or not target_root or not job_dir_name:
+                raise ValueError("v3 relay_upload 缺少任务级来源或目标目录")
+            return {
+                "job_id": int((job or {}).get("id") or 0),
+                "category": str((job or {}).get("category") or "").strip().lower(),
+                "category_label": str((job or {}).get("category_label") or "").strip(),
+                "job_dir_name": job_dir_name,
+                "source_category_root": source_root,
+                "storage_staging_category_root": target_root,
+                "storage_backend": str(destination.get("driver") or "cmcc_api").strip().lower(),
+                "destination_id": str(destination.get("id") or "").strip(),
+                "delete_source_after_ack": bool(transfer.get("delete_source_after_ack", True)),
+            }
+
     plan = validated_staging_plan_from_job(job)
     if not plan:
         return {}
@@ -203,6 +233,87 @@ def rclone_staging_run_from_job(job: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def rclone_copy_run_from_job(job: dict[str, Any] | None) -> dict[str, Any]:
+    """从 v3 执行计划派生 rclone_copy 运行参数（web 与 worker 共用）。非 copy 计划返回空。"""
+
+    raw_plan = execution_plan_from_job(job)
+    raw_transfer = raw_plan.get("transfer") if isinstance(raw_plan.get("transfer"), dict) else {}
+    if str(raw_transfer.get("strategy") or "").strip().lower() != "rclone_copy":
+        return {}
+    plan = validated_execution_plan_from_job(job)
+    if not plan:
+        return {}
+    transfer = plan.get("transfer") if isinstance(plan.get("transfer"), dict) else {}
+    if str(transfer.get("strategy") or "").strip().lower() != "rclone_copy":
+        return {}
+    paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
+    landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
+    staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
+    source_ns = str(landing.get("namespace_id") or "")
+    source_path = str(landing.get("path") or "")
+    target_ns = str(staging.get("namespace_id") or "")
+    target_path = str(staging.get("path") or "")
+    if not source_ns or not source_path or not target_ns or not target_path:
+        return {}
+    source_root, job_dir_name = _split_job_dir(source_path)
+    target_root, _ = _split_job_dir(target_path)
+    source_remote = _remote_from_namespace(source_ns)
+    target_remote = _remote_from_namespace(target_ns)
+    if not source_remote:
+        return {}
+    is_local = bool(str(target_ns).lower().startswith("local:")) or not target_remote
+    job_id = _job_id_value(job)
+    category = str((job or {}).get("category") or "").strip().lower()
+    category_suffix = ""
+    for key, label, job_name, suffix in RcloneDirectoryMappingValidator.CATEGORIES:
+        aliases = {"".join(str(value or "").strip().lower().split()) for value in (key, label, job_name, suffix)}
+        if "".join(category.split()) in aliases:
+            category_suffix = suffix
+            category = key
+            break
+    if job_id <= 0 or not category_suffix or job_dir_name != f"job-{job_id}":
+        return {}
+    return {
+        "copy_mode": True,
+        "job_id": job_id,
+        "category": category,
+        "category_suffix": category_suffix,
+        "job_dir_name": job_dir_name,
+        "source_remote": source_remote,
+        "source_root": source_root,
+        "target_remote": target_remote,
+        "target_root": target_root,
+        "local_target": target_root if is_local else "",
+        "destination_id": str((plan.get("destination") or {}).get("id") or "").strip(),
+        "delete_source_after_ack": bool(transfer.get("delete_source_after_ack", True)),
+    }
+
+
+def _job_id_value(job: dict[str, Any] | None) -> int:
+    try:
+        return int((job or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _remote_from_namespace(namespace_id: str) -> str:
+    text = str(namespace_id or "").strip()
+    if text.lower().startswith("rclone:"):
+        return text[len("rclone:") :]
+    return ""
+
+
+def _split_job_dir(path: str) -> tuple[str, str]:
+    text = str(path or "").strip().replace("\\", "/")
+    absolute = text.startswith("/")
+    parts = [part for part in text.strip("/").split("/") if part]
+    if parts and parts[-1].startswith("job-") and parts[-1][4:].isdigit():
+        root = "/".join(parts[:-1])
+        return (f"/{root}" if absolute else root), parts[-1]
+    root = "/".join(parts)
+    return (f"/{root}" if absolute else root), ""
+
+
 def map_staging_path_to_openlist(path: Any, plan: dict[str, Any] | None) -> str:
     plan = plan if isinstance(plan, dict) else {}
     value = _normalize_path(path)
@@ -224,6 +335,34 @@ def map_staging_path_to_openlist(path: Any, plan: dict[str, Any] | None) -> str:
     if value_folded.startswith(f"{source_folded}/"):
         suffix = value[len(source_root) + 1 :]
         return f"/{visible_root}/{suffix}"
+    return ""
+
+
+def map_execution_path_to_organizer(path: Any, plan: dict[str, Any] | None) -> str:
+    """Map a frozen v3 destination staging path into its Organizer namespace."""
+
+    plan = plan if isinstance(plan, dict) else {}
+    paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
+    staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
+    organizer = paths.get("organizer") if isinstance(paths.get("organizer"), dict) else {}
+    value = _normalize_path(path)
+    source_root = _normalize_path(staging.get("path"))
+    visible_root = _normalize_path(organizer.get("path"))
+    if (
+        not value
+        or not source_root
+        or not visible_root
+        or _has_unsafe_path_segments(value)
+        or _has_unsafe_path_segments(source_root)
+        or _has_unsafe_path_segments(visible_root)
+    ):
+        return ""
+    value_folded = value.casefold()
+    source_folded = source_root.casefold()
+    if value_folded == source_folded:
+        return f"/{visible_root}"
+    if value_folded.startswith(f"{source_folded}/"):
+        return f"/{visible_root}/{value[len(source_root) + 1:]}"
     return ""
 
 

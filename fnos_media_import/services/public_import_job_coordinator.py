@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .import_planner import destination_scoped_idempotency_key
+
 
 @dataclass(frozen=True)
 class PublicImportJobResult:
@@ -97,7 +99,9 @@ class PublicImportJobCoordinator:
         except (TypeError, ValueError):
             compensation_retry_job_id = 0
         payload = dict(submit_payload)
-        payload["idempotency_key"] = f"guest-request:{request_token}"
+        payload["idempotency_key"] = destination_scoped_idempotency_key(
+            f"guest-request:{request_token}", payload.get("destination_id")
+        )
         payload["config_revision"] = payload.get("config_revision") or self.runtime_revision()
         payload["executor_id"] = payload.get("executor_id") or self.executor_id()
         submissions = self.submission_service()

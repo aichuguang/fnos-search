@@ -93,6 +93,7 @@ def test_optional_env_example_only_exposes_common_user_settings() -> None:
         "RCLONE_CACHE_HOST_PATH",
         "RCLONE_TEMP_HOST_PATH",
         "RCLONE_WORKER_CONTROL_TOKEN",
+        "RCLONE_LOCAL_STORAGE_HOST_PATH",
     }
 
 

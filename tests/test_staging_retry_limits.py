@@ -448,6 +448,61 @@ class Cloud139SubmittedStartupRecoveryTests(unittest.TestCase):
         self.assertEqual(database.job["status"], JOB_REVIEW)
         self.assertIn("staging_plan 无效", database.job["error_message"])
 
+    def test_v3_native_save_is_recovered_after_restart(self) -> None:
+        job = {
+            "id": 42,
+            "plan_version": 3,
+            "destination_id": "mobile_main",
+            "status": "submitted",
+            "category": "tv",
+            "source_type": "cloud139",
+            "target_route": "cloud139_direct",
+            "raw_data": {
+                "save": {"success": True},
+                "execution_plan": {
+                    "version": 3,
+                    "job_id": 42,
+                    "source": {"kind": "cloud139", "ingress": "cloud139_direct", "namespace_id": "cmcc:primary"},
+                    "destination": {"id": "mobile_main", "driver": "cmcc_api", "namespace_id": "cmcc:primary"},
+                    "transfer": {"strategy": "native_save", "executor": "none", "delete_source_after_ack": True},
+                    "paths": {
+                        "landing": None,
+                        "staging": {"namespace_id": "cmcc:primary", "path": "电视剧/_入库暂存/电视剧/job-42"},
+                        "final": {"namespace_id": "cmcc:primary", "path": "电视剧"},
+                        "organizer": {"namespace_id": "openlist:main", "path": "/电视剧/job-42"},
+                    },
+                    "postprocess": {"organizer_enabled": True},
+                },
+            },
+        }
+
+        class Database:
+            def __init__(self) -> None:
+                self.events: list[tuple] = []
+
+            @staticmethod
+            def list_jobs(**filters) -> list[dict]:
+                return [copy.deepcopy(job)] if filters.get("status") == "submitted" else []
+
+            @staticmethod
+            def get_job(_job_id: int) -> dict:
+                return copy.deepcopy(job)
+
+            def add_event(self, *values) -> None:
+                self.events.append(values)
+
+        database = Database()
+        service = RcloneService.__new__(RcloneService)
+        service.db = database
+        dispatches: list[tuple] = []
+        service._direct_ready_handler = (
+            lambda result, reason: dispatches.append((result, reason))
+            or {"success": True, "queued": True, "task_id": 90}
+        )
+        result = service.recover_submitted_cloud139_staging_dispatches()
+        self.assertEqual(result["recovered_job_ids"], [42])
+        self.assertEqual(dispatches[0][1], "startup_recover_cloud139_staging")
+
 
 class WaitingOrganizerInvalidPlanRecoveryTests(unittest.TestCase):
     def test_invalid_enabled_plan_moves_waiting_organizer_job_to_review(self) -> None:
@@ -475,6 +530,34 @@ class WaitingOrganizerInvalidPlanRecoveryTests(unittest.TestCase):
         self.assertEqual(result["review_job_ids"], [42])
         self.assertEqual(database.job["status"], JOB_REVIEW)
         self.assertIn("未返回有效结果", database.job["error_message"])
+
+    def test_v3_rclone_waiting_organizer_is_recovered_after_restart(self) -> None:
+        job, file_events = _completed_job(status="waiting_organizer")
+        job.update({"plan_version": 3, "destination_id": "quark_archive"})
+        job["raw_data"]["execution_plan"] = {
+            "version": 3,
+            "job_id": 42,
+            "source": {"kind": "quark", "ingress": "quark_to_mobile", "namespace_id": "rclone:MP"},
+            "destination": {"id": "quark_archive", "driver": "rclone", "namespace_id": "rclone:quark_dst"},
+            "transfer": {"strategy": "rclone_copy", "executor": "rclone", "delete_source_after_ack": True},
+            "paths": {
+                "landing": {"namespace_id": "rclone:MP", "path": "/旧夸克/电视剧/job-42"},
+                "staging": {"namespace_id": "rclone:quark_dst", "path": "/旧移动云/_入库暂存/电视剧/job-42"},
+                "final": {"namespace_id": "rclone:quark_dst", "path": "/旧移动云/电视剧"},
+                "organizer": {"namespace_id": "openlist:main", "path": "/OpenList/电视剧/job-42"},
+            },
+            "postprocess": {"organizer_enabled": True},
+        }
+        database = _FakeDatabase(job, file_events=file_events)
+        service = _service(database)
+        dispatches: list[tuple] = []
+        service._run_ready_handler = (
+            lambda refresh, payload: dispatches.append((refresh, payload))
+            or {"success": True, "items": [{"success": True, "task_id": 91}]}
+        )
+        result = service.recover_waiting_organizer_dispatches()
+        self.assertEqual(result["recovered_job_ids"], [42])
+        self.assertEqual(len(dispatches), 1)
 
     def test_legacy_direct_jobs_without_staging_plan_are_recovered(self) -> None:
         for source_type, route in (("cloud139", "cloud139_direct"), ("magnet", "sixpan_offline")):

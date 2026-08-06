@@ -67,3 +67,7 @@ services:
       - "${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone"
       - "${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache"
       - "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp"
+      # 可选：本地目录存储目标（local folder storage target）。
+      # 启用前先在 .env 中把 RCLONE_LOCAL_STORAGE_HOST_PATH 指向已挂载的目录，
+      # 再取消下一行注释；容器内映射到 /storage-targets。
+      # - "${RCLONE_LOCAL_STORAGE_HOST_PATH:-./rclone/local-storage}:/storage-targets"

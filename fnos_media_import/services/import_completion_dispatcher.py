@@ -9,7 +9,8 @@ from ..constants import (
     JOB_WAITING_ORGANIZER,
     JOB_WAITING_TRANSFER,
 )
-from .import_staging_service import rclone_staging_run_from_job
+from .import_staging_service import rclone_copy_run_from_job, rclone_staging_run_from_job
+from .import_planner import execution_plan_from_job
 
 
 class ImportCompletionDispatcher:
@@ -55,20 +56,33 @@ class ImportCompletionDispatcher:
         job_id = _job_id(job)
         category_key = str(job.get("category") or "").strip()
         try:
+            copy_run = rclone_copy_run_from_job(job)
             staging_run = rclone_staging_run_from_job(job)
         except ValueError as exc:
             result = {"success": False, "message": f"拒绝启动 rclone：{exc}"}
             if job_id:
                 self.database.add_event(job_id, "error", result["message"], {"reason": reason})
             return result
-        if staging_run:
+        run = copy_run or staging_run
+        execution = execution_plan_from_job(job)
+        if execution and not run:
+            strategy = str((execution.get("transfer") or {}).get("strategy") or "").strip().lower()
+            result = {
+                "success": False,
+                "skipped": True,
+                "message": f"v3 任务策略 {strategy or 'missing'} 不应启动 rclone Worker",
+            }
+            if job_id:
+                self.database.add_event(job_id, "warn", result["message"], {"reason": reason})
+            return result
+        if run:
             # The category key is a stable worker alias. Runtime labels and
             # library names may be edited after this job has been created.
-            category_filter = staging_run["category"]
+            category_filter = run["category"]
             result = self.rclone_service.start(
                 reason=reason,
                 category_filter=category_filter,
-                staging_run=staging_run,
+                staging_run=run,
             )
         else:
             category = self.category(category_key)
@@ -81,8 +95,8 @@ class ImportCompletionDispatcher:
             result = self.rclone_service.start(reason=reason, category_filter=category_filter)
         if job_id:
             event_data = {"reason": reason, "category_filter": category_filter, "rclone": result}
-            if staging_run:
-                event_data["staging_run"] = staging_run
+            if run:
+                event_data["staging_run"] = run
             self.database.add_event(
                 job_id,
                 "info" if result.get("success") else "warn",
@@ -93,6 +107,13 @@ class ImportCompletionDispatcher:
 
     @staticmethod
     def uses_rclone_staging(job: dict[str, Any]) -> bool:
+        execution = execution_plan_from_job(job)
+        if execution:
+            transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
+            return str(transfer.get("strategy") or "").strip().lower() in {
+                "rclone_copy",
+                "relay_upload",
+            }
         source_type = str((job or {}).get("source_type") or "").strip().lower()
         target_route = str((job or {}).get("target_route") or "").strip().lower()
         return source_type in {"quark", "uc"} or target_route == "quark_to_mobile"

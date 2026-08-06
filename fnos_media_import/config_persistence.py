@@ -5,7 +5,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from .config import AppConfig, _deep_merge
+from .config import AppConfig, _deep_merge, _ensure_storage_config
 from .constants import (
     CATEGORY_ANIME,
     CATEGORY_LABELS,
@@ -26,6 +26,7 @@ ADVANCED_CONFIG_EXPORT_FORMAT = "fnos-media-import/advanced-config"
 ADVANCED_CONFIG_EXPORT_VERSION = 1
 
 CATEGORY_KEYS = [CATEGORY_MOVIE, CATEGORY_TV, CATEGORY_ANIME, CATEGORY_VARIETY, CATEGORY_OTHER]
+CATEGORY_KEYS_SET = frozenset(CATEGORY_KEYS)
 ROUTE_DEFAULTS = {
     "quark": ROUTE_QUARK_TO_MOBILE,
     "uc": ROUTE_QUARK_TO_MOBILE,
@@ -53,6 +54,7 @@ ADVANCED_CONFIG_SECTIONS = (
     "routes",
     "categories",
     "rclone",
+    "storage",
 )
 
 SENSITIVE_FIELDS = {
@@ -69,6 +71,7 @@ SENSITIVE_FIELDS = {
     "trace_base64",
     "app_key",
     "proxy_url",
+    "phone",
 }
 SECRET_PLACEHOLDERS = {"", "***", "******", "已配置，留空不修改"}
 MASKED_SECRET_PLACEHOLDERS = SECRET_PLACEHOLDERS - {""}
@@ -81,6 +84,25 @@ def _allowed_secret_paths() -> set[str]:
         for field, field_type in schema.items()
         if field_type == "secret"
     }
+
+
+def _storage_secret_paths(config: dict[str, Any]) -> set[str]:
+    """返回配置中实际出现的 storage.targets.<id>.<secret> 路径。"""
+
+    paths: set[str] = set()
+    storage = config.get("storage")
+    if not isinstance(storage, dict):
+        return paths
+    targets = storage.get("targets")
+    if not isinstance(targets, dict):
+        return paths
+    for destination_id, target in targets.items():
+        if not isinstance(target, dict):
+            continue
+        for field in STORAGE_TARGET_SECRET_FIELDS:
+            if field in target:
+                paths.add(f"storage.targets.{destination_id}.{field}")
+    return paths
 
 SECTION_SCHEMA: dict[str, dict[str, str]] = {
     "pansou": {
@@ -300,6 +322,46 @@ CATEGORY_SCHEMA = {
     "fnos_dir_list": "list",
 }
 
+CATEGORY_KEYS_SET = frozenset(CATEGORY_KEYS)
+
+# storage 段是动态 destination ID 的注册表，不能塞进扁平 SECTION_SCHEMA。
+STORAGE_TOP_FIELDS = frozenset({"enabled", "plan_version", "default_target", "targets"})
+STORAGE_TARGET_FIELDS = frozenset({
+    "name",
+    "driver",
+    "enabled",
+    "guest_selectable",
+    "namespace_id",
+    "native_ingress",
+    "host",
+    "auth_mode",
+    "access_token",
+    "phone",
+    "upload_mode",
+    "rename_mode",
+    "base_path",
+    "openlist_mount",
+    "remote",
+    "config_path",
+    "root",
+    "organizer_namespace_id",
+    "organizer_root",
+    "categories",
+})
+STORAGE_TARGET_SECRET_FIELDS = frozenset({
+    "access_token",
+    "phone",
+    "token",
+    "password",
+    "secret",
+    "client_secret",
+    "api_key",
+})
+STORAGE_CATEGORY_FIELDS = frozenset({"final_root", "organizer_namespace_id", "organizer_root"})
+DESTINATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+STORAGE_NATIVE_INGRESSES = frozenset({"cloud139_direct"})
+
+
 
 def apply_persisted_config(app_config: AppConfig, settings: dict[str, Any]) -> AppConfig:
     """把数据库高级配置合并到运行时配置。
@@ -313,6 +375,19 @@ def apply_persisted_config(app_config: AppConfig, settings: dict[str, Any]) -> A
         return app_config
     merged = _deep_merge(copy.deepcopy(app_config.raw), persisted)
     _ensure_derived_config(merged)
+    persisted_storage = persisted.get("storage") if isinstance(persisted.get("storage"), dict) else {}
+    persisted_targets = (
+        persisted_storage.get("targets")
+        if isinstance(persisted_storage.get("targets"), dict)
+        else {}
+    )
+    if not isinstance(persisted_targets.get("mobile_main"), dict) and any(
+        section in persisted for section in ("cmcc_upload", "cloud139", "categories")
+    ):
+        merged_storage = merged.get("storage") if isinstance(merged.get("storage"), dict) else {}
+        merged_targets = merged_storage.get("targets") if isinstance(merged_storage.get("targets"), dict) else {}
+        merged_targets.pop("mobile_main", None)
+    _ensure_storage_config(merged)
     return AppConfig(raw=merged, base_dir=app_config.base_dir)
 
 
@@ -372,7 +447,12 @@ def normalize_advanced_config_payload(payload: dict[str, Any], current_stored: d
         clear_secrets = []
     if not isinstance(clear_secrets, list) or any(not isinstance(path, str) for path in clear_secrets):
         raise ValueError("待清除的密钥字段格式不正确")
-    invalid_clear_paths = sorted(set(clear_secrets) - _allowed_secret_paths())
+    allowed_clear = (
+        _allowed_secret_paths()
+        | _storage_secret_paths(config_payload)
+        | _storage_secret_paths(current_stored or {})
+    )
+    invalid_clear_paths = sorted(set(clear_secrets) - allowed_clear)
     if invalid_clear_paths:
         preview = "、".join(invalid_clear_paths[:8])
         raise ValueError(f"不能清除非密钥字段：{preview}")
@@ -383,6 +463,18 @@ def normalize_advanced_config_payload(payload: dict[str, Any], current_stored: d
         preserve_secret_placeholders=mode == "merge",
     )
     for path in clear_secrets:
+        if path.startswith("storage.targets."):
+            parts = path.split(".")
+            if len(parts) == 4:
+                storage_cfg = normalized.get("storage")
+                target_cfg = (
+                    storage_cfg.get("targets", {}).get(parts[2])
+                    if isinstance(storage_cfg, dict)
+                    else None
+                )
+                if isinstance(target_cfg, dict):
+                    target_cfg.pop(parts[3], None)
+            continue
         section, field = path.split(".", 1)
         section_config = normalized.get(section)
         if isinstance(section_config, dict):
@@ -408,7 +500,7 @@ def advanced_config_payload_mode(payload: dict[str, Any]) -> str:
 
 
 def _unknown_advanced_config_paths(config: dict[str, Any]) -> list[str]:
-    allowed_sections = set(SECTION_SCHEMA) | {"routes", "categories"}
+    allowed_sections = set(SECTION_SCHEMA) | {"routes", "categories", "storage"}
     unknown: list[str] = []
     for section in config:
         if section not in allowed_sections:
@@ -455,6 +547,98 @@ def _unknown_advanced_config_paths(config: dict[str, Any]) -> list[str]:
             )
     elif categories is not None:
         unknown.append("categories")
+
+    unknown.extend(_validate_storage_config_paths(config))
+    return sorted(set(unknown))
+
+
+def _validate_storage_config_paths(config: dict[str, Any]) -> list[str]:
+    """严格校验动态 storage.targets。<destination_id> 是动态 key，字段逐层白名单。"""
+
+    unknown: list[str] = []
+    storage = config.get("storage")
+    if storage is None:
+        return unknown
+    if not isinstance(storage, dict):
+        return ["storage"]
+    for field in storage:
+        if field not in STORAGE_TOP_FIELDS:
+            unknown.append(f"storage.{field}")
+    plan_version = storage.get("plan_version")
+    if plan_version is not None:
+        try:
+            parsed_plan_version = int(plan_version)
+        except (TypeError, ValueError):
+            unknown.append("storage.plan_version")
+        else:
+            if parsed_plan_version != 3:
+                unknown.append("storage.plan_version")
+    targets = storage.get("targets")
+    if targets is None:
+        return sorted(set(unknown))
+    if not isinstance(targets, dict):
+        return sorted(set(unknown) | {"storage.targets"})
+
+    from .storage.registry import registered_driver_kinds
+
+    known_drivers = set(registered_driver_kinds())
+    for destination_id, target in targets.items():
+        if not DESTINATION_ID_RE.match(str(destination_id)):
+            unknown.append(f"storage.targets.{destination_id}")
+            continue
+        if not isinstance(target, dict):
+            unknown.append(f"storage.targets.{destination_id}")
+            continue
+        if not str(target.get("driver") or "").strip():
+            unknown.append(f"storage.targets.{destination_id}.driver")
+        for field in target:
+            if field not in STORAGE_TARGET_FIELDS:
+                unknown.append(f"storage.targets.{destination_id}.{field}")
+        driver = str(target.get("driver") or "").strip().lower()
+        if driver and driver not in known_drivers:
+            unknown.append(f"storage.targets.{destination_id}.driver")
+        native_ingress = str(target.get("native_ingress") or "").strip().lower()
+        if native_ingress and (
+            native_ingress not in STORAGE_NATIVE_INGRESSES or driver != "cmcc_api"
+        ):
+            unknown.append(f"storage.targets.{destination_id}.native_ingress")
+        if driver == "rclone":
+            remote = str(target.get("remote") or "").strip()
+            root = str(target.get("root") or "").strip().replace("\\", "/")
+            if bool(remote) == bool(root):
+                unknown.append(f"storage.targets.{destination_id}.remote")
+                unknown.append(f"storage.targets.{destination_id}.root")
+            if remote and root:
+                unknown.append(f"storage.targets.{destination_id}.remote")
+                unknown.append(f"storage.targets.{destination_id}.root")
+            if remote and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
+                unknown.append(f"storage.targets.{destination_id}.remote")
+            if root and not (
+                root == "/storage-targets" or root.startswith("/storage-targets/")
+            ):
+                unknown.append(f"storage.targets.{destination_id}.root")
+        categories = target.get("categories")
+        if categories is None:
+            continue
+        if not isinstance(categories, dict):
+            unknown.append(f"storage.targets.{destination_id}.categories")
+            continue
+        for category_key, category_cfg in categories.items():
+            if category_key not in CATEGORY_KEYS_SET:
+                unknown.append(f"storage.targets.{destination_id}.categories.{category_key}")
+                continue
+            if not isinstance(category_cfg, dict):
+                unknown.append(f"storage.targets.{destination_id}.categories.{category_key}")
+                continue
+            for field in category_cfg:
+                if field not in STORAGE_CATEGORY_FIELDS:
+                    unknown.append(f"storage.targets.{destination_id}.categories.{category_key}.{field}")
+            final_root = str(category_cfg.get("final_root") or "").strip().replace("\\", "/")
+            if final_root and any(part in {"", ".", ".."} for part in final_root.strip("/").split("/")):
+                unknown.append(f"storage.targets.{destination_id}.categories.{category_key}.final_root")
+    default_target = str(storage.get("default_target") or "").strip()
+    if default_target and isinstance(targets, dict) and targets and default_target not in targets:
+        unknown.append("storage.default_target")
     return sorted(set(unknown))
 
 
@@ -469,6 +653,16 @@ def _masked_secret_paths(config: dict[str, Any]) -> list[str]:
                 continue
             if str(section_payload.get(field) or "").strip() in MASKED_SECRET_PLACEHOLDERS:
                 masked.append(f"{section}.{field}")
+    storage = config.get("storage")
+    if isinstance(storage, dict):
+        targets = storage.get("targets")
+        if isinstance(targets, dict):
+            for destination_id, target in targets.items():
+                if not isinstance(target, dict):
+                    continue
+                for field in STORAGE_TARGET_SECRET_FIELDS:
+                    if field in target and str(target.get(field) or "").strip() in MASKED_SECRET_PLACEHOLDERS:
+                        masked.append(f"storage.targets.{destination_id}.{field}")
     return masked
 
 
@@ -607,9 +801,84 @@ def sanitize_advanced_config(
                     category_result[field] = converted
             category_result.setdefault("label", CATEGORY_LABELS.get(category_key, category_key))
 
+    storage_payload = payload.get("storage")
+    if isinstance(storage_payload, dict):
+        current_storage = result.get("storage") if isinstance(result.get("storage"), dict) else {}
+        result["storage"] = _sanitize_storage_config(
+            storage_payload,
+            preserve_secret_placeholders,
+            current=current_storage,
+        )
+
     result = _prune_empty_sections(result)
     normalize_sixpan_path_sources(result, materialize_category_paths=False)
     return _prune_empty_sections(result)
+
+
+def _sanitize_storage_config(
+    storage_payload: dict[str, Any],
+    preserve_secret_placeholders: bool,
+    *,
+    current: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """按 storage 动态 schema 清洗目标注册表。未知字段被过滤（未知字段在保存前已被校验拒绝）。"""
+
+    storage_result: dict[str, Any] = copy.deepcopy(current) if isinstance(current, dict) else {}
+    if "enabled" in storage_payload:
+        storage_result["enabled"] = _to_bool(storage_payload.get("enabled"), True)
+    if "plan_version" in storage_payload:
+        storage_result["plan_version"] = _to_int(storage_payload.get("plan_version"), 3)
+    if "default_target" in storage_payload:
+        storage_result["default_target"] = str(storage_payload.get("default_target") or "").strip()
+    targets_payload = storage_payload.get("targets")
+    if isinstance(targets_payload, dict):
+        existing_targets = storage_result.get("targets")
+        targets_result: dict[str, Any] = (
+            copy.deepcopy(existing_targets) if isinstance(existing_targets, dict) else {}
+        )
+        for destination_id, target_payload in targets_payload.items():
+            if not isinstance(target_payload, dict) or not DESTINATION_ID_RE.match(str(destination_id)):
+                continue
+            existing_target = targets_result.get(destination_id)
+            target_result: dict[str, Any] = (
+                copy.deepcopy(existing_target) if isinstance(existing_target, dict) else {}
+            )
+            for field in STORAGE_TARGET_FIELDS:
+                if field not in target_payload or field == "categories":
+                    continue
+                if field in {"enabled", "guest_selectable"}:
+                    target_result[field] = _to_bool(target_payload.get(field), False)
+                elif field in STORAGE_TARGET_SECRET_FIELDS:
+                    text = str(target_payload.get(field) or "").strip()
+                    if preserve_secret_placeholders and text in SECRET_PLACEHOLDERS:
+                        continue
+                    target_result[field] = text
+                else:
+                    target_result[field] = str(target_payload.get(field) or "").strip()
+            categories_payload = target_payload.get("categories")
+            if isinstance(categories_payload, dict):
+                existing_categories = target_result.get("categories")
+                categories_result: dict[str, Any] = (
+                    copy.deepcopy(existing_categories) if isinstance(existing_categories, dict) else {}
+                )
+                for category_key, category_cfg in categories_payload.items():
+                    if category_key not in CATEGORY_KEYS_SET or not isinstance(category_cfg, dict):
+                        continue
+                    previous_category = categories_result.get(category_key)
+                    cleaned_category = (
+                        copy.deepcopy(previous_category) if isinstance(previous_category, dict) else {}
+                    )
+                    for field in STORAGE_CATEGORY_FIELDS:
+                        if field in category_cfg:
+                            cleaned_category[field] = str(category_cfg.get(field) or "").strip()
+                    if cleaned_category:
+                        categories_result[category_key] = cleaned_category
+                if categories_result:
+                    target_result["categories"] = categories_result
+            if target_result:
+                targets_result[destination_id] = target_result
+        storage_result["targets"] = targets_result
+    return storage_result
 
 
 def _filter_known_advanced_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -653,6 +922,41 @@ def _filter_known_advanced_config(config: dict[str, Any]) -> dict[str, Any]:
                 categories_result[category_key] = filtered
         if categories_result:
             result["categories"] = categories_result
+
+    storage = config.get("storage")
+    if isinstance(storage, dict):
+        storage_result: dict[str, Any] = {}
+        for top_field in STORAGE_TOP_FIELDS:
+            if top_field in storage:
+                storage_result[top_field] = copy.deepcopy(storage[top_field])
+        targets = storage.get("targets")
+        if isinstance(targets, dict):
+            targets_result: dict[str, Any] = {}
+            for destination_id, target in targets.items():
+                if not isinstance(target, dict):
+                    continue
+                filtered_target = {
+                    field: copy.deepcopy(target[field])
+                    for field in STORAGE_TARGET_FIELDS
+                    if field in target
+                }
+                categories_cfg = target.get("categories")
+                if isinstance(categories_cfg, dict):
+                    filtered_target["categories"] = {
+                        key: {
+                            field: copy.deepcopy(cfg[field])
+                            for field in STORAGE_CATEGORY_FIELDS
+                            if field in cfg
+                        }
+                        for key, cfg in categories_cfg.items()
+                        if isinstance(cfg, dict) and key in CATEGORY_KEYS_SET
+                    }
+                if filtered_target:
+                    targets_result[destination_id] = filtered_target
+            if targets_result:
+                storage_result["targets"] = targets_result
+        if storage_result:
+            result["storage"] = storage_result
 
     return result
 

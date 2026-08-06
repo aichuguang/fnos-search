@@ -1143,11 +1143,14 @@ def _public_request_response(guest_request: dict[str, Any] | None) -> dict[str, 
     if not item:
         return {}
     status = str(item.get("status") or "")
+    raw_data = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
+    request_data = raw_data.get("request") if isinstance(raw_data.get("request"), dict) else {}
     return {
         "token": item.get("request_token"),
         "title": item.get("title"),
         "category": item.get("category"),
         "category_label": item.get("category_label"),
+        "destination_id": str(request_data.get("destination_id") or "").strip() or None,
         "status": item.get("public_status") or _public_status(status),
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
@@ -1240,6 +1243,9 @@ def _public_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
         }
     quark_selection = _safe_public_quark_selection(payload.get("quark_selection"))
     cloud139_selection = _safe_public_cloud139_selection(payload.get("cloud139_selection"))
+    destination_id = str(payload.get("destination_id") or "").strip()
+    if destination_id and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", destination_id):
+        destination_id = ""
     return {
         "public_id": payload.get("public_id") or payload.get("resource_id") or "",
         "category": payload.get("category") or "",
@@ -1250,6 +1256,7 @@ def _public_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "sixpan_selection": sixpan_selection,
         "quark_selection": quark_selection,
         "cloud139_selection": cloud139_selection,
+        "destination_id": destination_id or None,
     }
 
 

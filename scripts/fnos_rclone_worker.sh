@@ -72,6 +72,18 @@ RCLONE_ONLY_FILE="${RCLONE_ONLY_FILE:-}"
 RCLONE_ONLY_JOB_DIR="${RCLONE_ONLY_JOB_DIR:-}"
 RCLONE_RETRY_EVENT_ID="${RCLONE_RETRY_EVENT_ID:-}"
 RCLONE_STAGING_ENABLED="${RCLONE_STAGING_ENABLED:-false}"
+RCLONE_DELETE_SOURCE_AFTER_ACK="${RCLONE_DELETE_SOURCE_AFTER_ACK:-true}"
+
+# rclone_copy 直连复制模式（阶段 3）：源 remote 直接复制到目标 remote 或受控
+# 本地路径，不经过“下载到本地 temp 再上传”的中转链路。
+# 由持久化 v3 plan 派生，与 relay_upload 链路（process_job）完全隔离。
+RCLONE_COPY_MODE="${RCLONE_COPY_MODE:-false}"
+RCLONE_COPY_SOURCE_REMOTE="${RCLONE_COPY_SOURCE_REMOTE:-$REMOTE_NAME}"
+RCLONE_COPY_SOURCE_ROOT="${RCLONE_COPY_SOURCE_ROOT:-}"
+RCLONE_COPY_TARGET_REMOTE="${RCLONE_COPY_TARGET_REMOTE:-$REMOTE_NAME}"
+RCLONE_COPY_TARGET_ROOT="${RCLONE_COPY_TARGET_ROOT:-}"
+RCLONE_COPY_LOCAL_TARGET="${RCLONE_COPY_LOCAL_TARGET:-}"
+RCLONE_COPY_DELETE_SOURCE_AFTER_ACK="${RCLONE_COPY_DELETE_SOURCE_AFTER_ACK:-true}"
 
 LOCK_FILE="${LOCK_FILE:-/tmp/fnos_media_import_rclone.lock}"
 LOCK_DIR="${LOCK_FILE}.d"
@@ -1122,6 +1134,14 @@ dedupe_adjacent_path_segments() {
 }
 
 job_dirs_overlap() {
+  left_remote="${3:-}"
+  right_remote="${4:-}"
+  # 只有两端处于同一 remote（或都未显式指定 remote，视为同一 remote）时才做
+  # 路径重叠判断。不同 remote 之间即使路径字符串相同也合法（namespace 不同），
+  # 不能仅凭路径误判重叠。
+  if [ -n "$left_remote" ] && [ -n "$right_remote" ] && [ "$left_remote" != "$right_remote" ]; then
+    return 1
+  fi
   left="$(normalize_job_dir "$1")"
   right="$(normalize_job_dir "$2")"
   [ -n "$left" ] && [ -n "$right" ] || return 1
@@ -1325,6 +1345,10 @@ finish_successful_file() {
     "${finished_local_file}.fnos-cmcc-result.rc" \
     "${finished_local_file}.fnos-cmcc-upload.json" \
     >/dev/null 2>&1 || true
+  if [ "$RCLONE_DELETE_SOURCE_AFTER_ACK" != "true" ]; then
+    log "执行计划要求保留源文件，已完成目标确认：${finished_source_remote_file}"
+    return 0
+  fi
   source_delete_retries=3
   delete_attempt=1
   delete_ok=0
@@ -1908,8 +1932,12 @@ process_job() {
         clear_upload_pending "${local_file}.fnos-upload-pending"
         clear_download_complete "$local_file"
         container_exec rm -f "$local_file" >/dev/null 2>&1 || true
-        rclone_cmd deletefile "$source_remote_file" >/dev/null 2>&1 || true
-        [ "$dirname" != "." ] && rclone_cmd rmdir "${source_remote}/${dirname}" >/dev/null 2>&1 || true
+        if [ "$RCLONE_DELETE_SOURCE_AFTER_ACK" = "true" ]; then
+          rclone_cmd deletefile "$source_remote_file" >/dev/null 2>&1 || true
+          [ "$dirname" != "." ] && rclone_cmd rmdir "${source_remote}/${dirname}" >/dev/null 2>&1 || true
+        else
+          log "执行计划要求保留源文件，已完成目标确认：${source_remote_file}"
+        fi
         notify_legacy_file_completion "skipped_existing" "$category_key" "$filename" "$target_callback_path" "$source_callback_path" "" "" "" "$naming_plan_json"
         continue
       fi
@@ -2140,6 +2168,350 @@ EOF
   [ "$failed_count" -eq 0 ]
 }
 
+# ---------------------------------------------------------------------------
+# rclone_copy 直连复制模式（阶段 3）
+# RCLONE_COPY_MODE=true 时启用：把源 remote 的任务目录直接复制到目标 remote
+# 或受控本地路径，跳过“下载到本地 temp 再上传”的中转链路。
+# 该链路与 relay_upload（process_job / upload_with_circuit_breaker /
+# cmcc_upload_file）完全隔离，不修改任何 relay 逻辑。
+# 流程：复制 -> 目标端大小校验 -> 应用完成回调 ACK -> 删除源端。
+# 未校验大小或回调未 ACK 时一律保留源端。
+# ---------------------------------------------------------------------------
+
+normalize_remote_path() {
+  # 远端相对路径：归一化斜杠、去掉首尾斜杠（rclone remote 路径不允许前导 /）。
+  printf '%s' "$1" | sed 's#\\#/#g; s#//*#/#g; s#^/*##; s#/*$##'
+}
+
+normalize_local_path() {
+  # 容器本地路径：保留前导 /（绝对路径），只归一化斜杠和去掉尾部斜杠。
+  printf '%s' "$1" | sed 's#\\#/#g; s#//*#/#g; s#/*$##'
+}
+
+copy_local_size() {
+  copy_local_size_file="$1"
+  container_exec stat -c '%s' "$copy_local_size_file" 2>/dev/null || true
+}
+
+wait_local_size_match() {
+  wait_local_file="$1"
+  wait_local_expected_size="$2"
+  wait_local_label="${3:-$wait_local_file}"
+  wait_local_retries="${RCLONE_VERIFY_SIZE_RETRIES:-6}"
+  wait_local_delay="${RCLONE_VERIFY_SIZE_DELAY:-5}"
+  case "$wait_local_retries" in
+    ''|*[!0-9]*) wait_local_retries=1 ;;
+  esac
+  case "$wait_local_delay" in
+    ''|*[!0-9]*) wait_local_delay=1 ;;
+  esac
+  [ "$wait_local_retries" -gt 0 ] || wait_local_retries=1
+
+  attempt=1
+  while [ "$attempt" -le "$wait_local_retries" ]; do
+    stop_if_requested
+    actual_size="$(copy_local_size "$wait_local_file")"
+    if [ -n "$wait_local_expected_size" ] && [ "$actual_size" = "$wait_local_expected_size" ]; then
+      [ "$attempt" -gt 1 ] && log "本地大小确认通过：${wait_local_label} size=${actual_size}"
+      return 0
+    fi
+    log "本地大小确认未通过：${wait_local_label} source=${wait_local_expected_size:-unknown} target=${actual_size:-none}，第 ${attempt}/${wait_local_retries} 次"
+    attempt=$((attempt + 1))
+    [ "$attempt" -le "$wait_local_retries" ] && sleep_or_stop "$wait_local_delay" || true
+    stop_if_requested
+  done
+  return 1
+}
+
+copy_wait_size_match() {
+  copy_target_spec="$1"
+  copy_expected_size="$2"
+  copy_label="$3"
+  copy_is_local_target="$4"
+  if [ "$copy_is_local_target" = "1" ]; then
+    wait_local_size_match "$copy_target_spec" "$copy_expected_size" "$copy_label"
+  else
+    wait_remote_size_match "$copy_target_spec" "$copy_expected_size" "$copy_label"
+  fi
+}
+
+copy_file() {
+  copy_source_spec="$1"
+  copy_dest_spec="$2"
+  if [ -n "$RCLONE_UPLOAD_MAX_DURATION" ] && [ "$RCLONE_UPLOAD_MAX_DURATION" != "0" ]; then
+    rclone_cmd copyto "$copy_source_spec" "$copy_dest_spec" \
+      --transfers 1 \
+      --checkers 1 \
+      --no-traverse \
+      --buffer-size "$BUFFER_SIZE" \
+      --retries "$RCLONE_UPLOAD_RETRIES" \
+      --low-level-retries "$RCLONE_LOW_LEVEL_RETRIES" \
+      --retries-sleep "${RETRY_DELAY}s" \
+      --timeout "$RCLONE_TIMEOUT" \
+      --contimeout "$RCLONE_CONNECT_TIMEOUT" \
+      --max-duration "$RCLONE_UPLOAD_MAX_DURATION" \
+      --stats 5s \
+      --stats-log-level NOTICE
+  else
+    rclone_cmd copyto "$copy_source_spec" "$copy_dest_spec" \
+      --transfers 1 \
+      --checkers 1 \
+      --no-traverse \
+      --buffer-size "$BUFFER_SIZE" \
+      --retries "$RCLONE_UPLOAD_RETRIES" \
+      --low-level-retries "$RCLONE_LOW_LEVEL_RETRIES" \
+      --retries-sleep "${RETRY_DELAY}s" \
+      --timeout "$RCLONE_TIMEOUT" \
+      --contimeout "$RCLONE_CONNECT_TIMEOUT" \
+      --stats 5s \
+      --stats-log-level NOTICE
+  fi
+}
+
+copy_scoped_job() {
+  stop_if_requested
+  ensure_rclone_available
+
+  if [ -z "$RCLONE_ONLY_JOB_DIR" ]; then
+    log "rclone_copy 模式必须绑定具体任务目录（RCLONE_ONLY_JOB_DIR），拒绝按后台配置扫描全部任务"
+    return 2
+  fi
+  if [ -z "$APP_CALLBACK_URL" ]; then
+    log "rclone_copy 模式缺少主程序回调地址（APP_CALLBACK_URL），无法获得完成确认，拒绝执行"
+    return 2
+  fi
+
+  copy_source_remote="$RCLONE_COPY_SOURCE_REMOTE"
+  copy_source_root="$(normalize_remote_path "$RCLONE_COPY_SOURCE_ROOT")"
+  copy_target_remote="$RCLONE_COPY_TARGET_REMOTE"
+  copy_target_root="$(normalize_remote_path "$RCLONE_COPY_TARGET_ROOT")"
+  copy_job_dir="$(normalize_remote_path "$RCLONE_ONLY_JOB_DIR")"
+  if [ -z "$copy_job_dir" ]; then
+    log "rclone_copy 模式任务目录非法：${RCLONE_ONLY_JOB_DIR}"
+    return 2
+  fi
+
+  copy_is_local=0
+  copy_local_root=""
+  if [ -n "$RCLONE_COPY_LOCAL_TARGET" ]; then
+    copy_is_local=1
+    copy_local_root="$(normalize_local_path "$RCLONE_COPY_LOCAL_TARGET")"
+    if [ -z "$copy_local_root" ] || [ "$copy_local_root" = "." ]; then
+      log "rclone_copy 本地目标根目录非法：${RCLONE_COPY_LOCAL_TARGET}"
+      return 2
+    fi
+    case "$copy_local_root" in
+      /storage-targets|/storage-targets/*) ;;
+      *)
+        log "rclone_copy 本地目标不在 /storage-targets 受控挂载内：${RCLONE_COPY_LOCAL_TARGET}"
+        return 2
+        ;;
+    esac
+    copy_local_temp_norm="$(normalize_local_path "$LOCAL_TEMP")"
+    if [ -n "$copy_local_temp_norm" ]; then
+      case "$copy_local_root" in
+        "$copy_local_temp_norm"|"$copy_local_temp_norm"/*)
+          log "rclone_copy 本地目标落在本地 temp 缓存目录内，拒绝执行：${RCLONE_COPY_LOCAL_TARGET}"
+          return 2
+          ;;
+      esac
+    fi
+  fi
+
+  copy_source_dir="${copy_source_root:+${copy_source_root}/}${copy_job_dir}"
+  source_remote_dir="${copy_source_remote}:${copy_source_dir}"
+  if [ "$copy_is_local" -eq 1 ]; then
+    copy_target_dir="${copy_local_root}/${copy_job_dir}"
+  else
+    copy_target_dir="${copy_target_root:+${copy_target_root}/}${copy_job_dir}"
+    target_remote_dir="${copy_target_remote}:${copy_target_dir}"
+  fi
+
+  # 源目标重叠防护（remote 身份 + 归一化路径）：同一 remote 且路径互相包含时
+  # 拒绝执行，避免循环复制把文件写回源端。
+  if [ "$copy_is_local" -ne 1 ]; then
+    if job_dirs_overlap "$copy_source_dir" "$copy_target_dir" "$copy_source_remote" "$copy_target_remote"; then
+      log "rclone_copy 源与目标处于同一 remote 且路径重叠，拒绝执行以避免循环复制：${source_remote_dir} -> ${target_remote_dir}"
+      return 1
+    fi
+  fi
+
+  if [ "$copy_is_local" -eq 1 ]; then
+    log "rclone_copy 模式启动：${source_remote_dir} -> ${copy_target_dir}"
+  else
+    log "rclone_copy 模式启动：${source_remote_dir} -> ${target_remote_dir}"
+  fi
+
+  if ! ensure_remote_dir "$source_remote_dir"; then
+    log "rclone_copy 源任务目录不可用，本轮拒绝执行：${source_remote_dir}"
+    return 1
+  fi
+  if [ "$copy_is_local" -eq 1 ]; then
+    if ! container_exec mkdir -p "$copy_target_dir"; then
+      log "rclone_copy 本地目标目录创建失败：${copy_target_dir}"
+      return 1
+    fi
+    copy_mount_real="$(container_exec readlink -f /storage-targets 2>/dev/null || true)"
+    copy_root_real="$(container_exec readlink -f "$copy_local_root" 2>/dev/null || true)"
+    copy_target_real="$(container_exec readlink -f "$copy_target_dir" 2>/dev/null || true)"
+    if [ -z "$copy_mount_real" ] || [ -z "$copy_root_real" ] || [ -z "$copy_target_real" ]; then
+      log "rclone_copy 无法解析本地目标真实路径，拒绝执行：${copy_target_dir}"
+      return 1
+    fi
+    case "$copy_root_real" in
+      "$copy_mount_real"|"$copy_mount_real"/*) ;;
+      *)
+        log "rclone_copy 本地目标通过符号链接越出受控挂载，拒绝执行：${copy_local_root} -> ${copy_root_real}"
+        return 1
+        ;;
+    esac
+    case "$copy_target_real" in
+      "$copy_root_real"|"$copy_root_real"/*) ;;
+      *)
+        log "rclone_copy 任务目录通过符号链接越出目标根，拒绝执行：${copy_target_dir} -> ${copy_target_real}"
+        return 1
+        ;;
+    esac
+  elif ! ensure_remote_dir "$target_remote_dir"; then
+    log "rclone_copy 目标任务目录不可用，本轮拒绝执行：${target_remote_dir}"
+    return 1
+  fi
+
+  # 复用任务级暂存稳定性清单语义：以源根 remote 为列目录起点，include 只观察
+  # 当前 job 目录，强制稳定性等待、拒绝固化半批清单。返回的路径带 job-<id>/ 前缀。
+  copy_source_list_remote="${copy_source_remote}:${copy_source_root}"
+  [ -n "$copy_source_root" ] || copy_source_list_remote="${copy_source_remote}:"
+  copy_file_list="$(
+    RCLONE_STAGING_ENABLED=true \
+    RCLONE_ONLY_JOB_DIR="$copy_job_dir" \
+    stable_file_list "$copy_source_list_remote" "$copy_job_dir"
+  )"
+  copy_list_rc=$?
+  if [ "$copy_list_rc" -ne 0 ]; then
+    if is_interrupted_rc "$copy_list_rc"; then
+      log "rclone_copy 源文件清单读取被停止请求中断，本轮不处理不删除任何文件"
+      return "$copy_list_rc"
+    fi
+    log "rclone_copy 源文件清单读取失败，本轮不处理不删除任何文件：${source_remote_dir}"
+    return "$copy_list_rc"
+  fi
+  if [ -z "$copy_file_list" ]; then
+    log "rclone_copy 源任务目录没有待复制文件：${copy_job_dir}"
+    return 0
+  fi
+  log "rclone_copy 源文件数：$(line_count "$copy_file_list")"
+  if ! persist_staging_manifest "$copy_file_list" "$RCLONE_ONLY_CATEGORY" "$copy_target_root" "$copy_source_root"; then
+    log "rclone_copy 文件清单未被应用确认，本轮不复制也不删除任何源文件"
+    return 1
+  fi
+
+  copied_count=0
+  failed_count=0
+  while IFS= read -r file; do
+    stop_if_requested
+    [ -z "$file" ] && continue
+    case "$file" in
+      \[20[0-9][0-9]-*)
+        log "跳过疑似日志污染行，避免误当文件复制：${file}"
+        continue
+        ;;
+    esac
+
+    # 清单路径带 job-<id>/ 前缀（复用任务级暂存清单语义），复制时精确剥离
+    # 该任务目录前缀，得到 job 目录内的相对路径。
+    copy_rel_path="$file"
+    case "$copy_rel_path" in
+      "$copy_job_dir"/*) copy_rel_path="${copy_rel_path#${copy_job_dir}/}" ;;
+    esac
+    copy_basename="$(basename "$file")"
+    source_file_remote="${source_remote_dir}/${copy_rel_path}"
+    if [ "$copy_is_local" -eq 1 ]; then
+      target_file="${copy_target_dir}/${copy_rel_path}"
+    else
+      target_file="${target_remote_dir}/${copy_rel_path}"
+    fi
+    source_callback_path="${copy_source_root:+${copy_source_root}/}${file}"
+    if [ "$copy_is_local" -eq 1 ]; then
+      target_callback_path="${RCLONE_COPY_LOCAL_TARGET}/${file}"
+    else
+      target_callback_path="${copy_target_root:+${copy_target_root}/}${file}"
+    fi
+
+    source_size="$(remote_file_size "$source_file_remote")"
+    if [ -z "$source_size" ]; then
+      log "rclone_copy 源文件大小读取失败，保留源端：${source_file_remote}"
+      failed_count=$((failed_count + 1))
+      callback_app "failed" "$RCLONE_ONLY_CATEGORY" "$copy_basename" "$target_callback_path" "$source_callback_path" "" "" "源文件大小读取失败，保留源端" "" "" || true
+      continue
+    fi
+
+    log "复制文件：${file} size=${source_size}"
+    if [ "$copy_is_local" -eq 1 ]; then
+      copy_local_parent="$(dirname "$target_file")"
+      container_exec mkdir -p "$copy_local_parent" >/dev/null 2>&1 || true
+    fi
+
+    if retry_count "复制 ${copy_basename}" "$MAX_RETRIES" copy_file "$source_file_remote" "$target_file"; then
+      :
+    else
+      copy_result=$?
+      if is_interrupted_rc "$copy_result"; then
+        log "复制被停止请求中断，保留源端：${file}"
+        callback_app "stopped" "$RCLONE_ONLY_CATEGORY" "$copy_basename" "$target_callback_path" "$source_callback_path" "" "" "复制被停止请求中断，保留源端" "" "" || true
+        return "$copy_result"
+      fi
+      log "复制失败，保留源端等待下次重试：${file}"
+      callback_app "failed" "$RCLONE_ONLY_CATEGORY" "$copy_basename" "$target_callback_path" "$source_callback_path" "" "" "复制失败，保留源端" "" "" || true
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+
+    # 目标端大小校验（remote 目标复用 wait_remote_size_match，本地目标走 stat）。
+    if ! copy_wait_size_match "$target_file" "$source_size" "$file" "$copy_is_local"; then
+      log "目标端大小校验未通过，保留源端：${file}"
+      callback_app "failed" "$RCLONE_ONLY_CATEGORY" "$copy_basename" "$target_callback_path" "$source_callback_path" "" "" "目标端大小校验未通过，保留源端" "" "" || true
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+
+    # 应用完成回调 ACK：未确认则不删除源端。
+    if ! callback_app "done" "$RCLONE_ONLY_CATEGORY" "$copy_basename" "$target_callback_path" "$source_callback_path"; then
+      log "完成回调未确认，保留源端等待下次重试：${file}"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+
+    stop_if_requested
+    if [ "$RCLONE_COPY_DELETE_SOURCE_AFTER_ACK" != "true" ]; then
+      log "执行计划要求保留源文件，已完成目标确认：${source_file_remote}"
+      copied_count=$((copied_count + 1))
+      continue
+    fi
+
+    if ! rclone_cmd deletefile "$source_file_remote" >/dev/null 2>&1; then
+      log "源端文件删除失败，已保留源端：${source_file_remote}"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+    log "源端文件已删除：${source_file_remote}"
+    copied_count=$((copied_count + 1))
+
+    # 剪除源端空目录（保留 job 根目录，末尾 rmdirs --leave-root 统一清理）。
+    copy_rel_dir="$(dirname "$copy_rel_path")"
+    if [ "$copy_rel_dir" != "." ]; then
+      rclone_cmd rmdir "${source_remote_dir}/${copy_rel_dir}" >/dev/null 2>&1 || true
+    fi
+  done <<EOF
+$copy_file_list
+EOF
+
+  stop_if_requested
+  rclone_cmd rmdirs "$source_remote_dir" --leave-root >/dev/null 2>&1 || true
+
+  log "rclone_copy 任务结束：${copy_job_dir}，复制 ${copied_count} 个文件，失败 ${failed_count} 个文件"
+  [ "$failed_count" -eq 0 ]
+}
+
 acquire_lock() {
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
@@ -2154,6 +2526,19 @@ main() {
   acquire_lock
 
   log "飞牛影视 rclone 搬运脚本启动 ${SCRIPT_VERSION}"
+  if [ "$RCLONE_COPY_MODE" = "true" ]; then
+    log "rclone_copy 直连复制模式，不再使用 download->upload 中转链路"
+    set +e
+    copy_scoped_job
+    copy_rc=$?
+    set -e
+    if is_interrupted_rc "$copy_rc"; then
+      log "rclone_copy 已被停止请求中断，保留源端，exit=${copy_rc}"
+      exit "$copy_rc"
+    fi
+    log "rclone_copy 执行结束，exit=${copy_rc}"
+    exit "$copy_rc"
+  fi
   log "upload backend: ${RCLONE_UPLOAD_BACKEND}, cmcc mode: ${CMCC_UPLOAD_MODE}"
   if [ "$RCLONE_STAGING_ENABLED" = "true" ] && [ -z "$RCLONE_ONLY_JOB_DIR" ]; then
     log "任务级暂存已启用，但未绑定具体 job 目录；拒绝按可变后台配置扫描全部任务"

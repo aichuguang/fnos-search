@@ -65,7 +65,11 @@ from .organizer.service import OrganizerService
 from .providers.btbtla import BtbtlaClient
 from .providers.hot_sources import IqiyiHotSource, TencentHotSource, YoukuHotSource
 from .services.import_service import ImportService
-from .services.import_staging_service import map_staging_path_to_openlist, staging_plan_from_job
+from .services.import_staging_service import (
+    map_execution_path_to_organizer,
+    map_staging_path_to_openlist,
+    staging_plan_from_job,
+)
 from .services.job_service import JobService
 from .services.rclone_service import RcloneService
 from .services.rclone_webdav_config_service import RcloneWebdavConfigError, RcloneWebdavConfigService
@@ -106,6 +110,7 @@ from .services.external_diagnostics_service import ExternalDiagnosticsDependenci
 from .services.btbtla_proxy_diagnostics_service import BtbtlaProxyDiagnosticsService
 from .services.public_resource_service import PublicResourceDependencies, PublicResourceService
 from .services.settings_service import SettingsDependencies, SettingsService
+from .services.storage_target_probe_service import StorageTargetProbeService
 from .repositories.admin_profile_repository import AdminProfileRepository
 from .services.search_service import SearchService
 from .services.update_scheduler import UpdateScheduler
@@ -116,6 +121,11 @@ from .services.trending_initial_import_service import TrendingInitialImportError
 from .services.sixpan_polling_runtime import SixPanPollingRuntime
 from .services.sixpan_offline_sync_service import SixPanOfflineSyncService
 from .services.import_completion_dispatcher import ImportCompletionDispatcher
+from .services.import_planner import (
+    execution_plan_from_job,
+    resolve_destination_id,
+    validate_public_destination,
+)
 from .services.organizer_dispatch_service import OrganizerDispatchService
 from .services.job_completion_info_service import JobCompletionInfoService
 from .services.runtime_reload_service import RuntimeReloadService, finalize_organizer_runtime_transition
@@ -704,6 +714,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         categories=app_config.categories,
         cmcc_upload_config=app_config.raw.get("cmcc_upload", {}),
         cloud139_config=app_config.raw.get("cloud139", {}),
+        storage_config=app_config.raw.get("storage", {}),
         owner_id=process_owner_id,
         scheduler_allowed=role_runs(active_process_role, "worker"),
     )
@@ -1151,6 +1162,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def _organizer_plan_for_rclone_completed_item(item: dict[str, Any]) -> dict[str, Any] | None:
         job = item.get("job") if isinstance(item.get("job"), dict) else {}
         staging_plan = staging_plan_from_job(job)
+        execution_plan = execution_plan_from_job(job)
         category_key = str(item.get("category") or job.get("category") or "").strip()
         category = app_config.category(category_key) if category_key in app_config.categories else {}
         update_payload_extra = _update_organizer_payload_extra(job)
@@ -1174,7 +1186,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         openlist_transport_paths = [
             path
             for path in (
-                _map_category_path_to_openlist(path, category, staging_plan)
+                _map_category_path_to_openlist(path, category, staging_plan, execution_plan)
                 for path in target_paths
             )
             if path
@@ -1182,7 +1194,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         openlist_target_paths = [
             path
             for path in (
-                _map_category_path_to_openlist(path, category, staging_plan)
+                _map_category_path_to_openlist(path, category, staging_plan, execution_plan)
                 for path in video_target_paths
             )
             if path
@@ -1209,7 +1221,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             if isinstance(update_payload_extra.get("scan_filters"), dict)
             else {},
         )
-        category_openlist_root = str(staging_plan.get("openlist_final_category_root") or "").strip() or _rclone_category_openlist_root(category)
+        postprocess = execution_plan.get("postprocess") if isinstance(execution_plan.get("postprocess"), dict) else {}
+        category_openlist_root = (
+            str(postprocess.get("organizer_final_root") or "").strip()
+            or str(staging_plan.get("openlist_final_category_root") or "").strip()
+            or _rclone_category_openlist_root(category)
+        )
         target_plan = _rclone_organizer_target_plan(category_openlist_root, preferred_root)
         return {
             "root_path": root_path,
@@ -1226,6 +1243,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 "video_file_count": len(expected_target_paths),
                 "scan_filters": scan_filters,
                 "staging_plan": staging_plan,
+                "execution_plan": execution_plan,
                 **target_plan,
             },
         }
@@ -1239,6 +1257,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def _rclone_completed_openlist_root(category_key: str, category: dict[str, Any], item: dict[str, Any], *, preferred_root: str = "") -> str:
         job = item.get("job") if isinstance(item.get("job"), dict) else {}
         staging_plan = staging_plan_from_job(job)
+        execution_plan = execution_plan_from_job(job)
+        execution_paths = execution_plan.get("paths") if isinstance(execution_plan.get("paths"), dict) else {}
+        organizer_ref = execution_paths.get("organizer") if isinstance(execution_paths.get("organizer"), dict) else {}
+        execution_root = _safe_openlist_path(organizer_ref.get("path"))
+        if execution_root:
+            return execution_root
         staged_job_root = _safe_openlist_path(staging_plan.get("openlist_job_root"))
         if staged_job_root:
             return staged_job_root
@@ -1248,7 +1272,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         mapped_roots = []
         for target_path in target_paths:
             root = organizer_service._root_path_from_target(category_key, target_path)  # noqa: SLF001
-            mapped = _map_category_path_to_openlist(root, category, staging_plan)
+            mapped = _map_category_path_to_openlist(root, category, staging_plan, execution_plan)
             if mapped:
                 mapped_roots.append(mapped)
         common_root = _safe_openlist_path(_common_virtual_path(mapped_roots))
@@ -1260,10 +1284,18 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             return common_root
         return category_root
 
-    def _map_category_path_to_openlist(path: str, category: dict[str, Any], staging_plan: dict[str, Any] | None = None) -> str:
+    def _map_category_path_to_openlist(
+        path: str,
+        category: dict[str, Any],
+        staging_plan: dict[str, Any] | None = None,
+        execution_plan: dict[str, Any] | None = None,
+    ) -> str:
         value = _safe_openlist_path(path)
         if not value:
             return ""
+        execution = execution_plan if isinstance(execution_plan, dict) else {}
+        if execution:
+            return _safe_openlist_path(map_execution_path_to_organizer(value, execution))
         staged = _safe_openlist_path(map_staging_path_to_openlist(value, staging_plan))
         if staged:
             return staged
@@ -1849,6 +1881,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         sanitize_string_list=lambda value: _safe_public_string_list(value, max_items=2000, max_length=512),
         sanitize_quark_selection=_safe_public_quark_selection,
         sanitize_cloud139_selection=_safe_public_cloud139_selection,
+        resolve_destination=lambda requested: resolve_destination_id(app_config.raw, requested),
     )
     app.extensions["trending_initial_import_service"] = trending_initial_import_service
     rate_limit_service = RateLimitService(
@@ -3289,7 +3322,24 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def _external_diagnostics_application() -> ExternalDiagnosticsService:
         return ExternalDiagnosticsService(ExternalDiagnosticsDependencies(organizer=organizer_service))
 
-    settings_service = SettingsService(SettingsDependencies(db=db, raw_config=lambda: app_config.raw, redact_config=_redact_config, advanced_response=advanced_config_response, normalize_advanced=normalize_advanced_config_payload, advanced_key=ADVANCED_CONFIG_KEY, reload_runtime=_reload_runtime_config, effective_settings=_effective_settings, payload_bool=_payload_bool, search_providers=search_service.describe_providers))
+    storage_target_probe_service = StorageTargetProbeService(
+        rclone_config=lambda: rclone_runtime_config(app_config)
+    )
+    settings_service = SettingsService(
+        SettingsDependencies(
+            db=db,
+            raw_config=lambda: app_config.raw,
+            redact_config=_redact_config,
+            advanced_response=advanced_config_response,
+            normalize_advanced=normalize_advanced_config_payload,
+            advanced_key=ADVANCED_CONFIG_KEY,
+            reload_runtime=_reload_runtime_config,
+            effective_settings=_effective_settings,
+            payload_bool=_payload_bool,
+            search_providers=search_service.describe_providers,
+            storage_probe=storage_target_probe_service.probe,
+        )
+    )
     notification_settings_service = NotificationSettingsService(
         db=db,
         public_base_url=lambda: request.host_url.rstrip("/"),
@@ -3350,6 +3400,20 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     def api_admin_settings_update_all():
         return _settings_response(settings_service.update_all(request.get_json(silent=True) or {}))
+
+    def api_admin_settings_storage_status():
+        return _settings_response(settings_service.storage_status())
+
+    def api_admin_settings_storage_test():
+        payload = request.get_json(silent=True) or {}
+        return _settings_response(settings_service.storage_test(payload.get("destination_id")))
+
+    def api_admin_settings_storage_update():
+        payload = request.get_json(silent=True) or {}
+        return _settings_response(settings_service.storage_update(payload))
+
+    def api_public_storage_targets():
+        return _settings_response(settings_service.public_storage_targets())
 
     def _notification_response(result: tuple[dict[str, Any], int]):
         body, status_code = result
@@ -3878,6 +3942,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         detect_link=detect_link,
         security_config=lambda: security_config,
         config_int=_config_int,
+        validate_destination=lambda **kwargs: validate_public_destination(
+            raw_config=app_config.raw,
+            **kwargs,
+        ),
     )
 
     def _cancel_unbound_public_import_job(
@@ -4537,6 +4605,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 notifications_test=api_admin_notifications_test,
                 notifications_deliveries=api_admin_notifications_deliveries,
                 notifications_retry=api_admin_notifications_retry,
+                storage_status=api_admin_settings_storage_status,
+                storage_test=api_admin_settings_storage_test,
+                storage_update=api_admin_settings_storage_update,
+                public_storage_targets=api_public_storage_targets,
             )
         )
     )

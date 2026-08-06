@@ -34,6 +34,8 @@ class JobCommandRepository:
         raw_data = data.get("raw_data")
         raw_text = json.dumps(raw_data, ensure_ascii=False) if raw_data is not None else None
         idempotency_key = str(data.get("idempotency_key") or f"legacy:{uuid.uuid4().hex}")
+        destination_id = str(data.get("destination_id") or "").strip() or None
+        plan_version = self._safe_plan_version(data.get("plan_version"))
         with self._connection_factory() as connection:
             idempotent = connection.execute(
                 "SELECT id FROM import_jobs WHERE idempotency_key = ? LIMIT 1", (idempotency_key,)
@@ -45,6 +47,7 @@ class JobCommandRepository:
                 SELECT id, status, error_message
                 FROM import_jobs
                 WHERE source_url = ? AND category = ?
+                  AND (destination_id = ? OR (destination_id IS NULL AND ? IS NULL))
                   AND status NOT IN ('cancelled', 'failed', 'unsupported', 'skipped', 'rejected')
                   AND COALESCE(status, '') NOT LIKE '%取消%'
                   AND COALESCE(status, '') NOT LIKE '%拒绝%'
@@ -53,7 +56,7 @@ class JobCommandRepository:
                   AND COALESCE(status, '') NOT LIKE '%暂不支持%'
                 ORDER BY id DESC LIMIT 1
                 """,
-                (data["source_url"], data["category"]),
+                (data["source_url"], data["category"], destination_id, destination_id),
             ).fetchone()
             if existing and not self._terminal_status_checker(existing["status"], existing["error_message"]):
                 return int(existing["id"]), False
@@ -62,8 +65,8 @@ class JobCommandRepository:
                 INSERT INTO import_jobs
                 (title, category, category_label, source_type, source_url, password, target_route,
                  target_path, status, external_task_id, error_message, raw_data, created_at, updated_at,
-                 idempotency_key, config_revision, executor_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 idempotency_key, config_revision, executor_id, destination_id, plan_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     data["title"], data["category"], data["category_label"], data["source_type"],
@@ -71,9 +74,18 @@ class JobCommandRepository:
                     data.get("target_path"), data["status"], data.get("external_task_id"),
                     data.get("error_message"), raw_text, now, now, idempotency_key,
                     self._safe_revision(data.get("config_revision")), str(data.get("executor_id") or ""),
+                    destination_id, plan_version,
                 ),
             )
             return int(cursor.lastrowid), True
+
+    @staticmethod
+    def _safe_plan_version(value: Any) -> int | None:
+        try:
+            version = int(value or 0)
+        except (TypeError, ValueError):
+            return None
+        return version if version > 0 else None
 
     @staticmethod
     def _safe_revision(value: Any) -> int:

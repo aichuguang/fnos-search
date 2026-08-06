@@ -101,6 +101,35 @@ class RcloneEnvironmentChecker:
             item["message"] = f"{remote} 可访问"
         return item
 
+    def check_copy_mode(self) -> dict[str, Any]:
+        """校验 rclone_copy 模式的源/目标 remote 与受控本地目标。"""
+
+        checks = [{"name": "rclone 搬运脚本", "ok": True, "message": "copy 模式"}]
+        checks.append(self.command_runner("rclone", ["rclone", "version"], False))
+        source_remote = str(self.config.get("copy_source_remote") or "").strip() or str(self.config.get("remote_name") or "MP")
+        target_remote = str(self.config.get("copy_target_remote") or "").strip()
+        local_target = str(self.config.get("copy_local_target") or "").strip()
+        checks.append(self._remote_check_for(source_remote, "copy 源 remote"))
+        if target_remote:
+            checks.append(self._remote_check_for(target_remote, "copy 目标 remote"))
+        if local_target:
+            checks.append(
+                {
+                    "name": "copy 本地目标",
+                    "ok": local_target.startswith("/") and ".." not in local_target.replace("\\", "/").split("/"),
+                    "message": local_target or "未配置",
+                }
+            )
+        failed = [item for item in checks if not item["ok"]]
+        message = "copy 环境检查通过" if not failed else "copy 环境检查失败：" + "、".join(str(item["name"]) for item in failed)
+        return {"success": not failed, "message": message, "items": checks}
+
+    def _remote_check_for(self, remote: str, label: str) -> dict[str, Any]:
+        item = self.command_runner(label, self._rclone_command("lsd", f"{remote}:"), True)
+        if item["ok"]:
+            item["message"] = f"{remote}: 可访问"
+        return item
+
     def _rclone_command(self, *arguments: str) -> list[str]:
         return [
             "rclone",

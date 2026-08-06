@@ -31,6 +31,7 @@ from .update_candidate_batch_import_service import UpdateCandidateBatchImportSer
 from .update_run_outcome_service import UpdateRunOutcomeInput, UpdateRunOutcomeService
 from .update_run_failure_service import UpdateRunFailureService
 from .update_run_lease_service import UpdateRunAlreadyActive, UpdateRunLease
+from .import_planner import resolve_destination_id
 from .update_episode_scan_service import UpdateEpisodeScanService
 from .update_source_discovery_service import UpdateSourceDiscoveryService
 
@@ -97,6 +98,7 @@ class UpdateService:
             tmdb_basic_hint=self._tmdb_basic_hint,
             path_health=self._subscription_path_health,
             normalize_source=self._normalize_source,
+            resolve_destination=lambda requested: resolve_destination_id(self.config, requested),
         )
         self.subscription_queries = UpdateSubscriptionQueryService(
             database=self.db,

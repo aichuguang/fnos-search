@@ -28,7 +28,9 @@ from ..fnos_paths import match_actual_dirs, match_library, normalize_library_nam
 from ..media_path_rules import EPISODIC_CATEGORY_KEYS, FALLBACK_ORGANIZE_DIR, build_standard_naming_plan, sanitize_resource_dir_name
 from ..media.fnos import FnosMediaRefresher
 from ..storage_paths import cmcc_upload_root
+from .import_planner import execution_plan_from_job, validated_execution_plan_from_job
 from .import_staging_service import (
+    rclone_copy_run_from_job,
     rclone_staging_run_from_job,
     staging_category_root,
     validated_staging_plan_from_job,
@@ -68,6 +70,7 @@ class RcloneService:
         categories: dict[str, dict[str, Any]] | None = None,
         cmcc_upload_config: dict[str, Any] | None = None,
         cloud139_config: dict[str, Any] | None = None,
+        storage_config: dict[str, Any] | None = None,
         owner_id: str = "",
         scheduler_allowed: bool = True,
     ):
@@ -78,6 +81,7 @@ class RcloneService:
         self.categories = categories or {}
         self.cmcc_upload_config = cmcc_upload_config or {}
         self.cloud139_config = cloud139_config or {}
+        self.storage_config = storage_config or {}
         self.enabled = bool(config.get("enabled", True))
         self.lock = threading.Lock()
         self.process: subprocess.Popen[str] | None = None
@@ -257,8 +261,12 @@ class RcloneService:
             if job_id <= 0:
                 continue
             try:
-                plan = validated_staging_plan_from_job(job)
-            except ValueError as exc:
+                plan_version = int(job.get("plan_version") or 0)
+                execution_plan = (
+                    validated_execution_plan_from_job(job) if plan_version >= 3 else {}
+                )
+                plan = {} if execution_plan else validated_staging_plan_from_job(job)
+            except (TypeError, ValueError) as exc:
                 self._mark_invalid_staging_plan_review(
                     job,
                     context="服务重启恢复 139 暂存任务",
@@ -266,7 +274,11 @@ class RcloneService:
                 )
                 reviewed.append(job_id)
                 continue
-            if str(plan.get("route") or "").strip().lower() != "cloud139_direct":
+            strategy = str((execution_plan.get("transfer") or {}).get("strategy") or "").strip().lower()
+            if execution_plan:
+                if strategy != "native_save":
+                    continue
+            elif str(plan.get("route") or "").strip().lower() != "cloud139_direct":
                 continue
             try:
                 dispatch_result = direct_handler(
@@ -297,7 +309,10 @@ class RcloneService:
                 job_id,
                 EVENT_INFO,
                 "服务重启后已恢复 139 暂存任务并补投 Organizer",
-                {"startup_recovery": True, "staging_plan_version": plan.get("version")},
+                {
+                    "startup_recovery": True,
+                    "plan_version": execution_plan.get("version") or plan.get("version"),
+                },
             )
             recovered.append(job_id)
         return {
@@ -352,7 +367,7 @@ class RcloneService:
             if job_id <= 0:
                 continue
             try:
-                staging_run = rclone_staging_run_from_job(job)
+                staging_run = self._copy_run_from_job(job) or rclone_staging_run_from_job(job)
             except ValueError as exc:
                 self._mark_invalid_staging_plan_review(
                     job,
@@ -455,8 +470,12 @@ class RcloneService:
             if job_id <= 0:
                 continue
             try:
-                plan = validated_staging_plan_from_job(job)
-            except ValueError as exc:
+                plan_version = int(job.get("plan_version") or 0)
+                execution_plan = (
+                    validated_execution_plan_from_job(job) if plan_version >= 3 else {}
+                )
+                plan = {} if execution_plan else validated_staging_plan_from_job(job)
+            except (TypeError, ValueError) as exc:
                 self._mark_invalid_staging_plan_review(
                     job,
                     context="服务重启恢复等待 Organizer 的任务",
@@ -471,8 +490,20 @@ class RcloneService:
             completion = raw_data.get("completion") if isinstance(raw_data.get("completion"), dict) else {}
             run_id = self._int_value(completion.get("rclone_run_id"))
             persisted_route = str(job.get("target_route") or "").strip().lower()
-            is_rclone_route = str((plan or {}).get("route") or persisted_route).strip().lower() == ROUTE_QUARK_TO_MOBILE
-            if not plan and is_rclone_route:
+            strategy = str((execution_plan.get("transfer") or {}).get("strategy") or "").strip().lower()
+            if execution_plan and strategy not in {"native_save", "rclone_copy", "relay_upload"}:
+                self._mark_run_ready_items_review(
+                    [{"job_id": job_id, "job": job}],
+                    f"服务重启后发现 v3 任务没有可恢复的执行策略：{strategy or 'missing'}",
+                )
+                reviewed.append(job_id)
+                continue
+            is_rclone_route = (
+                strategy in {"rclone_copy", "relay_upload"}
+                if execution_plan
+                else str((plan or {}).get("route") or persisted_route).strip().lower() == ROUTE_QUARK_TO_MOBILE
+            )
+            if not execution_plan and not plan and is_rclone_route:
                 # Legacy Quark jobs have no immutable task root. Treating them as
                 # direct/offline imports can make Organizer scan a shared category
                 # directory and attach unrelated files. Stop the silent stall, but
@@ -524,10 +555,10 @@ class RcloneService:
                     EVENT_INFO,
                     (
                         "服务重启后已按历史直转/离线任务证据补投 Organizer 标准化任务"
-                        if not plan
+                        if not plan and not execution_plan
                         else "服务重启后已按原直转/离线计划补投 Organizer 标准化任务"
                     ),
-                    {"staging_plan_version": plan.get("version") if plan else None},
+                    {"plan_version": execution_plan.get("version") or (plan.get("version") if plan else None)},
                 )
                 recovered.append(job_id)
                 continue
@@ -600,7 +631,7 @@ class RcloneService:
                 job_id,
                 EVENT_INFO,
                 "服务重启后已补投 Organizer 标准化任务",
-                {"run_id": run_id, "staging_plan_version": plan.get("version")},
+                {"run_id": run_id, "plan_version": execution_plan.get("version") or plan.get("version")},
             )
             recovered.append(job_id)
         return {
@@ -894,6 +925,7 @@ class RcloneService:
         categories: dict[str, dict[str, Any]] | None = None,
         cmcc_upload_config: dict[str, Any] | None = None,
         cloud139_config: dict[str, Any] | None = None,
+        storage_config: dict[str, Any] | None = None,
     ) -> None:
         """更新运行时配置，不中断正在执行的搬运任务。"""
 
@@ -904,6 +936,7 @@ class RcloneService:
         self.categories = categories or {}
         self.cmcc_upload_config = cmcc_upload_config or {}
         self.cloud139_config = cloud139_config or {}
+        self.storage_config = storage_config or {}
         self.enabled = bool(config.get("enabled", True))
         self.environment_checker.apply_config(config)
         self.worker_command.apply_config(config)
@@ -1293,11 +1326,38 @@ class RcloneService:
             self._category_dir_env(os.environ.copy()),
         )
 
-    def _cleanup_specs_from_events(self, file_events: list[dict[str, Any]]) -> list[dict[str, str]]:
+    def _cleanup_specs_from_events(
+        self,
+        file_events: list[dict[str, Any]],
+        *,
+        job: dict[str, Any] | None = None,
+    ) -> list[dict[str, str]]:
         specs: list[dict[str, str]] = []
+        source_remote = ""
+        target_remote = ""
+        target_is_local = False
+        if isinstance(job, dict) and job:
+            try:
+                execution = validated_execution_plan_from_job(job)
+            except ValueError:
+                execution = {}
+            if execution:
+                paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
+                landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
+                staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
+                source_remote = self._remote_from_namespace(str(landing.get("namespace_id") or ""))
+                target_namespace = str(staging.get("namespace_id") or "")
+                target_remote = self._remote_from_namespace(target_namespace)
+                target_is_local = target_namespace.startswith("local:")
         for event in file_events[:200]:
             source_path = self._clean_remote_file_path(event.get("source_path"))
             target_path = self._clean_remote_file_path(event.get("target_path"))
+            if source_remote and source_path and ":" not in source_path.split("/", 1)[0]:
+                source_path = f"{source_remote}:{source_path}"
+            if target_is_local:
+                target_path = ""
+            elif target_remote and target_path and ":" not in target_path.split("/", 1)[0]:
+                target_path = f"{target_remote}:{target_path}"
             filename = str(event.get("filename") or "").strip()
             if not filename:
                 filename = posixpath.basename(source_path or target_path)
@@ -1324,18 +1384,33 @@ class RcloneService:
         title = str(subject.get("title") or "").strip()
         category = str(subject.get("category") or (request_item or {}).get("category") or "").strip()
         plan: dict[str, Any] = {}
+        execution: dict[str, Any] = {}
         if isinstance(job, dict) and job:
             try:
-                plan = validated_staging_plan_from_job(job)
+                if int(job.get("plan_version") or 0) >= 3:
+                    execution = validated_execution_plan_from_job(job)
+                else:
+                    plan = validated_staging_plan_from_job(job)
             except ValueError:
                 # 已损坏的固化边界不能降级成分类目录模糊扫描，否则取消一个任务
                 # 可能清理到其他任务。状态修复由主取消/恢复流程负责。
                 return []
-        exclusive_job_root = bool(plan)
+        exclusive_job_root = bool(plan or execution)
         if exclusive_job_root:
-            if str(plan.get("route") or "").strip().lower() != ROUTE_QUARK_TO_MOBILE:
-                return []
-            source_dir = self._clean_remote_file_path(plan.get("quark_job_root"))
+            if execution:
+                transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
+                if str(transfer.get("strategy") or "").strip() not in {"rclone_copy", "relay_upload"}:
+                    return []
+                paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
+                landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
+                source_dir = self._clean_remote_file_path(landing.get("path"))
+                source_remote = self._remote_from_namespace(str(landing.get("namespace_id") or ""))
+                if source_dir and source_remote:
+                    source_dir = f"{source_remote}:{source_dir}"
+            else:
+                if str(plan.get("route") or "").strip().lower() != ROUTE_QUARK_TO_MOBILE:
+                    return []
+                source_dir = self._clean_remote_file_path(plan.get("quark_job_root"))
         else:
             if not self._is_legacy_quark_cleanup_subject(subject):
                 return []
@@ -1498,7 +1573,23 @@ class RcloneService:
         if not source_path:
             return ""
         try:
-            plan = validated_staging_plan_from_job(job)
+            if int(job.get("plan_version") or 0) >= 3:
+                execution = validated_execution_plan_from_job(job)
+                transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
+                if str(transfer.get("strategy") or "").strip() != "relay_upload":
+                    return ""
+                paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
+                landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
+                landing_root = self._clean_remote_file_path(landing.get("path"))
+                source_root, job_dir = self._split_job_dir(landing_root)
+                if not source_root or job_dir != f"job-{int(job.get('id') or 0)}":
+                    return ""
+                plan = {
+                    "route": ROUTE_QUARK_TO_MOBILE,
+                    "quark_source_category_root": source_root,
+                }
+            else:
+                plan = validated_staging_plan_from_job(job)
         except ValueError:
             return ""
         if plan and str(plan.get("route") or "").strip().lower() != ROUTE_QUARK_TO_MOBILE:
@@ -2798,9 +2889,12 @@ class RcloneService:
         env = os.environ.copy()
         app_callback_url = str(self.config.get("app_callback_url") or "")
         category_dirs = self._category_dir_env(env)
-        cmcc_env = self._cmcc_env()
         persisted_staging_run = self._validated_staging_run(staging_run)
-        if staging_run is not None and not persisted_staging_run:
+        persisted_copy_run = self._validated_copy_run(staging_run)
+        cmcc_env = self._cmcc_env(
+            persisted_staging_run.get("destination_id") if persisted_staging_run else ""
+        )
+        if staging_run is not None and not persisted_staging_run and not persisted_copy_run:
             raise ValueError("持久化暂存搬运参数无效，禁止按当前后台配置降级")
         if persisted_staging_run:
             suffix = persisted_staging_run["category_suffix"]
@@ -2870,11 +2964,35 @@ class RcloneService:
             "RCLONE_ONLY_FILE": retry_file_filter,
             "RCLONE_RETRY_EVENT_ID": (file_retry or {}).get("event_id", ""),
             "RCLONE_ONLY_JOB_DIR": persisted_staging_run.get("job_dir_name", "") if persisted_staging_run else "",
-            "RCLONE_STAGING_ENABLED": "true" if persisted_staging_run or self.config.get("staging_enabled") else "false",
+            "RCLONE_STAGING_ENABLED": (
+                "true"
+                if persisted_staging_run or persisted_copy_run or self.config.get("staging_enabled")
+                else "false"
+            ),
+            "RCLONE_DELETE_SOURCE_AFTER_ACK": (
+                "true"
+                if not persisted_staging_run
+                or persisted_staging_run.get("delete_source_after_ack", True)
+                else "false"
+            ),
             "LOCK_FILE": self.config.get("lock_file", "/tmp/fnos_media_import_rclone.lock"),
             **category_dirs,
             **cmcc_env,
         }
+        if persisted_copy_run:
+            values["RCLONE_UPLOAD_BACKEND"] = "rclone_copy"
+            values["RCLONE_COPY_MODE"] = "true"
+            values["RCLONE_COPY_SOURCE_REMOTE"] = persisted_copy_run["source_remote"]
+            values["RCLONE_COPY_SOURCE_ROOT"] = persisted_copy_run["source_root"]
+            values["RCLONE_COPY_TARGET_REMOTE"] = persisted_copy_run["target_remote"]
+            values["RCLONE_COPY_TARGET_ROOT"] = persisted_copy_run["target_root"]
+            values["RCLONE_COPY_LOCAL_TARGET"] = persisted_copy_run["local_target"]
+            values["RCLONE_COPY_DESTINATION_ID"] = persisted_copy_run.get("destination_id", "")
+            values["RCLONE_COPY_DELETE_SOURCE_AFTER_ACK"] = (
+                "true" if persisted_copy_run.get("delete_source_after_ack", True) else "false"
+            )
+            values["RCLONE_ONLY_JOB_DIR"] = persisted_copy_run["job_dir_name"]
+            values["RCLONE_ONLY_CATEGORY"] = persisted_copy_run["category"]
         for key, value in values.items():
             env[key] = str(value)
         return env
@@ -2916,25 +3034,152 @@ class RcloneService:
             "source_category_root": source_root,
             "storage_staging_category_root": destination_root,
             "storage_backend": backend,
+            "destination_id": str(staging_run.get("destination_id") or "").strip(),
+            "delete_source_after_ack": bool(staging_run.get("delete_source_after_ack", True)),
         }
+
+    def _copy_run_from_job(self, job: dict[str, Any] | None) -> dict[str, Any]:
+        """从 v3 执行计划派生 rclone_copy 运行参数。非 copy 计划返回空。"""
+
+        return rclone_copy_run_from_job(job)
+
+    @classmethod
+    def _validated_copy_run(cls, run: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(run, dict) or not run.get("copy_mode"):
+            return {}
+        try:
+            job_id = int(run.get("job_id") or 0)
+        except (TypeError, ValueError):
+            return {}
+        category = cls._normalize_filter_text(run.get("category"))
+        category_suffix = ""
+        for key, label, job_name, suffix in RcloneDirectoryMappingValidator.CATEGORIES:
+            aliases = {cls._normalize_filter_text(value) for value in (key, label, job_name, suffix)}
+            if category in aliases:
+                category_suffix = suffix
+                category = key
+                break
+        job_dir_name = str(run.get("job_dir_name") or "").strip()
+        source_remote = str(run.get("source_remote") or "").strip()
+        source_root = cls._clean_dir(run.get("source_root"))
+        target_remote = str(run.get("target_remote") or "").strip()
+        local_target = cls._clean_local_target(run.get("local_target"))
+        target_root = local_target or cls._clean_dir(run.get("target_root"))
+        if (
+            job_id <= 0
+            or not category_suffix
+            or job_dir_name != f"job-{job_id}"
+            or not source_remote
+            or not source_root
+            or not target_root
+            or (not target_remote and not local_target)
+        ):
+            return {}
+        if local_target and not (
+            local_target == "/storage-targets" or local_target.startswith("/storage-targets/")
+        ):
+            return {}
+        if cls._copy_paths_overlap(source_remote, source_root, target_remote, target_root):
+            return {}
+        return {
+            "copy_mode": True,
+            "job_id": job_id,
+            "category": category,
+            "category_suffix": category_suffix,
+            "job_dir_name": job_dir_name,
+            "source_remote": source_remote,
+            "source_root": source_root,
+            "target_remote": target_remote,
+            "target_root": target_root,
+            "local_target": local_target,
+            "destination_id": str(run.get("destination_id") or "").strip(),
+            "delete_source_after_ack": bool(run.get("delete_source_after_ack", True)),
+        }
+
+    @staticmethod
+    def _copy_run_identity(run: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            int(run.get("job_id") or 0),
+            str(run.get("category") or "").strip().casefold(),
+            str(run.get("job_dir_name") or "").strip().casefold(),
+            str(run.get("source_remote") or "").strip().casefold(),
+            str(run.get("source_root") or "").replace("\\", "/").strip("/").casefold(),
+            str(run.get("target_remote") or "").strip().casefold(),
+            str(run.get("target_root") or "").replace("\\", "/").strip("/").casefold(),
+            str(run.get("local_target") or "").replace("\\", "/").strip("/").casefold(),
+            str(run.get("destination_id") or "").strip().casefold(),
+            bool(run.get("delete_source_after_ack", True)),
+        )
+
+    @staticmethod
+    def _copy_paths_overlap(
+        source_remote: Any,
+        source_path: Any,
+        target_remote: Any,
+        target_path: Any,
+    ) -> bool:
+        """同一 remote 且路径相同/包含/被包含时才判重叠。跨 remote 不重叠。"""
+
+        if str(source_remote or "").strip().casefold() != str(target_remote or "").strip().casefold():
+            return False
+        return RcloneDirectoryMappingValidator.overlap(source_path, target_path)
+
+    @staticmethod
+    def _remote_from_namespace(namespace_id: str) -> str:
+        text = str(namespace_id or "").strip()
+        if text.lower().startswith("rclone:"):
+            return text[len("rclone:"):]
+        return ""
+
+    @staticmethod
+    def _split_job_dir(path: str) -> tuple[str, str]:
+        parts = str(path or "").strip().strip("/").split("/")
+        if parts and parts[-1].startswith("job-") and parts[-1][4:].isdigit():
+            return "/".join(parts[:-1]), parts[-1]
+        return "/".join(parts), ""
+
+    @classmethod
+    def _clean_dir(cls, value: Any) -> str:
+        return str(value or "").strip().replace("\\", "/").strip("/")
+
+    @staticmethod
+    def _clean_local_target(value: Any) -> str:
+        text = str(value or "").strip().replace("\\", "/")
+        while "//" in text:
+            text = text.replace("//", "/")
+        if any(part in {".", ".."} for part in text.split("/")):
+            return ""
+        return text.rstrip("/")
 
     def _database_bound_staging_run(
         self,
         staging_run: dict[str, Any] | None,
     ) -> tuple[dict[str, Any], str]:
         requested = self._validated_staging_run(staging_run)
-        if not requested:
+        requested_copy = self._validated_copy_run(staging_run)
+        if not requested and not requested_copy:
             return {}, "持久化暂存搬运参数无效，已拒绝按当前后台配置降级搬运"
         if not self.db:
-            return {}, "数据库未初始化，无法核对任务固化的 staging_plan，已拒绝启动搬运"
+            return {}, "数据库未初始化，无法核对任务固化的执行计划，已拒绝启动搬运"
 
-        job_id = self._int_value(requested.get("job_id"))
+        job_id = self._int_value((requested_copy or requested).get("job_id"))
         job = self.db.get_job(job_id) if job_id > 0 else None
         if not isinstance(job, dict):
-            return {}, f"任务 #{job_id or '?'} 不存在，无法核对 staging_plan，已拒绝启动搬运"
+            return {}, f"任务 #{job_id or '?'} 不存在，无法核对执行计划，已拒绝启动搬运"
         status = str(job.get("status") or "").strip().lower()
         if self._staging_status_blocks_execution(status):
             return {}, f"任务 #{job_id} 当前状态为 {status}，已拒绝启动搬运"
+        if requested_copy:
+            try:
+                persisted_copy = self._copy_run_from_job(job)
+            except ValueError as exc:
+                return {}, f"任务 #{job_id} 的固化执行计划无效，已拒绝启动搬运：{exc}"
+            persisted_copy = self._validated_copy_run(persisted_copy)
+            if not persisted_copy:
+                return {}, f"任务 #{job_id} 无法从固化执行计划派生 rclone_copy 参数，已拒绝启动搬运"
+            if self._copy_run_identity(requested_copy) != self._copy_run_identity(persisted_copy):
+                return {}, f"任务 #{job_id} 的搬运参数与数据库固化执行计划不一致，已拒绝启动"
+            return persisted_copy, ""
         try:
             persisted = rclone_staging_run_from_job(job)
         except ValueError as exc:
@@ -2963,6 +3208,8 @@ class RcloneService:
             .strip("/")
             .casefold(),
             str(staging_run.get("storage_backend") or "").strip().casefold(),
+            str(staging_run.get("destination_id") or "").strip().casefold(),
+            bool(staging_run.get("delete_source_after_ack", True)),
         )
 
     def _category_dir_env(self, env: dict[str, str]) -> dict[str, str]:
@@ -2991,8 +3238,23 @@ class RcloneService:
             result[dst_env] = self._remote_dir(final_destination)
         return result
 
-    def _cmcc_env(self) -> dict[str, str]:
+    def _cmcc_env(self, destination_id: Any = "") -> dict[str, str]:
         cmcc = self.cmcc_upload_config if isinstance(self.cmcc_upload_config, dict) else {}
+        destination = str(destination_id or "").strip()
+        if destination:
+            storage = self.storage_config if isinstance(self.storage_config, dict) else {}
+            targets = storage.get("targets") if isinstance(storage.get("targets"), dict) else {}
+            target = targets.get(destination)
+            if not isinstance(target, dict):
+                raise ValueError(f"存储目标不存在，无法解析上传凭据：{destination}")
+            driver = str(target.get("driver") or "").strip().lower()
+            if driver != "cmcc_api":
+                raise ValueError(f"存储目标 {destination} 不是 cmcc_api，无法启动 relay_upload")
+            cmcc = {
+                **cmcc,
+                **target,
+                "mode": target.get("upload_mode") or target.get("mode") or cmcc.get("mode"),
+            }
         result: dict[str, str] = {}
 
         def put(name: str, value: Any) -> None:
@@ -3008,7 +3270,7 @@ class RcloneService:
         put("CMCC_UPLOAD_PUT_TIMEOUT", cmcc.get("put_timeout"))
         put("CMCC_HOST", cmcc.get("host"))
         put("CM_CLOUD_HOST", cmcc.get("host"))
-        put("CMCC_AUTH_MODE", "web_basic")
+        put("CMCC_AUTH_MODE", cmcc.get("auth_mode") or "web_basic")
         put("CMCC_ACCESS_TOKEN", cmcc.get("access_token"))
         put("CMCC_PHONE", cmcc.get("phone"))
         put("CM_CLOUD_ACCESS_TOKEN", cmcc.get("access_token"))
