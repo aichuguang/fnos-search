@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from tests._v4_planning_fakes import (
+    fake_source_resolver,
+    fake_destination_resolver,
+    fake_plan_import,
+    fake_validate_v4_plan,
+)
+
 import copy
 import threading
 import unittest
