@@ -3371,6 +3371,48 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     app.extensions["v1_openlist_mounts"] = v1_openlist_mounts
     app.extensions["v1_target_service"] = v1_target_service
     app.extensions["v1_rules_service"] = v1_rules_service
+    from .planning.source_resolver import SourceResolver
+    from .planning.destination_resolver import DestinationResolver
+    from .planning.planner import ImportPlannerV4
+    from .planning.plan_validator import PlanValidationDeps, validate_v4_plan
+    from .planning import DefaultAdapterRegistry
+
+    v1_adapter_registry = DefaultAdapterRegistry()
+    v1_source_resolver = SourceResolver(
+        detect_link=lambda url, password="", **_kw: detect_link(url, app_config.raw.get("routes", {}), password=password),
+        config=app_config.raw,
+    )
+    v1_destination_resolver = DestinationResolver(v1_rules_service, v1_target_service, v1_accounts_service)
+    v1_planner = ImportPlannerV4(
+        accounts_service=v1_accounts_service,
+        target_service=v1_target_service,
+        rules_service=v1_rules_service,
+        mount_service=v1_openlist_mounts,
+        registry=v1_adapter_registry,
+        config=app_config.raw,
+        destination_resolver=v1_destination_resolver,
+    )
+    v1_plan_deps = PlanValidationDeps(
+        accounts_service=v1_accounts_service,
+        target_service=v1_target_service,
+        mount_service=v1_openlist_mounts,
+        registry=v1_adapter_registry,
+        config=app_config.raw,
+    )
+
+    def _v1_plan_import(**kwargs: Any) -> dict[str, Any]:
+        return v1_planner.plan_import(**kwargs)
+
+    def _v1_validate_plan(plan: dict[str, Any], job_record: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        return validate_v4_plan(plan, job_record, deps=v1_plan_deps, **kwargs)
+
+    for service in (import_service.job_creation, getattr(import_service, "job_retry", None)):
+        if service is None:
+            continue
+        service.source_resolver = v1_source_resolver
+        service.destination_resolver = v1_destination_resolver
+        service.plan_import = _v1_plan_import
+        service.validate_v4_plan = _v1_validate_plan
     notification_settings_service = NotificationSettingsService(
         db=db,
         public_base_url=lambda: request.host_url.rstrip("/"),

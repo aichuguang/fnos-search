@@ -361,3 +361,21 @@ __all__ = [
     "PlanValidator",
     "validate_v4_plan",
 ]
+
+
+class DefaultAdapterRegistry:
+    """最小可用注册表：按 provider_kind 返回 Adapter，缺失即失败关闭。"""
+
+    def __init__(self, adapters: dict[str, ProviderAdapter] | None = None) -> None:
+        self._adapters = dict(adapters or {})
+
+    def register(self, adapter: ProviderAdapter) -> None:
+        self._adapters[adapter.kind] = adapter
+
+    def get(self, provider_kind: str) -> ProviderAdapter:
+        try:
+            return self._adapters[provider_kind]
+        except KeyError as exc:
+            raise PlanningError(
+                f"未注册 Provider Adapter：{provider_kind}", code="PROVIDER_UNAVAILABLE"
+            ) from exc
