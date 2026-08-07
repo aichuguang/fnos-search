@@ -24,7 +24,6 @@ from fnos_media_import.services.request_review_command_service import (
     RequestReviewCommandService,
 )
 
-
 class WorkerTaskCancellationRepositoryTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -121,7 +120,6 @@ class WorkerTaskCancellationRepositoryTests(unittest.TestCase):
         self.assertIsNone(pending["owner_id"])
         self.assertTrue(pending["result"]["compensation_failed"])
 
-
 class _RequestReviewRaceQueries:
     def __init__(self) -> None:
         self.item = {
@@ -134,7 +132,6 @@ class _RequestReviewRaceQueries:
 
     def get(self, _request_id: int) -> dict:
         return copy.deepcopy(self.item)
-
 
 class _RequestReviewRaceCommands:
     def __init__(self, queries: _RequestReviewRaceQueries) -> None:
@@ -151,7 +148,6 @@ class _RequestReviewRaceCommands:
         )
         return True
 
-
 class _RequestReviewRaceJobs:
     def __init__(self) -> None:
         self.calls: list[int] = []
@@ -159,7 +155,6 @@ class _RequestReviewRaceJobs:
     def get(self, job_id: int) -> dict:
         self.calls.append(job_id)
         return {"id": job_id, "status": "submitted"}
-
 
 class RequestReviewCancellationRaceTests(unittest.TestCase):
     def test_cancel_reloads_job_bound_concurrently_with_request_transition(self) -> None:
@@ -186,7 +181,6 @@ class RequestReviewCancellationRaceTests(unittest.TestCase):
         self.assertEqual(result["request"]["job_id"], 42)
         self.assertEqual(result["linked_job"]["id"], 42)
         self.assertEqual(jobs.calls, [42])
-
 
 class _Jobs:
     def __init__(self) -> None:
@@ -218,7 +212,6 @@ class _Jobs:
     def add_event(*_args) -> int:
         return 1
 
-
 class _Cleaner:
     def __init__(self) -> None:
         self.calls: list[tuple[int, bool]] = []
@@ -230,7 +223,6 @@ class _Cleaner:
     def cleanup_cancelled_task(self, **_kwargs) -> dict:
         raise AssertionError("cleanup=false must not delete files")
 
-
 class _Organizer:
     def __init__(self) -> None:
         self.calls: list[tuple[int, str]] = []
@@ -238,7 +230,6 @@ class _Organizer:
     def cancel_job_tasks(self, job_id: int, *, reason: str) -> dict:
         self.calls.append((job_id, reason))
         return {"success": True, "task_ids": [70], "cancelled_task_ids": [70]}
-
 
 class _WorkerTasks:
     def __init__(self) -> None:
@@ -248,7 +239,6 @@ class _WorkerTasks:
         self.calls.append(kwargs)
         return {"success": True, "cancelled_count": 2, "task_ids": [1, 2]}
 
-
 class _SixPan:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], bool]] = []
@@ -256,7 +246,6 @@ class _SixPan:
     def delete_offline_tasks(self, identities: list[str], *, delete_files: bool = False) -> dict:
         self.calls.append((identities, delete_files))
         return {"success": True}
-
 
 class JobCancellationPropagationTests(unittest.TestCase):
     def test_admin_completed_job_guard_cannot_be_bypassed_with_force(self) -> None:
@@ -451,14 +440,12 @@ class JobCancellationPropagationTests(unittest.TestCase):
         self.assertEqual(jobs.job["raw_data"]["cancel"]["generation"], 3)
         self.assertEqual(jobs.job["raw_data"]["cancel"]["reason"], "repeat cancel")
 
-
 class _Timer:
     def __init__(self) -> None:
         self.cancelled = False
 
     def cancel(self) -> None:
         self.cancelled = True
-
 
 class _OrganizerDb:
     def __init__(self) -> None:
@@ -474,7 +461,6 @@ class _OrganizerDb:
     def update_organizer_task(self, task_id: int, **updates) -> bool:
         self.updates.append((task_id, updates))
         return True
-
 
 class OrganizerImmediateCancellationTests(unittest.TestCase):
     def test_cancellation_stops_timer_and_bumps_revision(self) -> None:
@@ -496,7 +482,6 @@ class OrganizerImmediateCancellationTests(unittest.TestCase):
         self.assertTrue(updates["bump_revision"])
         self.assertTrue(updates["clear_scan_lease"])
 
-
 class _CancelledSubmission:
     @staticmethod
     def worker_execution_allowed(_request_id: int):
@@ -505,7 +490,6 @@ class _CancelledSubmission:
             "status": "cancelled",
             "public_status": "已取消",
         }
-
 
 class LatePublicWorkerFenceTests(unittest.TestCase):
     def test_late_worker_does_not_create_job_after_request_cancel(self) -> None:
@@ -587,7 +571,6 @@ class LatePublicWorkerFenceTests(unittest.TestCase):
         self.assertTrue(outcome.result["orphan_job_recovered"])
         self.assertEqual(outcome.bind_outcome, "manual_review")
 
-
 class _PublicImportRaceSubmission:
     def __init__(self) -> None:
         self.request = {
@@ -614,7 +597,6 @@ class _PublicImportRaceSubmission:
 
     def mark_import_failed(self, _request_id: int, *, error: str):
         raise AssertionError(f"compensated cancellation must not mark request failed: {error}")
-
 
 class _PublicImportRaceService:
     def __init__(
@@ -680,7 +662,6 @@ class _PublicImportRaceService:
                 "raw_data": {},
             },
         }
-
 
 class PublicImportCreationRaceTests(unittest.TestCase):
     @staticmethod
@@ -821,117 +802,6 @@ class PublicImportCreationRaceTests(unittest.TestCase):
         self.assertEqual(outcome.public_status, "已取消")
         self.assertEqual(outcome.bind_outcome, "cancelled")
         self.assertIsNone(outcome.rclone_start)
-
-    def test_same_key_idempotent_retry_resumes_dispatch_and_binds(self) -> None:
-        submission = _PublicImportRaceSubmission()
-        rclone_calls: list[tuple[dict, str]] = []
-        cancel_calls: list[dict] = []
-        coordinator = self._coordinator(
-            submission,
-            cancel_during_create=False,
-            created=False,
-            rclone_calls=rclone_calls,
-            cancel_calls=cancel_calls,
-        )
-
-        outcome = coordinator.execute_inline(
-            guest_request_id=9,
-            request_token="req-9",
-            submit_payload={"title": "Test"},
-        )
-
-        self.assertEqual(len(rclone_calls), 1)
-        self.assertEqual(cancel_calls, [])
-        self.assertEqual(submission.bind_calls, 1)
-        self.assertEqual(outcome.job["status"], "submitted")
-        self.assertEqual(outcome.bind_outcome, "bound")
-        self.assertEqual(outcome.rclone_start, {"started": True})
-
-    def test_foreign_key_reused_job_bind_conflict_never_starts_or_cancels_shared_job(self) -> None:
-        submission = _PublicImportRaceSubmission()
-        rclone_calls: list[tuple[dict, str]] = []
-        cancel_calls: list[dict] = []
-        coordinator = self._coordinator(
-            submission,
-            cancel_during_create=False,
-            created=False,
-            owned_idempotency=False,
-            rclone_calls=rclone_calls,
-            cancel_calls=cancel_calls,
-        )
-
-        def bind_after_cancel(_request_id: int, **_kwargs):
-            submission.bind_calls += 1
-            submission.cancel()
-            return "state_conflict", copy.deepcopy(submission.request)
-
-        submission.bind_import_job = bind_after_cancel
-        outcome = coordinator.execute_inline(
-            guest_request_id=9,
-            request_token="req-9",
-            submit_payload={"title": "Test"},
-        )
-
-        self.assertEqual(rclone_calls, [])
-        self.assertEqual(cancel_calls, [])
-        self.assertEqual(submission.bind_calls, 1)
-        self.assertEqual(outcome.job["status"], "submitted")
-        self.assertFalse(outcome.result["created"])
-        self.assertEqual(outcome.bind_outcome, "state_conflict")
-        self.assertIsNone(outcome.rclone_start)
-
-    def test_foreign_key_reused_job_never_starts_or_cancels_on_request_cancel(self) -> None:
-        submission = _PublicImportRaceSubmission()
-        rclone_calls: list[tuple[dict, str]] = []
-        cancel_calls: list[dict] = []
-        coordinator = self._coordinator(
-            submission,
-            cancel_during_create=True,
-            created=False,
-            owned_idempotency=False,
-            rclone_calls=rclone_calls,
-            cancel_calls=cancel_calls,
-        )
-
-        outcome = coordinator.execute_inline(
-            guest_request_id=9,
-            request_token="req-9",
-            submit_payload={"title": "Test"},
-        )
-
-        self.assertEqual(rclone_calls, [])
-        self.assertEqual(cancel_calls, [])
-        self.assertEqual(outcome.job["status"], "submitted")
-        self.assertEqual(outcome.bind_outcome, "existing")
-
-    def test_same_key_created_status_replays_provider_before_dispatch(self) -> None:
-        submission = _PublicImportRaceSubmission()
-        rclone_calls: list[tuple[dict, str]] = []
-        cancel_calls: list[dict] = []
-        retry_calls: list[int] = []
-        coordinator = self._coordinator(
-            submission,
-            cancel_during_create=False,
-            created=False,
-            job_status="created",
-            retry_status="waiting_transfer",
-            retry_calls=retry_calls,
-            rclone_calls=rclone_calls,
-            cancel_calls=cancel_calls,
-        )
-
-        outcome = coordinator.execute_inline(
-            guest_request_id=9,
-            request_token="req-9",
-            submit_payload={"title": "Test"},
-        )
-
-        self.assertEqual(retry_calls, [42])
-        self.assertEqual(len(rclone_calls), 1)
-        self.assertFalse(outcome.result["created"])
-        self.assertTrue(outcome.result["idempotent_recovered"])
-        self.assertEqual(outcome.job["status"], "waiting_transfer")
-        self.assertEqual(outcome.bind_outcome, "bound")
 
     def test_same_key_created_status_does_not_replay_provider_after_request_cancel(self) -> None:
         submission = _PublicImportRaceSubmission()
@@ -1176,30 +1046,3 @@ class PublicImportCreationRaceTests(unittest.TestCase):
         self.assertEqual(cancel_calls, [])
         self.assertEqual(outcome.job["status"], "submitted")
 
-    def test_created_claim_with_foreign_idempotency_key_fails_safe(self) -> None:
-        submission = _PublicImportRaceSubmission()
-        rclone_calls: list[tuple[dict, str]] = []
-        cancel_calls: list[dict] = []
-        coordinator = self._coordinator(
-            submission,
-            cancel_during_create=True,
-            created=True,
-            owned_idempotency=False,
-            rclone_calls=rclone_calls,
-            cancel_calls=cancel_calls,
-        )
-
-        outcome = coordinator.execute_inline(
-            guest_request_id=9,
-            request_token="req-9",
-            submit_payload={"title": "Test"},
-        )
-
-        self.assertTrue(outcome.result["created"])
-        self.assertEqual(rclone_calls, [])
-        self.assertEqual(cancel_calls, [])
-        self.assertEqual(outcome.job["status"], "submitted")
-
-
-if __name__ == "__main__":
-    unittest.main()

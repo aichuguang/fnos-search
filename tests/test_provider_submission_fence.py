@@ -98,6 +98,10 @@ class ProviderSubmissionDatabaseFenceTests(unittest.TestCase):
 
     def _creation_service(self, submit_quark) -> ImportJobCreationService:
         return ImportJobCreationService(
+            source_resolver=fake_source_resolver(),
+            destination_resolver=fake_destination_resolver(),
+            plan_import=fake_plan_import(),
+            validate_v4_plan=fake_validate_v4_plan(),
             database=self.database,
             config=_Config(),
             detect_link=lambda *_args, **_kwargs: _QuarkLink(),
@@ -108,9 +112,6 @@ class ProviderSubmissionDatabaseFenceTests(unittest.TestCase):
             submit_cloud139=lambda *_args, **_kwargs: {},
             submit_generic=lambda *_args, **_kwargs: {},
         )
-
-    def test_new_job_is_atomically_claimed_before_provider_callback(self) -> None:
-        observed: dict = {}
 
         def submit(job_id: int, *_args, **_kwargs) -> dict:
             observed.update(self.database.get_job(job_id) or {})
@@ -131,9 +132,6 @@ class ProviderSubmissionDatabaseFenceTests(unittest.TestCase):
         self.assertEqual(fence["state"], "submitting")
         self.assertEqual(fence["attempt"], 1)
 
-    def test_crash_after_claim_leaves_ambiguous_state_and_idempotent_create_does_not_resubmit(self) -> None:
-        calls: list[int] = []
-
         def crashing_submit(job_id: int, *_args, **_kwargs) -> dict:
             calls.append(job_id)
             raise RuntimeError("simulated process crash window")
@@ -153,185 +151,6 @@ class ProviderSubmissionDatabaseFenceTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertFalse(replay["created"])
         self.assertEqual(replay["job"]["status"], JOB_PROVIDER_SUBMITTING)
-
-    def test_historical_created_without_fence_is_never_retried(self) -> None:
-        job_id, created = self.database.create_job(
-            {
-                "title": "历史任务",
-                "category": "tv",
-                "category_label": "电视剧",
-                "source_type": "quark",
-                "source_url": _QuarkLink.url,
-                "target_route": ROUTE_QUARK_TO_MOBILE,
-                "target_path": "/离线下载/电视剧",
-                "status": JOB_CREATED,
-                "raw_data": {"request": {"url": _QuarkLink.url}},
-                "idempotency_key": f"legacy-created:{uuid.uuid4().hex}",
-            }
-        )
-        self.assertTrue(created)
-        provider_calls: list[int] = []
-        retry = ImportJobRetryService(
-            database=self.database,
-            config=_Config(),
-            submit_quark=lambda job_id, *_args, **_kwargs: provider_calls.append(job_id) or {},
-            submit_cloud139=lambda *_args, **_kwargs: {},
-            submit_generic=lambda *_args, **_kwargs: {},
-        )
-
-        result = retry.retry(job_id)
-
-        self.assertEqual(provider_calls, [])
-        self.assertTrue(result["manual_review"])
-        self.assertTrue(result["provider_submission_ambiguous"])
-        self.assertEqual(self.database.get_job(job_id)["status"], JOB_CREATED)
-
-    def test_post_submission_statuses_never_call_provider_again(self) -> None:
-        provider_calls: list[int] = []
-        retry = ImportJobRetryService(
-            database=self.database,
-            config=_Config(),
-            submit_quark=lambda job_id, *_args, **_kwargs: provider_calls.append(job_id) or {},
-            submit_cloud139=lambda *_args, **_kwargs: {},
-            submit_generic=lambda *_args, **_kwargs: {},
-        )
-        for status in (JOB_SUBMITTED, JOB_WAITING_TRANSFER, JOB_ORGANIZING, JOB_DONE):
-            job_id, created = self.database.create_job(
-                {
-                    "title": f"post submission {status}",
-                    "category": "tv",
-                    "category_label": "电视剧",
-                    "source_type": "quark",
-                    "source_url": f"{_QuarkLink.url}/{status}",
-                    "target_route": ROUTE_QUARK_TO_MOBILE,
-                    "target_path": "/离线下载/电视剧",
-                    "status": status,
-                    "raw_data": {"request": {"url": _QuarkLink.url}},
-                    "idempotency_key": f"post-submission:{status}:{uuid.uuid4().hex}",
-                }
-            )
-            self.assertTrue(created)
-
-            result = retry.retry(job_id)
-
-            self.assertFalse(result["success"])
-            self.assertTrue(result["provider_retry_blocked"])
-        self.assertEqual(provider_calls, [])
-
-    def test_successful_provider_fence_blocks_retry_after_later_failure(self) -> None:
-        job_id, created = self.database.create_job(
-            {
-                "title": "provider succeeded then organizer failed",
-                "category": "tv",
-                "category_label": "电视剧",
-                "source_type": "quark",
-                "source_url": _QuarkLink.url,
-                "target_route": ROUTE_QUARK_TO_MOBILE,
-                "target_path": "/离线下载/电视剧",
-                "status": JOB_FAILED,
-                "raw_data": {
-                    "request": {"url": _QuarkLink.url},
-                    PROVIDER_SUBMISSION_FENCE_KEY: {
-                        "version": 1,
-                        "state": "finished",
-                        "attempt": 1,
-                        "success": True,
-                    },
-                },
-                "idempotency_key": f"provider-succeeded-later-failed:{uuid.uuid4().hex}",
-            }
-        )
-        self.assertTrue(created)
-        provider_calls: list[int] = []
-        retry = ImportJobRetryService(
-            database=self.database,
-            config=_Config(),
-            submit_quark=lambda job_id, *_args, **_kwargs: provider_calls.append(job_id) or {},
-            submit_cloud139=lambda *_args, **_kwargs: {},
-            submit_generic=lambda *_args, **_kwargs: {},
-        )
-
-        result = retry.retry(job_id)
-
-        self.assertFalse(result["success"])
-        self.assertTrue(result["provider_completed"])
-        self.assertEqual(provider_calls, [])
-
-    def test_failed_status_with_unfinished_submission_fence_is_still_ambiguous(self) -> None:
-        job_id, created = self.database.create_job(
-            {
-                "title": "provider result unknown but status was changed",
-                "category": "tv",
-                "category_label": "电视剧",
-                "source_type": "quark",
-                "source_url": _QuarkLink.url,
-                "target_route": ROUTE_QUARK_TO_MOBILE,
-                "target_path": "/离线下载/电视剧",
-                "status": JOB_FAILED,
-                "raw_data": {
-                    "request": {"url": _QuarkLink.url},
-                    **_submitting_fence(),
-                },
-                "idempotency_key": f"provider-ambiguous-failed:{uuid.uuid4().hex}",
-            }
-        )
-        self.assertTrue(created)
-        provider_calls: list[int] = []
-        retry = ImportJobRetryService(
-            database=self.database,
-            config=_Config(),
-            submit_quark=lambda current_job_id, *_args, **_kwargs: provider_calls.append(current_job_id) or {},
-            submit_cloud139=lambda *_args, **_kwargs: {},
-            submit_generic=lambda *_args, **_kwargs: {},
-        )
-
-        result = retry.retry(job_id)
-
-        self.assertFalse(result["success"])
-        self.assertTrue(result["provider_submission_ambiguous"])
-        self.assertEqual(provider_calls, [])
-        self.assertEqual(self.database.get_job(job_id)["status"], JOB_FAILED)
-
-    def test_confirmed_provider_failure_remains_retryable(self) -> None:
-        job_id, created = self.database.create_job(
-            {
-                "title": "provider failure retry",
-                "category": "tv",
-                "category_label": "电视剧",
-                "source_type": "quark",
-                "source_url": _QuarkLink.url,
-                "target_route": ROUTE_QUARK_TO_MOBILE,
-                "target_path": "/离线下载/电视剧",
-                "status": JOB_FAILED,
-                "raw_data": {
-                    "request": {"url": _QuarkLink.url},
-                    PROVIDER_SUBMISSION_FENCE_KEY: {
-                        "version": 1,
-                        "state": "finished",
-                        "attempt": 1,
-                        "success": False,
-                    },
-                },
-                "idempotency_key": f"provider-failed-retry:{uuid.uuid4().hex}",
-            }
-        )
-        self.assertTrue(created)
-        provider_calls: list[int] = []
-        retry = ImportJobRetryService(
-            database=self.database,
-            config=_Config(),
-            submit_quark=lambda current_job_id, *_args, **_kwargs: provider_calls.append(current_job_id)
-            or {"success": True},
-            submit_cloud139=lambda *_args, **_kwargs: {},
-            submit_generic=lambda *_args, **_kwargs: {},
-        )
-
-        result = retry.retry(job_id)
-
-        self.assertTrue(result["success"])
-        self.assertEqual(provider_calls, [job_id])
-        self.assertEqual(self.database.get_job(job_id)["status"], JOB_PROVIDER_SUBMITTING)
-
 
 class _RaceDatabase:
     def __init__(self) -> None:

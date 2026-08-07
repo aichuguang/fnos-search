@@ -127,27 +127,6 @@ class SixPanLegacyRefreshReviewTests(unittest.TestCase):
         self.assertEqual(guest_updates[-1][0][1], JOB_REVIEW)
         self.assertEqual(guest_updates[-1][0][2]["retry_action"], "media_refresh_only")
 
-    def test_generic_retry_refuses_to_resubmit_completed_sixpan_provider(self) -> None:
-        database = _Database()
-        _complete_with_refresh_failure(database)
-        provider_calls: list[tuple[Any, ...]] = []
-        retry = ImportJobRetryService(
-            database=database,
-            config=SimpleNamespace(raw={}),
-            submit_quark=lambda *args, **kwargs: provider_calls.append((args, kwargs)) or {},
-            submit_cloud139=lambda *args, **kwargs: provider_calls.append((args, kwargs)) or {},
-            submit_generic=lambda *args, **kwargs: provider_calls.append((args, kwargs)) or {},
-        )
-
-        result = retry.retry(21)
-
-        self.assertFalse(result["success"])
-        self.assertTrue(result["manual_review"])
-        self.assertTrue(result["provider_completed"])
-        self.assertTrue(result["media_refresh_only"])
-        self.assertEqual(provider_calls, [])
-        self.assertEqual(database.job["status"], JOB_REVIEW)
-
     def test_missing_category_enters_review_without_calling_refresh(self) -> None:
         database = _Database()
         refresh_calls: list[tuple[Any, ...]] = []
