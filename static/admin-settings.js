@@ -384,3 +384,79 @@
         loadStorageTargets().catch(() => {});
     }
 })();
+
+/* ============ V1.0 云盘与入库工作区（账号 / OpenList / 存储目标 / 入库规则） ============ */
+(function () {
+  "use strict";
+  if (!window.FnosUI || !window.FnosUI.requestJson) return;
+  const api = (path, opts) => window.FnosUI.requestJson(path, Object.assign({ allowFailure: true }, opts || {}));
+  const esc = (v) => window.FnosUI.escapeHtml(v ?? "");
+
+  function mount() {
+    const anchor = document.getElementById("storageTargetsBody")?.closest(".settings-card")
+      || document.querySelector("#storageTargetsRefreshBtn")?.closest(".settings-card")
+      || document.querySelector(".settings-section-block[data-settings-section~='clouds']");
+    const host = anchor ? anchor.parentElement : document.body;
+    const panel = document.createElement("section");
+    panel.className = "settings-card";
+    panel.id = "v1Workspace";
+    panel.innerHTML = `
+      <h3>云盘与入库（V1.0）</h3>
+      <div class="v1-grid" style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));">
+        ${card("账号", "v1Accounts")}
+        ${card("OpenList 挂载", "v1Openlist")}
+        ${card("存储目标", "v1Targets")}
+        ${card("入库规则", "v1Rules")}
+      </div>`;
+    host.insertBefore(panel, anchor ? anchor.nextSibling : null);
+    loadAccounts(); loadOpenlist(); loadTargets(); loadRules();
+  }
+  function card(title, id) {
+    return `<section class="v1-card" style="border:1px solid #333;border-radius:8px;padding:10px;">
+      <h4 style="margin:0 0 8px;">${esc(title)}</h4><div id="${id}" class="v1-body" style="font-size:13px;"></div></section>`;
+  }
+
+  async function loadAccounts() {
+    const box = document.getElementById("v1Accounts"); if (!box) return;
+    const data = await api("/api/admin/provider-accounts");
+    const rows = (data.accounts || []).map((a) => `<div>${esc(a.name || a.account_id)} · ${esc(a.provider_kind)} · ${esc(a.identity_hint || "")} · ${esc(a.last_test_status || "untested")} ${a.enabled ? "" : "(停用)"}</div>`).join("");
+    box.innerHTML = `<div style="margin-bottom:6px;"><input placeholder="账号名" id="v1acctName" style="width:110px;"><select id="v1acctKind"><option>mobile</option><option>quark</option><option>tianyi</option><option>sixpan</option></select> <button class="secondary mini" id="v1acctAdd">新增</button></div>${rows || '<span class="muted">无账号</span>'}`;
+    document.getElementById("v1acctAdd")?.addEventListener("click", async () => {
+      const name = document.getElementById("v1acctName").value.trim() || "未命名";
+      const kind = document.getElementById("v1acctKind").value;
+      const r = await api("/api/admin/provider-accounts", { method: "POST", body: JSON.stringify({ name, provider_kind: kind }) });
+      loadAccounts();
+    });
+  }
+
+  async function loadTargets() {
+    const box = document.getElementById("v1Targets"); if (!box) return;
+    const data = await api("/api/admin/storage-targets");
+    const rows = (data.targets || []).map((t) => `<div>${esc(t.name || t.destination_id)} · ${esc(t.provider_kind || "")} · ${esc(t.target_kind || "")} ${t.enabled ? "" : "(停用)"}</div>`).join("");
+    box.innerHTML = `<div style="margin-bottom:6px;"><input placeholder="目标ID" id="v1tgtId" style="width:110px;"><input placeholder="名称" id="v1tgtName" style="width:110px;"> <button class="secondary mini" id="v1tgtAdd">新增</button></div>${rows || '<span class="muted">无目标</span>'}`;
+    document.getElementById("v1tgtAdd")?.addEventListener("click", async () => {
+      const destination_id = (document.getElementById("v1tgtId").value || "").trim();
+      const name = (document.getElementById("v1tgtName").value || "").trim() || destination_id;
+      if (!destination_id) return;
+      await api("/api/admin/storage-targets", { method: "POST", body: JSON.stringify({ destination_id, name, provider_kind: "generic", target_kind: "openlist_generic" }) });
+      loadTargets();
+    });
+  }
+
+  async function loadOpenlist() {
+    const box = document.getElementById("v1Openlist"); if (!box) return;
+    const data = await api("/api/admin/openlist/mounts");
+    const rows = (data.items || []).map((m) => `<div>${esc(m.name || m.mount_id)} · ${esc(m.namespace_id || "")} ${m.readable ? "R" : ""}${m.writable ? "W" : ""}</div>`).join("");
+    box.innerHTML = rows || '<span class="muted">无挂载（先到高级配置配好 OpenList）</span>';
+  }
+
+  async function loadRules() {
+    const box = document.getElementById("v1Rules"); if (!box) return;
+    const data = await api("/api/admin/destination-rules");
+    const rows = (data.rules || []).map((r) => `<div>${esc(r.source_provider_kind)}/${esc(r.source_form)} → ${esc(r.destination_id)} ${r.is_default ? "(默认)" : ""}</div>`).join("");
+    box.innerHTML = rows || '<span class="muted">无规则（为每个搜索源配置默认保存目标）</span>';
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", mount);
+  else mount();
+})();
