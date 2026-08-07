@@ -3416,6 +3416,41 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def _v1_validate_plan(plan: dict[str, Any], job_record: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         return validate_v4_plan(plan, job_record, deps=v1_plan_deps, **kwargs)
 
+    from .transfer.dispatch import TransferDispatchService
+    from .openlist.locator_resolver import RcloneLocatorResolver
+
+    v1_transfer_dispatch = TransferDispatchService(
+        accounts_service=v1_accounts_service,
+        target_service=v1_target_service,
+        mount_service=v1_openlist_mounts,
+        registry=v1_adapter_registry,
+        rclone_service=rclone_service,
+        locator_resolver=RcloneLocatorResolver(rclone_runtime_config(app_config)),
+        rclone_config=app_config.raw.get("rclone", {}),
+    )
+    app.extensions["v1_transfer_dispatch"] = v1_transfer_dispatch
+
+    def _dispatch_v4_job(job_id: int) -> None:
+        dispatch = app.extensions.get("v1_transfer_dispatch")
+        if dispatch is None:
+            return
+        job = db.get_job(job_id) if job_id > 0 else None
+        if not isinstance(job, dict):
+            return
+        try:
+            result = dispatch.dispatch(job)
+            if job_id:
+                db.add_event(
+                    job_id,
+                    "info" if result.get("success") else "warn",
+                    f"v4 执行编排阶段：{result.get('phase') or result.get('message') or '完成'}",
+                    {"dispatch": result},
+                )
+        except Exception as exc:  # noqa: BLE001
+            if job_id:
+                db.add_event(job_id, "warn", f"v4 执行编排失败：{exc}")
+    app.extensions["dispatch_v4_job"] = _dispatch_v4_job
+
     for service in (import_service.job_creation, getattr(import_service, "job_retry", None)):
         if service is None:
             continue
@@ -4368,6 +4403,9 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         if not str(payload.get("url") or payload.get("source_url") or "").strip():
             return jsonify({"success": False, "message": "缺少资源链接"}), 400
         result = import_service.create_import_job(payload)
+        if result.get("created") and int((result.get("job") or {}).get("id") or 0) > 0:
+            job_id = int(result["job"]["id"])
+            threading.Timer(1.0, _dispatch_v4_job, args=(job_id,)).start()
         _auto_start_rclone_for_import(result, "api_import")
         return jsonify({"success": bool(result.get("success", True)), **result})
 
