@@ -3378,6 +3378,16 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     from .planning import DefaultAdapterRegistry
 
     v1_adapter_registry = DefaultAdapterRegistry()
+    from .transfer.native_executor import LegacyNativeAdapter
+
+    v1_adapter_registry.register(
+        LegacyNativeAdapter(cloud139_importer, "mobile", supports_native_save=True)
+    )
+    v1_adapter_registry.register(LegacyNativeAdapter(quark_importer, "quark", supports_native_save=True))
+    _sixpan_importer = generic_importers.get("sixpan")
+    v1_adapter_registry.register(
+        LegacyNativeAdapter(_sixpan_importer, "sixpan", supports_native_offline=True)
+    )
     v1_source_resolver = SourceResolver(
         detect_link=lambda url, password="", **_kw: detect_link(url, app_config.raw.get("routes", {}), password=password),
         config=app_config.raw,

@@ -354,6 +354,28 @@ class LegacyNativeAdapter:
             return OperationStatus("running", "Provider 不支持轮询，按进行中处理")
         return normalize_operation_status(poll_op(receipt))
 
+    def can_native_transfer(self, source: Any, destination: Any, account: Any = None) -> Any:
+        from ..planning import CapabilityDecision
+
+        if not self._supports_native_save:
+            return CapabilityDecision(
+                available=False,
+                reason=f"{self.kind} 同源原生转存未实现，不降级为跨盘",
+                code="NATIVE_TRANSFER_UNAVAILABLE",
+            )
+        source_kind = str(getattr(source, "provider_kind", None) or "").strip().lower()
+        destination_kind = str(getattr(destination, "provider_kind", None) or "").strip().lower()
+        if source_kind != self.kind or destination_kind != self.kind:
+            return CapabilityDecision(available=False, reason="非同源目标，不适用原生转存", code="NOT_SAME_PROVIDER")
+        return CapabilityDecision(available=True)
+
+    def relay_uploader(self) -> Any:
+        if self.kind != "mobile":
+            return None
+        from ..cmcc.uploader import CmccUploader
+
+        return CmccUploader
+
     # -- 结果校验 --
     def verify_native_result(self, request: Any) -> TransferVerifyResult:
         verify_op = getattr(self.importer, "verify_native_result", None)
