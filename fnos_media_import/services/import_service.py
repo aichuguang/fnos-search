@@ -40,7 +40,13 @@ from .import_job_service import (
     ImportJobCreationService,
     ImportJobRetryService,
 )
-from .import_staging_service import ImportStagingService, staging_plan_from_job
+from .execution_plan_guard import (
+    LEGACY_PLAN_FIELD,
+    LEGACY_SIXPAN_REFRESH_FIELD,
+    plan_requires_organizer,
+    require_v1_execution_plan,
+    v1_plan_or_review,
+)
 
 
 class ImportService:
@@ -56,18 +62,19 @@ class ImportService:
         self.db = db
         self.config = config
         self.quark = quark_importer
-        raw_config = getattr(config, "raw", {}) if config is not None else {}
-        self.cloud139 = cloud139_importer or Cloud139Importer(raw_config.get("cloud139", {}), cmcc_config=raw_config.get("cmcc_upload", {}))
+        # 139 credentials and destination paths belong to the active V1
+        # Provider account/storage binding.  An omitted adapter is an empty
+        # shell, never a fallback to removed global ``cloud139`` or
+        # ``cmcc_upload`` configuration.
+        self.cloud139 = cloud139_importer or Cloud139Importer({}, cmcc_config={})
         self.fnos = fnos
         self.generic_importers = generic_importers or {}
-        self.staging = ImportStagingService(config)
         self.job_creation = ImportJobCreationService(
             database=self.db,
             config=self.config,
             detect_link=detect_link,
             job_source_url=self._job_source_url,
             target_path=self._target_path,
-            staging_plan=self.staging.build,
             submit_quark=self._submit_quark_job,
             submit_cloud139=self._submit_cloud139_job,
             submit_generic=self._submit_generic_job,
@@ -83,10 +90,16 @@ class ImportService:
     FNOS_DIR_REQUIRED_MESSAGE = "未匹配到飞牛媒体库真实刷新目录，已跳过扫描；请先在媒体库管理中确认分类 dir_list"
 
     def detect(self, url: str, password: str = "") -> dict[str, Any]:
-        return detect_link(url, self.config.raw.get("routes", {}), password=password).to_dict()
+        # Routing is resolved later by the V1 source/assignment planner.  URL
+        # detection only classifies the provider and must not consult a global
+        # route switch.
+        return detect_link(url, {}, password=password).to_dict()
 
     def create_import_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.job_creation.create(payload)
+
+    def create_internal_import_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.job_creation.create_internal(payload)
 
     def retry_job(self, job_id: int) -> dict[str, Any]:
         return self.job_retry.retry(job_id)
@@ -246,7 +259,11 @@ class ImportService:
 
         if result.success and getattr(self.cloud139, "refresh_after_submit", False):
             stored_job = self.db.get_job(job_id) or {}
-            if staging_plan_from_job(stored_job) or self._defer_media_refresh_to_organizer():
+            plan = require_v1_execution_plan(
+                stored_job,
+                execution_repository=getattr(self.job_creation, "execution_repository", None),
+            )
+            if plan_requires_organizer(plan):
                 self.db.add_event(
                     job_id,
                     EVENT_INFO,
@@ -335,7 +352,27 @@ class ImportService:
             # 明确忽略的视频误算为应到达文件，导致任务永远无法完成。
             if ignore_files:
                 effective_request_payload["ignore_files"] = ignore_files
-        result = importer.import_resource(title=title, source_url=url, category=category, password=password, **kwargs)
+        elif source_type == SOURCE_CLOUD189:
+            tianyi_selection = effective_request_payload.get("tianyi_selection")
+            if isinstance(tianyi_selection, dict) and tianyi_selection:
+                kwargs["native_selection"] = tianyi_selection
+        if source_type == SOURCE_CLOUD189:
+            result = importer.import_resource(
+                title=title,
+                share_url=url,
+                save_path=target_path,
+                category=category,
+                password=password,
+                **kwargs,
+            )
+        else:
+            result = importer.import_resource(
+                title=title,
+                source_url=url,
+                category=category,
+                password=password,
+                **kwargs,
+            )
         stored_status = JOB_WAITING_ORGANIZER if result.success and is_sixpan and result.status == JOB_DONE else result.status
         raw_data = self._merge_provider_raw_data(job_id, result.raw_data)
         if effective_request_payload:
@@ -370,7 +407,11 @@ class ImportService:
 
         if result.success and is_sixpan and result.status == JOB_DONE:
             stored_job = self.db.get_job(job_id) or {}
-            if staging_plan_from_job(stored_job) or self._defer_media_refresh_to_organizer():
+            plan = require_v1_execution_plan(
+                stored_job,
+                execution_repository=getattr(self.job_creation, "execution_repository", None),
+            )
+            if plan_requires_organizer(plan):
                 self.db.add_event(
                     job_id,
                     EVENT_INFO,
@@ -413,20 +454,31 @@ class ImportService:
         return dict(raw_data)
 
     def _merge_provider_raw_data(self, job_id: int, provider_raw_data: Any) -> dict[str, Any]:
-        """Merge provider evidence without allowing it to replace the staging contract."""
+        """Merge provider evidence without allowing it to replace the V1 plan."""
 
         persisted = self._job_raw_data(job_id)
         provider = provider_raw_data if isinstance(provider_raw_data, dict) else {}
         merged = {**persisted, **provider}
-        for key in ("staging_plan", "staging_plan_required"):
-            if key in persisted:
-                merged[key] = persisted[key]
-            else:
-                merged.pop(key, None)
+        # import_execution_plans is the sole immutable plan store.  Provider
+        # evidence may update the job envelope but can never copy or replace
+        # a full execution plan in raw_data.
+        merged.pop("execution_plan", None)
+        merged.pop(LEGACY_PLAN_FIELD, None)
+        merged.pop(f"{LEGACY_PLAN_FIELD}_required", None)
+        merged.pop(LEGACY_SIXPAN_REFRESH_FIELD, None)
         return merged
 
     def _provider_submission_ready(self, job_id: int) -> tuple[bool, dict[str, Any]]:
         job = self.db.get_job(job_id) or {}
+        _plan, rejection = v1_plan_or_review(
+            self.db,
+            job,
+            context="提交网盘任务前",
+            execution_repository=getattr(self.job_creation, "execution_repository", None),
+        )
+        if rejection:
+            latest = self.db.get_job(job_id) or job
+            return False, {**rejection, "job": latest, "provider_submission_claim_failed": True}
         raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
         fence = (
             raw_data.get(PROVIDER_SUBMISSION_FENCE_KEY)
@@ -555,6 +607,7 @@ class ImportService:
         scoped = {
             "quark_selection": payload.get("quark_selection") if isinstance(payload.get("quark_selection"), dict) else {},
             "cloud139_selection": payload.get("cloud139_selection") if isinstance(payload.get("cloud139_selection"), dict) else {},
+            "tianyi_selection": payload.get("tianyi_selection") if isinstance(payload.get("tianyi_selection"), dict) else {},
         }
         # SixPan's effective selection is represented by the ignored file
         # identities.  Keep only this semantic field in the job identity:
@@ -563,7 +616,11 @@ class ImportService:
         sixpan_ignore_files = ImportService._extract_ignore_files(payload)
         if sixpan_ignore_files:
             scoped["sixpan_selection"] = {"ignore_files": sorted(set(sixpan_ignore_files))}
-        if not scoped["quark_selection"] and not scoped["cloud139_selection"]:
+        if (
+            not scoped["quark_selection"]
+            and not scoped["cloud139_selection"]
+            and not scoped["tianyi_selection"]
+        ):
             if "sixpan_selection" not in scoped:
                 return url
         try:
@@ -628,10 +685,9 @@ class ImportService:
         return self._sixpan_refresh_hints(category, target_path)
 
     def _defer_media_refresh_to_organizer(self) -> bool:
-        raw = getattr(self.config, "raw", {}) if self.config else {}
-        organizer = raw.get("organizer", {}) if isinstance(raw.get("organizer"), dict) else {}
-        openlist = raw.get("openlist", {}) if isinstance(raw.get("openlist"), dict) else {}
-        return bool(organizer.get("enabled", False) and str(openlist.get("base_url") or "").strip())
+        # Organizer deferral is a property of the persisted V1 execution plan
+        # and OpenList target binding, not a process-wide OpenList URL flag.
+        return False
 
     def record_sixpan_completed(self, job_id: int, category: dict[str, Any], target_path: str = "", trigger: str = "sixpan_done") -> dict[str, Any]:
         return self._record_media_refresh(
@@ -645,23 +701,22 @@ class ImportService:
 
     def _sixpan_refresh_hints(self, category: dict[str, Any], target_path: str = "") -> list[str]:
         label = str(category.get("label") or "").strip()
-        save_path = self._normalize_remote_hint(target_path or category.get("sixpan_save_path") or label).strip("/")
+        save_path = self._normalize_remote_hint(target_path or label).strip("/")
         suffixes = [item for item in [save_path, label] if item]
-        values: list[Any] = [
-            category.get("sixpan_fnos_dir_list"),
-            category.get("sixpan_fnos_target_path"),
-            category.get("sixpan_mount_path"),
-            target_path,
-        ]
+        # Category paths are generated by the V1 target binding.  Only the
+        # canonical FNOS directory list and the immutable execution-plan path
+        # are valid refresh hints here.
+        values: list[Any] = [category.get("fnos_dir_list"), target_path]
         importer = self.generic_importers.get("sixpan")
         configured_mounts = [
             getattr(importer, "fnos_mount_name", "") if importer else "",
             getattr(importer, "mount_name", "") if importer else "",
-            category.get("sixpan_mount_path"),
         ]
         raw_config = getattr(importer, "config", {}) if importer else {}
         if isinstance(raw_config, dict):
-            configured_mounts.extend([raw_config.get("fnos_mount_name"), raw_config.get("mount_name"), raw_config.get("mount_path")])
+            # These values are operational metadata only; credential-bearing
+            # account fields are never read from the process config.
+            configured_mounts.extend([raw_config.get("fnos_mount_name"), raw_config.get("mount_name")])
         mount_names = [*configured_mounts, "六盘", "6盘"]
         for mount in mount_names:
             mount_text = self._normalize_remote_hint(mount).strip("/")
@@ -681,12 +736,8 @@ class ImportService:
 
 
     def _cloud139_refresh_hints(self, category: dict[str, Any], target_path: str = "") -> list[str]:
-        values = [
-            category.get("cloud139_fnos_dir_list"),
-            category.get("cloud139_fnos_target_path"),
-            category.get("cloud139_mount_path"),
-        ]
-        mount_name = "" if category.get("cloud139_fnos_target_path") else str(getattr(self.cloud139, "fnos_mount_name", "") or "").strip()
+        values = [category.get("fnos_dir_list"), target_path]
+        mount_name = str(getattr(self.cloud139, "fnos_mount_name", "") or "").strip()
         if mount_name:
             for suffix in self._cloud139_refresh_suffixes(category, target_path):
                 values.append(f"{mount_name}/{suffix}")
@@ -710,14 +761,10 @@ class ImportService:
         used for FNOS matching must be only "电影".
         """
 
-        root = self._normalize_remote_hint(getattr(self.cloud139, "target_root_path", "")).strip("/")
-        raw_values = [
-            category.get("cloud139_fnos_sub_path"),
-            category.get("cloud139_target_sub_path"),
-            category.get("cloud139_target_path"),
-            target_path,
-            category.get("label"),
-        ]
+        # The execution plan already contains the destination path.  There is
+        # no category-level 139 path to merge or override in V1.
+        root = ""
+        raw_values = [target_path, category.get("label")]
         result: list[str] = []
         for raw in raw_values:
             for item in self._split_fnos_values(raw):
@@ -881,33 +928,16 @@ class ImportService:
 
     @classmethod
     def _fnos_target_hints(cls, category: dict[str, Any], target_path: str = "", route: str = "", extra_hints: list[str] | None = None) -> list[str]:
-        if route == ROUTE_CLOUD139_DIRECT:
-            values = [
-                *(extra_hints or []),
-                category.get("cloud139_fnos_dir_list"),
-                category.get("cloud139_fnos_target_path"),
-                category.get("cloud139_mount_path"),
-                category.get("cloud139_target_path"),
-                target_path,
-                category.get("label"),
-            ]
-        elif route == ROUTE_SIXPAN_OFFLINE:
-            values = [
-                *(extra_hints or []),
-                category.get("sixpan_fnos_dir_list"),
-                category.get("sixpan_fnos_target_path"),
-                category.get("sixpan_mount_path"),
-                category.get("sixpan_save_path"),
-                target_path,
-                category.get("label"),
-            ]
-        else:
-            values = [
-                target_path,
-                category.get("mobile_target_path"),
-                category.get("fnos_target_path"),
-                category.get("label"),
-            ]
+        del route
+        # All destination paths are frozen in the V1 execution plan.  The
+        # category contributes only its canonical FNOS library directory list
+        # and display label; removed provider-specific path keys are ignored.
+        values = [
+            *(extra_hints or []),
+            category.get("fnos_dir_list"),
+            target_path,
+            category.get("label"),
+        ]
         result: list[str] = []
         for value in values:
             for item in cls._split_fnos_values(value):
@@ -949,18 +979,8 @@ class ImportService:
 
     @staticmethod
     def _fnos_dir_list(category: dict[str, Any], target_path: str = "", route: str = "") -> list[str]:
-        if route == ROUTE_CLOUD139_DIRECT:
-            configured = category.get("cloud139_fnos_dir_list") or category.get("cloud139_fnos_dirs")
-        elif route == ROUTE_SIXPAN_OFFLINE:
-            configured = (
-                category.get("sixpan_fnos_dir_list")
-                or category.get("sixpan_fnos_dirs")
-                or category.get("fnos_dir_list")
-                or category.get("fnos_dirs")
-                or category.get("fnos_mdb_dir_list")
-            )
-        else:
-            configured = category.get("fnos_dir_list") or category.get("fnos_dirs") or category.get("fnos_mdb_dir_list")
+        del route
+        configured = category.get("fnos_dir_list")
         values: list[Any]
         if isinstance(configured, str):
             values = configured.replace("\n", ",").replace("|", ",").split(",")
@@ -970,7 +990,7 @@ class ImportService:
             values = []
 
         target = str(target_path or "").strip()
-        if target.startswith("/") and route != ROUTE_SIXPAN_OFFLINE:
+        if target.startswith("/"):
             values = [target]
 
         return ImportService._absolute_fnos_dirs(values)
@@ -996,42 +1016,10 @@ class ImportService:
         return result
 
     def _target_path(self, route: str, category: dict[str, Any], request_payload: dict[str, Any] | None = None) -> str:
-        request_payload = request_payload if isinstance(request_payload, dict) else {}
-        if route == ROUTE_QUARK_TO_MOBILE:
-            return str(category.get("quark_save_path") or "")
-        if route == ROUTE_CLOUD139_DIRECT:
-            override = self._target_path_override(request_payload)
-            if override:
-                return override
-            resolver = getattr(self.cloud139, "target_path_for_category", None)
-            if callable(resolver):
-                return str(resolver(category=category) or "")
-            return str(category.get("cloud139_target_path") or category.get("mobile_target_path") or category.get("quark_save_path") or "")
-        if route == ROUTE_SIXPAN_OFFLINE:
-            importer = self.generic_importers.get("sixpan")
-            resolver = getattr(importer, "target_path_for_category", None)
-            if callable(resolver):
-                return str(resolver(category) or "")
-            return str(category.get("sixpan_save_path") or category.get("quark_save_path") or "")
-        return str(category.get("mobile_target_path") or category.get("quark_save_path") or "")
-
-    @staticmethod
-    def _target_path_override(payload: dict[str, Any]) -> str:
-        context = payload.get("update_context") if isinstance(payload.get("update_context"), dict) else {}
-        values = [
-            payload.get("target_path_override"),
-            payload.get("cloud139_target_path_override"),
-            context.get("cloud139_target_path"),
-            context.get("target_path_override"),
-        ]
-        for value in values:
-            text = str(value or "").strip().replace("\\", "/")
-            if not text or "://" in text:
-                continue
-            lowered = text.strip("/").lower()
-            if lowered in {"none", "null", "undefined"}:
-                continue
-            return text.strip("/")
+        del route, category, request_payload
+        # ImportJobCreationService persists the path generated by the V1
+        # planner.  Returning a category-derived path here would reintroduce
+        # the removed global/category save-path contract.
         return ""
 
     @staticmethod

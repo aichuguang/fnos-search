@@ -21,7 +21,6 @@ TERMINAL_JOB_STATUSES = frozenset(
     {"done", "failed", "unsupported", "cancelled", "canceled", "skipped", "rejected"}
 )
 
-
 class ProviderAccountError(RuntimeError):
     """账号体系错误基类（repository 层可直接抛出，service/blueprint 统一捕获）。"""
 
@@ -60,30 +59,25 @@ def _parse_raw_data(value: Any) -> Any:
     return None
 
 
-def _plan_account_ids(raw: Any) -> set[str]:
-    """从 v4 执行计划（raw_data.execution_plan）收集引用的 account_id。"""
+def _object_account_ids(value: Any) -> set[str]:
+    """Extract account IDs from a canonical plan or execution snapshot."""
+    data = _parse_raw_data(value)
     ids: set[str] = set()
-    data = _parse_raw_data(raw)
-    if not isinstance(data, dict):
-        return ids
-    plan = data.get("execution_plan")
-    if isinstance(plan, dict):
-        for key in ("source", "destination"):
-            block = plan.get(key)
-            if isinstance(block, dict):
-                aid = str(block.get("account_id") or "").strip()
-                if aid:
-                    ids.add(aid)
-    # 向前兼容：计划直接内联或平铺在 raw_data 时也能识别。
-    for key in ("source", "destination"):
-        block = data.get(key)
-        if isinstance(block, dict):
-            aid = str(block.get("account_id") or "").strip()
-            if aid:
-                ids.add(aid)
-    aid = str(data.get("account_id") or "").strip()
-    if aid:
-        ids.add(aid)
+
+    def visit(candidate: Any) -> None:
+        if isinstance(candidate, dict):
+            for key, child in candidate.items():
+                if str(key).strip().lower() == "account_id":
+                    account_id = str(child or "").strip()
+                    if account_id:
+                        ids.add(account_id)
+                elif isinstance(child, (dict, list, tuple)):
+                    visit(child)
+        elif isinstance(candidate, (list, tuple)):
+            for child in candidate:
+                visit(child)
+
+    visit(data)
     return ids
 
 
@@ -204,11 +198,29 @@ class ProviderAccountRepository:
 
     def delete_account(self, account_id: str, *, conn: Any = None) -> None:
         with self._session(conn) as c:
-            c.execute(
-                "DELETE FROM provider_account_revisions WHERE account_id = ?", (account_id,)
-            )
+            # Historical selection revisions are immutable references to
+            # account revisions.  They may be removed only after the service
+            # has proved no live V1 plan/execution still depends on them.
             c.execute(
                 "DELETE FROM provider_account_selections WHERE account_id = ?", (account_id,)
+            )
+            c.execute(
+                "DELETE FROM provider_account_selection_revisions WHERE account_id = ?",
+                (account_id,),
+            )
+            # Auth sessions are ephemeral; retain no FK pointing at a deleted
+            # account while preserving the session audit row.
+            try:
+                c.execute(
+                    "UPDATE provider_auth_sessions SET account_id = NULL "
+                    "WHERE account_id = ?",
+                    (account_id,),
+                )
+            except sqlite3.OperationalError:
+                # Older isolated test schemas may not have auth sessions.
+                pass
+            c.execute(
+                "DELETE FROM provider_account_revisions WHERE account_id = ?", (account_id,)
             )
             try:
                 cursor = c.execute(
@@ -296,6 +308,30 @@ class ProviderAccountRepository:
             ).fetchone()
             return self._row_to_selection(row) if row is not None else None
 
+    def get_selection_revision(
+        self,
+        provider_kind: str,
+        scope: str,
+        selection_revision: int,
+        *,
+        conn: Any = None,
+    ) -> AccountSelection | None:
+        """Read an immutable historical account selection.
+
+        Execution plans freeze the selection revision at creation time.  The
+        current selection may legitimately move to another account later, so
+        validators must consult this append-only history rather than compare
+        against :meth:`get_selection`.
+        """
+        with self._session(conn) as c:
+            row = c.execute(
+                "SELECT provider_kind, scope, account_id, account_revision, selection_revision "
+                "FROM provider_account_selection_revisions "
+                "WHERE provider_kind = ? AND scope = ? AND selection_revision = ?",
+                (provider_kind, scope, int(selection_revision)),
+            ).fetchone()
+            return self._row_to_selection(row) if row is not None else None
+
     def list_selections(self, *, conn: Any = None) -> list[AccountSelection]:
         with self._session(conn) as c:
             rows = c.execute("SELECT * FROM provider_account_selections").fetchall()
@@ -356,6 +392,12 @@ class ProviderAccountRepository:
                     """,
                     (provider_kind, scope, account_id, account_revision, next_revision, utc_now()),
                 )
+            c.execute(
+                "INSERT INTO provider_account_selection_revisions "
+                "(provider_kind, scope, selection_revision, account_id, account_revision, selected_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (provider_kind, scope, next_revision, account_id, account_revision, utc_now()),
+            )
             return AccountSelection(
                 provider_kind=provider_kind,
                 scope=scope,
@@ -373,20 +415,56 @@ class ProviderAccountRepository:
 
     # ---- job reference counting ----
 
+    def count_frozen_plans_referencing_account(
+        self, account_id: str, *, conn: Any = None
+    ) -> int:
+        """Count live references using canonical V1 plan/execution rows.
+
+        ``import_jobs.raw_data`` is a denormalized presentation snapshot and
+        is not a safe source for deletion decisions. Canonical plans and
+        execution snapshots are both inspected. Immutable V1 plans are audit
+        records, so even completed/cancelled executions retain their frozen
+        account revisions and block physical account deletion.
+        """
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            return 0
+        try:
+            with self._session(conn) as c:
+                rows = c.execute(
+                    "SELECT p.job_id, p.plan_json, e.phase, e.snapshot_json "
+                    "FROM import_execution_plans p "
+                    "LEFT JOIN transfer_executions e ON e.job_id = p.job_id"
+                ).fetchall()
+                execution_rows = c.execute(
+                    "SELECT e.job_id, e.phase, e.snapshot_json "
+                    "FROM transfer_executions e "
+                    "LEFT JOIN import_execution_plans p ON p.job_id = e.job_id "
+                    "WHERE p.job_id IS NULL"
+                ).fetchall()
+        except sqlite3.OperationalError:
+            # A missing V1 schema must never fall back to mutable job raw_data.
+            # Report one conservative live reference so destructive account
+            # deletion remains fail-closed in isolated or broken databases.
+            return 1
+
+        referenced_jobs: set[int] = set()
+        for row in rows:
+            plan_ids = _object_account_ids(row["plan_json"])
+            snapshot_ids = _object_account_ids(row["snapshot_json"])
+            if account_id in plan_ids or account_id in snapshot_ids:
+                referenced_jobs.add(int(row["job_id"]))
+        for row in execution_rows:
+            if account_id in _object_account_ids(row["snapshot_json"]):
+                referenced_jobs.add(int(row["job_id"]))
+        return len(referenced_jobs)
+
     def count_non_terminal_jobs_referencing_account(
         self, account_id: str, *, conn: Any = None
     ) -> int:
-        """统计引用该账号的非终态 v4 任务数量（计划中 source/destination 任意一侧）。"""
-        with self._session(conn) as c:
-            rows = c.execute("SELECT status, raw_data FROM import_jobs").fetchall()
-        count = 0
-        for row in rows:
-            status = str(row["status"] or "").strip().lower()
-            if status in TERMINAL_JOB_STATUSES:
-                continue
-            if account_id in _plan_account_ids(row["raw_data"]):
-                count += 1
-        return count
+        """Compatibility name for the stricter immutable-plan reference count."""
+
+        return self.count_frozen_plans_referencing_account(account_id, conn=conn)
 
     @staticmethod
     def _row_to_account(row: sqlite3.Row) -> ProviderAccount:

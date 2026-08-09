@@ -23,15 +23,11 @@ from typing import Any, Callable
 
 from flask import Blueprint, jsonify, request
 
-from .rules_service import (
-    DestinationRulesService,
-    RuleNotFoundError,
-    RuleValidationError,
-    rule_to_dict,
-)
+from .assignment_service import AssignmentError, SourceAssignmentService, assignment_to_dict
 from .target_service import (
     StorageTargetService,
     TargetInUseError,
+    TargetConflictError,
     TargetNotFoundError,
     TargetRevisionNotFoundError,
     TargetValidationError,
@@ -56,14 +52,14 @@ class StorageBlueprintContext:
 
     admin_required: Callable[[Callable[..., Any]], Callable[..., Any]]
     target_service: StorageTargetService
-    rules_service: DestinationRulesService
+    assignment_service: SourceAssignmentService
 
 
 def create_storage_blueprint(context: StorageBlueprintContext) -> Blueprint:
     blueprint = Blueprint("storage_v1", __name__)
     protected = context.admin_required
     target_service = context.target_service
-    rules_service = context.rules_service
+    assignment_service = context.assignment_service
 
     def _extract_categories(payload: dict[str, Any]) -> dict[str, Any]:
         raw = payload.get("categories")
@@ -79,10 +75,15 @@ def create_storage_blueprint(context: StorageBlueprintContext) -> Blueprint:
     @protected
     def _create_target() -> Any:
         payload = request.get_json(silent=True) or {}
-        categories = _extract_categories(payload)
-        kwargs = {key: payload[key] for key in _CREATE_FIELDS if key in payload}
         try:
-            target = target_service.create_target(categories=categories, **kwargs)
+            categories = _extract_categories(payload)
+            kwargs = {key: payload[key] for key in _CREATE_FIELDS if key in payload}
+            target = target_service.create_target(
+                categories=categories,
+                account_id=payload.get("account_id"),
+                binding_locator=payload.get("binding_locator") or {},
+                **kwargs,
+            )
         except TargetValidationError as exc:
             return jsonify({"success": False, "code": "TARGET_INVALID", "message": str(exc)}), 400
         return jsonify({"success": True, "target": target_to_dict(target)}), 201
@@ -106,18 +107,23 @@ def create_storage_blueprint(context: StorageBlueprintContext) -> Blueprint:
     @protected
     def _revise_target(destination_id: str) -> Any:
         payload = request.get_json(silent=True) or {}
-        raw_categories = payload.get("categories")
-        categories = decode_categories(raw_categories) if raw_categories else None
         try:
+            raw_categories = payload.get("categories")
+            categories = decode_categories(raw_categories) if raw_categories else None
             target = target_service.revise_target(
                 destination_id,
                 name=payload.get("name"),
                 audience=payload.get("audience"),
                 categories=categories,
                 allow_mount_root=bool(payload.get("allow_mount_root", False)),
+                account_id=payload.get("account_id") if "account_id" in payload else None,
+                binding_locator=payload.get("binding_locator") if "binding_locator" in payload else None,
+                expected_revision=payload.get("expected_revision", payload.get("revision")),
             )
         except TargetNotFoundError as exc:
             return jsonify({"success": False, "code": "TARGET_NOT_FOUND", "message": str(exc)}), 404
+        except TargetConflictError as exc:
+            return jsonify({"success": False, "code": "TARGET_CONFLICT", "message": str(exc)}), 409
         except TargetValidationError as exc:
             return jsonify({"success": False, "code": "TARGET_INVALID", "message": str(exc)}), 400
         return jsonify({"success": True, "target": target_to_dict(target)})
@@ -149,27 +155,50 @@ def create_storage_blueprint(context: StorageBlueprintContext) -> Blueprint:
         return jsonify({"success": True})
 
     @protected
-    def _list_rules() -> Any:
-        rules = rules_service.list_rules()
-        return jsonify({"success": True, "rules": [rule_to_dict(r) for r in rules]})
+    def _list_assignments() -> Any:
+        items = assignment_service.list_assignments()
+        return jsonify({"success": True, "assignments": [assignment_to_dict(item) for item in items]})
 
     @protected
-    def _put_rules() -> Any:
+    def _put_assignments() -> Any:
         payload = request.get_json(silent=True) or {}
-        rules = payload.get("rules") if isinstance(payload, dict) else None
-        if not isinstance(rules, list):
-            return jsonify({"success": False, "code": "RULES_INVALID", "message": "rules 必须是数组"}), 400
+        assignments = payload.get("assignments") if isinstance(payload, dict) else None
+        if not isinstance(assignments, list):
+            return jsonify({"success": False, "code": "ASSIGNMENTS_INVALID", "message": "assignments 必须是数组"}), 400
         try:
-            saved = rules_service.put_rules(rules)
+            saved = assignment_service.replace(assignments)
         except TargetNotFoundError as exc:
             return jsonify({"success": False, "code": "TARGET_NOT_FOUND", "message": str(exc)}), 404
-        except RuleValidationError as exc:
-            return jsonify({"success": False, "code": "RULES_INVALID", "message": str(exc)}), 400
-        return jsonify({"success": True, "rules": [rule_to_dict(r) for r in saved]})
+        except (AssignmentError, TargetValidationError) as exc:
+            return jsonify({"success": False, "code": "ASSIGNMENTS_INVALID", "message": str(exc)}), 400
+        return jsonify({"success": True, "assignments": [assignment_to_dict(item) for item in saved]})
 
     @protected
     def _transfer_matrix() -> Any:
-        return jsonify(rules_service.transfer_matrix())
+        return jsonify(assignment_service.matrix())
+
+    @protected
+    def _list_bindings(destination_id: str) -> Any:
+        try:
+            bindings = target_service.list_bindings(destination_id)
+        except TargetNotFoundError as exc:
+            return jsonify({"success": False, "code": "TARGET_NOT_FOUND", "message": str(exc)}), 404
+        return jsonify({
+            "success": True,
+            "bindings": [
+                {
+                    "binding_id": item.binding_id,
+                    "target_revision": item.target_revision,
+                    "binding_revision": item.current_revision,
+                    "provider_kind": item.provider_kind,
+                    "account_id": item.account_id,
+                    "account_revision": item.account_revision,
+                    "locator": item.locator,
+                    "enabled": item.enabled,
+                }
+                for item in bindings
+            ],
+        })
 
     blueprint.add_url_rule(
         "/api/admin/storage-targets",
@@ -214,21 +243,27 @@ def create_storage_blueprint(context: StorageBlueprintContext) -> Blueprint:
         methods=["DELETE"],
     )
     blueprint.add_url_rule(
-        "/api/admin/destination-rules",
-        endpoint="destination_rules_list",
-        view_func=_list_rules,
+        "/api/admin/source-assignments",
+        endpoint="source_assignments_list",
+        view_func=_list_assignments,
         methods=["GET"],
     )
     blueprint.add_url_rule(
-        "/api/admin/destination-rules",
-        endpoint="destination_rules_put",
-        view_func=_put_rules,
+        "/api/admin/source-assignments",
+        endpoint="source_assignments_put",
+        view_func=_put_assignments,
         methods=["PUT"],
     )
     blueprint.add_url_rule(
-        "/api/admin/transfer-matrix",
-        endpoint="transfer_matrix",
+        "/api/admin/routing-matrix",
+        endpoint="routing_matrix",
         view_func=_transfer_matrix,
+        methods=["GET"],
+    )
+    blueprint.add_url_rule(
+        "/api/admin/storage-targets/<destination_id>/bindings",
+        endpoint="storage_target_bindings",
+        view_func=_list_bindings,
         methods=["GET"],
     )
     return blueprint

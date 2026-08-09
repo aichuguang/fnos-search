@@ -8,6 +8,11 @@ from typing import Any
 from fnos_media_import.database import Database
 from fnos_media_import.organizer.service import OrganizerService
 from fnos_media_import.services.organizer_admin_service import OrganizerAdminCommandDependencies, OrganizerAdminCommandService
+from tests._organizer_v1_fixtures import (
+    attach_organizer_v1_task,
+    bind_organizer_v1_execution_repository,
+    organizer_v1_plan,
+)
 
 
 class _FakeOrganizer:
@@ -137,6 +142,7 @@ class OrganizerAtomicBatchRenameDatabaseTests(unittest.TestCase):
         self.db_path = root / f"organizer-batch-rename-{uuid.uuid4().hex}.db"
         self.database = Database(self.db_path)
         self.database.init_schema()
+        self.plans: dict[int, dict[str, Any]] = {}
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -145,11 +151,37 @@ class OrganizerAtomicBatchRenameDatabaseTests(unittest.TestCase):
                 candidate.unlink()
 
     def _create_task(self, *, duplicate_episode: bool = False, mapping_status: str = "ready") -> int:
+        job_id, created = self.database.create_job(
+            {
+                "title": "批量重命名",
+                "category": "anime",
+                "category_label": "动漫",
+                "source_type": "quark",
+                "source_url": f"source-record:organizer-batch-{uuid.uuid4().hex}",
+                "target_route": "native_save",
+                "target_path": "/移动云/动漫",
+                "status": "waiting_organizer",
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": f"test:organizer-batch:{uuid.uuid4().hex}",
+            }
+        )
+        self.assertTrue(created)
+        plan = organizer_v1_plan(
+            job_id,
+            category="anime",
+            organizer_root="/暂存/动漫/job-15",
+            destination_final="/移动云/动漫",
+        )
+        self.plans[job_id] = plan
+        task_payload = attach_organizer_v1_task({}, plan)
         task_id = self.database.create_organizer_task(
             category="anime",
             openlist_root_path="/暂存/动漫/job-15",
+            job_id=job_id,
             status="waiting_review",
             evidence={"source": "test"},
+            raw_data=task_payload["raw_data"],
         )
         mappings = []
         for index, name in enumerate(("a.mp4", "b.mp4"), start=1):
@@ -194,6 +226,7 @@ class OrganizerAtomicBatchRenameDatabaseTests(unittest.TestCase):
         service = OrganizerService.__new__(OrganizerService)
         service.db = self.database
         service.categories = {"anime": {"label": "动漫", "openlist_root_path": "/移动云/动漫"}}
+        bind_organizer_v1_execution_repository(service, *self.plans.values())
         return service
 
     def test_service_updates_mappings_operations_and_evidence_atomically(self) -> None:
@@ -207,7 +240,7 @@ class OrganizerAtomicBatchRenameDatabaseTests(unittest.TestCase):
         self.assertEqual(int(after["revision"]), int(before["revision"]) + 1)
         self.assertEqual({item["title"] for item in after["mappings"]}, {"新片"})
         self.assertEqual({item["season"] for item in after["mappings"]}, {2})
-        self.assertTrue(all("/新片/Season 02/" in item["target_path"] for item in after["mappings"]))
+        self.assertTrue(all("/Season 02/新片 - S02E" in item["target_path"] for item in after["mappings"]))
         move_targets = {item["target_path"] for item in after["operations"] if item["type"] == "move_file"}
         self.assertEqual(move_targets, {item["target_path"] for item in after["mappings"]})
         self.assertIn("episode_completeness", after["evidence"])
@@ -288,7 +321,7 @@ class OrganizerAtomicBatchRenameDatabaseTests(unittest.TestCase):
         after = self.database.get_organizer_task(task_id)
         self.assertEqual({item["title"] for item in after["mappings"]}, {"并发新片"})
         self.assertEqual({item["season"] for item in after["mappings"]}, {1})
-        self.assertTrue(all("/并发新片/Season 01/" in item["target_path"] for item in after["mappings"]))
+        self.assertTrue(all("/Season 01/并发新片 - S01E" in item["target_path"] for item in after["mappings"]))
         self.assertEqual(int(after["revision"]), int(before["revision"]) + 1)
 
     def test_approve_rejects_unresolved_mappings_without_writing(self) -> None:
@@ -360,7 +393,7 @@ class OrganizerAtomicBatchRenameDatabaseTests(unittest.TestCase):
 
         self.assertFalse(result["success"], result)
         self.assertTrue(result.get("conflict"))
-        self.assertIn("不在任务扫描目录", result["message"])
+        self.assertIn("escaped frozen organizer root", result["message"])
 
     def test_approve_rejects_duplicate_targets(self) -> None:
         task_id = self._create_task(mapping_status="ready")

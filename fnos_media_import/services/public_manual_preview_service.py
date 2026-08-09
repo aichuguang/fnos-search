@@ -20,6 +20,7 @@ class PublicManualPreviewService:
         cloud139_importer: Callable[[], Any],
         sixpan_importer: Callable[[], Any],
         hide_full_links: Callable[[], bool],
+        tianyi_importer: Callable[[], Any] | None = None,
     ) -> None:
         self.cache = cache
         self.new_public_id = new_public_id
@@ -32,6 +33,7 @@ class PublicManualPreviewService:
         self.cloud139_importer = cloud139_importer
         self.sixpan_importer = sixpan_importer
         self.hide_full_links = hide_full_links
+        self.tianyi_importer = tianyi_importer or (lambda: None)
 
     def preview(self, *, url: str, password: str, title: str) -> dict[str, Any]:
         routes = self.routes()
@@ -66,6 +68,7 @@ class PublicManualPreviewService:
         hidden = self.hide_full_links()
         cloud139 = self.cloud139_importer()
         sixpan = self.sixpan_importer()
+        tianyi = self.tianyi_importer()
         detail = self.resource_detail(
             cached,
             routes=routes,
@@ -73,6 +76,7 @@ class PublicManualPreviewService:
             cloud139_importer=cloud139,
             sixpan_importer=sixpan,
             hide_full_links=hidden,
+            tianyi_importer=tianyi,
         )
         item = self.present_item(
             {**cache_item, "title": title, "url": link.url, "source_type": link.source_type, "supported": link.supported},
@@ -93,6 +97,7 @@ class PublicManualPreviewService:
                     link.source_type,
                     cloud139_importer=cloud139,
                     sixpan_importer=sixpan,
+                    tianyi_importer=tianyi,
                 ),
             },
             "expires_in_minutes": 60,

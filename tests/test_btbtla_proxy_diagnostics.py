@@ -7,7 +7,11 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from fnos_media_import.config_persistence import normalize_advanced_config_payload
+from fnos_media_import.config_persistence import (
+    ADVANCED_CONFIG_EXPORT_FORMAT,
+    ADVANCED_CONFIG_EXPORT_VERSION,
+    normalize_advanced_config_payload,
+)
 from fnos_media_import.providers.btbtla import BtbtlaClient
 from fnos_media_import.services.btbtla_proxy_diagnostics_service import BtbtlaProxyDiagnosticsService
 
@@ -225,11 +229,16 @@ class BtbtlaProxyProbeTests(unittest.TestCase):
             normalize_advanced_config_payload(
                 {
                     "config": {
-                        "btbtla": {
-                            "proxy_enabled": True,
-                            "proxy_url": "socks5h://proxy.local:70000",
-                        }
-                    }
+                        "format": ADVANCED_CONFIG_EXPORT_FORMAT,
+                        "version": ADVANCED_CONFIG_EXPORT_VERSION,
+                        "stored": {
+                            "btbtla": {
+                                "proxy_enabled": True,
+                                "proxy_url": "socks5h://proxy.local:70000",
+                            }
+                        },
+                    },
+                    "mode": "merge",
                 }
             )
 

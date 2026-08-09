@@ -108,6 +108,55 @@ class WorkerTaskDispatcher:
             reactivate_terminal=True,
         )
 
+    def import_transfer_execute(self, job_id: int, *, reactivate: bool = False) -> dict[str, Any] | None:
+        return self.dispatch(
+            "import_transfer_execute",
+            {"job_id": int(job_id)},
+            f"import-transfer:{int(job_id)}",
+            max_attempts=20,
+            reactivate_terminal=reactivate,
+            force=True,
+        )
+
+    def import_transfer_execute_with_connection(
+        self,
+        connection: Any,
+        job_id: int,
+        *,
+        reactivate: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically enqueue a V1 transfer task in a caller-owned transaction.
+
+        Import-job creation persists the source snapshot, immutable execution
+        plan, execution row and durable worker task under one SQLite write
+        lock.  The regular :meth:`import_transfer_execute` method opens its
+        own connection and therefore cannot be used by that transaction.
+        """
+
+        normalized_job_id = int(job_id or 0)
+        if normalized_job_id <= 0:
+            raise ValueError("import_transfer_execute 缺少有效 job_id")
+        enqueue = getattr(self.repository, "enqueue_with_connection", None)
+        if not callable(enqueue):
+            raise RuntimeError("Worker 队列不支持事务内入队")
+        task_id, created = enqueue(
+            connection,
+            "import_transfer_execute",
+            {"job_id": normalized_job_id},
+            f"import-transfer:{normalized_job_id}",
+            max_attempts=20,
+            config_revision=self.config_revision(),
+            reactivate_terminal=bool(reactivate),
+        )
+        return {
+            "success": True,
+            "queued": True,
+            "created": bool(created),
+            "worker_task_id": int(task_id),
+            "task_type": "import_transfer_execute",
+            "message": "后台传输任务已加入持久化 Worker 队列" if created else "后台传输任务已在 Worker 队列中",
+        }
+
     def public_import_create(
         self,
         *,

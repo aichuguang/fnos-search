@@ -1,22 +1,10 @@
-"""公共流程 v4 接入：访客不选择保存路径。
-
-`ImportJobCreationService.create` 在服务端解析来源（SourceDescriptor）与
-管理员通过 source_destination_rules 分配的目标，解析激活账号，调用 v4
-Planner 冻结执行计划并持久化。访客提交的任何目标/账号/路径字段都在进入
-业务层前被忽略；没有任何可用目标时任务失败关闭，绝不回退默认盘。
-
-`ImportJobRetryService.retry` 只接受 v4 计划；旧版本一律返回
-UNSUPPORTED_PLAN_VERSION，且不从当前配置重建计划。
-
-v4 规划依赖（SourceResolver / DestinationResolver / plan_import /
-validate_v4_plan）由并行 Agent 提供的 planning 包实现。这里以构造函数注入
-为主，未注入时通过受控的惰性导入加载；planning 尚未就绪时错误会清晰暴露，
-不会被静默吞掉。
-"""
+"""V1 多链路任务创建：目标只由管理员 assignment 决定。"""
 
 from __future__ import annotations
 
 import hashlib
+import json
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -44,19 +32,21 @@ from ..constants import (
 from ..domain.models import EXECUTION_PLAN_VERSION, DestinationDescriptor, SourceDescriptor
 
 
-class V4PlanningError(ValueError):
-    """v4 规划失败且必须失败关闭（不生成任务、不回退默认盘）。"""
+class V1PlanningError(ValueError):
+    """V1 规划失败且必须失败关闭。"""
 
     def __init__(self, message: str, code: str = "PLANNING_FAILED") -> None:
         super().__init__(message)
         self.code = code
 
 
-# 访客/调用方提交时不允许携带的“基础设施”字段。进入业务层前被忽略，
-# 绝不参与来源识别、目标解析或执行计划。
+# 所有调用方都不允许覆盖管理员配置的基础设施字段。
 GUEST_FORBIDDEN_FIELDS = frozenset(
     {
         "destination_id",
+        "idempotency_key",
+        "executor_id",
+        "config_revision",
         "account_id",
         "provider_kind",
         "driver",
@@ -95,13 +85,21 @@ PROVIDER_POST_SUBMISSION_JOB_STATUSES = frozenset(
     }
 )
 
+_PLAN_SECRET_FIELDS = frozenset(
+    {
+        "url", "source_url", "share_url", "shareurl", "magnet", "magnet_uri",
+        "password", "pwd", "token", "access_token", "refresh_token", "cookie",
+        "authorization", "credentials", "credentials_ciphertext", "secret",
+    }
+)
+
 
 def _load_planning_dependency(name: str) -> Any:
-    """Lazily import a v4 planning dependency.
+    """Lazily import a V1 planning dependency.
 
-    The planning package is owned by the parallel v4 build.  If a module is
+    If a planning module is unavailable, the error is surfaced clearly
     not yet present, the ImportError is surfaced as a clear
-    ``V4PlanningError`` instead of being swallowed or silently falling back.
+    ``V1PlanningError`` instead of being swallowed or silently falling back.
     """
     try:
         if name == "source_resolver":
@@ -116,16 +114,16 @@ def _load_planning_dependency(name: str) -> Any:
             from ..planning.planner import plan_import
 
             return plan_import
-        if name == "validate_v4_plan":
-            from ..planning.plan_validator import validate_v4_plan
+        if name == "validate_plan":
+            from ..planning.plan_validator import validate_plan
 
-            return validate_v4_plan
+            return validate_plan
     except ImportError as exc:
-        raise V4PlanningError(
-            f"v4 规划依赖 planning.{name} 尚未就绪：{exc}",
+        raise V1PlanningError(
+            f"V1 规划依赖 planning.{name} 尚未就绪：{exc}",
             code="PLANNING_UNAVAILABLE",
         ) from exc
-    raise V4PlanningError(f"未知的 v4 规划依赖：{name}", code="PLANNING_UNAVAILABLE")
+    raise V1PlanningError(f"未知的 V1 规划依赖：{name}", code="PLANNING_UNAVAILABLE")
 
 
 def _account_id(account: Any) -> str:
@@ -141,8 +139,8 @@ def _account_revision(account: Any) -> int:
 
 
 def _selection_revision(account: Any) -> int:
-    if isinstance(account, (tuple, list)) and len(account) >= 3:
-        return _to_nonneg_int(account[2])
+    if isinstance(account, (tuple, list)):
+        return _to_nonneg_int(account[2]) if len(account) >= 3 else 0
     return _to_nonneg_int((account or {}).get("selection_revision"))
 
 
@@ -174,12 +172,12 @@ def _plan_target_path(plan: dict[str, Any]) -> str:
 
 
 class ImportJobCreationService:
-    """Creates the durable v4 import record from a server-resolved plan.
+    """Creates the durable V1 import record from a server-resolved plan.
 
     The guest never selects a save path.  The source is resolved from the
     trusted search-cache record (or re-detected from the validated URL), the
-    destination is resolved from admin ``source_destination_rules``, the
-    active accounts are frozen, and the v4 Planner produces an immutable
+    destination is resolved from admin ``source_destination_assignments``, the
+    active accounts are frozen, and the V1 Planner produces an immutable
     execution plan that is validated and persisted with the job.
     """
 
@@ -198,8 +196,14 @@ class ImportJobCreationService:
         source_resolver: Any | None = None,
         destination_resolver: Any | None = None,
         plan_import: Callable[..., dict[str, Any]] | None = None,
-        validate_v4_plan: Callable[..., Any] | None = None,
+        validate_plan: Callable[..., Any] | None = None,
         plan_validation_deps: Any | None = None,
+        execution_repository: Any | None = None,
+        enqueue_transfer: Callable[[int], Any] | None = None,
+        enqueue_transfer_with_connection: Callable[[Any, int], Any] | None = None,
+        source_record_service: Any | None = None,
+        config_revision_provider: Callable[[], int] | None = None,
+        executor_id: str = "web",
     ) -> None:
         self.database = database
         self.config = config
@@ -210,129 +214,223 @@ class ImportJobCreationService:
         self.submit_quark = submit_quark
         self.submit_cloud139 = submit_cloud139
         self.submit_generic = submit_generic
-        # v4 planning dependencies.  Injected by tests / the integration layer;
+        # V1 planning dependencies. Injected by tests / the integration layer;
         # defaults are lazily imported from the planning package.
         self.source_resolver = source_resolver
         self.destination_resolver = destination_resolver
         self.plan_import = plan_import
-        self.validate_v4_plan = validate_v4_plan
+        self.validate_plan = validate_plan
         self.plan_validation_deps = plan_validation_deps
+        self.execution_repository = execution_repository
+        self.enqueue_transfer = enqueue_transfer
+        self.enqueue_transfer_with_connection = enqueue_transfer_with_connection
+        self.source_record_service = source_record_service
+        self.config_revision_provider = config_revision_provider
+        self.executor_id = str(executor_id or "web").strip() or "web"
 
     def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a job from an untrusted HTTP/public payload."""
+
         payload = dict(payload or {})
-        # 访客提交不体现、不选择保存位置：任何目标/账号/路径/凭证形状字段
-        # 都在进入业务层前被丢弃，绝不影响来源识别或目标解析。
+        forbidden = sorted(field for field in GUEST_FORBIDDEN_FIELDS if field in payload)
+        if forbidden:
+            raise V1PlanningError(
+                f"保存位置由管理员配置，提交不得包含：{', '.join(forbidden)}",
+                code="CLIENT_DESTINATION_FORBIDDEN",
+            )
+
+        return self._create(payload)
+
+    def create_internal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a job for a trusted workflow without trusting its routing fields."""
+
+        sanitized = dict(payload or {})
         for field in GUEST_FORBIDDEN_FIELDS:
-            payload.pop(field, None)
+            sanitized.pop(field, None)
+        return self._create(sanitized)
+
+    def _create(self, payload: dict[str, Any]) -> dict[str, Any]:
 
         title = str(payload.get("title") or "未命名资源").strip()
         url = str(payload.get("url") or payload.get("source_url") or "").strip()
         if not url:
             raise ValueError("资源链接不能为空")
-        password = str(payload.get("password") or "")
         category_key = str(payload.get("category") or "movie")
         category = self.config.category(category_key)
         category_label = category.get("label", category_key)
 
         # (1) 服务端识别来源，不信任客户端 provider 字段。
-        source = self._resolve_source(record=self._build_source_record(payload))
-        # (2) 管理员通过 source_destination_rules 分配目标；0 个可用目标
+        source_record = self._build_source_record(payload)
+        source = self._resolve_source(record=source_record)
+        if self.source_record_service is None:
+            raise V1PlanningError("来源快照服务未装配", code="SOURCE_SNAPSHOT_UNAVAILABLE")
+        # (2) 管理员通过 source_destination_assignments 分配目标；0 个可用目标
         #     必须失败关闭，绝不为空目标回退默认盘。
         destination = self._resolve_destination(source, category_key)
         if destination is None:
-            raise V4PlanningError(
+            raise V1PlanningError(
                 "该资源当前没有可用的保存位置，请联系管理员为该来源配置入库目标",
                 code="SOURCE_DESTINATION_NOT_CONFIGURED",
             )
         # (3) 解析并冻结来源与目标激活账号。
         source_account = self._resolve_source_account(source)
         destination_account = self._resolve_destination_account(destination)
-        selected_items_hash = str(source.selected_items_hash or "")
-
-        idempotency_key = self._v4_idempotency_key(
-            payload,
-            source=source,
-            destination=destination,
-            source_account=source_account,
-            destination_account=destination_account,
-            selected_items_hash=selected_items_hash,
-        )
-        source_url = self.job_source_url(url, payload)
-        raw_data = {
-            "request": payload,
-            "source": self._source_dict(source),
-            "destination": self._destination_dict(destination),
-            "source_account": _account_dict(source_account),
-            "destination_account": _account_dict(destination_account),
-            "selected_items_hash": selected_items_hash,
-            "idempotency_identity": idempotency_key,
-            PROVIDER_SUBMISSION_FENCE_KEY: {
-                "version": PROVIDER_SUBMISSION_FENCE_VERSION,
-                "state": "not_started",
-                "attempt": 0,
-            },
-        }
-        job_id, created = self.database.create_job(
-            {
-                "title": title,
-                "category": category_key,
-                "category_label": category_label,
-                "source_type": source.provider_kind,
-                "source_url": source_url,
-                "password": password,
-                "target_route": _source_route(source),
-                "target_path": "",
-                "status": JOB_CREATED,
-                "raw_data": raw_data,
-                "idempotency_key": idempotency_key,
-                "config_revision": payload.get("config_revision") or 1,
-                "executor_id": payload.get("executor_id") or "web",
-                "destination_id": destination.destination_id,
-                "plan_version": EXECUTION_PLAN_VERSION,
-            }
-        )
-        if not created:
-            job = self.database.get_job(job_id) or {}
-            return {
-                "job": job,
-                "created": False,
-                "message": "该资源和分类已存在入库任务",
-                "idempotency_key": str(job.get("idempotency_key") or ""),
-            }
+        job_id = 0
+        idempotency_key = ""
+        duplicate_job_id = 0
+        duplicate_idempotency_key = ""
         try:
-            # (4) v4 Planner 冻结唯一执行策略。
-            plan = self._plan_import(
-                source=source,
-                destination=destination,
-                category_key=category_key,
-                category=category,
-                job_id=job_id,
-                request_payload=payload,
-            )
-            # (5) 校验器与生成器执行相同约束。
-            self._validate_v4_plan(plan, job_record=self.database.get_job(job_id) or {})
-            # (6) 固化 v4 计划与 destination_id / plan_version。
-            target_path = _plan_target_path(plan)
-            if not _update_created_job(
-                self.database,
-                job_id,
-                target_path=target_path,
-                raw_data={**raw_data, "execution_plan": plan},
-            ):
-                raise V4PlanningError(
-                    "任务状态已变化，未固化 v4 执行计划", code="PLANNING_CONFLICT"
+            if self.execution_repository is None or self.enqueue_transfer_with_connection is None:
+                raise V1PlanningError("V1 持久执行器未装配", code="EXECUTION_UNAVAILABLE")
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                # Source snapshot participates in the same transaction as the
+                # job, immutable plan, execution row and durable queue task.
+                # Any planning/validation/enqueue failure therefore leaves no
+                # orphan encrypted source revision behind.
+                source = self.source_record_service.capture(
+                    source,
+                    source_record,
+                    connection=connection,
                 )
+                selected_items_hash = str(source.selected_items_hash or "")
+                idempotency_key = self._v1_idempotency_key(
+                    category_key=category_key,
+                    source=source,
+                    destination=destination,
+                    source_account=source_account,
+                    destination_account=destination_account,
+                    selected_items_hash=selected_items_hash,
+                )
+                raw_data = {
+                    # Full share URLs, magnet URIs and extraction passwords are
+                    # held only in the encrypted source revision.  The job row
+                    # contains a non-sensitive request summary and references.
+                    "request": self._safe_request_summary(payload, category_key=category_key),
+                    "source": self._source_dict(source),
+                    "destination": self._destination_dict(destination),
+                    "source_account": _account_dict(source_account),
+                    "destination_account": _account_dict(destination_account),
+                    "selected_items_hash": selected_items_hash,
+                    "idempotency_identity": idempotency_key,
+                    PROVIDER_SUBMISSION_FENCE_KEY: {
+                        "version": PROVIDER_SUBMISSION_FENCE_VERSION,
+                        "state": "not_started",
+                        "attempt": 0,
+                    },
+                }
+                job_payload = {
+                    "title": title,
+                    "category": category_key,
+                    "category_label": category_label,
+                    "source_type": source.provider_kind,
+                    "source_url": self._job_source_reference(source),
+                    "password": "",
+                    "target_route": _source_route(source),
+                    "target_path": "",
+                    "status": JOB_CREATED,
+                    "raw_data": raw_data,
+                    "idempotency_key": idempotency_key,
+                    # These are trusted server execution attributes. Client
+                    # payload values with the same names are intentionally
+                    # ignored and cannot select a config revision/executor.
+                    "config_revision": self._trusted_config_revision(),
+                    "executor_id": self.executor_id,
+                    "destination_id": destination.destination_id,
+                    "plan_version": EXECUTION_PLAN_VERSION,
+                }
+                job_id, created = self.database.job_commands.create_with_connection(
+                    connection, job_payload
+                )
+                if not created:
+                    existing = connection.execute(
+                        "SELECT idempotency_key FROM import_jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                    duplicate_job_id = int(job_id)
+                    duplicate_idempotency_key = (
+                        str(existing["idempotency_key"] or "") if existing else ""
+                    )
+                else:
+                    plan = self._plan_import(
+                        source=source,
+                        destination=destination,
+                        category_key=category_key,
+                        category=category,
+                        job_id=job_id,
+                        request_payload=payload,
+                    )
+                    secret_path = _first_secret_path(plan)
+                    if secret_path:
+                        raise V1PlanningError(
+                            f"执行计划包含明文凭证字段：{secret_path}",
+                            code="PLAN_CONTAINS_PLAINTEXT_SECRET",
+                        )
+                    job_record = {
+                        "id": job_id,
+                        "category": category_key,
+                        "destination_id": destination.destination_id,
+                        "plan_version": EXECUTION_PLAN_VERSION,
+                    }
+                    # PlanValidator must see the uncommitted source revision
+                    # through this transaction, not through a second SQLite
+                    # connection that would report it as missing. Composition
+                    # roots normally share one service, but bind both objects
+                    # when a test/container supplied separate instances.
+                    source_services = [self.source_record_service]
+                    dependency_service = getattr(
+                        self.plan_validation_deps, "source_record_service", None
+                    )
+                    if dependency_service is not None and dependency_service is not self.source_record_service:
+                        source_services.append(dependency_service)
+                    with ExitStack() as stack:
+                        for service in source_services:
+                            binder = getattr(service, "bind_connection", None)
+                            if callable(binder):
+                                stack.enter_context(binder(connection))
+                        self._validate_plan(plan, job_record=job_record)
+                    # The immutable plan has exactly one source of truth:
+                    # import_execution_plans.  Job raw_data contains only a
+                    # non-sensitive reference/summary so status and provider
+                    # callbacks cannot accidentally become a second plan store.
+                    transfer = plan.get("transfer") if isinstance(plan.get("transfer"), dict) else {}
+                    raw_data_with_plan = {
+                        **raw_data,
+                        "execution_plan_ref": {
+                            "schema_version": int(EXECUTION_PLAN_VERSION),
+                            "plan_hash": _canonical_plan_hash(plan),
+                            "strategy": str(transfer.get("strategy") or ""),
+                        },
+                    }
+                    connection.execute(
+                        "UPDATE import_jobs SET target_path=?, raw_data=?, updated_at=? "
+                        "WHERE id=? AND status=?",
+                        (
+                            _plan_target_path(plan),
+                            json.dumps(raw_data_with_plan, ensure_ascii=False),
+                            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            job_id,
+                            JOB_CREATED,
+                        ),
+                    )
+                    self.execution_repository.create_with_connection(connection, job_id, plan)
+                    self.enqueue_transfer_with_connection(connection, job_id)
         except Exception as exc:  # noqa: BLE001
-            message = str(exc) if isinstance(exc, V4PlanningError) else f"v4 执行计划失败：{exc}"
-            _mark_creation_failed(self.database, job_id, message)
-            self.database.add_event(job_id, EVENT_ERROR, message)
+            message = str(exc) if isinstance(exc, V1PlanningError) else f"V1 执行计划失败：{exc}"
             return {
-                "job": self.database.get_job(job_id),
-                "created": True,
+                "job": None,
+                "created": False,
                 "message": message,
                 "success": False,
                 "plan_error": True,
                 "idempotency_key": idempotency_key,
+            }
+
+        if duplicate_job_id:
+            return {
+                "job": self.database.get_job(duplicate_job_id) or {},
+                "created": False,
+                "message": "相同来源快照、选集、分类、目标和账号修订的任务已存在",
+                "idempotency_key": duplicate_idempotency_key,
             }
 
         self.database.add_event(job_id, EVENT_INFO, f"创建入库任务：{title}")
@@ -359,7 +457,7 @@ class ImportJobCreationService:
         return bool(organizer.get("enabled", False))
 
     def _build_source_record(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Build the trusted source record for the v4 SourceResolver.
+        """Build the trusted source record for the V1 SourceResolver.
 
         Prefers the search-cache record (server-trusted).  For manual URL
         submissions without a cache entry, a minimal record is synthesized
@@ -386,7 +484,33 @@ class ImportJobCreationService:
             record = getter(public_id)
         except Exception:  # noqa: BLE001
             return None
-        return record if isinstance(record, dict) else None
+        if not isinstance(record, dict):
+            return None
+        # The cached URL/password remain the trusted source identity, while a
+        # guest's already-sanitized file selection belongs to this submission.
+        # Returning the cache row verbatim discarded Quark/139/Tianyi choices
+        # before SourceResolver froze the encrypted source revision.
+        merged = dict(record)
+        raw = dict(record.get("raw_data") or {}) if isinstance(record.get("raw_data"), dict) else {}
+        selection_fields = (
+            "quark_selection",
+            "cloud139_selection",
+            "tianyi_selection",
+            "sixpan_selection",
+            "selected_items",
+            "selected_files",
+            "selected_folders",
+            "selected_dirs",
+            "ignore_files",
+        )
+        for field in selection_fields:
+            if field not in payload:
+                continue
+            value = payload.get(field)
+            merged[field] = value
+            raw[field] = value
+        merged["raw_data"] = raw
+        return merged
 
     def _source_resolver(self) -> Any:
         if self.source_resolver is not None:
@@ -406,8 +530,8 @@ class ImportJobCreationService:
         resolver_cls = _load_planning_dependency("destination_resolver")
         # DestinationResolver 需要 rules/target/accounts 服务，必须由集成层注入；
         # 这里只加载类以清晰暴露依赖缺口。
-        raise V4PlanningError(
-            "v4 目标解析器 DestinationResolver 必须由集成层注入"
+        raise V1PlanningError(
+            "V1 目标解析器 DestinationResolver 必须由集成层注入"
             "（rules_service / target_service / accounts_service）",
             code="PLANNING_UNAVAILABLE",
         )
@@ -416,14 +540,14 @@ class ImportJobCreationService:
         resolver = self._source_resolver()
         try:
             source = resolver.resolve(record)
-        except V4PlanningError:
+        except V1PlanningError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise V4PlanningError(
+            raise V1PlanningError(
                 f"无法解析入库来源：{exc}", code="SOURCE_UNRESOLVABLE"
             ) from exc
         if not isinstance(source, SourceDescriptor):
-            raise V4PlanningError(
+            raise V1PlanningError(
                 "来源解析器返回了无效的来源描述", code="SOURCE_UNRESOLVABLE"
             )
         return source
@@ -434,16 +558,16 @@ class ImportJobCreationService:
         resolver = self._destination_resolver()
         try:
             destination = resolver.resolve(source, category_key, audience="guest")
-        except V4PlanningError:
+        except V1PlanningError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise V4PlanningError(
+            raise V1PlanningError(
                 f"解析保存目标失败：{exc}", code="SOURCE_DESTINATION_NOT_CONFIGURED"
             ) from exc
         if destination is None:
             return None
         if not isinstance(destination, DestinationDescriptor):
-            raise V4PlanningError(
+            raise V1PlanningError(
                 "目标解析器返回了无效的目标描述", code="PLANNING_FAILED"
             )
         return destination
@@ -454,55 +578,77 @@ class ImportJobCreationService:
             return resolver.resolve_account(
                 source.provider_kind, source.account_scope or "default", role="source"
             )
-        except V4PlanningError:
+        except V1PlanningError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise V4PlanningError(
+            raise V1PlanningError(
                 f"当前来源账号不可用：{exc}", code="SOURCE_ACCOUNT_UNAVAILABLE"
             ) from exc
 
     def _resolve_destination_account(self, destination: DestinationDescriptor) -> Any:
-        if not destination.account_scope:
-            # 本地/无账号目标不需要账号。
+        if not destination.account_id:
             return None
-        resolver = self._destination_resolver()
-        try:
-            return resolver.resolve_account(
-                destination.provider_kind, destination.account_scope, role="destination"
-            )
-        except V4PlanningError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise V4PlanningError(
-                f"保存位置暂不可用：{exc}", code="DESTINATION_ACCOUNT_UNAVAILABLE"
-            ) from exc
+        return destination.account_id, destination.account_revision or 0
 
-    def _v4_idempotency_key(
+    def _v1_idempotency_key(
         self,
-        payload: dict[str, Any],
         *,
+        category_key: str,
         source: SourceDescriptor,
         destination: DestinationDescriptor,
         source_account: dict[str, Any] | None,
         destination_account: dict[str, Any] | None,
         selected_items_hash: str,
     ) -> str:
-        base = str(payload.get("idempotency_key") or "").strip()
-        if not base:
-            raw = f"v4|{source.canonical_source_id}|{str(payload.get('category') or '').strip()}"
-            base = "v4:" + hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
+        raw = (
+            f"v1|{source.source_record_id}|{source.source_record_revision}|"
+            f"{source.canonical_source_id}|{str(category_key or '').strip()}"
+        )
+        base = "v1:" + hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
         parts = [
+            f"srev={source.source_record_id}@{source.source_record_revision}",
             f"src={source.canonical_source_id}",
-            f"cat={str(payload.get('category') or '').strip()}",
+            f"cat={str(category_key or '').strip()}",
             f"sel={selected_items_hash}",
             f"dest={destination.destination_id}",
             f"drev={int(destination.target_revision or 1)}",
+            f"binding={destination.binding_id}@{destination.binding_revision}",
         ]
         if source_account:
             parts.append(f"sa={_account_id(source_account)}@{_account_revision(source_account)}")
         if destination_account:
             parts.append(f"da={_account_id(destination_account)}@{_account_revision(destination_account)}")
         return f"{base}:{':'.join(parts)}"
+
+    @staticmethod
+    def _job_source_reference(source: SourceDescriptor) -> str:
+        return f"source-record:{source.source_record_id}@{int(source.source_record_revision)}"
+
+    @staticmethod
+    def _safe_request_summary(payload: dict[str, Any], *, category_key: str) -> dict[str, Any]:
+        """Return the small non-secret subset kept on ``import_jobs``.
+
+        Selection and Provider locator details are already frozen in the
+        encrypted source revision and immutable plan.  An allow-list avoids a
+        future client field (cookie/token/share URL) being copied to raw_data.
+        """
+        summary: dict[str, Any] = {"category": str(category_key or "")}
+        for key in ("public_id", "resource_id"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                summary[key] = value
+        return summary
+
+    def _trusted_config_revision(self) -> int:
+        provider = self.config_revision_provider
+        if provider is None:
+            return 1
+        try:
+            return max(1, int(provider() or 1))
+        except (TypeError, ValueError):
+            raise V1PlanningError(
+                "服务端配置修订无效", code="CONFIG_REVISION_INVALID"
+            ) from None
 
     def _plan_import(
         self,
@@ -520,33 +666,32 @@ class ImportJobCreationService:
                 source=source,
                 category_key=category_key,
                 job_id=int(job_id),
-                destination_id=destination.destination_id,
                 audience="guest",
                 organizer_enabled=self._organizer_enabled(),
                 media_refresh_enabled=False,
             )
-        except V4PlanningError:
+        except V1PlanningError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise V4PlanningError(f"v4 计划生成失败：{exc}", code="PLANNING_FAILED") from exc
+            raise V1PlanningError(f"V1 计划生成失败：{exc}", code="PLANNING_FAILED") from exc
         if not isinstance(plan, dict) or not plan:
-            raise V4PlanningError("v4 Planner 未返回执行计划", code="PLANNING_FAILED")
+            raise V1PlanningError("V1 Planner 未返回执行计划", code="PLANNING_FAILED")
         return plan
 
-    def _validate_v4_plan(
+    def _validate_plan(
         self, plan: dict[str, Any], job_record: dict[str, Any]
     ) -> None:
-        validator = self.validate_v4_plan or _load_planning_dependency("validate_v4_plan")
+        validator = self.validate_plan or _load_planning_dependency("validate_plan")
         try:
             if self.plan_validation_deps is not None:
                 validator(plan, job_record, deps=self.plan_validation_deps)
             else:
                 validator(plan, job_record)
-        except V4PlanningError:
+        except V1PlanningError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise V4PlanningError(
-                f"v4 执行计划校验失败：{exc}", code="PLANNING_VALIDATION_FAILED"
+            raise V1PlanningError(
+                f"V1 执行计划校验失败：{exc}", code="PLANNING_VALIDATION_FAILED"
             ) from exc
 
     @staticmethod
@@ -557,6 +702,9 @@ class ImportJobCreationService:
             "canonical_source_id": source.canonical_source_id,
             "account_scope": source.account_scope,
             "selected_items_hash": source.selected_items_hash,
+            "search_source_id": source.search_source_id,
+            "source_record_id": source.source_record_id,
+            "source_record_revision": source.source_record_revision,
         }
 
     @staticmethod
@@ -564,16 +712,19 @@ class ImportJobCreationService:
         return {
             "destination_id": destination.destination_id,
             "provider_kind": destination.provider_kind,
-            "account_scope": destination.account_scope,
             "target_revision": destination.target_revision,
+            "binding_id": destination.binding_id,
+            "binding_revision": destination.binding_revision,
+            "account_id": destination.account_id,
+            "account_revision": destination.account_revision,
         }
 
 
 class ImportJobRetryService:
-    """Only retries frozen v4 plans.
+    """Only retries frozen V1 plans.
 
     Older plan versions are rejected with ``UNSUPPORTED_PLAN_VERSION``; the
-    plan is never rebuilt from current configuration.  A v4 plan is validated
+    plan is never rebuilt from current configuration. A V1 plan is validated
     before the durable submission fence is re-established for the executor.
     """
 
@@ -585,16 +736,20 @@ class ImportJobRetryService:
         submit_quark: Callable[..., dict[str, Any]] | None = None,
         submit_cloud139: Callable[..., dict[str, Any]] | None = None,
         submit_generic: Callable[..., dict[str, Any]] | None = None,
-        validate_v4_plan: Callable[..., Any] | None = None,
+        validate_plan: Callable[..., Any] | None = None,
         plan_validation_deps: Any | None = None,
+        execution_repository: Any | None = None,
+        enqueue_transfer: Callable[[int], Any] | None = None,
     ) -> None:
         self.database = database
         self.config = config
         self.submit_quark = submit_quark
         self.submit_cloud139 = submit_cloud139
         self.submit_generic = submit_generic
-        self.validate_v4_plan = validate_v4_plan
+        self.validate_plan = validate_plan
         self.plan_validation_deps = plan_validation_deps
+        self.execution_repository = execution_repository
+        self.enqueue_transfer = enqueue_transfer
 
     def retry(self, job_id: int) -> dict[str, Any]:
         job = self.database.get_job(job_id)
@@ -615,7 +770,7 @@ class ImportJobRetryService:
         if persisted_plan_version != EXECUTION_PLAN_VERSION:
             message = (
                 f"任务计划版本为 {persisted_plan_version or '未知'}，"
-                f"仅支持执行 v{EXECUTION_PLAN_VERSION} 计划；"
+                f"仅支持执行 schema v{EXECUTION_PLAN_VERSION} 计划；"
                 f"已拒绝重试，请按当前配置重新提交为新任务"
             )
             self.database.add_event(job_id, EVENT_WARN, message)
@@ -629,9 +784,9 @@ class ImportJobRetryService:
                 "error_code": "UNSUPPORTED_PLAN_VERSION",
             }
 
-        plan = self._persisted_plan(job)
+        plan = self.execution_repository.plan(job_id) if self.execution_repository is not None else None
         if not plan:
-            message = "任务标记为 v4，但没有固化 execution_plan，已拒绝重试"
+            message = "任务没有 V1 不可变执行计划，已拒绝重试"
             self.database.add_event(job_id, EVENT_WARN, message)
             return {
                 "job": job,
@@ -641,9 +796,9 @@ class ImportJobRetryService:
                 "manual_review": True,
             }
         try:
-            self._validate_v4_plan(plan, job_record=job)
-        except V4PlanningError as exc:
-            message = f"持久化 v4 执行计划无效，已拒绝重试：{exc}"
+            self._validate_plan(plan, job_record=job)
+        except V1PlanningError as exc:
+            message = f"持久化 V1 执行计划无效，已拒绝重试：{exc}"
             self.database.add_event(job_id, EVENT_WARN, message)
             return {
                 "job": job,
@@ -654,113 +809,93 @@ class ImportJobRetryService:
                 "error_code": str(getattr(exc, "code", "PLANNING_VALIDATION_FAILED")),
             }
 
-        current_status = str(job.get("status") or "").strip().lower()
-        if current_status == JOB_CANCELLED:
-            message = "任务已取消，如需重新入库请重新提交资源"
+        if self.execution_repository is None or self.enqueue_transfer is None:
+            return {"job": job, "created": False, "message": "V1 Worker 未装配", "success": False}
+        execution = self.execution_repository.get(job_id)
+        if execution is None:
+            return {
+                "job": job,
+                "created": False,
+                "message": "任务缺少持久执行状态，已停止重试",
+                "success": False,
+                "manual_review": True,
+                "error_code": "EXECUTION_MISSING",
+            }
+        if execution.phase in {"cancelled", "manual_review"}:
+            message = (
+                "已取消或人工复核任务不能复用原外部操作栅栏；"
+                "请按当前来源与管理员路由创建新一代入库任务"
+            )
+            self.database.add_event(job_id, EVENT_WARN, message)
+            return {
+                "job": job,
+                "created": False,
+                "message": message,
+                "success": False,
+                "requires_new_job": True,
+                "error_code": "REIMPORT_NEW_GENERATION_REQUIRED",
+            }
+        try:
+            self.execution_repository.reactivate(job_id)
+            queued = self.enqueue_transfer(job_id)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
             self.database.add_event(job_id, EVENT_WARN, message)
             return {"job": job, "created": False, "message": message, "success": False}
-        if current_status == JOB_PROVIDER_SUBMITTING or _provider_submission_is_ambiguous(job):
-            message = (
-                "任务已进入网盘提交栅栏，但尚未确认外部接口是否成功；"
-                "为避免重复转存或重复离线下载，禁止自动重提，请人工核对"
-            )
-            self.database.add_event(job_id, EVENT_WARN, message)
-            return {
-                "job": job,
-                "created": False,
-                "message": message,
-                "success": False,
-                "manual_review": True,
-                "provider_submission_ambiguous": True,
-            }
-        if current_status == JOB_CREATED and not _has_not_started_provider_fence(job):
-            message = (
-                "该历史任务停留在已创建状态，但没有可证明尚未调用网盘接口的提交栅栏；"
-                "为避免重复提交，已转为人工核对"
-            )
-            self.database.add_event(job_id, EVENT_WARN, message)
-            return {
-                "job": job,
-                "created": False,
-                "message": message,
-                "success": False,
-                "manual_review": True,
-                "provider_submission_ambiguous": True,
-            }
-        if current_status not in PROVIDER_RETRYABLE_JOB_STATUSES:
-            stage_label = "已完成" if current_status == JOB_DONE else "已进入网盘提交后的处理阶段"
-            message = (
-                f"任务{stage_label}（当前状态：{current_status or '未知'}），"
-                "通用重试不会再次调用网盘接口，请使用对应阶段的重试入口"
-            )
-            self.database.add_event(job_id, EVENT_WARN, message)
-            return {
-                "job": job,
-                "created": False,
-                "message": message,
-                "success": False,
-                "manual_review": current_status in PROVIDER_POST_SUBMISSION_JOB_STATUSES,
-                "provider_retry_blocked": True,
-            }
-
-        self.database.add_event(job_id, EVENT_INFO, "手动重试 v4 任务")
-        claimed, claimed_job, claim_message = _claim_provider_submission(
-            self.database,
-            job_id=job_id,
-            expected_status=current_status,
-            provider=str(job.get("source_type") or job.get("target_route") or "unknown"),
-            require_not_started_fence=current_status == JOB_CREATED,
-        )
-        if not claimed:
-            return {
-                "job": claimed_job,
-                "created": False,
-                "message": claim_message,
-                "success": False,
-                "provider_submission_claim_failed": True,
-                "retryable": True,
-            }
-        # v4 计划已冻结，执行器按计划恢复，不再从配置重建。
-        self.database.add_event(
-            job_id,
-            EVENT_INFO,
-            "v4 计划校验通过，已建立提交栅栏，等待 v4 执行器接管",
-            {"execution_plan_version": EXECUTION_PLAN_VERSION},
-        )
+        self.database.add_event(job_id, EVENT_INFO, "V1 持久执行任务已重新入队")
         return {
-            "job": claimed_job,
+            "job": self.database.get_job(job_id),
             "created": False,
-            "message": "v4 计划已校验并重新建立提交栅栏，等待执行器接管",
+            "message": "V1 执行状态已恢复并重新入队",
             "success": True,
-            "v4_plan_ready": True,
-            "idempotency_key": str(claimed_job.get("idempotency_key") or ""),
+            "queued": queued,
+            "idempotency_key": str(job.get("idempotency_key") or ""),
         }
 
-    @staticmethod
-    def _persisted_plan(job: dict[str, Any]) -> dict[str, Any]:
-        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        plan = raw_data.get("execution_plan") if isinstance(raw_data.get("execution_plan"), dict) else {}
-        return plan
-
-    def _validate_v4_plan(
+    def _validate_plan(
         self, plan: dict[str, Any], job_record: dict[str, Any]
     ) -> None:
-        validator = self.validate_v4_plan or _load_planning_dependency("validate_v4_plan")
+        validator = self.validate_plan or _load_planning_dependency("validate_plan")
         try:
             if self.plan_validation_deps is not None:
                 validator(plan, job_record, deps=self.plan_validation_deps)
             else:
                 validator(plan, job_record)
-        except V4PlanningError:
+        except V1PlanningError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise V4PlanningError(
-                f"v4 执行计划校验失败：{exc}", code="PLANNING_VALIDATION_FAILED"
+            raise V1PlanningError(
+                f"V1 执行计划校验失败：{exc}", code="PLANNING_VALIDATION_FAILED"
             ) from exc
 
 
 def _source_route(source: SourceDescriptor) -> str:
     return f"{source.provider_kind}:{source.source_form}"
+
+
+def _first_secret_path(value: Any, prefix: str = "plan") -> str:
+    if isinstance(value, dict):
+        for key, candidate in value.items():
+            field = str(key).strip()
+            path = f"{prefix}.{field}"
+            if field.lower() in _PLAN_SECRET_FIELDS and candidate not in (None, "", [], {}):
+                return path
+            nested = _first_secret_path(candidate, path)
+            if nested:
+                return nested
+    elif isinstance(value, (list, tuple)):
+        for index, candidate in enumerate(value):
+            nested = _first_secret_path(candidate, f"{prefix}[{index}]")
+            if nested:
+                return nested
+    return ""
+
+
+def _canonical_plan_hash(plan: dict[str, Any]) -> str:
+    """Hash the exact JSON representation persisted in import_execution_plans."""
+
+    encoded = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _claim_provider_submission(

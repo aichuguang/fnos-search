@@ -4,18 +4,33 @@ import unittest
 from types import SimpleNamespace
 
 from fnos_media_import.app import _rclone_organizer_target_plan
-from fnos_media_import.organizer.parser import standard_target_path
+from fnos_media_import.organizer.parser import (
+    V1_DESTINATION_FINAL_FIELD,
+    V1_DESTINATION_IS_RESOURCE_FIELD,
+    standard_target_path,
+)
 from fnos_media_import.organizer.service import OrganizerService
 from fnos_media_import.services.update_service import _resource_root_from_openlist_root
+from tests._organizer_v1_fixtures import (
+    attach_organizer_v1_task,
+    bind_organizer_v1_execution_repository,
+    bind_task_openlist_resolver,
+    organizer_v1_job,
+    organizer_v1_plan,
+)
 
 
 class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
     @staticmethod
     def _target_category(category: dict, target_plan: dict) -> dict:
-        return OrganizerService._target_category_for_task(
-            {"raw_data": dict(target_plan)},
-            category,
-        )
+        # Runtime Organizer execution derives these values from the immutable
+        # V1 plan.  This helper keeps the path-planning tests pure while still
+        # rejecting legacy category roots in production code.
+        scoped = dict(category)
+        scoped["source_category_root_path"] = str(category.get("openlist_root_path") or "")
+        scoped[V1_DESTINATION_FINAL_FIELD] = str(target_plan.get("target_root_path") or "")
+        scoped[V1_DESTINATION_IS_RESOURCE_FIELD] = bool(target_plan.get("target_root_is_resource"))
+        return scoped
 
     def test_regular_upload_targets_category_root_instead_of_nested_scan_root(self) -> None:
         category = {"label": "电视剧", "openlist_root_path": "/移动云/电视剧"}
@@ -150,6 +165,12 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
         tv = {"label": "电视剧", "openlist_root_path": "/移动云/电视剧"}
         service = OrganizerService.__new__(OrganizerService)
         service.categories = {"movie": movie, "tv": tv}
+        target_category = {
+            **movie,
+            "source_category_root_path": movie["openlist_root_path"],
+            V1_DESTINATION_FINAL_FIELD: tv["openlist_root_path"],
+            V1_DESTINATION_IS_RESOURCE_FIELD: False,
+        }
 
         operations = service._operations_for_mappings(
             [
@@ -160,7 +181,7 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
                     "reason": [],
                 }
             ],
-            movie,
+            target_category,
         )
 
         create_paths = [item["target_path"] for item in operations if item["type"] == "create_dir"]
@@ -170,43 +191,6 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
                 "/移动云/电视剧/正确剧名 (2026)",
                 "/移动云/电视剧/正确剧名 (2026)/Season 01",
             ],
-        )
-
-    def test_old_task_paths_still_create_and_cleanup_after_mount_name_changes(self) -> None:
-        movie = {"label": "电影", "mobile_target_path": "/移动云盘A/电影"}
-        tv = {"label": "电视剧", "mobile_target_path": "/移动云盘A/电视剧"}
-        service = OrganizerService.__new__(OrganizerService)
-        service.categories = {"movie": movie, "tv": tv}
-        task = {
-            "category": "movie",
-            "openlist_root_path": "/移动云/电影/旧包装目录",
-            "raw_data": {},
-        }
-        target_category = service._target_category_for_task(task, movie)
-
-        operations = service._operations_for_mappings(
-            [
-                {
-                    "source_path": "/移动云/电影/旧包装目录/720P/原剧集.mp4",
-                    "target_path": "/移动云/电视剧/正确剧名 (2026)/Season 01/正确剧名 (2026) - S01E01.mp4",
-                    "status": "ready",
-                    "reason": [],
-                }
-            ],
-            target_category,
-        )
-
-        self.assertEqual(target_category["source_category_root_path"], "/移动云/电影")
-        self.assertEqual(
-            [item["target_path"] for item in operations if item["type"] == "create_dir"],
-            [
-                "/移动云/电视剧/正确剧名 (2026)",
-                "/移动云/电视剧/正确剧名 (2026)/Season 01",
-            ],
-        )
-        self.assertIn(
-            "/移动云/电影/旧包装目录",
-            [item["target_path"] for item in operations if item["type"] == "cleanup_empty_dir"],
         )
 
     def test_move_retry_uses_already_renamed_source_file(self) -> None:
@@ -326,6 +310,12 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
         category = {"label": "动漫", "openlist_root_path": "/移动云/动漫"}
         service = OrganizerService.__new__(OrganizerService)
         service.categories = {"anime": category}
+        target_category = {
+            **category,
+            "source_category_root_path": category["openlist_root_path"],
+            V1_DESTINATION_FINAL_FIELD: category["openlist_root_path"],
+            V1_DESTINATION_IS_RESOURCE_FIELD: False,
+        }
 
         operations = service._operations_for_mappings(
             [
@@ -336,7 +326,7 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
                     "reason": ["目标路径已存在"],
                 }
             ],
-            category,
+            target_category,
         )
 
         self.assertEqual(operations[0]["type"], "delete_duplicate_file")
@@ -529,15 +519,23 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
         self.assertEqual(root, "/mount/movie")
 
     def test_update_job_can_create_a_new_task_on_an_existing_resource_root(self) -> None:
+        plan = organizer_v1_plan(
+            80,
+            category="anime",
+            organizer_root="/incoming/anime/job-80",
+            destination_final="/library/anime/resource-80",
+        )
+        job = organizer_v1_job(plan, title="Resource")
+
         class FakeDatabase:
             def __init__(self) -> None:
                 self.created: list[dict] = []
 
+            def get_job(self, _job_id: int) -> dict:
+                return job
+
             def list_organizer_tasks_by_job(self, _job_id: int, limit: int = 1) -> list:
                 return []
-
-            def find_recent_organizer_task(self, _root: str, _category: str):
-                return {"id": 7, "job_id": 70, "status": "auto_approved"}
 
             def list_guest_requests_by_job(self, _job_id: int) -> list:
                 return []
@@ -550,20 +548,17 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
         service.db = FakeDatabase()
         service.organizer_config = {"enabled": True}
         service.openlist = SimpleNamespace(configured=True)
-        service.categories = {"anime": {"label": "动漫", "openlist_root_path": "/移动云/动漫"}}
+        service.categories = {"anime": {"label": "Anime"}}
         service._mark_linked_job_waiting = lambda _task_id: None
         service._schedule_initial_openlist_visibility_wait = lambda _task_id: False
         service._schedule = lambda _task_id: None
+        bind_organizer_v1_execution_repository(service, plan)
+        bind_task_openlist_resolver(service, SimpleNamespace(configured=True), plan)
 
         result = service.enqueue_from_completed_directory(
-            job={"id": 80, "category": "anime", "title": "仙逆"},
-            root_path="/移动云/动漫/仙逆 (2023)",
-            payload={
-                "update_context": {
-                    "subscription_id": 5,
-                    "canonical_resource_root": "/移动云/动漫/仙逆 (2023)",
-                }
-            },
+            job=job,
+            root_path=plan["paths"]["organizer"]["path"],
+            payload={"update_context": {"subscription_id": 5}},
         )
 
         self.assertEqual(result["task_id"], 8)
@@ -571,12 +566,27 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
         self.assertEqual(service.db.created[0]["job_id"], 80)
 
     def test_duplicate_callback_for_the_same_job_reuses_its_existing_task(self) -> None:
+        plan = organizer_v1_plan(
+            80,
+            category="anime",
+            organizer_root="/incoming/anime/job-80",
+            destination_final="/library/anime/resource-80",
+        )
+        job = organizer_v1_job(plan, title="Resource")
+        existing_task = attach_organizer_v1_task(
+            {"id": 9, "status": "waiting_openlist", "revision": 1},
+            plan,
+        )
+
         class FakeDatabase:
             def __init__(self) -> None:
                 self.created = 0
 
+            def get_job(self, _job_id: int) -> dict:
+                return job
+
             def list_organizer_tasks_by_job(self, _job_id: int, limit: int = 1) -> list:
-                return [{"id": 9, "status": "waiting_openlist"}]
+                return [existing_task]
 
             def create_organizer_task(self, **_values) -> int:
                 self.created += 1
@@ -586,30 +596,47 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
         service.db = FakeDatabase()
         service.organizer_config = {"enabled": True}
         service.openlist = SimpleNamespace(configured=True)
-        service.categories = {"anime": {"label": "动漫", "openlist_root_path": "/移动云/动漫"}}
+        service.categories = {"anime": {"label": "Anime"}}
+        bind_organizer_v1_execution_repository(service, plan)
+        bind_task_openlist_resolver(service, SimpleNamespace(configured=True), plan)
 
         result = service.enqueue_from_completed_directory(
-            job={"id": 80, "category": "anime", "title": "仙逆"},
-            root_path="/移动云/动漫/仙逆 (2023)",
-            payload={"allow_same_root_task": True},
+            job=job,
+            root_path=plan["paths"]["organizer"]["path"],
+            payload={},
         )
 
         self.assertEqual(result["task_id"], 9)
         self.assertEqual(service.db.created, 0)
 
     def test_one_failed_organizer_operation_does_not_stop_later_files(self) -> None:
+        plan = organizer_v1_plan(
+            1,
+            category="anime",
+            organizer_root="/incoming/anime/job-1",
+            destination_final="/library/anime/resource-1",
+        )
+        job = organizer_v1_job(plan)
+        task = attach_organizer_v1_task(
+            {
+                "id": 1,
+                "status": "executing",
+                "revision": 1,
+                "mappings": [],
+                "operations": [],
+            },
+            plan,
+        )
+
         class FakeDatabase:
             def __init__(self) -> None:
-                self.task = {
-                    "id": 1,
-                    "category": "anime",
-                    "openlist_root_path": "/移动云/动漫/仙逆 (2023)",
-                    "mappings": [],
-                    "operations": [],
-                }
+                self.task = task
                 self.operation_updates: list[tuple[int, dict]] = []
                 self.run_updates: list[tuple[int, str, dict]] = []
                 self.task_updates: list[tuple[int, dict]] = []
+
+            def get_job(self, _job_id: int) -> dict:
+                return job
 
             def get_organizer_task(self, _task_id: int, include_children: bool = True):
                 return self.task
@@ -622,6 +649,7 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
 
             def update_organizer_task(self, task_id: int, **values) -> None:
                 self.task_updates.append((task_id, values))
+                self.task.update({key: value for key, value in values.items() if key in {"status", "error_message"}})
 
             def update_organizer_operation(self, operation_id: int, **values) -> None:
                 self.operation_updates.append((operation_id, values))
@@ -634,13 +662,27 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
 
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
-        service.categories = {"anime": {"openlist_root_path": "/移动云/动漫"}}
+        service.categories = {"anime": {"label": "Anime"}}
+        service.organizer_config = {}
         service._operations_for_mappings = lambda *_args, **_kwargs: [
-            {"type": "move_file", "source_path": "/来源/E151.mkv", "target_path": "/标准/E151.mkv", "status": "pending"},
-            {"type": "move_file", "source_path": "/来源/E152.mkv", "target_path": "/标准2/E152.mkv", "status": "pending"},
+            {
+                "type": "move_file",
+                "source_path": "/incoming/anime/job-1/E151.mkv",
+                "target_path": "/library/anime/resource-1/E151.mkv",
+                "status": "pending",
+            },
+            {
+                "type": "move_file",
+                "source_path": "/incoming/anime/job-1/E152.mkv",
+                "target_path": "/library/anime/resource-1/E152.mkv",
+                "status": "pending",
+            },
         ]
+        service._collect_move_file_batch = lambda operations, index: [operations[index]]
         service._acquire_organizer_locks = lambda *_args, **_kwargs: []
         service._sync_linked_job = lambda *_args, **_kwargs: None
+        bind_organizer_v1_execution_repository(service, plan)
+        bind_task_openlist_resolver(service, SimpleNamespace(configured=True), plan)
         executed: list[str] = []
 
         def execute(op: dict):
@@ -654,7 +696,10 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
         result = service.apply_task(1)
 
         self.assertFalse(result["success"])
-        self.assertEqual(executed, ["/来源/E151.mkv", "/来源/E152.mkv"])
+        self.assertEqual(
+            executed,
+            ["/incoming/anime/job-1/E151.mkv", "/incoming/anime/job-1/E152.mkv"],
+        )
         statuses = {operation_id: values["status"] for operation_id, values in service.db.operation_updates}
         self.assertEqual(statuses, {1: "failed", 2: "done"})
         self.assertEqual(service.db.run_updates[-1][1], "failed")
@@ -662,17 +707,32 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
         self.assertEqual(service.db.run_updates[-1][2]["summary"]["failed"], 1)
 
     def test_failed_final_confirmation_does_not_mark_the_run_done(self) -> None:
+        plan = organizer_v1_plan(
+            1,
+            category="anime",
+            organizer_root="/incoming/anime/job-1",
+            destination_final="/library/anime/resource-1",
+        )
+        job = organizer_v1_job(plan)
+        task = attach_organizer_v1_task(
+            {
+                "id": 1,
+                "status": "executing",
+                "revision": 1,
+                "mappings": [],
+                "operations": [],
+                "evidence": {},
+            },
+            plan,
+        )
+
         class FakeDatabase:
             def __init__(self) -> None:
-                self.task = {
-                    "id": 1,
-                    "category": "anime",
-                    "openlist_root_path": "/移动云/动漫/仙逆 (2023)",
-                    "mappings": [],
-                    "operations": [],
-                    "evidence": {},
-                }
+                self.task = task
                 self.run_updates: list[tuple[int, str, dict]] = []
+
+            def get_job(self, _job_id: int) -> dict:
+                return job
 
             def get_organizer_task(self, _task_id: int, include_children: bool = True):
                 return self.task
@@ -683,8 +743,14 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
             def create_organizer_run(self, _task_id: int) -> int:
                 return 12
 
-            def update_organizer_task(self, _task_id: int, **_values) -> None:
-                return None
+            def update_organizer_task(self, _task_id: int, **values) -> None:
+                self.task.update(
+                    {
+                        key: value
+                        for key, value in values.items()
+                        if key in {"status", "error_message", "evidence"}
+                    }
+                )
 
             def update_organizer_run(self, run_id: int, status: str, **values) -> None:
                 self.run_updates.append((run_id, status, values))
@@ -694,13 +760,18 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
 
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
-        service.categories = {"anime": {"openlist_root_path": "/移动云/动漫"}}
+        service.categories = {"anime": {"label": "Anime"}}
+        service.organizer_config = {}
         service._operations_for_mappings = lambda *_args, **_kwargs: []
         service._acquire_organizer_locks = lambda *_args, **_kwargs: []
         service._sync_linked_job = lambda *_args, **_kwargs: None
         service._cleanup_source_empty_dirs_after_apply = lambda _task: {}
-        service._refresh_openlist_strm_for_task = lambda _task_id, _task: {}
-        service._confirm_standardized_targets = lambda _task: {"success": False, "message": "目标文件不可见"}
+        service._confirm_standardized_targets = lambda _task: {
+            "success": False,
+            "message": "target not visible",
+        }
+        bind_organizer_v1_execution_repository(service, plan)
+        bind_task_openlist_resolver(service, SimpleNamespace(configured=True), plan)
 
         result = service.apply_task(1)
 

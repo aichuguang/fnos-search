@@ -11,21 +11,36 @@ from unittest.mock import patch
 from fnos_media_import.database import Database
 from fnos_media_import.organizer.service import OrganizerService
 from fnos_media_import.organizer.run_lease import OrganizerRunLease
+from tests._organizer_v1_fixtures import (
+    attach_organizer_v1_task,
+    bind_organizer_v1_execution_repository,
+    bind_task_openlist_resolver,
+    organizer_v1_job,
+    organizer_v1_plan,
+)
 
 
 class _StartApplyDatabase:
     def __init__(self) -> None:
-        self.task = {
-            "id": 1,
-            "status": "manual_confirmed",
-            "category": "tv",
-            "mappings": [],
-        }
+        self.plan = organizer_v1_plan(1, category="tv")
+        self.job = organizer_v1_job(self.plan, status="organizing")
+        self.task = attach_organizer_v1_task(
+            {
+                "id": 1,
+                "status": "manual_confirmed",
+                "category": "tv",
+                "mappings": [],
+            },
+            self.plan,
+        )
         self.events: list[tuple] = []
         self.run_updates: list[tuple[int, str, dict]] = []
 
     def get_organizer_task(self, _task_id: int, include_children: bool = True):
         return self.task
+
+    def get_job(self, _job_id: int):
+        return self.job
 
     def create_organizer_run(self, task_id: int, *, owner_id: str = "") -> int:
         self.events.append(("create_run", task_id, owner_id))
@@ -46,6 +61,7 @@ def _start_apply_service(database: _StartApplyDatabase) -> OrganizerService:
     service._background_apply_lock = threading.Lock()
     service._background_apply_tasks = set()
     service._sync_linked_job = lambda *_args, **_kwargs: None
+    bind_organizer_v1_execution_repository(service, database.plan)
     return service
 
 
@@ -100,22 +116,37 @@ class OrganizerApplyStartupRecoveryTests(unittest.TestCase):
 
 class OrganizerApplyRunReuseTests(unittest.TestCase):
     def test_apply_task_reuses_precreated_run(self) -> None:
+        plan = organizer_v1_plan(
+            1,
+            category="tv",
+            organizer_root="/移动云/_入库暂存/电视剧/job-1",
+            destination_final="/移动云/电视剧",
+        )
+        job = organizer_v1_job(plan, status="organizing")
+
         class FakeDatabase:
             def __init__(self) -> None:
-                self.task = {
-                    "id": 1,
-                    "status": "executing",
-                    "category": "tv",
-                    "openlist_root_path": "/移动云/_入库暂存/电视剧/job-1",
-                    "mappings": [],
-                    "operations": [],
-                    "evidence": {},
-                }
+                self.task = attach_organizer_v1_task(
+                    {
+                        "id": 1,
+                        "status": "executing",
+                        "category": "tv",
+                        "openlist_root_path": "/移动云/_入库暂存/电视剧/job-1",
+                        "mappings": [],
+                        "operations": [],
+                        "evidence": {},
+                    },
+                    plan,
+                )
                 self.create_calls = 0
                 self.run_updates: list[tuple[int, str, dict]] = []
 
             def get_organizer_task(self, _task_id: int, include_children: bool = True):
                 return self.task
+
+            @staticmethod
+            def get_job(_job_id: int):
+                return job
 
             def replace_organizer_operations(self, _task_id: int, operations: list[dict]) -> None:
                 self.task["operations"] = operations
@@ -149,6 +180,7 @@ class OrganizerApplyRunReuseTests(unittest.TestCase):
             "target_dirs": [],
         }
         service._refresh_openlist_strm_for_task = lambda _task_id, _task: {}
+        bind_task_openlist_resolver(service, None, plan)
 
         result = service.apply_task(1, run_id=71)
 
@@ -179,20 +211,35 @@ class OrganizerApplyRunReuseTests(unittest.TestCase):
         self.assertEqual(database.run_updates[-1][0:2], (71, "failed"))
 
     def test_review_early_return_finishes_precreated_run(self) -> None:
+        plan = organizer_v1_plan(
+            1,
+            category="tv",
+            organizer_root="/移动云/_入库暂存/电视剧/job-1",
+            destination_final="/移动云/电视剧",
+        )
+        job = organizer_v1_job(plan, status="organizing")
+
         class FakeDatabase:
             def __init__(self) -> None:
-                self.task = {
-                    "id": 1,
-                    "status": "executing",
-                    "category": "tv",
-                    "openlist_root_path": "/移动云/_入库暂存/电视剧/job-1",
-                    "mappings": [{"status": "conflict"}],
-                    "operations": [],
-                }
+                self.task = attach_organizer_v1_task(
+                    {
+                        "id": 1,
+                        "status": "executing",
+                        "category": "tv",
+                        "openlist_root_path": "/移动云/_入库暂存/电视剧/job-1",
+                        "mappings": [{"status": "conflict"}],
+                        "operations": [],
+                    },
+                    plan,
+                )
                 self.run_updates: list[tuple[int, str, dict]] = []
 
             def get_organizer_task(self, _task_id: int, include_children: bool = True):
                 return self.task
+
+            @staticmethod
+            def get_job(_job_id: int):
+                return job
 
             def replace_organizer_operations(self, _task_id: int, operations: list[dict]) -> None:
                 self.task["operations"] = operations
@@ -209,6 +256,7 @@ class OrganizerApplyRunReuseTests(unittest.TestCase):
         service.categories = {"tv": {"label": "电视剧"}}
         service._operations_for_mappings = lambda *_args, **_kwargs: []
         service._sync_linked_job = lambda *_args, **_kwargs: None
+        bind_task_openlist_resolver(service, None, plan)
 
         result = service.apply_task(1, run_id=71)
 
@@ -231,10 +279,36 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
                 candidate.unlink()
 
     def test_two_service_instances_submit_only_one_background_apply(self) -> None:
+        job_id, created = self.database.create_job(
+            {
+                "title": "并发应用",
+                "category": "tv",
+                "category_label": "电视剧",
+                "source_type": "quark",
+                "source_url": "source-record:test-apply-claim",
+                "target_route": "native_save",
+                "target_path": "/移动云/电视剧",
+                "status": "waiting_organizer",
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": f"test:organizer-claim:{uuid.uuid4().hex}",
+            }
+        )
+        self.assertTrue(created)
+        plan = organizer_v1_plan(
+            job_id,
+            category="tv",
+            organizer_root=f"/移动云/_入库暂存/电视剧/job-{job_id}",
+            destination_final="/移动云/电视剧",
+        )
+        job = organizer_v1_job(plan, status="waiting_organizer")
+        task_payload = attach_organizer_v1_task({}, plan)
         task_id = self.database.create_organizer_task(
             category="tv",
-            openlist_root_path="/移动云/_入库暂存/电视剧/job-88",
+            openlist_root_path=plan["paths"]["organizer"]["path"],
+            job_id=job_id,
             status="manual_confirmed",
+            raw_data=task_payload["raw_data"],
         )
         initial_read_barrier = threading.Barrier(2)
 
@@ -247,6 +321,10 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
                 initial_read_barrier.wait(timeout=5)
                 return task
 
+            @staticmethod
+            def get_job(_job_id: int):
+                return job
+
             def __getattr__(self, name: str):
                 return getattr(self.database, name)
 
@@ -256,7 +334,9 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
         release_background = threading.Event()
         background_finished = threading.Event()
         for owner in ("process-a", "process-b"):
-            service = _start_apply_service(CoordinatedDatabase(Database(self.db_path)))
+            coordinated = CoordinatedDatabase(Database(self.db_path))
+            coordinated.plan = plan
+            service = _start_apply_service(coordinated)
             service.owner_id = owner
 
             def fake_apply(requested_task_id: int, *, run_id: int | None = None) -> dict:
@@ -433,22 +513,37 @@ class OrganizerRunLeaseTests(unittest.TestCase):
         self.assertEqual(database.renewals, stopped_at)
 
     def test_apply_stops_before_next_operation_when_lease_is_lost(self) -> None:
+        plan = organizer_v1_plan(
+            1,
+            category="tv",
+            organizer_root="/移动云/_入库暂存/电视剧/job-1",
+            destination_final="/移动云/电视剧",
+        )
+        job = organizer_v1_job(plan, status="organizing")
+
         class FakeDatabase:
             def __init__(self) -> None:
                 self.owned = True
                 self.operation_updates: list[int] = []
-                self.task = {
-                    "id": 1,
-                    "status": "executing",
-                    "category": "tv",
-                    "openlist_root_path": "/移动云/_入库暂存/电视剧/job-1",
-                    "mappings": [],
-                    "operations": [{"id": 1, "status": "pending"}, {"id": 2, "status": "pending"}],
-                    "evidence": {},
-                }
+                self.task = attach_organizer_v1_task(
+                    {
+                        "id": 1,
+                        "status": "executing",
+                        "category": "tv",
+                        "openlist_root_path": "/移动云/_入库暂存/电视剧/job-1",
+                        "mappings": [],
+                        "operations": [{"id": 1, "status": "pending"}, {"id": 2, "status": "pending"}],
+                        "evidence": {},
+                    },
+                    plan,
+                )
 
             def get_organizer_task(self, _task_id: int, include_children: bool = True):
                 return self.task
+
+            @staticmethod
+            def get_job(_job_id: int):
+                return job
 
             @staticmethod
             def renew_organizer_run(_run_id: int, _owner_id: str, **_kwargs) -> bool:
@@ -496,6 +591,7 @@ class OrganizerRunLeaseTests(unittest.TestCase):
             return {"type": "move"}
 
         service._execute_operation = execute
+        bind_task_openlist_resolver(service, None, plan)
 
         result = service.apply_task(1, run_id=71)
 

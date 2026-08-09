@@ -13,22 +13,12 @@ from fnos_media_import.services.organizer_admin_service import (
     OrganizerAdminCommandDependencies,
     OrganizerAdminCommandService,
 )
-from tests.test_rclone_persisted_staging_plan import _persisted_plan
-
-
-def _movie_plan(job_id: int) -> dict[str, Any]:
-    plan = _persisted_plan(job_id)
-    result: dict[str, Any] = {}
-    for key, value in plan.items():
-        result[key] = value.replace("电视剧", "电影") if isinstance(value, str) else value
-    result.update(
-        {
-            "category": "movie",
-            "category_label": "电影",
-            "route": ROUTE_QUARK_TO_MOBILE,
-        }
-    )
-    return result
+from tests._organizer_v1_fixtures import (
+    attach_organizer_v1_task,
+    bind_organizer_v1_execution_repository,
+    bind_task_openlist_resolver,
+    organizer_v1_plan,
+)
 
 
 class _TreeOpenList:
@@ -128,41 +118,62 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
             if candidate.exists():
                 candidate.unlink()
 
-    def _create_staging_task(self, rows: dict[str, list[tuple[str, bool]]]) -> tuple[OrganizerService, int]:
-        plan = _movie_plan(1)
-        job_id, _created = self.database.create_job(
+    def _create_v1_job(
+        self,
+        *,
+        title: str,
+        status: str,
+        organizer_root: str,
+        destination_final: str,
+    ) -> tuple[int, dict[str, Any]]:
+        job_id, created = self.database.create_job(
             {
-                "title": "电影资源",
+                "title": title,
                 "category": "movie",
                 "category_label": "电影",
                 "source_type": "quark",
-                "source_url": "https://pan.quark.cn/s/passthrough",
+                "source_url": f"source-record:passthrough-{uuid.uuid4().hex}",
                 "target_route": ROUTE_QUARK_TO_MOBILE,
-                "target_path": plan["storage_job_root"],
-                "status": "review",
-                "raw_data": {"staging_plan": plan},
+                "target_path": destination_final,
+                "status": status,
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": f"test:passthrough:{uuid.uuid4().hex}",
             }
         )
+        self.assertTrue(created)
+        return job_id, organizer_v1_plan(
+            job_id,
+            category="movie",
+            organizer_root=organizer_root,
+            destination_final=destination_final,
+        )
+
+    def _create_staging_task(self, rows: dict[str, list[tuple[str, bool]]]) -> tuple[OrganizerService, int]:
+        organizer_root = "/旧挂载/_入库暂存/电影/job-1"
+        job_id, plan = self._create_v1_job(
+            title="电影资源",
+            status="review",
+            organizer_root=organizer_root,
+            destination_final="/旧挂载/电影",
+        )
         self.assertEqual(job_id, 1)
+        task_payload = attach_organizer_v1_task({}, plan)
         task_id = self.database.create_organizer_task(
             category="movie",
             category_label="电影",
             title="电影资源",
-            openlist_root_path=plan["openlist_job_root"],
+            openlist_root_path=organizer_root,
             job_id=job_id,
             status="waiting_review",
-            raw_data={"staging_plan": plan},
+            raw_data=task_payload["raw_data"],
         )
         service = OrganizerService.__new__(OrganizerService)
         service.db = self.database
-        service.categories = {
-            "movie": {
-                "label": "电影",
-                "openlist_root_path": plan["openlist_final_category_root"],
-            }
-        }
+        service.categories = {"movie": {"label": "电影"}}
         service.organizer_config = {"max_files_per_task": 500, "skip_passthrough_max_files": 5000}
         service.openlist = _TreeOpenList(rows)
+        bind_task_openlist_resolver(service, None, plan)
         return service, task_id
 
     def test_collection_directories_keep_names_and_relative_paths(self) -> None:
@@ -244,7 +255,7 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         self.assertEqual(task["mappings"], [])
         self.assertEqual(task["operations"], [])
 
-    def test_non_staging_task_keeps_legacy_skip_without_openlist_scan(self) -> None:
+    def test_unlinked_legacy_skip_is_moved_to_manual_review(self) -> None:
         task_id = self.database.create_organizer_task(
             category="movie",
             openlist_root_path="/旧挂载/电影/已入库电影",
@@ -256,11 +267,14 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
 
         result = service.skip_task(task_id)
 
-        self.assertTrue(result["success"], result)
-        self.assertTrue(result["skipped"])
-        self.assertEqual(self.database.get_organizer_task(task_id, include_children=False)["status"], "skipped")
+        self.assertFalse(result["success"], result)
+        self.assertTrue(result["manual_review"])
+        self.assertEqual(
+            self.database.get_organizer_task(task_id, include_children=False)["status"],
+            "waiting_review",
+        )
 
-    def test_non_staging_skip_completes_linked_job_and_guest_request(self) -> None:
+    def test_linked_legacy_skip_does_not_complete_job_or_guest_request(self) -> None:
         job_id, _created = self.database.create_job(
             {
                 "title": "已在正式目录的电影",
@@ -297,31 +311,21 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
 
         result = service.skip_task(task_id)
 
-        self.assertTrue(result["success"], result)
-        self.assertEqual(self.database.get_job(job_id)["status"], "done")
+        self.assertFalse(result["success"], result)
+        self.assertTrue(result["manual_review"])
+        self.assertEqual(self.database.get_job(job_id)["status"], "review")
         guest_request = self.database.get_guest_request(request_id)
-        self.assertEqual(guest_request["status"], "done")
-        self.assertEqual(guest_request["public_status"], "已完成")
-        self.assertEqual(guest_request["raw_data"]["status_sync"]["organizer_task_id"], task_id)
-        self.assertTrue(
-            any(
-                event["message"] == "系统同步关联正式任务状态"
-                for event in self.database.list_guest_request_events(request_id)
-            )
-        )
+        self.assertEqual(guest_request["status"], "review")
+        self.assertEqual(guest_request["public_status"], "等待审核")
+        self.assertNotIn("status_sync", guest_request.get("raw_data") or {})
 
     def test_startup_repairs_confirmed_skipped_task_but_not_unconfirmed_staging_task(self) -> None:
-        repaired_job_id, _created = self.database.create_job(
-            {
-                "title": "已确认完成的合集",
-                "category": "movie",
-                "category_label": "电影",
-                "source_type": "magnet",
-                "source_url": "magnet:?xt=urn:btih:confirmed-skipped",
-                "target_route": ROUTE_QUARK_TO_MOBILE,
-                "target_path": "/暂存/电影/job-confirmed",
-                "status": "review",
-            }
+        repaired_root = "/暂存/电影/job-confirmed"
+        repaired_job_id, repaired_plan = self._create_v1_job(
+            title="已确认完成的合集",
+            status="review",
+            organizer_root=repaired_root,
+            destination_final="/媒体/电影",
         )
         repaired_request_id = self.database.create_guest_request(
             {
@@ -338,9 +342,9 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         repaired_task_id = self.database.create_organizer_task(
             job_id=repaired_job_id,
             category="movie",
-            openlist_root_path="/暂存/电影/job-confirmed",
+            openlist_root_path=repaired_root,
             status="skipped",
-            raw_data={"staging_plan": {"enabled": True}},
+            raw_data=attach_organizer_v1_task({}, repaired_plan)["raw_data"],
             evidence={"completion_confirmation": {"success": True, "confirmed_count": 3}},
         )
 
@@ -365,6 +369,7 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         )
         service = OrganizerService.__new__(OrganizerService)
         service.db = self.database
+        bind_organizer_v1_execution_repository(service, repaired_plan)
 
         result = service._recover_completed_linked_jobs_on_startup()
 
@@ -375,17 +380,12 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         self.assertEqual(self.database.get_job(blocked_job_id)["status"], "review")
 
     def test_startup_repairs_guest_when_linked_job_is_already_done(self) -> None:
-        job_id, _created = self.database.create_job(
-            {
-                "title": "状态补偿测试",
-                "category": "movie",
-                "category_label": "电影",
-                "source_type": "magnet",
-                "source_url": "magnet:?xt=urn:btih:guest-only-recovery",
-                "target_route": ROUTE_QUARK_TO_MOBILE,
-                "target_path": "/媒体/电影/状态补偿测试",
-                "status": "done",
-            }
+        organizer_root = "/媒体/电影/状态补偿测试"
+        job_id, plan = self._create_v1_job(
+            title="状态补偿测试",
+            status="done",
+            organizer_root=organizer_root,
+            destination_final="/媒体/电影",
         )
         request_id = self.database.create_guest_request(
             {
@@ -402,11 +402,13 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         task_id = self.database.create_organizer_task(
             job_id=job_id,
             category="movie",
-            openlist_root_path="/媒体/电影/状态补偿测试",
+            openlist_root_path=organizer_root,
             status="skipped",
+            raw_data=attach_organizer_v1_task({}, plan)["raw_data"],
         )
         service = OrganizerService.__new__(OrganizerService)
         service.db = self.database
+        bind_organizer_v1_execution_repository(service, plan)
 
         result = service._recover_completed_linked_jobs_on_startup()
 

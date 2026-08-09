@@ -58,17 +58,30 @@ class GenericWebhookImporter:
             return config_result
         return AdapterCheckResult(True, "placeholder", f"{self.name} 对接入口已预留，尚未执行真实平台探测", self.describe())
 
-    def import_resource(self, title: str, source_url: str, category: dict[str, Any], password: str = "") -> ImportResult:
+    def import_resource(
+        self,
+        title: str,
+        source_url: str,
+        category: dict[str, Any],
+        password: str = "",
+        save_path: str = "",
+    ) -> ImportResult:
         if not self.endpoint:
             return ImportResult(False, JOB_FAILED, f"{self.name} 入库接口未配置")
 
+        locator = category.get("native_locator") if isinstance(category, dict) else None
+        target_path = str(save_path or "").strip()
+        if not target_path and isinstance(locator, dict):
+            target_path = str(locator.get("value") or "").strip()
+        if not target_path:
+            return ImportResult(False, JOB_FAILED, f"{self.name} 保存位置未在 V1 存储目标中配置")
         payload = {
             "title": title,
             "url": source_url,
             "shareurl": source_url,
             "password": password,
             "category": category.get("label"),
-            "target_path": category.get("mobile_target_path") or category.get("quark_save_path"),
+            "target_path": target_path,
             "fnos_lib": category.get("fnos_lib") or category.get("label"),
         }
         url = self.endpoint

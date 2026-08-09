@@ -7,10 +7,13 @@
 from __future__ import annotations
 
 import json
-import tempfile
+import os
+import shutil
 import unittest
+import uuid
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from flask import Flask
 
@@ -29,12 +32,14 @@ from fnos_media_import.openlist.blueprint import (
 from fnos_media_import.openlist.connection_service import (
     CONNECTION_KEY_ID,
     OpenListConnectionService,
+    env_master_key_provider,
 )
 from fnos_media_import.openlist.locator_resolver import RcloneLocatorResolver
 from fnos_media_import.openlist.mount_service import OpenListMountService
 from fnos_media_import.time_utils import utc_now_iso
 
-MASTER_KEY_HEX = "0123456789abcdef0123456789abcdef"  # 16 字节
+MASTER_KEY_HEX = "0123456789abcdef" * 4  # 32 字节 AES-256
+WORK_TEST_ROOT = Path.cwd() / "codex_tmp" / "openlist-v1-tests"
 
 
 def _relative_path(root: str, target: str) -> str | None:
@@ -125,10 +130,28 @@ class FakeWebDAV:
 
 
 def _new_database(testcase: unittest.TestCase) -> Database:
-    temporary = tempfile.TemporaryDirectory()
-    testcase.addCleanup(temporary.cleanup)
-    database = Database(Path(temporary.name) / "openlist-test.db")
+    WORK_TEST_ROOT.mkdir(parents=True, exist_ok=True)
+    database_path = WORK_TEST_ROOT / f"openlist-{uuid.uuid4().hex}.db"
+    database = Database(database_path)
     database.init_schema()
+
+    def cleanup() -> None:
+        try:
+            database.close_all_connections()
+        except AttributeError:
+            pass
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(f"{database_path}{suffix}").unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            if WORK_TEST_ROOT.exists() and not any(WORK_TEST_ROOT.iterdir()):
+                shutil.rmtree(WORK_TEST_ROOT)
+        except OSError:
+            pass
+
+    testcase.addCleanup(cleanup)
     return database
 
 
@@ -178,7 +201,7 @@ class OpenListConnectionTests(unittest.TestCase):
         self.assertNotIn("password", listed[0])
         self.assertNotIn("password_ciphertext", listed[0])
 
-        # 直接查库：密文是 BLOB 且不等于明文，key_id 固定为 ol:v1
+        # 直接查库：密文是 BLOB，key_id 记录用途派生版本。
         with self.database.connect() as conn:
             row = conn.execute(
                 "SELECT password_ciphertext, credential_key_id FROM openlist_connections WHERE connection_id='ol_main'"
@@ -198,6 +221,132 @@ class OpenListConnectionTests(unittest.TestCase):
         self.assertTrue(got["credential_configured"])
 
         self.assertIsNone(self.service.get_connection("missing"))
+
+    def test_connection_probe_can_be_read_only(self) -> None:
+        self._create()
+        before = self.service.get_connection("ol_main")
+
+        result = self.service.test_connection(
+            "ol_main",
+            expected_revision=before["revision"],
+            persist_result=False,
+        )
+
+        after = self.service.get_connection("ol_main")
+        self.assertTrue(result["ok"])
+        self.assertEqual(after["revision"], before["revision"])
+        self.assertEqual(after["last_test_status"], before["last_test_status"])
+        self.assertEqual(after["last_tested_at"], before["last_tested_at"])
+
+    def test_resolve_credentials_can_read_frozen_revision_after_edit(self) -> None:
+        self._create(password="old-secret")
+        updated = self.service.update_connection(
+            "ol_main",
+            {
+                "base_url": "http://127.0.0.1:6244/dav",
+                "username": "new-admin",
+                "password": "new-secret",
+            },
+        )
+        current = self.service.resolve_credentials("ol_main")
+        frozen = self.service.resolve_credentials("ol_main", 1)
+        self.assertEqual(current["revision"], updated["revision"])
+        self.assertEqual(current["base_url"], "http://127.0.0.1:6244/dav")
+        self.assertEqual(current["username"], "new-admin")
+        self.assertEqual(current["password"], "new-secret")
+        self.assertEqual(frozen["revision"], 1)
+        self.assertEqual(frozen["base_url"], "http://127.0.0.1:5244/dav")
+        self.assertEqual(frozen["username"], "admin")
+        self.assertEqual(frozen["password"], "old-secret")
+
+    def test_connection_update_uses_revision_cas(self) -> None:
+        self._create()
+        first = self.service.update_connection("ol_main", {"name": "第一次"})
+        with self.assertRaises(OpenListValidationError) as caught:
+            self.service.update_connection(
+                "ol_main",
+                {"name": "覆盖并发修改", "expected_revision": 1},
+            )
+        self.assertEqual(getattr(caught.exception, "code", ""), "OPENLIST_CONNECTION_CONFLICT")
+        self.assertEqual(getattr(caught.exception, "status", 0), 409)
+        self.assertEqual(self.service.get_connection("ol_main")["revision"], first["revision"])
+
+    def test_delete_connection_rejects_execution_plan_reference(self) -> None:
+        self._create()
+        now = utc_now_iso()
+        with self.database.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO import_jobs
+                  (title, category, category_label, source_type, source_url, target_route,
+                   status, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                ("计划", "movie", "电影", "quark", "https://example.invalid/s", "v1", "queued", now, now),
+            )
+            job_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute(
+                "INSERT INTO import_execution_plans(job_id, schema_version, plan_json, plan_hash, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    job_id,
+                    1,
+                    json.dumps({"bindings": {"destination_connection_id": "ol_main"}}),
+                    "hash",
+                    now,
+                ),
+            )
+        with self.assertRaisesRegex(OpenListValidationError, "执行计划引用"):
+            self.service.delete_connection("ol_main")
+
+    def test_delete_connection_rejects_transfer_execution_reference(self) -> None:
+        self._create()
+        now = utc_now_iso()
+        with self.database.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO import_jobs
+                  (title, category, category_label, source_type, source_url, target_route,
+                   status, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                ("执行", "movie", "电影", "quark", "https://example.invalid/s", "v1", "queued", now, now),
+            )
+            job_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute(
+                """
+                INSERT INTO transfer_executions
+                  (job_id, strategy, phase, snapshot_json, cleanup_json, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    job_id,
+                    "rclone_copy",
+                    "planned",
+                    json.dumps({"destination": {"connection_id": "ol_main"}}),
+                    "{}",
+                    now,
+                    now,
+                ),
+            )
+        with self.assertRaisesRegex(OpenListValidationError, "传输执行引用"):
+            self.service.delete_connection("ol_main")
+
+    def test_legacy_ol_v1_ciphertext_is_rejected(self) -> None:
+        self._create()
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE openlist_connections SET password_ciphertext=?, credential_key_id='ol:v1' "
+                "WHERE connection_id='ol_main'",
+                (b"legacy-ciphertext",),
+            )
+        with self.assertRaises(OpenListCredentialError):
+            self.service.resolve_credentials("ol_main")
+        self.assertFalse(self.service.get_connection("ol_main")["credential_configured"])
+
+    def test_environment_provider_ignores_legacy_root_name(self) -> None:
+        with mock.patch.dict(os.environ, {"FNOS_ACCOUNT_MASTER_KEY": MASTER_KEY_HEX}, clear=True):
+            self.assertEqual(env_master_key_provider()(), "")
 
     def test_connection_test_updates_status(self) -> None:
         self._create()
@@ -226,6 +375,34 @@ class OpenListConnectionTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(service.get_connection("ol_fail")["last_test_status"], "failed")
 
+    def test_connection_probe_result_cannot_overwrite_new_revision(self) -> None:
+        self._create()
+
+        def stale_probe(context: dict[str, Any]) -> dict[str, Any]:
+            # Simulate an administrator rotating the credentials while the
+            # network probe is still in flight.
+            self.service.update_connection(
+                "ol_main",
+                {
+                    "password": "rotated-secret",
+                    "expected_revision": context["revision"],
+                },
+            )
+            return {"ok": True, "message": "旧凭证探测成功"}
+
+        service = OpenListConnectionService(
+            self.database,
+            master_key_provider=lambda: MASTER_KEY_HEX,
+            probe_runner=stale_probe,
+        )
+        with self.assertRaises(OpenListValidationError) as caught:
+            service.test_connection("ol_main", expected_revision=1)
+        self.assertEqual(getattr(caught.exception, "code", ""), "OPENLIST_CONNECTION_CONFLICT")
+        self.assertEqual(getattr(caught.exception, "status", 0), 409)
+        current = service.get_connection("ol_main")
+        self.assertEqual(current["revision"], 2)
+        self.assertEqual(current["last_test_status"], "untested")
+
     def test_missing_master_key_raises_clear_error(self) -> None:
         service = OpenListConnectionService(
             self.database,
@@ -241,7 +418,7 @@ class OpenListConnectionTests(unittest.TestCase):
                     "password": "s3cret",
                 }
             )
-        self.assertIn("FNOS_ACCOUNT_MASTER_KEY", str(caught.exception))
+        self.assertIn("FNOS_ROOT_KEY", str(caught.exception))
 
     def test_invalid_base_url_rejected(self) -> None:
         with self.assertRaises(OpenListValidationError):
@@ -267,7 +444,7 @@ class OpenListConnectionTests(unittest.TestCase):
         self._create()
         broken = OpenListConnectionService(
             self.database,
-            master_key_provider=lambda: "ffffffffffffffffffffffffffffffff",
+            master_key_provider=lambda: "f" * 64,
             probe_runner=lambda _ctx: {"ok": True},
         )
         with self.assertRaises(OpenListCredentialError):
@@ -318,7 +495,7 @@ class OpenListMountTests(unittest.TestCase):
 
     def test_mount_auto_generates_mount_id(self) -> None:
         mount = self.mount_service.create_mount(
-            {"connection_id": "ol_main", "webdav_root": "/电影"}
+            {"connection_id": "ol_main", "webdav_root": "/电影", "storage_identity_id": "storage:auto"}
         )
         self.assertTrue(mount["mount_id"].startswith("mount_"))
         self.assertEqual(mount["namespace_id"], f"openlist:ol_main:{mount['mount_id']}")
@@ -349,22 +526,207 @@ class OpenListMountTests(unittest.TestCase):
         self.assertTrue(result["readable"])
         self.assertTrue(result["writable"])
         self.assertEqual(result["residue_warnings"], [])
-        self.assertEqual(result["identity_status"], "declared")
+        self.assertEqual(result["identity_status"], "unverified")
 
         stored = self.mount_service.get_mount("m1")
         self.assertTrue(stored["readable"])
         self.assertTrue(stored["writable"])
-        self.assertEqual(stored["identity_status"], "declared")
+        self.assertEqual(stored["identity_status"], "unverified")
         self.assertIsNotNone(stored["last_tested_at"])
 
-        # 探测临时目录只落在 /_fnos_probe，全部清理，从未污染 mount 根
-        self.assertEqual(fake.dirs, set())
+        # 探测临时目录只落在 /_fnos_probe，全部清理；探测根目录本身保留（持久配置目录）
+        self.assertEqual(fake.dirs, {"/影视/_fnos_probe"})
         self.assertEqual(fake.files, {})
-        self.assertFalse(any(path.startswith("/影视") for path in fake.dirs))
+        self.assertFalse(any("/fnos-probe-" in path for path in fake.dirs))
         self.assertFalse(any(path.startswith("/影视") for path in fake.files))
 
+    def test_repeated_probe_with_same_health_keeps_revision_and_history(self) -> None:
+        self.mount_service.create_mount(
+            {
+                "connection_id": "ol_main",
+                "mount_id": "m_probe_stable",
+                "webdav_root": "/影视",
+                "account_id": "acc_quark_a",
+            }
+        )
+        service = OpenListMountService(
+            self.database,
+            connection_service=self.connection_service,
+            webdav_factory=lambda _creds: FakeWebDAV(),
+        )
+        first = service.probe_mount("m_probe_stable")
+        with self.database.connect() as connection:
+            first_history = connection.execute(
+                "SELECT COUNT(*) FROM openlist_mount_revisions WHERE mount_id=?",
+                ("m_probe_stable",),
+            ).fetchone()[0]
+
+        second = service.probe_mount(
+            "m_probe_stable",
+            expected_revision=first["revision"],
+            expected_connection_revision=first["connection_revision"],
+        )
+        with self.database.connect() as connection:
+            second_history = connection.execute(
+                "SELECT COUNT(*) FROM openlist_mount_revisions WHERE mount_id=?",
+                ("m_probe_stable",),
+            ).fetchone()[0]
+
+        self.assertEqual(second["revision"], first["revision"])
+        self.assertEqual(second_history, first_history)
+
+    def test_probe_health_transition_creates_a_new_revision(self) -> None:
+        self.mount_service.create_mount(
+            {
+                "connection_id": "ol_main",
+                "mount_id": "m_probe_transition",
+                "webdav_root": "/影视",
+                "account_id": "acc_quark_a",
+            }
+        )
+        healthy = OpenListMountService(
+            self.database,
+            connection_service=self.connection_service,
+            webdav_factory=lambda _creds: FakeWebDAV(),
+        ).probe_mount("m_probe_transition")
+        failed = OpenListMountService(
+            self.database,
+            connection_service=self.connection_service,
+            webdav_factory=lambda _creds: FakeWebDAV(auth_fail=True),
+        ).probe_mount(
+            "m_probe_transition",
+            expected_revision=healthy["revision"],
+            expected_connection_revision=healthy["connection_revision"],
+        )
+
+        self.assertFalse(failed["readable"])
+        self.assertFalse(failed["writable"])
+        self.assertEqual(failed["revision"], healthy["revision"] + 1)
+
+    def test_read_only_probe_reports_health_without_advancing_revision(self) -> None:
+        self.mount_service.create_mount(
+            {
+                "connection_id": "ol_main",
+                "mount_id": "m_probe_read_only",
+                "webdav_root": "/media",
+                "account_id": "acc_quark_a",
+            }
+        )
+        service = OpenListMountService(
+            self.database,
+            connection_service=self.connection_service,
+            webdav_factory=lambda _creds: FakeWebDAV(),
+        )
+        before = self.mount_service.get_mount("m_probe_read_only")
+        with self.database.connect() as connection:
+            history_before = connection.execute(
+                "SELECT COUNT(*) FROM openlist_mount_revisions WHERE mount_id=?",
+                ("m_probe_read_only",),
+            ).fetchone()[0]
+
+        result = service.probe_mount(
+            "m_probe_read_only",
+            expected_revision=before["revision"],
+            expected_connection_revision=before["connection_revision"],
+            persist_result=False,
+        )
+
+        after = self.mount_service.get_mount("m_probe_read_only")
+        with self.database.connect() as connection:
+            history_after = connection.execute(
+                "SELECT COUNT(*) FROM openlist_mount_revisions WHERE mount_id=?",
+                ("m_probe_read_only",),
+            ).fetchone()[0]
+        self.assertTrue(result["readable"])
+        self.assertTrue(result["writable"])
+        self.assertFalse(after["readable"])
+        self.assertFalse(after["writable"])
+        self.assertEqual(after["revision"], before["revision"])
+        self.assertEqual(after["last_tested_at"], before["last_tested_at"])
+        self.assertEqual(history_after, history_before)
+
+    def test_name_only_mount_update_preserves_health_and_identity(self) -> None:
+        self.mount_service.create_mount(
+            {
+                "connection_id": "ol_main",
+                "mount_id": "m_name",
+                "webdav_root": "/影视",
+                "provider_kind": "quark",
+                "account_id": "acc_quark_a",
+            }
+        )
+        self.mount_service.probe_mount("m_name")
+        confirmed = self.mount_service.confirm_identity("m_name")
+        renamed = self.mount_service.update_mount(
+            "m_name",
+            {"name": "新展示名称", "expected_revision": confirmed["revision"]},
+        )
+        self.assertEqual(renamed["name"], "新展示名称")
+        self.assertEqual(renamed["identity_status"], "declared")
+        self.assertTrue(renamed["readable"])
+        self.assertTrue(renamed["writable"])
+        self.assertEqual(renamed["last_tested_at"], confirmed["last_tested_at"])
+
+    def test_connection_credential_change_invalidates_mount_health(self) -> None:
+        self.mount_service.create_mount(
+            {
+                "connection_id": "ol_main",
+                "mount_id": "m_conn_change",
+                "webdav_root": "/影视",
+                "provider_kind": "quark",
+                "account_id": "acc_quark_a",
+            }
+        )
+        self.mount_service.probe_mount("m_conn_change")
+        confirmed = self.mount_service.confirm_identity("m_conn_change")
+        updated_connection = self.connection_service.update_connection(
+            "ol_main",
+            {"password": "rotated-secret", "expected_revision": 1},
+        )
+        mount = self.mount_service.get_mount("m_conn_change")
+        self.assertEqual(mount["identity_status"], "unverified")
+        self.assertFalse(mount["readable"])
+        self.assertFalse(mount["writable"])
+        self.assertGreater(mount["revision"], confirmed["revision"])
+        self.assertEqual(mount["connection_revision"], updated_connection["revision"])
+
+    def test_connection_name_change_advances_mount_snapshot_without_invalidating_health(self) -> None:
+        self.mount_service.create_mount(
+            {
+                "connection_id": "ol_main",
+                "mount_id": "m_conn_name",
+                "webdav_root": "/影视",
+                "provider_kind": "quark",
+                "account_id": "acc_quark_a",
+            }
+        )
+        self.mount_service.probe_mount("m_conn_name")
+        confirmed = self.mount_service.confirm_identity("m_conn_name")
+        updated_connection = self.connection_service.update_connection(
+            "ol_main",
+            {"name": "新的展示名称", "expected_revision": 1},
+        )
+        mount = self.mount_service.get_mount("m_conn_name")
+        self.assertEqual(mount["identity_status"], "declared")
+        self.assertTrue(mount["readable"])
+        self.assertTrue(mount["writable"])
+        self.assertGreater(mount["revision"], confirmed["revision"])
+        self.assertEqual(mount["connection_revision"], updated_connection["revision"])
+
+    def test_connection_operational_change_resets_connection_health(self) -> None:
+        self.connection_service.test_connection("ol_main")
+        self.assertEqual(
+            self.connection_service.get_connection("ol_main")["last_test_status"], "ok"
+        )
+        updated = self.connection_service.update_connection(
+            "ol_main",
+            {"password": "rotated-secret", "expected_revision": 1},
+        )
+        self.assertEqual(updated["last_test_status"], "untested")
+        self.assertIsNone(updated["last_tested_at"])
+
     def test_probe_cleanup_failure_reports_residue_and_marks_unwritable(self) -> None:
-        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m2", "webdav_root": "/影视"})
+        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m2", "webdav_root": "/影视", "storage_identity_id": "storage:m2"})
         failing = OpenListMountService(
             self.database,
             connection_service=self.connection_service,
@@ -379,7 +741,7 @@ class OpenListMountTests(unittest.TestCase):
         self.assertFalse(stored["writable"])
 
     def test_probe_auth_failure_marks_unreadable(self) -> None:
-        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m3", "webdav_root": "/影视"})
+        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m3", "webdav_root": "/影视", "storage_identity_id": "storage:m3"})
         failing = OpenListMountService(
             self.database,
             connection_service=self.connection_service,
@@ -392,7 +754,7 @@ class OpenListMountTests(unittest.TestCase):
         self.assertEqual(self.mount_service.get_mount("m3")["readable"], False)
 
     def test_probe_partial_creation_still_cleans_up(self) -> None:
-        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m6", "webdav_root": "/影视"})
+        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m6", "webdav_root": "/影视", "storage_identity_id": "storage:m6"})
         fake = FakeWebDAV(put_fail=True)
         service = OpenListMountService(
             self.database,
@@ -402,8 +764,8 @@ class OpenListMountTests(unittest.TestCase):
         result = service.probe_mount("m6")
         self.assertFalse(result["success"])
         self.assertFalse(result["writable"])
-        # mkcol 成功但写入失败；清理步骤仍应删除残留目录，不留下“需要清理”告警
-        self.assertEqual(fake.dirs, set())
+        # mkcol 成功但写入失败；清理步骤仍应删除临时目录，仅保留探测根目录，不留下“需要清理”告警
+        self.assertEqual(fake.dirs, {"/影视/_fnos_probe"})
         self.assertEqual(fake.files, {})
         self.assertEqual(result["residue_warnings"], [])
 
@@ -421,7 +783,7 @@ class OpenListMountTests(unittest.TestCase):
         self.assertTrue(all("name" in item for item in items))
 
     def test_mount_delete(self) -> None:
-        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m4", "webdav_root": "/影视"})
+        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m4", "webdav_root": "/影视", "storage_identity_id": "storage:m4"})
         result = self.mount_service.delete_mount("m4")
         self.assertTrue(result["deleted"])
         self.assertIsNone(self.mount_service.get_mount("m4"))
@@ -429,7 +791,7 @@ class OpenListMountTests(unittest.TestCase):
             self.mount_service.delete_mount("m4")
 
     def test_connection_delete_blocked_by_mounts(self) -> None:
-        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m5", "webdav_root": "/影视"})
+        self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m5", "webdav_root": "/影视", "storage_identity_id": "storage:m5"})
         with self.assertRaises(OpenListValidationError):
             self.connection_service.delete_connection("ol_main")
 
@@ -543,6 +905,106 @@ class OpenListBlueprintTests(unittest.TestCase):
         body = response.get_json()
         self.assertTrue(body["success"])
         self.assertEqual(body["last_test_status"], "ok")
+        self.assertEqual(body["revision"], 1)
+
+    def test_invalid_json_and_revision_return_structured_errors(self) -> None:
+        invalid_json = self.client.post(
+            "/api/admin/openlist/connections",
+            data="not-json",
+            content_type="text/plain",
+            headers={"X-Request-ID": "openlist-trace"},
+        )
+        self.assertEqual(invalid_json.status_code, 400)
+        invalid_body = invalid_json.get_json()
+        self.assertEqual(invalid_body["code"], "INVALID_JSON")
+        self.assertEqual(invalid_body["trace_id"], "openlist-trace")
+        self.assertFalse(invalid_body["retryable"])
+
+        self.client.post(
+            "/api/admin/openlist/connections",
+            json={
+                "connection_id": "ol-main-revision",
+                "base_url": "http://127.0.0.1:5244/dav",
+                "username": "admin",
+                "password": "s3cret",
+            },
+        )
+        invalid_revision = self.client.patch(
+            "/api/admin/openlist/connections/ol-main-revision",
+            json={"name": "x", "expected_revision": "bad"},
+        )
+        self.assertEqual(invalid_revision.status_code, 400)
+        invalid_revision_body = invalid_revision.get_json()
+        self.assertEqual(invalid_revision_body["code"], "INVALID_REVISION")
+        self.assertEqual(
+            invalid_revision_body["field_errors"],
+            {"expected_revision": "必须是正整数"},
+        )
+
+    def test_confirm_identity_requires_expected_revisions(self) -> None:
+        response = self.client.post(
+            "/api/admin/openlist/mounts/any/confirm-identity",
+            json={},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["code"], "INVALID_REVISION")
+        self.assertIn("expected_revision", response.get_json()["field_errors"])
+
+    def test_mount_confirm_identity_uses_revision_cas(self) -> None:
+        self.client.post(
+            "/api/admin/openlist/connections",
+            json={
+                "connection_id": "ol_main",
+                "base_url": "http://127.0.0.1:5244/dav",
+                "username": "admin",
+                "password": "s3cret",
+            },
+        )
+        self.client.post(
+            "/api/admin/openlist/mounts",
+            json={"connection_id": "ol_main", "mount_id": "m-cas", "webdav_root": "/影视", "storage_identity_id": "storage:m-cas"},
+        )
+        probe = self.client.post("/api/admin/openlist/mounts/m-cas/test")
+        self.assertEqual(probe.status_code, 200)
+        stale_revision = probe.get_json()["revision"]
+        self.mount_service.update_mount(
+            "m-cas", {"name": "并发改名", "expected_revision": stale_revision}
+        )
+        response = self.client.post(
+            "/api/admin/openlist/mounts/m-cas/confirm-identity",
+            json={
+                "expected_revision": stale_revision,
+                "expected_connection_revision": probe.get_json()["connection_revision"],
+            },
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "MOUNT_CONFLICT")
+
+    def test_mount_confirm_identity_accepts_matching_revisions(self) -> None:
+        self.client.post(
+            "/api/admin/openlist/connections",
+            json={
+                "connection_id": "ol_main",
+                "base_url": "http://127.0.0.1:5244/dav",
+                "username": "admin",
+                "password": "s3cret",
+            },
+        )
+        self.client.post(
+            "/api/admin/openlist/mounts",
+            json={"connection_id": "ol_main", "mount_id": "m-cas-ok", "webdav_root": "/影视", "storage_identity_id": "storage:m-cas-ok"},
+        )
+        probe = self.client.post("/api/admin/openlist/mounts/m-cas-ok/test")
+        probe_body = probe.get_json()
+        response = self.client.post(
+            "/api/admin/openlist/mounts/m-cas-ok/confirm-identity",
+            json={
+                "expected_revision": probe_body["revision"],
+                "expected_connection_revision": probe_body["connection_revision"],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["item"]["identity_status"], "declared")
 
     def test_mount_api_flow(self) -> None:
         self.client.post(
@@ -556,7 +1018,7 @@ class OpenListBlueprintTests(unittest.TestCase):
         )
         response = self.client.post(
             "/api/admin/openlist/mounts",
-            json={"connection_id": "ol_main", "mount_id": "m1", "webdav_root": "/影视"},
+            json={"connection_id": "ol_main", "mount_id": "m1", "webdav_root": "/影视", "storage_identity_id": "storage:m1"},
         )
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.get_json()["item"]["namespace_id"], "openlist:ol_main:m1")

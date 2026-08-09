@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import posixpath
 import time
 from dataclasses import dataclass
@@ -88,6 +89,8 @@ class OpenListClient:
     def __init__(self, config: dict[str, Any]) -> None:
         self.base_url = str(config.get("base_url") or "").strip().rstrip("/")
         self.token = str(config.get("token") or "").strip()
+        self.username = str(config.get("username") or "").strip()
+        self.password = str(config.get("password") or "")
         self.timeout = int(config.get("timeout") or 30)
         self.batch_timeout = _bounded_int(config.get("batch_timeout"), default=600, minimum=30, maximum=3600)
         self.verify_tls = _as_bool(config.get("verify_tls"), True)
@@ -105,6 +108,11 @@ class OpenListClient:
     @property
     def configured(self) -> bool:
         return bool(self.base_url)
+
+    def close(self) -> None:
+        """Release the task-scoped HTTP session owned by this client."""
+
+        self.session.close()
 
     def test(self) -> dict[str, Any]:
         if not self.base_url:
@@ -425,6 +433,11 @@ class OpenListClient:
         headers = dict(kwargs.pop("headers", {}) or {})
         if self.token:
             headers["Authorization"] = self.token.replace("Bearer ", "").replace("bearer ", "").strip()
+        elif self.username or self.password:
+            encoded = base64.b64encode(
+                f"{self.username}:{self.password}".encode("utf-8")
+            ).decode("ascii")
+            headers["Authorization"] = f"Basic {encoded}"
         if "json" in kwargs:
             headers.setdefault("Content-Type", "application/json")
         timeout = kwargs.pop("timeout", self.timeout)

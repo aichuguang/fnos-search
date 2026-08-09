@@ -2,7 +2,7 @@
     function create(context) {
         const {
             state, getElement, api, toast, escapeHtml, statusPill,
-            collectSearchProviders, loadSettings, loadAdvancedConfig, loadSecurityStatus, saveAdvancedConfig,
+            collectSearchProviders, loadSettings, loadAdvancedConfig, loadSecurityStatus,
         } = context;
         const adminState = state;
         const $ = getElement;
@@ -65,78 +65,6 @@
             return data;
         }
 
-        function renderSixpanAuthStatus(sixpan = {}) {
-            const box = $("sixpanAuthStatus");
-            if (!box) return;
-            const hasClient = Boolean(sixpan.client_id && sixpan.client_secret);
-            const authorized = Boolean(sixpan.access_token || sixpan.refresh_token);
-            const oauth = adminState.sixpanOAuth || {};
-            if (authorized) {
-                box.innerHTML = `<strong>已授权</strong><p>六盘 token 已保存，磁链 / 种子可提交离线任务。</p>`;
-                return;
-            }
-            if (oauth.user_code || oauth.verification_uri) {
-                box.innerHTML = `
-                    <strong>等待六盘授权</strong>
-                    <p>验证码：<code>${escapeHtml(oauth.user_code || "-")}</code></p>
-                    <p>${oauth.verification_uri ? `<a href="${escapeHtml(oauth.verification_uri)}" target="_blank" rel="noreferrer">打开授权页面</a>` : "请在六盘授权页面输入验证码。"}</p>
-                `;
-                return;
-            }
-            if (hasClient) {
-                box.innerHTML = `<strong>未授权</strong><p>ClientID / ClientSecret 已填写。</p>`;
-                return;
-            }
-            box.innerHTML = `<strong>未配置</strong>`;
-        }
-
-        async function startSixpanDeviceAuth() {
-            const data = await api("/api/admin/sixpan/oauth/device-code", {
-                method: "POST",
-                body: JSON.stringify({
-                    device: "fnos-media-import/admin",
-                    credentials: {
-                        client_id: $("advSixpanClientId")?.value?.trim() || "",
-                        client_secret: $("advSixpanClientSecret")?.value?.trim() || "",
-                    },
-                }),
-                allowFailure: true,
-            });
-            if (!data.success) {
-                toast(data.message || "六盘授权入口创建失败", "error");
-                return;
-            }
-            if (data.config) {
-                adminState.advancedConfig = data.config;
-                adminState.advancedStoredConfig = data.stored || adminState.advancedStoredConfig;
-                adminState.advancedConfigMeta = data.meta || adminState.advancedConfigMeta;
-                await loadAdvancedConfig();
-            }
-            adminState.sixpanOAuth = data.auth || {};
-            renderSixpanAuthStatus(adminState.advancedConfig.sixpan || {});
-            const auth = data.auth || {};
-            if (auth.verification_uri) {
-                window.open(auth.verification_uri, "_blank", "noopener,noreferrer");
-            }
-            toast(data.message || "六盘授权入口已创建", "success");
-        }
-
-        async function checkSixpanDeviceAuth() {
-            const data = await api("/api/admin/sixpan/oauth/device-code/check", {
-                method: "POST",
-                body: JSON.stringify({}),
-                allowFailure: true,
-            });
-            toast(data.message || "六盘授权状态已检查", data.authorized ? "success" : data.success ? "" : "error");
-            if (data.authorized) {
-                adminState.sixpanOAuth = {};
-                await Promise.all([loadAdvancedConfig(), loadAdapters()]);
-            } else if (data.state) {
-                const statusText = data.status ? `状态：${data.status}` : "仍在等待授权";
-                if ($("sixpanAuthStatus")) $("sixpanAuthStatus").innerHTML = `<strong>${escapeHtml(statusText)}</strong><p>${escapeHtml(data.message || "")}</p>`;
-            }
-        }
-
         async function probeSixpan() {
             const data = await api("/api/admin/sixpan/probe", {
                 method: "POST",
@@ -151,9 +79,6 @@
             loadSearchProviders,
             renderSearchProviders,
             saveSearchProviders,
-            renderSixpanAuthStatus,
-            startSixpanDeviceAuth,
-            checkSixpanDeviceAuth,
             probeSixpan,
         });
     }

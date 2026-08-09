@@ -83,6 +83,8 @@ RCLONE_COPY_SOURCE_ROOT="${RCLONE_COPY_SOURCE_ROOT:-}"
 RCLONE_COPY_TARGET_REMOTE="${RCLONE_COPY_TARGET_REMOTE:-$REMOTE_NAME}"
 RCLONE_COPY_TARGET_ROOT="${RCLONE_COPY_TARGET_ROOT:-}"
 RCLONE_COPY_LOCAL_TARGET="${RCLONE_COPY_LOCAL_TARGET:-}"
+RCLONE_COPY_RELAY_MODE="${RCLONE_COPY_RELAY_MODE:-false}"
+RCLONE_COPY_RELAY_ROOT="${RCLONE_COPY_RELAY_ROOT:-}"
 RCLONE_COPY_DELETE_SOURCE_AFTER_ACK="${RCLONE_COPY_DELETE_SOURCE_AFTER_ACK:-true}"
 
 LOCK_FILE="${LOCK_FILE:-/tmp/fnos_media_import_rclone.lock}"
@@ -1660,6 +1662,7 @@ resolve_root_resource_dir() {
       "$PYTHON_BIN" - <<'PY'
 import json
 import os
+import re
 import sys
 import urllib.request
 
@@ -1672,6 +1675,14 @@ payload = {
     "target_path": os.environ.get("CALLBACK_TARGET_PATH", ""),
     "message": "resolve resource folder",
 }
+job_dir_match = re.fullmatch(
+    r"job-([1-9][0-9]{0,8})",
+    os.environ.get("RCLONE_ONLY_JOB_DIR", "").strip(),
+)
+if not job_dir_match:
+    print("")
+    sys.exit(0)
+payload["job_id"] = int(job_dir_match.group(1))
 try:
     request = urllib.request.Request(
         os.environ["CALLBACK_URL"],
@@ -1725,6 +1736,7 @@ build_standard_naming_plan_exports() {
   PYTHONPATH=".:${PYTHONPATH:-}" "$PYTHON_BIN" - <<'PY'
 import json
 import os
+import re
 import shlex
 import urllib.request
 
@@ -1744,6 +1756,13 @@ def callback_plan() -> dict:
         "target_path": os.environ.get("CALLBACK_TARGET_PATH", ""),
         "message": "build upload naming plan",
     }
+    job_dir_match = re.fullmatch(
+        r"job-([1-9][0-9]{0,8})",
+        os.environ.get("RCLONE_ONLY_JOB_DIR", "").strip(),
+    )
+    if not job_dir_match:
+        return {}
+    payload["job_id"] = int(job_dir_match.group(1))
     request = urllib.request.Request(
         url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -2300,13 +2319,28 @@ copy_scoped_job() {
       log "rclone_copy 本地目标根目录非法：${RCLONE_COPY_LOCAL_TARGET}"
       return 2
     fi
-    case "$copy_local_root" in
-      /storage-targets|/storage-targets/*) ;;
-      *)
-        log "rclone_copy 本地目标不在 /storage-targets 受控挂载内：${RCLONE_COPY_LOCAL_TARGET}"
+    if [ "$RCLONE_COPY_RELAY_MODE" = "true" ]; then
+      copy_relay_root="$(normalize_local_path "$RCLONE_COPY_RELAY_ROOT")"
+      if [ -z "$copy_relay_root" ] || [ "$copy_relay_root" = "." ]; then
+        log "rclone_copy relay mode is missing a controlled relay root"
         return 2
-        ;;
-    esac
+      fi
+      case "$copy_local_root" in
+        "$copy_relay_root"|"$copy_relay_root"/*) ;;
+        *)
+          log "rclone_copy relay target is outside the controlled relay root: ${RCLONE_COPY_LOCAL_TARGET}"
+          return 2
+          ;;
+      esac
+    else
+      case "$copy_local_root" in
+        /storage-targets|/storage-targets/*) ;;
+        *)
+          log "rclone_copy 本地目标不在 /storage-targets 受控挂载内：${RCLONE_COPY_LOCAL_TARGET}"
+          return 2
+          ;;
+      esac
+    fi
     copy_local_temp_norm="$(normalize_local_path "$LOCAL_TEMP")"
     if [ -n "$copy_local_temp_norm" ]; then
       case "$copy_local_root" in

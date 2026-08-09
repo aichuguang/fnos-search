@@ -1,4 +1,4 @@
-"""TransferOrchestrator —— 按 v4 冻结计划驱动 §13.1 状态机的编排器。
+"""TransferOrchestrator —— 按 V1 冻结计划驱动 §13.1 状态机的编排器。
 
 职责：
 - planning 阶段校验计划与策略约束（磁链->六盘、同源原生、relay 只到移动云、rclone 不到移动云）。
@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -26,6 +27,8 @@ from fnos_media_import.transfer import (
     PHASE_CLEANUP_PENDING,
     PHASE_COMPLETED,
     PHASE_FAILED,
+    PHASE_FINALIZING,
+    PHASE_FINAL_VERIFYING,
     PHASE_MANUAL_REVIEW,
     PHASE_NATIVE_SUBMITTING,
     PHASE_NATIVE_WAITING,
@@ -64,14 +67,23 @@ class TransferState:
     phase: str = PHASE_PLANNING
     receipt: OperationReceipt | None = None
     attempt: int = 0
+    # ``attempt`` is a monotonic audit counter.  Retry budgets are scoped to
+    # the phase that failed so a transient source visibility problem cannot
+    # permanently consume the budget of a later transfer/verification phase.
+    phase_attempts: dict[str, int] = field(default_factory=dict)
     retry_from: str = ""
     retry_ready: bool = False
     target_verified: bool = False
+    staging_verified: bool = False
+    final_verified: bool = False
     app_acked: bool = False
     message: str = ""
     error_code: str = ""
     executor_strategy: str = ""
     cleanup: dict[str, Any] = field(default_factory=dict)
+    submission_fence: dict[str, Any] = field(default_factory=dict)
+    organizer_task_id: int = 0
+    organizer_final_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -98,7 +110,7 @@ def _visibility_to_status(value: Any) -> VisibilityStatus:
 
 
 class TransferOrchestrator:
-    """按 §13.1 状态机驱动单一 v4 冻结计划。"""
+    """按 §13.1 状态机驱动单一 V1 冻结计划。"""
 
     def __init__(
         self,
@@ -109,6 +121,7 @@ class TransferOrchestrator:
         cleanup: Any = None,
         ack_service: Any = None,
         organizer_service: Any = None,
+        finalizer_service: Any = None,
         retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.plan = plan if isinstance(plan, TransferPlan) else TransferPlan.from_dict(plan)
@@ -117,6 +130,7 @@ class TransferOrchestrator:
         self.cleanup = cleanup
         self.ack_service = ack_service
         self.organizer_service = organizer_service
+        self.finalizer_service = finalizer_service
         self.retry_policy = retry_policy or RetryPolicy()
         self.state = TransferState()
 
@@ -129,13 +143,19 @@ class TransferOrchestrator:
             "message": self.state.message,
             "error_code": self.state.error_code,
             "attempt": self.state.attempt,
+            "phase_attempts": dict(self.state.phase_attempts),
             "retry_from": self.state.retry_from,
             "retry_ready": self.state.retry_ready,
             "target_verified": self.state.target_verified,
+            "staging_verified": self.state.staging_verified,
+            "final_verified": self.state.final_verified,
             "app_acked": self.state.app_acked,
             "executor_strategy": self.state.executor_strategy,
             "receipt": asdict(self.state.receipt) if self.state.receipt is not None else None,
             "cleanup": dict(self.state.cleanup),
+            "submission_fence": dict(self.state.submission_fence),
+            "organizer_task_id": self.state.organizer_task_id,
+            "organizer_final_path": self.state.organizer_final_path,
         }
 
     def restore(self, state: dict[str, Any] | TransferState | None) -> "TransferOrchestrator":
@@ -150,12 +170,36 @@ class TransferOrchestrator:
             self.state.attempt = int(raw.get("attempt") or 0)
         except (TypeError, ValueError):
             self.state.attempt = 0
+        raw_phase_attempts = raw.get("phase_attempts")
+        if isinstance(raw_phase_attempts, dict):
+            parsed_phase_attempts: dict[str, int] = {}
+            for key, value in raw_phase_attempts.items():
+                phase_key = str(key or "").strip()
+                if not phase_key:
+                    continue
+                try:
+                    parsed_value = int(value or 0)
+                except (TypeError, ValueError):
+                    parsed_value = 0
+                if parsed_value > 0:
+                    parsed_phase_attempts[phase_key] = parsed_value
+            self.state.phase_attempts = parsed_phase_attempts
+        else:
+            self.state.phase_attempts = {}
         self.state.retry_from = str(raw.get("retry_from") or "")
         self.state.retry_ready = bool(raw.get("retry_ready"))
         self.state.target_verified = bool(raw.get("target_verified"))
+        self.state.staging_verified = bool(raw.get("staging_verified"))
+        self.state.final_verified = bool(raw.get("final_verified"))
         self.state.app_acked = bool(raw.get("app_acked"))
         self.state.executor_strategy = str(raw.get("executor_strategy") or "")
         self.state.cleanup = dict(raw.get("cleanup") or {})
+        self.state.submission_fence = dict(raw.get("submission_fence") or {})
+        try:
+            self.state.organizer_task_id = int(raw.get("organizer_task_id") or 0)
+        except (TypeError, ValueError):
+            self.state.organizer_task_id = 0
+        self.state.organizer_final_path = str(raw.get("organizer_final_path") or "")
         receipt = raw.get("receipt")
         if isinstance(receipt, dict):
             try:
@@ -211,6 +255,10 @@ class TransferOrchestrator:
             return self._step_target_verifying()
         if phase == PHASE_ORGANIZING:
             return self._step_organizing()
+        if phase == PHASE_FINALIZING:
+            return self._step_finalizing()
+        if phase == PHASE_FINAL_VERIFYING:
+            return self._step_final_verifying()
         if phase == PHASE_ACK_PENDING:
             return self._step_ack()
         if phase == PHASE_CLEANUP_PENDING:
@@ -345,9 +393,17 @@ class TransferOrchestrator:
             )
         if status == VisibilityStatus.unknown:
             return self._to_manual_review("来源落地区可见性未知")
-        return self._handle_failure(
-            TransferError(ErrorCode.OPERATION_PENDING, "来源未稳定可见，等待后重试", retryable=True),
+        # ``pending`` is a healthy asynchronous state, not a failed Provider
+        # operation.  Waiting for a large landing must not consume the shared
+        # retry budget or eventually turn into a hard failure merely because
+        # several visibility polls were required.
+        self.state.message = "来源未稳定可见，等待后继续轮询"
+        self.state.error_code = ErrorCode.OPERATION_PENDING
+        return TransferStepResult(
             PHASE_SOURCE_WAITING_VISIBLE,
+            self.state.message,
+            finished=True,
+            needs_wait=True,
         )
 
     # ------------------------------------------------------------------
@@ -377,6 +433,12 @@ class TransferOrchestrator:
             return self._handle_failure(self._receipt_error(receipt), PHASE_NATIVE_SUBMITTING)
         if receipt.status == "unknown":
             return self._to_manual_review("原生提交结果未知，不重复创建转存")
+        if receipt.status == "completed":
+            # Providers are allowed to complete synchronously.  Do not invent
+            # a task id and enter a polling phase when the durable receipt
+            # already proves completion.
+            self.state.phase = PHASE_TARGET_VERIFYING
+            return TransferStepResult(PHASE_TARGET_VERIFYING, "原生任务已同步完成，进入目标校验", finished=False)
         self.state.phase = PHASE_NATIVE_WAITING
         return TransferStepResult(PHASE_NATIVE_WAITING, "原生任务已提交", finished=False)
 
@@ -388,6 +450,9 @@ class TransferOrchestrator:
         if receipt is None:
             # 结果未知且没有可轮询凭证：人工复核，禁止重复提交
             return self._to_manual_review("原生任务 receipt 缺失，结果未知，禁止重复提交")
+        if receipt.status == "completed":
+            self.state.phase = PHASE_TARGET_VERIFYING
+            return TransferStepResult(PHASE_TARGET_VERIFYING, "原生任务已完成，进入目标校验", finished=False)
         try:
             status = executor.poll(receipt)
         except TransferError as exc:
@@ -437,7 +502,13 @@ class TransferOrchestrator:
                 return self._handle_failure(self._receipt_error(receipt), PHASE_TRANSFERRING)
             if receipt.status == "unknown":
                 return self._to_manual_review("传输提交结果未知，保留来源")
+            if receipt.status == "completed":
+                self.state.phase = PHASE_TARGET_VERIFYING
+                return TransferStepResult(PHASE_TARGET_VERIFYING, "传输已同步完成，进入目标校验", finished=False)
             return TransferStepResult(PHASE_TRANSFERRING, receipt.message or "传输已启动", finished=True, needs_wait=True)
+        if receipt.status == "completed":
+            self.state.phase = PHASE_TARGET_VERIFYING
+            return TransferStepResult(PHASE_TARGET_VERIFYING, "传输已完成，进入目标校验", finished=False)
         try:
             status = executor.poll(receipt)
         except TransferError as exc:
@@ -465,21 +536,97 @@ class TransferOrchestrator:
     # ------------------------------------------------------------------
     # target_verifying
     # ------------------------------------------------------------------
+    def _verify_request(self, descriptor: dict[str, Any] | None) -> Any:
+        """构造 V1 原生校验请求。
+
+        Provider 原生校验统一接收 ``VerifyRequest``；路径 descriptor 仍由
+        编排器冻结计划决定，不能再以 ``plan + 一组散落关键字`` 调用原生
+        executor。Native executor 会使用 plan 的 native locator，并把
+        receipt 作为可选的旧 importer 适配信息传入。
+        """
+
+        from fnos_media_import.transfer.verifier import VerifyRequest
+
+        expected = self.plan.verification_expected()
+        return VerifyRequest(
+            source=self.plan.source_descriptor,
+            destination=self.plan.destination_descriptor,
+            locator=self.plan.native_locator(),
+            expected_file_count=int(expected["file_count"]),
+            expected_total_size=int(expected["total_size"]),
+            checksum=str(expected["checksum"]),
+        )
+
+    def _invoke_verifier(self, verifier: Any, *, descriptor: dict[str, Any], native_target: bool) -> Any:
+        """按统一协议调用目标校验器。
+
+        通用文件系统校验器保留现有 ``verify(plan, **kwargs)`` 契约；原生
+        校验器严格收到 VerifyRequest，且只在其方法声明了 receipt 参数时
+        才传递旧 importer 所需的 receipt，避免再次触发关键字 TypeError。
+        """
+
+        object_verify = getattr(verifier, "verify", None)
+        verify_call = object_verify
+        if not callable(verify_call) and callable(verifier):
+            verify_call = verifier
+        if not callable(verify_call):
+            raise TypeError("目标校验器不可调用")
+
+        if native_target:
+            request = self._verify_request(descriptor)
+            receipt = self.state.receipt
+            if receipt is None:
+                return verify_call(request)
+            try:
+                signature = inspect.signature(verify_call)
+            except (TypeError, ValueError):
+                signature = None
+            accepts_receipt = bool(
+                signature
+                and (
+                    "receipt" in signature.parameters
+                    or any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                )
+            )
+            if accepts_receipt:
+                return verify_call(request, receipt=receipt)
+            return verify_call(request)
+
+        expected = self.plan.verification_expected()
+        if callable(object_verify):
+            return verify_call(
+                self.plan,
+                descriptor=descriptor,
+                expected_file_count=int(expected["file_count"]),
+                expected_total_size=int(expected["total_size"]),
+                checksum=str(expected["checksum"]),
+            )
+        # 裸 callable 的 V1 兼容约定：传入冻结计划，而不是 receipt/None。
+        return verify_call(self.plan)
+
     def _step_target_verifying(self) -> TransferStepResult:
         executor = self._executor()
         if executor is None:
             return self._fail(TransferError(ErrorCode.NO_EXECUTOR, "目标校验阶段缺少执行器"))
-        verifier = self.verifier if self.verifier is not None else getattr(executor, "verify", None)
+        # Relay uploads write directly to the mobile Provider final root.  A
+        # stale/hand-built plan may still carry a native destination_staging
+        # alias; never let that alias select the wrong verification target.
+        descriptor = (
+            self.plan.destination_final
+            if self.plan.strategy == "relay_upload_mobile"
+            else self.plan.destination_staging or self.plan.destination_final
+        )
+        native_target = self._is_native_descriptor(descriptor)
+        verifier = getattr(executor, "verify", None) if native_target else self.verifier
+        if verifier is None:
+            verifier = getattr(executor, "verify", None)
         if verifier is None:
             return self._to_manual_review("未配置目标校验器，无法确认目标")
         try:
-            verify_call = getattr(verifier, "verify", None)
-            if callable(verify_call):
-                result = verify_call(self.plan)
-            elif callable(verifier):
-                result = verifier()
-            else:
-                return self._to_manual_review("目标校验器不可调用")
+            result = self._invoke_verifier(verifier, descriptor=descriptor, native_target=native_target)
         except TransferError as exc:
             if exc.code == ErrorCode.RESULT_UNKNOWN:
                 return self._to_manual_review(exc.message or "目标校验结果未知")
@@ -488,13 +635,17 @@ class TransferOrchestrator:
             return self._to_manual_review(f"目标校验异常：{exc}")
         result = self._normalize_verify_result(result)
         if result.status == "ok":
-            self.state.target_verified = True
-            self.state.message = "目标校验通过"
+            self.state.staging_verified = True
+            self.state.message = "暂存校验通过"
             if self.plan.organizer_enabled:
+                if self.organizer_service is None:
+                    return self._to_manual_review("Organizer 已启用但未装配，禁止跳过整理")
                 self.state.phase = PHASE_ORGANIZING
+            elif self.plan.strategy == "relay_upload_mobile" or self.plan.destination_staging is None:
+                self.state.phase = PHASE_FINAL_VERIFYING
             else:
-                self.state.phase = PHASE_ACK_PENDING
-            return TransferStepResult(self.state.phase, "目标校验通过", finished=False)
+                self.state.phase = PHASE_FINALIZING
+            return TransferStepResult(self.state.phase, "暂存校验通过", finished=False)
         if result.status == "unknown":
             return self._to_manual_review(result.message or "目标校验结果未知，保留来源")
         # missing / mismatch：目标未稳定，进入验证重试，不清理（§13.3）
@@ -512,16 +663,19 @@ class TransferOrchestrator:
     # ------------------------------------------------------------------
     def _step_organizing(self) -> TransferStepResult:
         if self.organizer_service is None:
-            self.state.phase = PHASE_ACK_PENDING
-            return TransferStepResult(PHASE_ACK_PENDING, "无需整理，进入 ACK", finished=False)
+            return self._to_manual_review("Organizer 已启用但未装配，禁止跳过整理")
         try:
-            result = self.organizer_service.organize(self.plan)
+            result = self._invoke_organizer()
         except Exception as exc:  # noqa: BLE001
             result = OrganizeResult("failed", f"整理异常：{exc}")
         result = self._normalize_organize_result(result)
+        if result.task_id:
+            self.state.organizer_task_id = result.task_id
+        if result.final_path:
+            self.state.organizer_final_path = result.final_path
         if result.status == "done":
-            self.state.phase = PHASE_ACK_PENDING
-            return TransferStepResult(PHASE_ACK_PENDING, "整理完成，进入 ACK", finished=False)
+            self.state.phase = PHASE_FINAL_VERIFYING
+            return TransferStepResult(PHASE_FINAL_VERIFYING, "整理完成，进入最终校验", finished=False)
         if result.status == "pending":
             return TransferStepResult(PHASE_ORGANIZING, result.message or "整理进行中", finished=True, needs_wait=True)
         if result.status == "unknown":
@@ -531,13 +685,92 @@ class TransferOrchestrator:
             PHASE_ORGANIZING,
         )
 
+    def _step_finalizing(self) -> TransferStepResult:
+        if self.plan.strategy == "relay_upload_mobile":
+            # Relay has no staging -> final archive operation.  This guard also
+            # repairs a restored snapshot produced by an older planner without
+            # invoking TransferFinalizer against a native namespace.
+            self.state.phase = PHASE_FINAL_VERIFYING
+            return TransferStepResult(PHASE_FINAL_VERIFYING, "中继已写入最终目录，跳过归档", finished=False)
+        if self.finalizer_service is None:
+            return self._to_manual_review("未装配 staging 到 final 的归档服务")
+        try:
+            value = self.finalizer_service.finalize(self.plan)
+        except Exception as exc:  # noqa: BLE001
+            return self._handle_failure(
+                TransferError(ErrorCode.NETWORK_TRANSIENT, f"归档异常：{exc}", retryable=True),
+                PHASE_FINALIZING,
+            )
+        if isinstance(value, dict):
+            status = str(value.get("status") or "").lower()
+            retryable = bool(value.get("retryable", True))
+            failure_message = str(value.get("message") or "归档到最终目录失败")
+            failure_code = str(value.get("code") or ErrorCode.NETWORK_TRANSIENT)
+        else:
+            status = str(getattr(value, "status", None) or value or "").lower()
+            retryable = True
+            failure_message = "归档到最终目录失败"
+            failure_code = ErrorCode.NETWORK_TRANSIENT
+        if status in {"done", "completed", "ok", "success", "true"} or value is True:
+            self.state.phase = PHASE_FINAL_VERIFYING
+            return TransferStepResult(PHASE_FINAL_VERIFYING, "已归档到最终目录", finished=False)
+        if status in {"pending", "running", "submitted"}:
+            return TransferStepResult(PHASE_FINALIZING, "归档进行中", finished=True, needs_wait=True)
+        return self._handle_failure(
+            TransferError(
+                failure_code,
+                failure_message,
+                retryable=retryable,
+            ),
+            PHASE_FINALIZING,
+        )
+
+    def _step_final_verifying(self) -> TransferStepResult:
+        if self.plan.organizer_enabled:
+            organizer = self.plan.organizer_path or {}
+            descriptor = (
+                {
+                    **organizer,
+                    "path": self.state.organizer_final_path,
+                }
+                if self.state.organizer_final_path
+                else None
+            )
+        else:
+            descriptor = self.plan.destination_final
+        if descriptor is None:
+            return self._to_manual_review("缺少 Organizer 最终映射或最终目录，无法完成入库")
+        native_target = self._is_native_descriptor(descriptor)
+        executor = self._executor()
+        verifier = getattr(executor, "verify", None) if native_target and executor else self.verifier
+        if verifier is None:
+            return self._to_manual_review("未配置最终目录校验器")
+        try:
+            result = self._invoke_verifier(verifier, descriptor=descriptor, native_target=native_target)
+        except Exception as exc:  # noqa: BLE001
+            return self._to_manual_review(f"最终目录校验异常：{exc}")
+        result = self._normalize_verify_result(result)
+        if result.status == "ok":
+            self.state.final_verified = True
+            self.state.target_verified = True
+            self.state.phase = PHASE_ACK_PENDING
+            return TransferStepResult(PHASE_ACK_PENDING, "最终目录校验通过", finished=False)
+        if result.status == "unknown":
+            return self._to_manual_review(result.message or "最终目录状态未知")
+        return self._handle_failure(
+            TransferError(ErrorCode.VERIFY_MISMATCH, result.message or "最终目录校验失败", retryable=True),
+            PHASE_FINAL_VERIFYING,
+        )
+
     def _step_ack(self) -> TransferStepResult:
-        if not self.state.target_verified:
-            # 防御：ACK 前必须已确认目标
-            self.state.phase = PHASE_TARGET_VERIFYING
-            return TransferStepResult(PHASE_TARGET_VERIFYING, "目标未确认，回到校验", finished=False)
+        if not self.state.final_verified:
+            # V1 ACK is gated by the final directory verification, not merely
+            # the staging/target check.  A restored legacy snapshot may only
+            # have target_verified; it is sent back through the final gate.
+            self.state.phase = PHASE_FINAL_VERIFYING
+            return TransferStepResult(PHASE_FINAL_VERIFYING, "最终目录未确认，回到最终校验", finished=False)
         if self.ack_service is None:
-            ack = AckResult(acked=True)
+            return self._to_manual_review("未装配应用 ACK 服务，禁止完成任务")
         else:
             try:
                 ack = self.ack_service.ack(self.plan)
@@ -557,9 +790,9 @@ class TransferOrchestrator:
 
     def _step_cleanup(self) -> TransferStepResult:
         if self.cleanup is None:
-            self.state.phase = PHASE_COMPLETED
-            self.state.message = "完成（无清理服务）"
-            return TransferStepResult(PHASE_COMPLETED, self.state.message, finished=True)
+            return self._to_manual_review("未装配清理服务，禁止跳过任务级落地清理")
+        previous_cleanup = dict(self.state.cleanup or {})
+        previous_attempt = previous_cleanup.get("attempt")
         try:
             result = self.cleanup.cleanup(
                 self.plan,
@@ -567,27 +800,65 @@ class TransferOrchestrator:
                 app_acked=self.state.app_acked,
             )
         except Exception as exc:  # noqa: BLE001
-            result = type(
-                "CleanupResult",
-                (),
-                {"ok": False, "reason": f"清理异常：{exc}", "to_dict": lambda self: {"ok": False, "reason": str(exc)}},
-            )()
-        ok = bool(getattr(result, "ok", True))
-        reason = str(getattr(result, "reason", "") or getattr(result, "message", "") or "")
+            reason = f"清理异常：{exc}"
+            return self._handle_cleanup_failure(reason, retryable=True)
+
+        if isinstance(result, dict):
+            ok = bool(result.get("ok", False))
+            retryable = bool(result.get("retryable", False))
+            reason = str(result.get("reason") or result.get("message") or "")
+        else:
+            ok = bool(getattr(result, "ok", True))
+            retryable = bool(getattr(result, "retryable", False))
+            reason = str(getattr(result, "reason", "") or getattr(result, "message", "") or "")
         if hasattr(result, "to_dict"):
             try:
                 self.state.cleanup = result.to_dict()
             except Exception:
-                self.state.cleanup = {"ok": ok}
+                self.state.cleanup = {"ok": ok, "retryable": retryable, "reason": reason}
         else:
-            self.state.cleanup = {"ok": ok, "reason": reason}
+            self.state.cleanup = {
+                **(dict(result) if isinstance(result, dict) else {}),
+                "ok": ok,
+                "retryable": retryable,
+                "reason": reason,
+            }
+        if previous_attempt is not None:
+            self.state.cleanup.setdefault("attempt", previous_attempt)
+        if not ok:
+            return self._handle_cleanup_failure(reason or "清理失败", retryable=retryable)
+
+        self.state.error_code = ""
         self.state.phase = PHASE_COMPLETED
         if ok:
             self.state.message = "完成，任务级来源落地与本地缓存已清理"
-        else:
-            # 清理失败不回滚已完成入库，记录告警并可重试（§13.3）
-            self.state.message = f"完成（清理警告，可重试）：{reason or '清理失败'}"
         return TransferStepResult(PHASE_COMPLETED, self.state.message, finished=True)
+
+    def _handle_cleanup_failure(self, reason: str, *, retryable: bool) -> TransferStepResult:
+        """把清理失败保留在 durable cleanup 阶段，禁止伪装 completed。"""
+
+        previous = self.state.cleanup if isinstance(self.state.cleanup, dict) else {}
+        try:
+            attempt = int(previous.get("attempt") or 0) + 1
+        except (TypeError, ValueError):
+            attempt = 1
+        self.state.cleanup = {
+            **previous,
+            "ok": False,
+            "warning": False,
+            "retryable": bool(retryable),
+            "attempt": attempt,
+            "reason": str(reason or "清理失败"),
+        }
+        self.state.error_code = ErrorCode.CLEANUP_FAILED
+        self.state.message = f"清理失败：{reason or '未知错误'}"
+        if not retryable or attempt >= max(1, int(self.retry_policy.max_attempts)):
+            self.state.phase = PHASE_FAILED
+            self.state.message = f"清理失败且无法继续重试：{reason or '未知错误'}"
+            return TransferStepResult(PHASE_FAILED, self.state.message, finished=True)
+        # 等待下一次 durable worker 唤醒；来源仍保留，不能进入 completed。
+        self.state.phase = PHASE_CLEANUP_PENDING
+        return TransferStepResult(PHASE_CLEANUP_PENDING, self.state.message, finished=True, needs_wait=True)
 
     # ------------------------------------------------------------------
     # retry_wait / cancel_pending
@@ -607,11 +878,36 @@ class TransferOrchestrator:
         executor = self._executor()
         if receipt is not None and executor is not None and callable(getattr(executor, "poll", None)):
             try:
-                status = executor.poll(receipt)
-                if getattr(status, "status", "") == "cancelled":
+                status = normalize_operation_status(executor.poll(receipt))
+                normalized = status.status
+                if normalized == "cancelled":
                     self.state.phase = PHASE_CANCELLED
                     self.state.message = "取消已确认"
                     return TransferStepResult(PHASE_CANCELLED, "取消已确认", finished=True)
+                if normalized in {"completed", "failed"}:
+                    self.state.phase = PHASE_CANCELLED
+                    self.state.message = (
+                        "外部操作已完成，任务按取消终止；目标可能存在残留，禁止自动删除"
+                        if normalized == "completed"
+                        else "外部操作已失败，取消终止已确认"
+                    )
+                    return TransferStepResult(
+                        PHASE_CANCELLED,
+                        self.state.message,
+                        finished=True,
+                    )
+                if normalized in {"running", "submitted"}:
+                    cancel_op = getattr(executor, "cancel", None)
+                    if callable(cancel_op):
+                        cancellation = self._normalize_cancel_result(cancel_op(receipt))
+                        if cancellation.status == "cancelled":
+                            self.state.phase = PHASE_CANCELLED
+                            self.state.message = cancellation.message or "取消已确认"
+                            return TransferStepResult(
+                                PHASE_CANCELLED,
+                                self.state.message,
+                                finished=True,
+                            )
             except Exception:  # noqa: BLE001
                 pass
         return TransferStepResult(PHASE_CANCEL_PENDING, "等待取消确认", finished=True, needs_wait=True)
@@ -662,12 +958,25 @@ class TransferOrchestrator:
             PHASE_TRANSFERRING,
         }:
             try:
-                completed_status = executor.poll(receipt)
-                if getattr(completed_status, "status", "") == "completed":
+                completed_status = normalize_operation_status(executor.poll(receipt))
+                if completed_status.status == "completed":
                     self.state.phase = PHASE_CANCELLED
                     return CancelResult(
                         "cancelled",
                         "操作已完成但未通过目标校验，取消任务（目标可能残留文件，不做清理）",
+                        operation_id=receipt.operation_id,
+                        phase=phase,
+                    )
+                if completed_status.status in {"cancelled", "failed"}:
+                    self.state.phase = PHASE_CANCELLED
+                    self.state.message = (
+                        "取消已确认"
+                        if completed_status.status == "cancelled"
+                        else "外部操作已失败，取消终止已确认"
+                    )
+                    return CancelResult(
+                        "cancelled",
+                        self.state.message,
                         operation_id=receipt.operation_id,
                         phase=phase,
                     )
@@ -712,6 +1021,33 @@ class TransferOrchestrator:
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_native_descriptor(descriptor: dict[str, Any] | None) -> bool:
+        if not isinstance(descriptor, dict):
+            return False
+        kind = str(descriptor.get("kind") or "").strip().lower()
+        if kind:
+            return kind == "native"
+        return str(descriptor.get("namespace_id") or "").strip().lower().startswith("native:")
+
+    def _invoke_organizer(self) -> Any:
+        """Pass the frozen Organizer task id when the service supports it."""
+
+        method = getattr(self.organizer_service, "organize", None)
+        if not callable(method):
+            raise TypeError("Organizer 服务不可调用")
+        task_id = int(self.state.organizer_task_id or 0)
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None and (
+            "organizer_task_id" in signature.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+        ):
+            return method(self.plan, organizer_task_id=task_id or None)
+        return method(self.plan)
+
     def _executor(self) -> Any:
         if not self.state.executor_strategy:
             return None
@@ -740,12 +1076,15 @@ class TransferOrchestrator:
 
     def _handle_failure(self, error: TransferError, retry_from: str) -> TransferStepResult:
         self.state.attempt += 1
+        phase_key = str(retry_from or self.state.phase or PHASE_PLANNING)
+        phase_attempt = int(self.state.phase_attempts.get(phase_key, 0) or 0) + 1
+        self.state.phase_attempts[phase_key] = phase_attempt
         self.state.message = error.message
         self.state.error_code = error.code
         if not error.retryable:
             self.state.phase = PHASE_FAILED
             return TransferStepResult(PHASE_FAILED, error.message, finished=True)
-        if self.state.attempt >= self.retry_policy.max_attempts:
+        if phase_attempt >= self.retry_policy.max_attempts:
             self.state.phase = PHASE_FAILED
             self.state.message = f"重试次数耗尽：{error.message}"
             return TransferStepResult(PHASE_FAILED, self.state.message, finished=True)
@@ -807,6 +1146,8 @@ class TransferOrchestrator:
                 status=str(value.get("status") or "pending"),
                 message=str(value.get("message") or ""),
                 retryable=bool(value.get("retryable", True)),
+                task_id=int(value.get("task_id") or value.get("organizer_task_id") or 0),
+                final_path=str(value.get("final_path") or ""),
             )
         text = str(value or "").strip().lower()
         if text in {"done", "success", "completed"}:

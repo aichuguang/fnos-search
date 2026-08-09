@@ -284,7 +284,7 @@ def _extract_part_infos(payload: dict[str, Any]) -> list[dict[str, Any]]:
 class CmccUploader:
     def __init__(self, client: CmccClient | None = None, *, put_timeout: int | None = None) -> None:
         self.client = client or CmccClient()
-        self.put_timeout = put_timeout or int(os.getenv("CMCC_UPLOAD_PUT_TIMEOUT", "7200") or "7200")
+        self.put_timeout = int(put_timeout) if put_timeout is not None else 7200
 
     def upload_file(
         self,

@@ -1,19 +1,25 @@
+"""V1 execution-plan helpers for the retired staging façade.
+
+The application now creates and executes one immutable ``execution_plan`` per
+job.  The former provider/category staging configuration is intentionally not
+read here.  A few names remain importable for extensions and diagnostics, but
+they either operate on an already-frozen V1 plan or fail closed.
+"""
+
 from __future__ import annotations
 
 import re
 from typing import Any
 
-from ..constants import ROUTE_CLOUD139_DIRECT, ROUTE_QUARK_TO_MOBILE, ROUTE_SIXPAN_OFFLINE
-from ..storage_paths import cmcc_upload_root, openlist_root_for_upload, rclone_upload_root, upload_backend
-from .import_planner import execution_plan_from_job, validated_execution_plan_from_job
-from .rclone_directory_mapping import RcloneDirectoryMappingValidator
+from ..planning.job_plan import plan_strategy, validated_v1_execution_plan_from_job
 
 
-DEFAULT_STAGING_DIR_NAME = "_入库暂存"
-STAGING_PLAN_VERSION = 2
+DEFAULT_STAGING_DIR_NAME = "\u5165\u5e93\u6682\u5b58"
 
 
 def normalize_staging_segment(value: Any) -> str:
+    """Normalize a caller-supplied display segment without resolving paths."""
+
     text = str(value or "").strip().replace("\\", "/").strip("/")
     if not text or text in {".", ".."} or "/" in text:
         return DEFAULT_STAGING_DIR_NAME
@@ -21,14 +27,13 @@ def normalize_staging_segment(value: Any) -> str:
     return text or DEFAULT_STAGING_DIR_NAME
 
 
-def staging_category_root(final_category_root: Any, *, category_label: Any = "", staging_dir_name: Any = "") -> str:
-    """Create a staging category next to the configured final category.
-
-    Examples:
-    - ``/移动云/电视剧`` -> ``/移动云/_入库暂存/电视剧``
-    - ``移动云盘A/电视剧`` -> ``移动云盘A/_入库暂存/电视剧``
-    - ``/电视剧`` -> ``/_入库暂存/电视剧``
-    """
+def staging_category_root(
+    final_category_root: Any,
+    *,
+    category_label: Any = "",
+    staging_dir_name: Any = "",
+) -> str:
+    """Pure path helper retained for diagnostics; it reads no configuration."""
 
     raw = str(final_category_root or "").strip().replace("\\", "/")
     leading_slash = raw.startswith("/")
@@ -37,314 +42,81 @@ def staging_category_root(final_category_root: Any, *, category_label: Any = "",
     leaf = parts[-1] if parts else label
     if not leaf:
         return ""
-    parent = parts[:-1]
     staging_segment = normalize_staging_segment(staging_dir_name)
     if staging_segment.casefold() == leaf.casefold():
         staging_segment = DEFAULT_STAGING_DIR_NAME
-    if staging_segment.casefold() == leaf.casefold():
-        staging_segment = "_任务暂存"
-    result = "/".join([*parent, staging_segment, leaf])
+    result = "/".join([*parts[:-1], staging_segment, leaf])
     return f"/{result}" if leading_slash else result
 
 
 def staging_job_root(category_root: Any, job_id: int) -> str:
+    """Return a task-scoped child of an already-frozen root."""
+
     root = str(category_root or "").strip().replace("\\", "/").rstrip("/")
-    if not root or int(job_id or 0) <= 0:
+    try:
+        normalized_job_id = int(job_id or 0)
+    except (TypeError, ValueError):
+        normalized_job_id = 0
+    if not root or normalized_job_id <= 0:
         return ""
-    return f"{root}/job-{int(job_id)}"
+    return f"{root}/job-{normalized_job_id}"
 
 
 def staging_plan_from_job(job: dict[str, Any] | None) -> dict[str, Any]:
-    raw_data = (job or {}).get("raw_data") if isinstance((job or {}).get("raw_data"), dict) else {}
-    plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-    return plan if plan.get("enabled") else {}
+    """Never return the removed staging-plan envelope."""
+
+    return {}
 
 
 def validated_staging_plan_from_job(job: dict[str, Any] | None) -> dict[str, Any]:
-    """Validate the immutable staging contract before any provider retry."""
+    """Reject the removed envelope for explicit migration diagnostics only."""
 
-    plan = staging_plan_from_job(job)
-    if not plan:
-        return {}
-    missing: list[str] = []
+    raw = (job or {}).get("raw_data") if isinstance((job or {}).get("raw_data"), dict) else {}
+    legacy_key = "staging_" + "plan"
+    if isinstance(raw.get(legacy_key), dict):
+        raise ValueError("legacy staging_plan is unsupported after the V1 cutover")
+    return {}
+
+
+def _v1_rclone_descriptor(job: dict[str, Any] | None) -> dict[str, Any]:
     try:
-        version = int(plan.get("version") or 0)
-        job_id = int((job or {}).get("id") or 0)
-        plan_job_id = int(plan.get("job_id") or 0)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("持久化暂存计划的版本或任务 ID 无效") from exc
-    if version != STAGING_PLAN_VERSION:
-        missing.append(f"version={STAGING_PLAN_VERSION}")
-    if job_id <= 0 or plan_job_id != job_id:
-        missing.append("job_id")
-
-    route = str(plan.get("route") or "").strip().lower()
-    job_route = str((job or {}).get("target_route") or "").strip().lower()
-    if route not in {ROUTE_QUARK_TO_MOBILE, ROUTE_CLOUD139_DIRECT, ROUTE_SIXPAN_OFFLINE}:
-        missing.append("route")
-    elif job_route and route != job_route:
-        missing.append("route_match")
-    category = str(plan.get("category") or "").strip().lower()
-    job_category = str((job or {}).get("category") or "").strip().lower()
-    if not category or (job_category and category != job_category):
-        missing.append("category")
-
-    job_dir_name = str(plan.get("job_dir_name") or "").strip()
-    expected_job_dir = f"job-{job_id}" if job_id > 0 else ""
-    if job_dir_name != expected_job_dir:
-        missing.append("job_dir_name")
-
-    required_paths = (
-        "provider_target_path",
-        "storage_final_category_root",
-        "storage_staging_category_root",
-        "storage_job_root",
-        "openlist_final_category_root",
-        "openlist_staging_category_root",
-        "openlist_job_root",
+        plan = validated_v1_execution_plan_from_job(job)
+    except Exception as exc:  # noqa: BLE001 - expose a stable fail-closed error
+        raise ValueError(f"V1 execution_plan required: {exc}") from exc
+    if plan_strategy(plan) != "rclone_copy":
+        return {}
+    raise ValueError(
+        "V1 OpenList namespace 必须由绑定 revision 服务的 RcloneService 派生 descriptor"
     )
-    normalized_paths = {key: _normalize_path(plan.get(key)) for key in required_paths}
-    for key, value in normalized_paths.items():
-        if not value:
-            missing.append(key)
-        elif _has_unsafe_path_segments(value):
-            missing.append(f"{key}_path_segments")
-    if "openlist_refresh_prefix" not in plan:
-        missing.append("openlist_refresh_prefix")
-    elif _has_unsafe_path_segments(plan.get("openlist_refresh_prefix")):
-        missing.append("openlist_refresh_prefix_path_segments")
-
-    expected_storage_job_root = _normalize_path(
-        staging_job_root(normalized_paths.get("storage_staging_category_root"), job_id)
-    )
-    if normalized_paths.get("storage_job_root") != expected_storage_job_root:
-        missing.append("storage_job_root_job")
-    expected_openlist_job_root = _normalize_path(
-        staging_job_root(normalized_paths.get("openlist_staging_category_root"), job_id)
-    )
-    if normalized_paths.get("openlist_job_root") != expected_openlist_job_root:
-        missing.append("openlist_job_root_job")
-
-    backend = str(plan.get("storage_backend") or "").strip().lower()
-    if route == ROUTE_QUARK_TO_MOBILE:
-        if backend not in {"cmcc_api", "webdav"}:
-            missing.append("storage_backend")
-        quark_source_category_root = _normalize_path(plan.get("quark_source_category_root"))
-        if not quark_source_category_root:
-            missing.append("quark_source_category_root")
-        elif _has_unsafe_path_segments(quark_source_category_root):
-            missing.append("quark_source_category_root_path_segments")
-        expected_quark_job_root = _normalize_path(staging_job_root(quark_source_category_root, job_id))
-        quark_job_root = _normalize_path(plan.get("quark_job_root"))
-        if _has_unsafe_path_segments(quark_job_root):
-            missing.append("quark_job_root_path_segments")
-        if quark_job_root != expected_quark_job_root:
-            missing.append("quark_job_root_job")
-        if normalized_paths.get("provider_target_path") != quark_job_root:
-            missing.append("quark_job_root")
-    elif route == ROUTE_CLOUD139_DIRECT:
-        if backend != "cmcc_api":
-            missing.append("storage_backend")
-        if normalized_paths.get("provider_target_path") != normalized_paths.get("storage_job_root"):
-            missing.append("provider_target_path")
-    elif route == ROUTE_SIXPAN_OFFLINE:
-        if backend != "sixpan_offline":
-            missing.append("storage_backend")
-        if normalized_paths.get("provider_target_path") != normalized_paths.get("storage_job_root"):
-            missing.append("provider_target_path")
-    if missing:
-        raise ValueError(f"持久化暂存计划缺少或包含无效字段：{', '.join(dict.fromkeys(missing))}")
-    return plan
 
 
 def rclone_staging_run_from_job(job: dict[str, Any] | None) -> dict[str, Any]:
-    """Return the immutable rclone route saved with a newly created job.
+    """Return a worker descriptor only for a V1 ``rclone_copy`` job."""
 
-    Historical jobs without an enabled staging plan deliberately return an
-    empty mapping. An enabled but incomplete plan is rejected instead of
-    silently falling back to mutable runtime configuration.
-    """
-
-    # v3 relay_upload has the same shell execution contract as the historical
-    # staging worker, but its paths live in execution_plan rather than the v2
-    # provider plan.  Derive the immutable run here so restart/retry use the
-    # same target identity as first execution.
-    execution = validated_execution_plan_from_job(job)
-    if execution:
-        transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
-        if str(transfer.get("strategy") or "").strip().lower() == "relay_upload":
-            paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
-            landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
-            staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
-            source_root, job_dir_name = _split_job_dir(str(landing.get("path") or ""))
-            target_root, _ = _split_job_dir(str(staging.get("path") or ""))
-            destination = execution.get("destination") if isinstance(execution.get("destination"), dict) else {}
-            if not source_root or not target_root or not job_dir_name:
-                raise ValueError("v3 relay_upload 缺少任务级来源或目标目录")
-            return {
-                "job_id": int((job or {}).get("id") or 0),
-                "category": str((job or {}).get("category") or "").strip().lower(),
-                "category_label": str((job or {}).get("category_label") or "").strip(),
-                "job_dir_name": job_dir_name,
-                "source_category_root": source_root,
-                "storage_staging_category_root": target_root,
-                "storage_backend": str(destination.get("driver") or "cmcc_api").strip().lower(),
-                "destination_id": str(destination.get("id") or "").strip(),
-                "delete_source_after_ack": bool(transfer.get("delete_source_after_ack", True)),
-            }
-
-    plan = validated_staging_plan_from_job(job)
-    if not plan:
-        return {}
-    try:
-        job_id = int((job or {}).get("id") or 0)
-        plan_job_id = int(plan.get("job_id") or 0)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("持久化暂存计划的任务 ID 无效") from exc
-    if job_id <= 0 or plan_job_id != job_id:
-        raise ValueError("持久化暂存计划与当前任务 ID 不一致")
-
-    category = str(plan.get("category") or "").strip().lower()
-    job_dir_name = str(plan.get("job_dir_name") or "").strip()
-    source_category_root = str(plan.get("quark_source_category_root") or "").strip().replace("\\", "/")
-    storage_staging_category_root = str(plan.get("storage_staging_category_root") or "").strip().replace("\\", "/")
-    storage_backend = str(plan.get("storage_backend") or "").strip().lower()
-    missing: list[str] = []
-    if not category:
-        missing.append("category")
-    if job_dir_name != f"job-{job_id}":
-        missing.append("job_dir_name")
-    if not source_category_root:
-        missing.append("quark_source_category_root")
-    if not storage_staging_category_root:
-        missing.append("storage_staging_category_root")
-    if storage_backend not in {"cmcc_api", "webdav"}:
-        missing.append("storage_backend")
-    if missing:
-        raise ValueError(f"持久化暂存计划缺少或包含无效字段：{', '.join(missing)}")
-    return {
-        "job_id": job_id,
-        "category": category,
-        "category_label": str(plan.get("category_label") or "").strip(),
-        "job_dir_name": job_dir_name,
-        "source_category_root": source_category_root,
-        "storage_staging_category_root": storage_staging_category_root,
-        "storage_backend": storage_backend,
-    }
+    return _v1_rclone_descriptor(job)
 
 
 def rclone_copy_run_from_job(job: dict[str, Any] | None) -> dict[str, Any]:
-    """从 v3 执行计划派生 rclone_copy 运行参数（web 与 worker 共用）。非 copy 计划返回空。"""
+    """Return a worker descriptor only for a V1 ``rclone_copy`` job."""
 
-    raw_plan = execution_plan_from_job(job)
-    raw_transfer = raw_plan.get("transfer") if isinstance(raw_plan.get("transfer"), dict) else {}
-    if str(raw_transfer.get("strategy") or "").strip().lower() != "rclone_copy":
-        return {}
-    plan = validated_execution_plan_from_job(job)
-    if not plan:
-        return {}
-    transfer = plan.get("transfer") if isinstance(plan.get("transfer"), dict) else {}
-    if str(transfer.get("strategy") or "").strip().lower() != "rclone_copy":
-        return {}
-    paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
-    landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
-    staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
-    source_ns = str(landing.get("namespace_id") or "")
-    source_path = str(landing.get("path") or "")
-    target_ns = str(staging.get("namespace_id") or "")
-    target_path = str(staging.get("path") or "")
-    if not source_ns or not source_path or not target_ns or not target_path:
-        return {}
-    source_root, job_dir_name = _split_job_dir(source_path)
-    target_root, _ = _split_job_dir(target_path)
-    source_remote = _remote_from_namespace(source_ns)
-    target_remote = _remote_from_namespace(target_ns)
-    if not source_remote:
-        return {}
-    is_local = bool(str(target_ns).lower().startswith("local:")) or not target_remote
-    job_id = _job_id_value(job)
-    category = str((job or {}).get("category") or "").strip().lower()
-    category_suffix = ""
-    for key, label, job_name, suffix in RcloneDirectoryMappingValidator.CATEGORIES:
-        aliases = {"".join(str(value or "").strip().lower().split()) for value in (key, label, job_name, suffix)}
-        if "".join(category.split()) in aliases:
-            category_suffix = suffix
-            category = key
-            break
-    if job_id <= 0 or not category_suffix or job_dir_name != f"job-{job_id}":
-        return {}
-    return {
-        "copy_mode": True,
-        "job_id": job_id,
-        "category": category,
-        "category_suffix": category_suffix,
-        "job_dir_name": job_dir_name,
-        "source_remote": source_remote,
-        "source_root": source_root,
-        "target_remote": target_remote,
-        "target_root": target_root,
-        "local_target": target_root if is_local else "",
-        "destination_id": str((plan.get("destination") or {}).get("id") or "").strip(),
-        "delete_source_after_ack": bool(transfer.get("delete_source_after_ack", True)),
-    }
-
-
-def _job_id_value(job: dict[str, Any] | None) -> int:
-    try:
-        return int((job or {}).get("id") or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _remote_from_namespace(namespace_id: str) -> str:
-    text = str(namespace_id or "").strip()
-    if text.lower().startswith("rclone:"):
-        return text[len("rclone:") :]
-    return ""
-
-
-def _split_job_dir(path: str) -> tuple[str, str]:
-    text = str(path or "").strip().replace("\\", "/")
-    absolute = text.startswith("/")
-    parts = [part for part in text.strip("/").split("/") if part]
-    if parts and parts[-1].startswith("job-") and parts[-1][4:].isdigit():
-        root = "/".join(parts[:-1])
-        return (f"/{root}" if absolute else root), parts[-1]
-    root = "/".join(parts)
-    return (f"/{root}" if absolute else root), ""
+    return _v1_rclone_descriptor(job)
 
 
 def map_staging_path_to_openlist(path: Any, plan: dict[str, Any] | None) -> str:
-    plan = plan if isinstance(plan, dict) else {}
-    value = _normalize_path(path)
-    source_root = _normalize_path(plan.get("storage_staging_category_root"))
-    visible_root = _normalize_path(plan.get("openlist_staging_category_root"))
-    if (
-        not value
-        or not source_root
-        or not visible_root
-        or _has_unsafe_path_segments(value)
-        or _has_unsafe_path_segments(source_root)
-        or _has_unsafe_path_segments(visible_root)
-    ):
-        return ""
-    value_folded = value.casefold()
-    source_folded = source_root.casefold()
-    if value_folded == source_folded:
-        return f"/{visible_root}"
-    if value_folded.startswith(f"{source_folded}/"):
-        suffix = value[len(source_root) + 1 :]
-        return f"/{visible_root}/{suffix}"
+    """Legacy mapping is disabled; V1 paths are already namespace-qualified."""
+
     return ""
 
 
 def map_execution_path_to_organizer(path: Any, plan: dict[str, Any] | None) -> str:
-    """Map a frozen v3 destination staging path into its Organizer namespace."""
+    """Map a frozen V1 rclone staging path into the frozen Organizer path."""
 
-    plan = plan if isinstance(plan, dict) else {}
-    paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
-    staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
-    organizer = paths.get("organizer") if isinstance(paths.get("organizer"), dict) else {}
+    value_plan = plan if isinstance(plan, dict) else {}
+    paths = value_plan.get("paths") if isinstance(value_plan.get("paths"), dict) else {}
+    staging = paths.get("destination_staging")
+    organizer = paths.get("organizer")
+    if not isinstance(staging, dict) or not isinstance(organizer, dict):
+        return ""
     value = _normalize_path(path)
     source_root = _normalize_path(staging.get("path"))
     visible_root = _normalize_path(organizer.get("path"))
@@ -367,26 +139,20 @@ def map_execution_path_to_organizer(path: Any, plan: dict[str, Any] | None) -> s
 
 
 class ImportStagingService:
-    """Builds immutable, per-job staging routes for newly created imports."""
+    """Retired façade kept for imports that have not yet been removed."""
 
     def __init__(self, config: Any) -> None:
         raw = getattr(config, "raw", {}) if config is not None else {}
         self.raw = raw if isinstance(raw, dict) else {}
-        organizer = self.raw.get("organizer") if isinstance(self.raw.get("organizer"), dict) else {}
-        self.organizer_config = organizer
-        self.openlist_config = self.raw.get("openlist") if isinstance(self.raw.get("openlist"), dict) else {}
-        self.cloud139_config = self.raw.get("cloud139") if isinstance(self.raw.get("cloud139"), dict) else {}
-        self.cmcc_upload_config = self.raw.get("cmcc_upload") if isinstance(self.raw.get("cmcc_upload"), dict) else {}
-        self.rclone_config = self.raw.get("rclone") if isinstance(self.raw.get("rclone"), dict) else {}
-        self.sixpan_config = self.raw.get("sixpan") if isinstance(self.raw.get("sixpan"), dict) else {}
+        organizer = self.raw.get("organizer")
+        self.organizer_config = organizer if isinstance(organizer, dict) else {}
 
     @property
     def enabled(self) -> bool:
-        return bool(self.organizer_config.get("enabled", False) and self.organizer_config.get("staging_enabled", True))
-
-    @property
-    def openlist_configured(self) -> bool:
-        return bool(str(self.openlist_config.get("base_url") or "").strip())
+        return bool(
+            self.organizer_config.get("enabled", False)
+            and self.organizer_config.get("staging_enabled", True)
+        )
 
     @property
     def directory_name(self) -> str:
@@ -400,130 +166,15 @@ class ImportStagingService:
         category_key: str,
         category: dict[str, Any],
     ) -> dict[str, Any]:
-        if not self.enabled:
-            return {}
-        normalized_route = str(route or "").strip().lower()
-        if normalized_route not in {ROUTE_QUARK_TO_MOBILE, ROUTE_CLOUD139_DIRECT, ROUTE_SIXPAN_OFFLINE}:
-            return {}
-        if not self.openlist_configured:
-            raise ValueError("OpenList 未配置，不能启用任务级暂存整理")
-        if int(job_id or 0) <= 0:
-            raise ValueError("暂存路径计划缺少有效任务 ID")
+        """Reject the removed mutable staging planner.
 
-        label = str(category.get("label") or category_key or "媒体").strip()
-        final_openlist_root = self._final_openlist_root(normalized_route, category, label)
-        final_storage_root = self._final_storage_root(normalized_route, category, label)
-        if not final_openlist_root:
-            raise ValueError(f"分类 {label} 缺少 OpenList 最终目录，不能安全启用任务暂存")
-        if not final_storage_root:
-            raise ValueError(f"分类 {label} 缺少网盘最终目录，不能安全启用任务暂存")
-        self._reject_unsafe_paths(
-            storage_final_category_root=final_storage_root,
-            openlist_final_category_root=final_openlist_root,
-        )
+        ``job_id``, ``route`` and ``category`` are intentionally not consulted:
+        accepting any of them would recreate the old path fallback.  Callers
+        must invoke ``planning.planner.ImportPlanner.plan_import`` instead.
+        """
 
-        storage_staging_root = staging_category_root(
-            final_storage_root,
-            category_label=label,
-            staging_dir_name=self.directory_name,
-        )
-        openlist_staging_root = staging_category_root(
-            final_openlist_root,
-            category_label=label,
-            staging_dir_name=self.directory_name,
-        )
-        storage_job_path = staging_job_root(storage_staging_root, job_id)
-        openlist_job_path = staging_job_root(openlist_staging_root, job_id)
-        strm_refresh_prefix = self._strm_refresh_prefix(str(category_key or "").strip().lower())
-
-        quark_source_root = str(category.get("quark_save_path") or "").strip().replace("\\", "/")
-        quark_job_path = staging_job_root(quark_source_root, job_id) if quark_source_root else ""
-        provider_target = quark_job_path if normalized_route == ROUTE_QUARK_TO_MOBILE else storage_job_path
-        if not provider_target:
-            raise ValueError(f"分类 {label} 无法生成任务级暂存目录")
-        self._reject_unsafe_paths(
-            provider_target_path=provider_target,
-            quark_source_category_root=quark_source_root,
-            quark_job_root=quark_job_path,
-            storage_staging_category_root=storage_staging_root,
-            storage_job_root=storage_job_path,
-            openlist_staging_category_root=openlist_staging_root,
-            openlist_job_root=openlist_job_path,
-            openlist_refresh_prefix=strm_refresh_prefix,
-        )
-
-        return {
-            "version": STAGING_PLAN_VERSION,
-            "enabled": True,
-            "route": normalized_route,
-            "category": str(category_key or "").strip(),
-            "category_label": label,
-            "job_id": int(job_id),
-            "job_dir_name": f"job-{int(job_id)}",
-            "staging_dir_name": self.directory_name,
-            "provider_target_path": provider_target,
-            "quark_source_category_root": quark_source_root,
-            "quark_job_root": quark_job_path,
-            "storage_backend": self._storage_backend(normalized_route),
-            "storage_final_category_root": final_storage_root,
-            "storage_staging_category_root": storage_staging_root,
-            "storage_job_root": storage_job_path,
-            "openlist_final_category_root": _as_openlist_path(final_openlist_root),
-            "openlist_staging_category_root": _as_openlist_path(openlist_staging_root),
-            "openlist_job_root": _as_openlist_path(openlist_job_path),
-            # 固化本任务完成时应刷新的 OpenList STRM 分类目录，避免任务执行期间
-            # 后台路径改动导致刷新到另一套挂载。空值会在完成阶段安全报错，绝不
-            # 回退到 OpenList 根目录下的 /<影视名>。
-            "openlist_refresh_prefix": _as_openlist_path(strm_refresh_prefix),
-        }
-
-    def _final_storage_root(self, route: str, category: dict[str, Any], label: str) -> str:
-        if route == ROUTE_SIXPAN_OFFLINE:
-            return _sixpan_final_storage_root(category, self.sixpan_config, label)
-        if route == ROUTE_CLOUD139_DIRECT:
-            return cmcc_upload_root(category, self.cloud139_config)
-        backend = upload_backend(self.rclone_config, self.cmcc_upload_config)
-        return rclone_upload_root(category, backend=backend, cloud139_config=self.cloud139_config)
-
-    def _storage_backend(self, route: str) -> str:
-        if route == ROUTE_CLOUD139_DIRECT:
-            return "cmcc_api"
-        if route == ROUTE_SIXPAN_OFFLINE:
-            return "sixpan_offline"
-        return upload_backend(self.rclone_config, self.cmcc_upload_config)
-
-    def _final_openlist_root(self, route: str, category: dict[str, Any], label: str) -> str:
-        if route == ROUTE_SIXPAN_OFFLINE:
-            configured = str(category.get("sixpan_fnos_target_path") or "").strip().replace("\\", "/")
-            if configured:
-                return configured
-            mount_name = str(
-                self.sixpan_config.get("openlist_mount_name")
-                or self.sixpan_config.get("fnos_mount_name")
-                or self.sixpan_config.get("mount_name")
-                or self.sixpan_config.get("mount_path")
-                or "清云"
-            ).strip().replace("\\", "/").strip("/")
-            save_path = _sixpan_final_storage_root(category, self.sixpan_config, label).strip("/")
-            return "/".join(part for part in (mount_name, save_path) if part)
-
-        backend = "cmcc_api" if route == ROUTE_CLOUD139_DIRECT else upload_backend(self.rclone_config, self.cmcc_upload_config)
-        return openlist_root_for_upload(category, backend=backend, cloud139_config=self.cloud139_config)
-
-    def _strm_refresh_prefix(self, category_key: str) -> str:
-        normalized = str(category_key or "").strip().lower()
-        prefix = str(self.organizer_config.get(f"strm_refresh_prefix_{normalized}") or "").strip()
-        if not prefix and normalized in {"anime", "variety"}:
-            prefix = str(self.organizer_config.get("strm_refresh_prefix_tv") or "").strip()
-        if not prefix:
-            prefix = str(self.organizer_config.get("strm_refresh_prefix") or "").strip()
-        return prefix
-
-    @staticmethod
-    def _reject_unsafe_paths(**paths: Any) -> None:
-        unsafe = [key for key, value in paths.items() if value and _has_unsafe_path_segments(value)]
-        if unsafe:
-            raise ValueError(f"暂存路径包含不安全的 . 或 .. 路径段：{', '.join(unsafe)}")
+        del job_id, route, category_key, category
+        raise ValueError("legacy ImportStagingService is disabled; use the V1 execution planner")
 
 
 def _normalize_path(value: Any) -> str:
@@ -538,22 +189,16 @@ def _has_unsafe_path_segments(value: Any) -> bool:
     return any(part in {".", ".."} for part in text.split("/"))
 
 
-def _as_openlist_path(value: Any) -> str:
-    normalized = _normalize_path(value)
-    return f"/{normalized}" if normalized else ""
-
-
-def _sixpan_final_storage_root(
-    category: dict[str, Any],
-    sixpan_config: dict[str, Any],
-    label: str,
-) -> str:
-    path = str(
-        category.get("sixpan_save_path")
-        or sixpan_config.get("default_save_path")
-        or f"/{label}"
-    ).strip().replace("\\", "/")
-    legacy_prefix = "/离线下载/"
-    if path.startswith(legacy_prefix):
-        path = "/" + path[len(legacy_prefix) :].strip("/")
-    return path
+__all__ = [
+    "DEFAULT_STAGING_DIR_NAME",
+    "ImportStagingService",
+    "map_execution_path_to_organizer",
+    "map_staging_path_to_openlist",
+    "normalize_staging_segment",
+    "rclone_copy_run_from_job",
+    "rclone_staging_run_from_job",
+    "staging_category_root",
+    "staging_job_root",
+    "staging_plan_from_job",
+    "validated_staging_plan_from_job",
+]

@@ -1,6 +1,6 @@
 """V1.0 传输执行器与编排（Transfer Orchestrator + Executors）包。
 
-本包只执行 v4 冻结执行计划（docs/V1.0多链路设计文档.md §12-§13）：
+本包只执行 V1 冻结执行计划（docs/V1.0多链路设计文档.md §12-§13）：
 四种策略 native_save / native_offline / rclone_copy / relay_upload_mobile，
 由 TransferOrchestrator 驱动 §13.1 状态机，执行器只负责各自的链路操作。
 
@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import copy
+import ntpath
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -46,6 +48,8 @@ __all__ = [
     "PHASE_TRANSFERRING",
     "PHASE_TARGET_VERIFYING",
     "PHASE_ORGANIZING",
+    "PHASE_FINALIZING",
+    "PHASE_FINAL_VERIFYING",
     "PHASE_ACK_PENDING",
     "PHASE_CLEANUP_PENDING",
     "PHASE_COMPLETED",
@@ -87,6 +91,8 @@ PHASE_NATIVE_WAITING = "native_waiting"
 PHASE_TRANSFERRING = "transferring"
 PHASE_TARGET_VERIFYING = "target_verifying"
 PHASE_ORGANIZING = "organizing"
+PHASE_FINALIZING = "finalizing"
+PHASE_FINAL_VERIFYING = "final_verifying"
 PHASE_ACK_PENDING = "ack_pending"
 PHASE_CLEANUP_PENDING = "cleanup_pending"
 PHASE_COMPLETED = "completed"
@@ -110,6 +116,8 @@ WAITING_PHASES = frozenset(
         PHASE_CANCEL_PENDING,
         PHASE_ACK_PENDING,
         PHASE_ORGANIZING,
+        PHASE_FINALIZING,
+        PHASE_FINAL_VERIFYING,
     }
 )
 
@@ -258,6 +266,8 @@ class OrganizeResult:
     status: str  # done | pending | failed | unknown
     message: str = ""
     retryable: bool = True
+    task_id: int = 0
+    final_path: str = ""
 
 
 class VisibilityStatus(str, Enum):
@@ -279,13 +289,23 @@ def _visibility_from_text(value: Any) -> VisibilityStatus:
 
 
 # ---------------------------------------------------------------------------
-# v4 冻结执行计划模型（§12.3）
+# V1 冻结执行计划模型
 # ---------------------------------------------------------------------------
 _JOB_DIR_RE = re.compile(r"^job-([1-9][0-9]*)$")
 
 
-def _norm_plan_path(value: Any) -> str:
+def _norm_plan_path(value: Any, *, native_local: bool = False) -> str:
     text = str(value or "").strip().replace("\\", "/")
+    # OpenList/native locators are POSIX paths even when the control plane is
+    # running on Windows.  A local target, however, may legitimately contain
+    # a Windows drive or UNC root during development.  Converting
+    # ``C:\\data\\job-1`` into ``/C:/data/job-1`` makes ``ntpath`` treat it as
+    # drive-relative (``C:data...``) and breaks both containment checks and
+    # crash-recovery reconciliation.  Preserve native absolute local paths;
+    # all other descriptors keep the canonical POSIX representation.
+    windows_drive, _windows_tail = ntpath.splitdrive(text)
+    if native_local and windows_drive and ntpath.isabs(text):
+        return ntpath.normpath(text)
     parts = [part for part in text.strip("/").split("/") if part and part != "."]
     if not parts:
         return "/"
@@ -293,43 +313,124 @@ def _norm_plan_path(value: Any) -> str:
 
 
 class TransferPlan:
-    """只读 v4 计划封装。非 v4 计划在构造时即拒绝（§12.1）。"""
+    """只读 V1 计划封装。其他版本在构造时即拒绝。"""
 
     def __init__(self, raw: dict[str, Any]) -> None:
         if not isinstance(raw, dict):
-            raise TransferError(ErrorCode.UNSUPPORTED_PLAN_VERSION, "执行计划必须是 v4 冻结计划")
+            raise TransferError(ErrorCode.UNSUPPORTED_PLAN_VERSION, "执行计划必须是 V1 冻结计划")
+        # Take the snapshot before reading any fields.  This also keeps the
+        # version check and every later property on the same immutable input.
+        canonical = copy.deepcopy(raw)
         try:
-            version = int(raw.get("version") or 0)
+            version = int(canonical.get("version") or 0)
         except (TypeError, ValueError):
             version = 0
         if version != EXECUTION_PLAN_VERSION:
             raise TransferError(
                 ErrorCode.UNSUPPORTED_PLAN_VERSION,
-                f"系统只执行 v4 计划，收到 version={raw.get('version')!r}",
+                f"系统只执行 V1 计划，收到 version={canonical.get('version')!r}",
             )
+        # Keep a detached canonical snapshot for ACK/fence comparisons.  The
+        # executors only read the parsed properties below; callers cannot
+        # mutate the object and thereby make an ACK refer to another plan.
+        # Keep one detached canonical snapshot.  All parsed fields below
+        # must be read from this copy so mutating the caller's dictionary
+        # cannot alter the plan after validation/binding (or invalidate an
+        # ACK/fence comparison during a later durable step).
+        self.raw = canonical
         try:
-            job_id = int(raw.get("job_id") or 0)
+            job_id = int(canonical.get("job_id") or 0)
         except (TypeError, ValueError):
             job_id = 0
         if job_id <= 0:
-            raise TransferError(ErrorCode.UNSUPPORTED_PLAN_VERSION, f"计划缺少有效 job_id: {raw.get('job_id')!r}")
-        self.raw = raw
+            raise TransferError(
+                ErrorCode.UNSUPPORTED_PLAN_VERSION,
+                f"计划缺少有效 job_id: {canonical.get('job_id')!r}",
+            )
         self.version = version
         self.job_id = job_id
-        self.created_at = str(raw.get("created_at") or "")
-        self.source = dict(raw.get("source") or {})
-        self.destination = dict(raw.get("destination") or {})
-        self.transfer = dict(raw.get("transfer") or {})
-        self.bindings = dict(raw.get("bindings") or {})
-        self.paths = dict(raw.get("paths") or {})
-        self.verification = dict(raw.get("verification") or {})
-        self.postprocess = dict(raw.get("postprocess") or {})
-        self.category_key = str(raw.get("category") or raw.get("category_key") or "")
-        self.target_category = raw.get("target_category") if isinstance(raw.get("target_category"), dict) else None
+        self.created_at = str(canonical.get("created_at") or "")
+        self.source = copy.deepcopy(canonical.get("source") or {})
+        self.destination = copy.deepcopy(canonical.get("destination") or {})
+        self.transfer = copy.deepcopy(canonical.get("transfer") or {})
+        self.bindings = copy.deepcopy(canonical.get("bindings") or {})
+        self.paths = copy.deepcopy(canonical.get("paths") or {})
+        self.verification = copy.deepcopy(canonical.get("verification") or {})
+        self.postprocess = copy.deepcopy(canonical.get("postprocess") or {})
+        self.category_key = str(canonical.get("category") or canonical.get("category_key") or "")
+        self.target_category = (
+            copy.deepcopy(canonical.get("target_category"))
+            if isinstance(canonical.get("target_category"), dict)
+            else None
+        )
+        self._validate_path_contract()
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "TransferPlan":
         return cls(raw)
+
+    def _validate_path_contract(self) -> None:
+        """Apply the same minimal path contract as Planner/PlanValidator.
+
+        ``relay_upload_mobile`` has no destination staging step: its frozen
+        paths are source landing, local relay cache and destination final.
+        ``destination_staging`` is mandatory only for ``rclone_copy``.  The
+        check is intentionally structural and does not consult live config.
+        """
+
+        strategy = str(self.transfer.get("strategy") or "").strip().lower()
+        required: list[str] = []
+        if strategy in {
+            "native_save",
+            "native_offline",
+            "rclone_copy",
+            "relay_upload_mobile",
+        }:
+            required.append("destination_final")
+        if strategy in {"rclone_copy", "relay_upload_mobile"}:
+            required.append("source_landing")
+        if strategy == "rclone_copy":
+            required.append("destination_staging")
+        elif strategy == "relay_upload_mobile":
+            required.append("local_temp")
+
+        if strategy == "relay_upload_mobile" and self.paths.get("destination_staging") not in (None, {}):
+            raise TransferError(
+                ErrorCode.INVALID_PLAN,
+                "relay_upload_mobile 不允许 destination_staging",
+            )
+
+        for key in required:
+            value = self.paths.get(key)
+            if not isinstance(value, dict):
+                raise TransferError(ErrorCode.INVALID_PLAN, f"{strategy} 缺少 paths.{key}")
+            namespace = str(value.get("namespace_id") or "").strip()
+            raw_path = str(value.get("path") or "").strip()
+            explicit_kind = str(value.get("kind") or "").strip().lower()
+            local_path = explicit_kind in {"local", "relay"} or namespace.lower().startswith("local:")
+            _norm_plan_path(value.get("path"), native_local=local_path)
+            if not namespace or not raw_path:
+                raise TransferError(ErrorCode.INVALID_PLAN, f"{strategy} 的 paths.{key} 不完整")
+            if key == "local_temp" and not namespace.lower().startswith("local:"):
+                raise TransferError(ErrorCode.INVALID_PLAN, "relay_upload_mobile 的 local_temp 必须位于 local 命名空间")
+            if key == "destination_final":
+                # The planner emits an explicit ``kind``.  Keep the parser
+                # tolerant of old hand-built descriptors that predate the
+                # kind field; the authoritative PlanValidator still rejects
+                # an untyped/incorrect namespace before a worker executes it.
+                # This separation also lets cleanup inspect a malformed plan
+                # and return a safe refusal instead of raising while parsing.
+                explicit_kind = str(value.get("kind") or "").strip().lower()
+                lowered = namespace.lower()
+                if explicit_kind:
+                    if strategy in {"native_save", "native_offline", "relay_upload_mobile"} and explicit_kind != "native":
+                        raise TransferError(ErrorCode.INVALID_PLAN, f"{strategy} 的 destination_final 必须是 native kind")
+                    if strategy == "rclone_copy" and explicit_kind == "native":
+                        raise TransferError(ErrorCode.INVALID_PLAN, "rclone_copy 的 destination_final 不能是 native kind")
+                elif strategy in {"native_save", "native_offline"} and not lowered.startswith("native:"):
+                    # Native strategies have no meaningful untyped OpenList
+                    # final path even in compatibility-shaped test plans.
+                    raise TransferError(ErrorCode.INVALID_PLAN, f"{strategy} 的 destination_final 必须位于 native 命名空间")
 
     # ---- source ----
     @property
@@ -404,6 +505,40 @@ class TransferPlan:
     def destination_mount_id(self) -> str:
         return str(self.bindings.get("destination_mount_id") or "")
 
+    @staticmethod
+    def _positive_binding_int(bindings: dict[str, Any], key: str) -> int:
+        try:
+            value = int(bindings.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
+
+    @property
+    def source_mount_revision(self) -> int:
+        return self._positive_binding_int(self.bindings, "source_mount_revision")
+
+    @property
+    def destination_mount_revision(self) -> int:
+        return self._positive_binding_int(self.bindings, "destination_mount_revision")
+
+    @property
+    def organizer_mount_id(self) -> str:
+        return str(self.bindings.get("organizer_mount_id") or "")
+
+    @property
+    def organizer_mount_revision(self) -> int:
+        return self._positive_binding_int(self.bindings, "organizer_mount_revision")
+
+    @property
+    def source_native_locator(self) -> NativeLocator:
+        value = self.bindings.get("source_native_locator")
+        if not isinstance(value, dict):
+            return NativeLocator(kind="", value="")
+        return NativeLocator(
+            kind=str(value.get("kind") or value.get("locator_kind") or ""),
+            value=str(value.get("value") or ""),
+        )
+
     # ---- postprocess ----
     @property
     def organizer_enabled(self) -> bool:
@@ -418,33 +553,75 @@ class TransferPlan:
     def job_dir_name(self) -> str:
         return f"job-{self.job_id}"
 
-    def path(self, key: str) -> dict[str, str] | None:
+    def path(self, key: str) -> dict[str, Any] | None:
+        """Return a detached, normalized path descriptor.
+
+        The mount/connection identity fields are part of the immutable V1
+        plan, not optional display metadata.  The previous implementation
+        returned only ``namespace_id/path/kind`` which meant the verifier and
+        finalizer silently fell back to the *current* OpenList mount after a
+        configuration edit.  Preserve the frozen identity tuple here so every
+        execution phase can resolve the exact revision from the repository.
+        """
         value = self.paths.get(key)
         if not isinstance(value, dict):
             return None
         namespace_id = str(value.get("namespace_id") or "")
-        path = _norm_plan_path(value.get("path"))
-        kind = "local" if str(namespace_id).lower().startswith("local:") else "openlist"
-        return {"namespace_id": namespace_id, "path": path, "kind": kind}
+        kind = str(value.get("kind") or "").strip().lower()
+        if not kind:
+            lowered = namespace_id.lower()
+            if lowered.startswith("local:"):
+                kind = "local"
+            elif lowered.startswith("native:"):
+                kind = "native"
+            else:
+                kind = "openlist"
+        if kind not in {"local", "openlist", "native", "relay"}:
+            raise TransferError(ErrorCode.INVALID_PLAN, f"unsupported path kind: {kind}")
+        path = _norm_plan_path(
+            value.get("path"),
+            native_local=kind in {"local", "relay"},
+        )
+        descriptor: dict[str, Any] = {
+            "namespace_id": namespace_id,
+            "path": path,
+            "kind": kind,
+        }
+        # Only copy immutable locator identity fields.  Do not expose the
+        # complete raw path payload (which may contain provider-specific
+        # secrets or control hints) to generic verifiers/cleanup code.
+        for field_name in (
+            "mount_id",
+            "mount_revision",
+            "connection_id",
+            "connection_revision",
+            "storage_identity_id",
+            "identity_root",
+            "locator_kind",
+            "role",
+        ):
+            if field_name in value and value[field_name] not in (None, ""):
+                descriptor[field_name] = copy.deepcopy(value[field_name])
+        return descriptor
 
     @property
-    def source_landing(self) -> dict[str, str] | None:
+    def source_landing(self) -> dict[str, Any] | None:
         return self.path("source_landing")
 
     @property
-    def destination_staging(self) -> dict[str, str] | None:
+    def destination_staging(self) -> dict[str, Any] | None:
         return self.path("destination_staging")
 
     @property
-    def destination_final(self) -> dict[str, str] | None:
+    def destination_final(self) -> dict[str, Any] | None:
         return self.path("destination_final")
 
     @property
-    def organizer_path(self) -> dict[str, str] | None:
+    def organizer_path(self) -> dict[str, Any] | None:
         return self.path("organizer")
 
     @property
-    def local_temp(self) -> dict[str, str] | None:
+    def local_temp(self) -> dict[str, Any] | None:
         return self.path("local_temp")
 
     # ---- descriptors ----
@@ -456,6 +633,11 @@ class TransferPlan:
             canonical_source_id=self.canonical_source_id,
             account_scope=str(self.source.get("account_scope") or "default"),
             selected_items_hash=str(self.source.get("selection_hash") or ""),
+            search_source_id=str(self.source.get("search_source_id") or ""),
+            source_record_id=str(self.source.get("record_id") or ""),
+            source_record_revision=int(self.source.get("record_revision") or 1),
+            expected_file_count=int(self.verification.get("expected_file_count") or 0),
+            expected_total_bytes=int(self.verification.get("expected_total_size") or 0),
         )
 
     @property
@@ -463,14 +645,17 @@ class TransferPlan:
         return DestinationDescriptor(
             destination_id=self.destination_id,
             provider_kind=self.destination_provider_kind,
-            account_scope=str(self.destination.get("account_scope") or None) or None,
             target_revision=self.destination_target_revision,
+            binding_id=str(self.destination.get("binding_id") or "") or None,
+            binding_revision=int(self.destination.get("binding_revision") or 0) or None,
+            account_id=self.destination_account_id or None,
+            account_revision=self.destination_account_revision or None,
         )
 
     def native_locator(self) -> NativeLocator:
         if self.target_category and isinstance(self.target_category.get("native_locator"), dict):
             nl = self.target_category["native_locator"]
-            return NativeLocator(kind=str(nl.get("kind") or "folder_id"), value=str(nl.get("value") or ""))
+            return NativeLocator(kind=str(nl.get("locator_kind") or "folder_id"), value=str(nl.get("value") or ""))
         return NativeLocator(kind="folder_id", value=self.destination_id)
 
     def verification_expected(self) -> dict[str, int | str]:
@@ -495,6 +680,7 @@ class NativeSaveRequest:
     account_id: str
     account_revision: int
     category_key: str = ""
+    landing_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -537,7 +723,14 @@ def normalize_receipt(value: Any, *, provider_kind: str = "") -> OperationReceip
             or ""
         ).strip()
         error_code = str(value.get("error_code") or value.get("errorCode") or "").strip()
-        message = str(value.get("message") or value.get("msg") or "").strip()
+        message = str(
+            value.get("message")
+            or value.get("msg")
+            or value.get("error_message")
+            or value.get("errorMessage")
+            or value.get("error")
+            or ""
+        ).strip()
         if status_text in {"failed", "fail", "error", "cancelled", "canceled"}:
             status = "failed"
         elif status_text in {"completed", "done", "success", "finished", "verified"}:
@@ -611,7 +804,14 @@ def normalize_operation_status(value: Any) -> OperationStatus:
     if isinstance(value, dict):
         status_text = str(value.get("status") or value.get("state") or value.get("result") or "").strip().lower()
         error_code = str(value.get("error_code") or value.get("errorCode") or "").strip()
-        message = str(value.get("message") or value.get("msg") or "").strip()
+        message = str(
+            value.get("message")
+            or value.get("msg")
+            or value.get("error_message")
+            or value.get("errorMessage")
+            or value.get("error")
+            or ""
+        ).strip()
         if status_text in {"completed", "done", "success", "finished", "verified"}:
             status = "completed"
         elif status_text in {"failed", "fail", "error"}:

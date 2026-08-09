@@ -34,8 +34,8 @@ from ..constants import (
     JOB_WAITING_OPENLIST,
     JOB_WAITING_ORGANIZER,
 )
-from .import_staging_service import validated_staging_plan_from_job
-from .import_planner import validated_execution_plan_from_job
+from ..planning.job_plan import plan_path, plan_strategy
+from .execution_plan_guard import v1_plan_or_review
 
 
 _IRREVERSIBLE_POST_TRANSFER_STATUSES = frozenset(
@@ -91,6 +91,7 @@ class CallbackDependencies:
     callback_level: Callable[[str], str]
     enqueue_organizer: Callable[[dict[str, Any], dict[str, Any]], Any]
     cancelled_status: str
+    execution_repository: Any = None
 
 
 class RcloneCallbackService:
@@ -112,6 +113,7 @@ class RcloneCallbackService:
         level = self.deps.callback_level(status)
         normalized_status = status.lower()
         explicit_job = db.get_job(job_id) if job_id else None
+        explicit_plan: dict[str, Any] = {}
         if explicit_job and str(explicit_job.get("status") or "").strip().lower() == self.deps.cancelled_status:
             # A category summary can arrive after an administrator cancelled the
             # job.  Do not hand it to the finalizer/Organizer, and most
@@ -125,6 +127,66 @@ class RcloneCallbackService:
                     "delete_source_allowed": False,
                     "job": db.get_job(job_id) or explicit_job,
                 }, 200
+            if normalized_status in {CALLBACK_STATUS_RESOLVE_FOLDER, CALLBACK_STATUS_NAMING_PLAN}:
+                return {
+                    "success": False,
+                    "message": "任务已取消，已拒绝 rclone 路径/命名解析",
+                    "disposition": "ignored_cancelled",
+                    "delete_source_allowed": False,
+                }, 409
+        if explicit_job:
+            explicit_plan, rejection = v1_plan_or_review(
+                db,
+                explicit_job,
+                context="处理 rclone 回调时",
+                execution_repository=self.deps.execution_repository,
+            )
+            if rejection:
+                db.add_rclone_event(
+                    run_id or None,
+                    "error",
+                    rejection["message"],
+                    {**payload, "callback_disposition": "rejected_non_v1"},
+                )
+                return {
+                    **rejection,
+                    "error_code": "unsupported_execution_plan",
+                    "disposition": "rejected_non_v1",
+                    "delete_source_allowed": False,
+                }, 409
+        if not explicit_job:
+            db.add_rclone_event(
+                run_id or None,
+                "error",
+                "unowned rclone callback rejected: matching V1 job_id is required",
+                {**payload, "callback_disposition": "rejected_unowned"},
+            )
+            return {
+                "success": False,
+                "rejected": True,
+                "error_code": "rclone_job_required",
+                "message": "V1 rclone callback requires a matching job_id",
+                "disposition": "rejected_unowned",
+                "delete_source_allowed": False,
+            }, 409
+        if (
+            normalized_status in {CALLBACK_STATUS_RESOLVE_FOLDER, CALLBACK_STATUS_NAMING_PLAN}
+            and filename
+        ):
+            validation_error = self._staging_file_callback_error(
+                explicit_job,
+                source_path,
+                target_path,
+                plan=explicit_plan,
+            )
+            if validation_error:
+                return {
+                    "success": False,
+                    "error_code": "rclone_staging_path_mismatch",
+                    "message": validation_error,
+                    "payload": payload,
+                    "delete_source_allowed": False,
+                }, 409
         if normalized_status == CALLBACK_STATUS_RESOLVE_FOLDER:
             return {"success": True, **rclone.resolve_resource_folder(category_label=category, filename=filename, source_path=source_path, target_path=target_path)}, 200
         if normalized_status == CALLBACK_STATUS_NAMING_PLAN:
@@ -163,31 +225,29 @@ class RcloneCallbackService:
                 "disposition": "ignored_cancelled" if cancelled_during_finalize else "accepted",
                 "delete_source_allowed": False,
             }, 200
-        if not job_id:
-            matched = db.find_job_for_rclone_callback(category=category, filename=filename, source_path=source_path, target_path=target_path)
-            if matched:
-                job_id = int(matched["id"])
-            else:
-                file_event_id = db.add_rclone_file_event(run_id=run_id or None, job_id=None, status=status or "unknown", level=level, category=category, filename=filename, source_path=source_path, target_path=target_path, message=message, raw_data=payload) if filename else None
-                if bool(payload.get("require_job_match")) and filename:
-                    return {
-                        "success": False,
-                        "error_code": "rclone_job_not_matched",
-                        "message": "rclone 文件未匹配到等待搬运任务，已拒绝确认，源文件应保留等待重试",
-                        "file_event_id": file_event_id,
-                        "payload": payload,
-                    }, 409
-                return {
-                    "success": True,
-                    "message": "已收到回调，但未匹配到具体任务",
-                    "file_event_id": file_event_id,
-                    "payload": payload,
-                    "disposition": "unmatched",
-                    "delete_source_allowed": False,
-                }, 200
         job = explicit_job or (db.get_job(job_id) if job_id else None)
+        plan = explicit_plan
+        if job and not plan:
+            plan, rejection = v1_plan_or_review(
+                db,
+                job,
+                context="匹配 rclone 回调任务时",
+                execution_repository=self.deps.execution_repository,
+            )
+            if rejection:
+                return {
+                    **rejection,
+                    "error_code": "unsupported_execution_plan",
+                    "disposition": "rejected_non_v1",
+                    "delete_source_allowed": False,
+                }, 409
         if job and filename and normalized_status != CALLBACK_STATUS_STAGING_MANIFEST:
-            validation_error = self._staging_file_callback_error(job, source_path, target_path)
+            validation_error = self._staging_file_callback_error(
+                job,
+                source_path,
+                target_path,
+                plan=plan,
+            )
             if validation_error:
                 return {
                     "success": False,
@@ -216,7 +276,7 @@ class RcloneCallbackService:
         if normalized_status == CALLBACK_STATUS_STAGING_MANIFEST:
             if not job:
                 return {"success": False, "message": "任务不存在，已拒绝确认 rclone 文件清单"}, 404
-            return self._record_staging_manifest(job, payload, run_id)
+            return self._record_staging_manifest(job, payload, run_id, plan=plan)
         current_job_status = str(job.get("status") or "").strip().lower() if job else ""
         if (
             job
@@ -300,53 +360,33 @@ class RcloneCallbackService:
         job: dict[str, Any],
         source_path: str,
         target_path: str,
+        *,
+        plan: dict[str, Any],
     ) -> str:
-        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        try:
-            plan_version = int(job.get("plan_version") or 0)
-        except (TypeError, ValueError):
-            return "任务 plan_version 无效，已拒绝 rclone 文件回调"
-        if plan_version >= 3:
-            try:
-                execution = validated_execution_plan_from_job(job)
-            except ValueError as exc:
-                return f"持久化 v3 执行计划无效，已拒绝 rclone 文件回调：{exc}"
-            transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
-            if str(transfer.get("strategy") or "").strip() not in {"rclone_copy", "relay_upload"}:
-                return "当前 v3 任务不是 rclone 传输策略，已拒绝文件回调"
-            paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
-            landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
-            staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
-            source_job_root = _normalize_manifest_path(landing.get("path"))
-            target_job_root = _normalize_manifest_path(staging.get("path"))
-            normalized_source = _normalize_manifest_path(source_path)
-            normalized_target = _normalize_manifest_path(target_path)
-            if not normalized_source or not _path_strictly_under(normalized_source, source_job_root):
-                return "rclone 文件回调越出 v3 来源任务目录，已拒绝确认，源文件应保留"
-            if not normalized_target or not _path_strictly_under(normalized_target, target_job_root):
-                return "rclone 文件回调越出 v3 目标暂存目录，已拒绝确认，源文件应保留"
-            return ""
-        raw_plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        if not raw_plan.get("enabled"):
-            return ""
-        try:
-            plan = validated_staging_plan_from_job(job)
-        except ValueError as exc:
-            return f"持久化暂存计划无效，已拒绝 rclone 文件回调：{exc}"
-        if str(plan.get("route") or "").strip().lower() != "quark_to_mobile":
-            return ""
-        source_job_root = _normalize_manifest_path(plan.get("quark_job_root"))
-        target_job_root = _normalize_manifest_path(plan.get("storage_job_root"))
+        strategy = plan_strategy(plan)
+        if strategy not in {"rclone_copy", "relay_upload_mobile"}:
+            return "当前 V1 任务不是数据面传输策略，已拒绝文件回调"
+        source_job_root = _normalize_manifest_path(plan_path(plan, "source_landing").get("path"))
+        target_path_name = (
+            "destination_staging"
+            if strategy == "rclone_copy"
+            else "local_temp"
+        )
+        target_job_root = _normalize_manifest_path(
+            plan_path(plan, target_path_name).get("path")
+        )
         normalized_source = _normalize_manifest_path(source_path)
         normalized_target = _normalize_manifest_path(target_path)
+        if not source_job_root or not target_job_root:
+            return "V1 execution_plan 缺少任务级来源或目标目录，已拒绝文件回调"
         if not normalized_source or not _path_strictly_under(normalized_source, source_job_root):
             return (
-                "rclone 文件回调越出当前任务源目录，已拒绝确认，源文件应保留等待重试："
+                "rclone 文件回调越出 V1 来源任务目录，已拒绝确认，源文件必须保留："
                 f"{normalized_source or source_path or '<empty>'}"
             )
         if not normalized_target or not _path_strictly_under(normalized_target, target_job_root):
             return (
-                "rclone 文件回调越出当前任务目标目录，已拒绝确认，源文件应保留等待重试："
+                "数据面文件回调越出 V1 目标任务目录，已拒绝确认，源文件必须保留："
                 f"{normalized_target or target_path or '<empty>'}"
             )
         return ""
@@ -356,32 +396,20 @@ class RcloneCallbackService:
         job: dict[str, Any],
         payload: dict[str, Any],
         run_id: int,
+        *,
+        plan: dict[str, Any],
     ) -> tuple[dict[str, Any], int]:
-        try:
-            plan_version = int(job.get("plan_version") or 0)
-        except (TypeError, ValueError):
-            plan_version = 0
-        if plan_version >= 3:
-            try:
-                execution = validated_execution_plan_from_job(job)
-            except ValueError as exc:
-                return {"success": False, "message": f"持久化 v3 执行计划无效，已拒绝 rclone 文件清单：{exc}"}, 409
-            transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
-            if str(transfer.get("strategy") or "").strip() not in {"rclone_copy", "relay_upload"}:
-                return {"success": False, "message": "当前 v3 任务不是 rclone 传输线路"}, 409
-            paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
-            landing = paths.get("landing") if isinstance(paths.get("landing"), dict) else {}
-            job_root = _normalize_manifest_path(landing.get("path"))
-        else:
-            try:
-                plan = validated_staging_plan_from_job(job)
-            except ValueError as exc:
-                return {"success": False, "message": f"持久化暂存计划无效，已拒绝 rclone 文件清单：{exc}"}, 409
-            if str(plan.get("route") or "").strip().lower() != "quark_to_mobile":
-                return {"success": False, "message": "当前任务不是 Quark 任务级 rclone 暂存线路"}, 409
-            job_root = _normalize_manifest_path(plan.get("quark_job_root"))
+        if plan_strategy(plan) not in {"rclone_copy", "relay_upload_mobile"}:
+            return {
+                "success": False,
+                "message": "当前 V1 任务不是数据面传输策略，已拒绝文件清单",
+            }, 409
+        job_root = _normalize_manifest_path(plan_path(plan, "source_landing").get("path"))
         if not job_root:
-            return {"success": False, "message": "任务来源根目录为空，已拒绝 rclone 文件清单"}, 409
+            return {
+                "success": False,
+                "message": "V1 execution_plan 来源任务目录为空，已拒绝数据面文件清单",
+            }, 409
         raw_paths = payload.get("manifest_paths") if isinstance(payload.get("manifest_paths"), list) else []
         incoming: list[str] = []
         incoming_seen: set[str] = set()
@@ -392,12 +420,12 @@ class RcloneCallbackService:
             if not _path_under(normalized, job_root):
                 return {
                     "success": False,
-                    "message": f"rclone 文件清单越出当前任务目录，已拒绝：{normalized}",
+                    "message": f"数据面文件清单越出当前任务目录，已拒绝：{normalized}",
                 }, 409
             incoming_seen.add(normalized)
             incoming.append(normalized)
         if not incoming:
-            return {"success": False, "message": "rclone 文件清单为空，已拒绝确认"}, 409
+            return {"success": False, "message": "数据面文件清单为空，已拒绝确认"}, 409
 
         raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
         existing = (

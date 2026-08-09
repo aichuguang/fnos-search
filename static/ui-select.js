@@ -96,7 +96,12 @@
         panel.id = `fnSelectOptions${Math.random().toString(36).slice(2, 10)}`;
         trigger.setAttribute("aria-controls", panel.id);
         const associatedLabel = select.id ? Array.from(document.querySelectorAll("label[for]")).find((label) => label.htmlFor === select.id) : null;
-        const accessibleName = select.getAttribute("aria-label") || associatedLabel?.textContent?.trim();
+        const wrappingLabel = select.closest("label");
+        const wrappingLabelText = wrappingLabel?.querySelector("span")?.textContent?.trim()
+            || wrappingLabel?.textContent?.trim();
+        const accessibleName = select.getAttribute("aria-label")
+            || associatedLabel?.textContent?.trim()
+            || wrappingLabelText;
         if (accessibleName) trigger.setAttribute("aria-label", accessibleName);
 
         root.appendChild(trigger);

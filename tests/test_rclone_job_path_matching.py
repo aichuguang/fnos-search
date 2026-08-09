@@ -7,6 +7,7 @@ from fnos_media_import.repositories.rclone_repository import (
     _rclone_category_match_values,
     _rclone_job_id_from_paths,
 )
+from tests._rclone_v1_fixtures import rclone_v1_job, rclone_v1_plan
 
 
 class RcloneJobPathMatchingTests(unittest.TestCase):
@@ -37,22 +38,13 @@ class RcloneJobPathMatchingTests(unittest.TestCase):
         self.assertEqual(job_id, -1)
         self.assertTrue(authoritative)
 
-    def test_persisted_plan_root_must_match_the_callback_path(self) -> None:
-        job = {
-            "raw_data": {
-                "staging_plan": {
-                    "enabled": True,
-                    "job_id": 17,
-                    "quark_job_root": "/离线下载/电视剧/job-17",
-                    "storage_job_root": "移动云盘A/_入库暂存/电视剧/job-17",
-                }
-            }
-        }
+    def test_v1_plan_root_must_match_the_callback_path(self) -> None:
+        job = rclone_v1_job(rclone_v1_plan(17), job_id=17)
 
         matched, configured = _job_matches_staging_callback_paths(
             job,
-            "/离线下载/电视剧/job-17/剧名/E01.mkv",
-            "移动云盘A/_入库暂存/电视剧/job-17/剧名/E01.mkv",
+            "/quark/tv/job-17/剧名/E01.mkv",
+            "/openlist/staging/tv/job-17/剧名/E01.mkv",
         )
         wrong_match, wrong_configured = _job_matches_staging_callback_paths(
             job,

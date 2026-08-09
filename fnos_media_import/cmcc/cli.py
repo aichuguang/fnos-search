@@ -23,7 +23,7 @@ def _print_progress(message: str) -> None:
 
 def cmd_upload(args: argparse.Namespace) -> int:
     uploader = CmccUploader()
-    mode = args.mode or os.getenv("CMCC_UPLOAD_MODE", "rapid_first")
+    mode = args.mode or "rapid_first"
     progress_enabled = str(os.getenv("CMCC_UPLOAD_PROGRESS", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
     try:
         result = uploader.upload_file(
@@ -34,7 +34,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
             target_relative_dir=args.target_relative_dir or "",
             category=args.category or "",
             mode=mode,
-            rename_mode=args.rename_mode or os.getenv("CMCC_UPLOAD_RENAME_MODE", "auto_rename"),
+            rename_mode=args.rename_mode or "auto_rename",
             progress=_print_progress if progress_enabled else None,
         )
         _print_json(result.to_dict())
@@ -102,7 +102,7 @@ def cmd_probe_create(args: argparse.Namespace) -> int:
             parent_file_id=parent_file_id,
             parent_path=parent_path,
             content_hash=content_hash,
-            rename_mode=args.rename_mode or os.getenv("CMCC_UPLOAD_RENAME_MODE", "auto_rename"),
+            rename_mode=args.rename_mode or "auto_rename",
             part_infos=_build_part_infos(size)[:100],
         )
         request_payload = {

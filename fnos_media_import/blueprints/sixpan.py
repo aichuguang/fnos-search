@@ -13,8 +13,6 @@ def create_sixpan_blueprint(context: SixPanRouteContext) -> Blueprint:
     routes = [
         ("/api/admin/sixpan/tasks", "tasks", "GET"),
         ("/api/admin/sixpan/probe", "probe", "POST"),
-        ("/api/admin/sixpan/oauth/device-code", "oauth_device_code", "POST"),
-        ("/api/admin/sixpan/oauth/device-code/check", "oauth_device_code_check", "POST"),
         ("/api/admin/sixpan/sync", "sync", "POST"),
         (
             "/api/admin/sixpan/jobs/<int:job_id>/retry-media-refresh",

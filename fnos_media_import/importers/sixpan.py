@@ -20,6 +20,7 @@ from .base import AdapterCheckResult, ImportResult
 
 
 DEFAULT_SIXPAN_HOST = "openapi.2dland.cn"
+DEFAULT_SIXPAN_VERIFICATION_URL = "https://static.2dland.cn/user/landing/"
 
 REQUEST_SUFFIX = "hl6_request"
 SIGN_PREFIX = "HL6"
@@ -76,36 +77,45 @@ class SixPanClient:
         if not self.auth_configured:
             raise SixPanApiError("六盘 OpenAPI ClientID/ClientSecret 未配置，无法发起授权")
         payload = {
-            "client_id": self.oauth_client_id or self.client_id,
+            # SixPan's v6 API uses protobuf JSON request names.  Requests must
+            # therefore be camelCase even though responses have existed in
+            # both camelCase and snake_case forms.
+            "clientId": self.oauth_client_id or self.client_id,
             "device": device or "fnos-media-import/1.0",
         }
         if scope:
             payload["scope"] = scope
         data = self.post("/v6/oauth/device_code", _compact_payload(payload), allow_refresh=False)
-        return data if isinstance(data, dict) else {"response": data}
+        response = _normalize_oauth_response(data)
+        if not _first_text(response, "verification_uri", "verificationUri"):
+            response["verification_uri"] = DEFAULT_SIXPAN_VERIFICATION_URL
+        return response
 
     def get_device_code_state(self, *, device_code: str, user_code: str = "") -> dict[str, Any]:
         if not self.auth_configured:
             raise SixPanApiError("六盘 OpenAPI ClientID/ClientSecret 未配置，无法检查授权状态")
+        # The v6 protobuf request contains only deviceCode.  Keep user_code in
+        # the public importer signature for auth-session compatibility, but do
+        # not send an unknown protobuf JSON field to the Provider.
+        del user_code
         payload = {
-            "device_code": str(device_code or "").strip(),
+            "deviceCode": str(device_code or "").strip(),
         }
-        if user_code:
-            payload["user_code"] = str(user_code or "").strip()
-        if not payload["device_code"]:
+        if not payload["deviceCode"]:
             raise SixPanApiError("六盘 device_code 为空，无法检查授权状态")
         data = self.post("/v6/oauth/get_device_code_state", payload, allow_refresh=False)
-        response = data if isinstance(data, dict) else {"response": data}
+        response = _normalize_oauth_response(data)
         self.apply_token_response(response)
         return response
 
     def apply_token_response(self, data: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(data, dict):
+        body = _normalize_oauth_response(data)
+        if not body:
             return {}
-        access_token = _first_text(data, "access_token", "accessToken")
-        refresh_token = _first_text(data, "refresh_token", "refreshToken")
-        expires_in = _int(_first_value(data, "expires_in", "expiresIn"), 0)
-        expires_in_ts = _int(_first_value(data, "expires_in_ts", "expiresInTs"), 0)
+        access_token = _first_text(body, "access_token", "accessToken")
+        refresh_token = _first_text(body, "refresh_token", "refreshToken")
+        expires_in = _int(_first_value(body, "expires_in", "expiresIn"), 0)
+        expires_in_ts = _int(_first_value(body, "expires_in_ts", "expiresInTs"), 0)
         if access_token:
             self.access_token = access_token
         if refresh_token:
@@ -130,15 +140,16 @@ class SixPanClient:
         if not self.refresh_token:
             raise SixPanApiError("六盘 refresh_token 未配置，无法刷新 access_token")
         payload = {
-            "refresh_token": self.refresh_token,
-            "grant_type": "refresh_token",
-            "client_id": self.client_id,
+            "refreshToken": self.refresh_token,
+            "grantType": "refresh_token",
+            "clientId": self.oauth_client_id or self.client_id,
         }
         data = self.post("/v6/oauth/refresh_token", payload, allow_refresh=False)
-        token_data = self.apply_token_response(data if isinstance(data, dict) else {})
+        response = _normalize_oauth_response(data)
+        token_data = self.apply_token_response(response)
         if not token_data.get("access_token"):
             raise SixPanApiError("六盘刷新 token 成功但响应缺少 access_token", data=data)
-        return data if isinstance(data, dict) else {"response": data}
+        return response
 
     def post(self, path: str, payload: dict[str, Any] | None = None, *, allow_refresh: bool = True) -> Any:
         if allow_refresh and not self.access_token and self.refresh_token:
@@ -256,10 +267,10 @@ class SixPanClient:
         payload: dict[str, Any] = {
             "url": source_url,
             "name": title,
-            "save_path": save_path,
+            "savePath": save_path,
         }
         if ignore_files:
-            payload["ignore_files"] = ignore_files
+            payload["ignoreFiles"] = ignore_files
         encoded_callbacks = [_encode_callback_url(url) for url in callbacks or [] if str(url or "").strip()]
         if encoded_callbacks:
             payload["callbacks"] = encoded_callbacks
@@ -270,17 +281,18 @@ class SixPanClient:
 
     def list_offline_tasks(self, *, limit: int = 100, token: str = "") -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "list_info": {
+            "listInfo": {
                 "limit": max(1, min(int(limit or 100), 500)),
+                "version": 0,
             }
         }
         if token:
-            payload["list_info"]["token"] = token
+            payload["listInfo"]["token"] = token
         data = self.post("/v6/offline_task/list", payload)
         return data if isinstance(data, dict) else {"response": data}
 
     def delete_offline_tasks(self, identities: list[str], *, delete_files: bool = False) -> dict[str, Any]:
-        payload = {"identity": identities, "delete_files": bool(delete_files)}
+        payload = {"identity": identities, "deleteFiles": bool(delete_files)}
         data = self.post("/v6/offline_task/delete", payload)
         return data if isinstance(data, dict) else {"response": data}
 
@@ -461,9 +473,9 @@ class SixPanOfflineImporter:
         if not config.ok:
             return ImportResult(False, JOB_FAILED, config.message)
 
-        save_path = str(save_path or "").strip() or self.target_path_for_category(category)
+        save_path = str(save_path or "").strip()
         if not save_path:
-            return ImportResult(False, JOB_FAILED, "六盘离线保存目录为空，请配置 sixpan_save_path 或 quark_save_path")
+            return ImportResult(False, JOB_FAILED, "六盘离线保存目录为空：请在 V1 存储目标分类中配置原生定位器")
 
         parse_data: dict[str, Any] = {}
         parse_error = ""
@@ -542,22 +554,11 @@ class SixPanOfflineImporter:
         )
 
     def target_path_for_category(self, category: dict[str, Any]) -> str:
-        path = str(
-            category.get("sixpan_save_path")
-            or self.config.get("default_save_path")
-            or category.get("quark_save_path")
-            or category.get("mobile_target_path")
-            or ""
-        ).strip()
-        # 早期配置沿用了夸克中转目录“/离线下载/分类”。六盘现在是直连保存，
-        # 用户只需要六盘根目录下的五个分类目录：/电影、/电视剧、/动漫、/综艺、/其他。
-        legacy_prefix = "/离线下载/"
-        if path.startswith(legacy_prefix):
-            path = "/" + path[len(legacy_prefix) :].strip("/")
-        if not path:
-            label = str(category.get("label") or "").strip()
-            path = f"/{label}" if label else ""
-        return path
+        category = category if isinstance(category, dict) else {}
+        locator = category.get("native_locator")
+        if isinstance(locator, dict):
+            return str(locator.get("value") or "").strip()
+        return ""
 
     def list_tasks(self, *, limit: int = 100) -> list[dict[str, Any]]:
         """Return up to ``limit`` tasks while following continuation tokens.
@@ -732,6 +733,34 @@ def _dict_body(data: Any) -> dict[str, Any]:
         if isinstance(value, dict):
             return value
     return data
+
+
+def _normalize_oauth_response(data: Any) -> dict[str, Any]:
+    """Unwrap OAuth responses and publish stable snake_case aliases.
+
+    SixPan deployments have returned both protobuf camelCase and legacy
+    snake_case field names.  Preserve the provider payload while exposing the
+    aliases consumed by the auth-session service.
+    """
+
+    body = _dict_body(data)
+    if not body:
+        return {}
+    result = dict(body)
+    aliases = {
+        "device_code": ("device_code", "deviceCode"),
+        "user_code": ("user_code", "userCode"),
+        "verification_uri": ("verification_uri", "verificationUri"),
+        "expires_in": ("expires_in", "expiresIn"),
+        "expires_in_ts": ("expires_in_ts", "expiresInTs"),
+        "access_token": ("access_token", "accessToken"),
+        "refresh_token": ("refresh_token", "refreshToken"),
+    }
+    for alias, keys in aliases.items():
+        value = _first_value(body, *keys)
+        if value not in (None, ""):
+            result[alias] = value
+    return result
 
 
 def _task_rows(body: dict[str, Any]) -> list[dict[str, Any]]:

@@ -6,7 +6,7 @@
             showGlobalLoading, hideGlobalLoading, showPublicModal, hidePublicModal,
             resetNoticeBox,
             syncCategorySelect, activatePublicTab, categoryIcons,
-            publicResourceById, isBtbtlaCandidate, isSixpanCandidate, isQuarkCandidate, isCloud139Candidate,
+            publicResourceById, isBtbtlaCandidate, isSixpanCandidate, isQuarkCandidate, isCloud139Candidate, isTianyiCandidate,
             recommendedCategoryForItem, isResourceInvalid, ensurePublicResourceDetail, updatePublicResourceState,
             refreshPublicResourceViews, renderPublicResults, categoryConfidenceText, knownSizeText,
             bindPreviewInteractions, sixpanSubmitSpeed, isInspectionInvalid,
@@ -18,61 +18,6 @@
         const CATEGORY_ICON = categoryIcons;
         const RECENT_REQUESTS_STORAGE_KEY = "fnos.public.recentRequests.v1";
         const RECENT_REQUESTS_LIMIT = 5;
-
-        // --- 目标存储选择（阶段 5）：请求级 destination_id，访客只看到管理员允许的目标。 ---
-        let storageTargetsPromise = null;
-
-        function ensureStorageTargets() {
-            if (!storageTargetsPromise) {
-                storageTargetsPromise = api("/api/public/storage-targets", { allowFailure: true })
-                    .then((data) => (Array.isArray(data.targets) ? data.targets : []))
-                    .catch(() => []);
-            }
-            return storageTargetsPromise;
-        }
-
-        function renderPublicDestinationSelect(targets = []) {
-            publicState.pendingDestinationId = "";
-            const previous = $("publicConfirmDestinationRow");
-            if (previous) previous.remove();
-            const modal = $("publicSubmitConfirm");
-            const anchor = modal?.querySelector(".confirm-category-row");
-            if (!anchor) return;
-            const selectable = (Array.isArray(targets) ? targets : []).filter((target) => target && target.destination_id);
-            if (selectable.length < 2) {
-                // 0 或 1 个可用目标：不展示选择器；单个目标时直接冻结该 destination_id。
-                if (selectable.length === 1) publicState.pendingDestinationId = selectable[0].destination_id;
-                return;
-            }
-            const row = document.createElement("div");
-            row.className = "confirm-category-row confirm-destination-row";
-            row.id = "publicConfirmDestinationRow";
-            const label = document.createElement("label");
-            label.htmlFor = "publicConfirmDestination";
-            label.textContent = "存入：";
-            const select = document.createElement("select");
-            select.id = "publicConfirmDestination";
-            select.setAttribute("autocomplete", "off");
-            selectable.forEach((target) => {
-                const option = document.createElement("option");
-                option.value = target.destination_id;
-                const mode = target.mode_label || "";
-                option.textContent = mode
-                    ? `${target.name || target.destination_id}（${mode}）`
-                    : target.name || target.destination_id;
-                if (target.default) option.selected = true;
-                select.appendChild(option);
-            });
-            row.append(label, select);
-            anchor.after(row);
-            window.syncCustomSelect?.(select);
-        }
-
-        function currentDestinationId() {
-            const select = $("publicConfirmDestination");
-            if (select && select.value) return select.value;
-            return publicState.pendingDestinationId || "";
-        }
 
         function loadRecentRequests() {
             try {
@@ -165,6 +110,7 @@
             const sixpanDetail = !btbtlaDetail && (isSixpanCandidate(detail) || isSixpanCandidate(link));
             const quarkDetail = isQuarkCandidate(detail) || isQuarkCandidate(link) || inspection.provider === "quark";
             const cloud139Detail = isCloud139Candidate(detail) || isCloud139Candidate(link) || inspection.provider === "cloud139";
+            const tianyiDetail = isTianyiCandidate(detail) || isTianyiCandidate(link) || inspection.provider === "cloud189";
             const sixpanState = sixpanDetail ? sixpanParseState(sixpanPublicKey(previewPublicId)) : null;
             const statusClass = sixpanDetail
                 ? sixpanState?.success ? "ok" : "warn"
@@ -191,7 +137,7 @@
                         <div><span>当前提交分类</span><strong>${escapeHtml(categoryLabel(publicState.selectedCategory || "movie"))}</strong></div>
                         <div><span>更新时间</span><strong>${escapeHtml(detailDate)}</strong></div>
                     </div>
-                    ${btbtlaDetail ? renderBtbtlaResourcePreview(previewPublicId, inspection) : sixpanDetail ? renderSixpanParseHtml(sixpanPublicKey(previewPublicId), { context: "detail" }) : previewItems.length ? (quarkDetail ? renderQuarkFilePreview(previewPublicId, previewItems) : cloud139Detail ? renderCloud139FilePreview(previewPublicId, previewItems) : renderFilePreview(previewPublicId, previewItems)) : renderEmptyFilePreview(inspection, capability)}
+                    ${btbtlaDetail ? renderBtbtlaResourcePreview(previewPublicId, inspection) : sixpanDetail ? renderSixpanParseHtml(sixpanPublicKey(previewPublicId), { context: "detail" }) : previewItems.length ? (quarkDetail ? renderQuarkFilePreview(previewPublicId, previewItems) : cloud139Detail ? renderCloud139FilePreview(previewPublicId, previewItems) : tianyiDetail ? renderTianyiFilePreview(previewPublicId, previewItems) : renderFilePreview(previewPublicId, previewItems)) : renderEmptyFilePreview(inspection, capability)}
                 </section>
             `;
         }
@@ -421,12 +367,14 @@
             if (current.items) return;
             try {
                 const data = await api(`/api/public/resources/${encodeURIComponent(publicId)}/files?fid=${encodeURIComponent(fid)}`, { allowFailure: true });
+                const failed = data.success === false;
                 publicState.filePreviews[key] = {
                     open: true,
                     loading: false,
                     items: data.items || [],
                     message: data.message || "",
-                    success: data.success !== false,
+                    success: !failed,
+                    error: failed ? (data.message || "目录读取失败") : "",
                 };
             } catch (error) {
                 publicState.filePreviews[key] = { open: true, loading: false, error: error.message };
@@ -449,7 +397,10 @@
             const fid = String(dataset.quarkFid || "").trim();
             const name = String(dataset.quarkName || fid || "未命名文件").trim();
             const isDir = dataset.quarkDir === "1";
-            return { fid, name, type: isDir ? "dir" : "file", is_dir: isDir };
+            const path = String(dataset.quarkPath || "").trim();
+            const payload = { fid, name, type: isDir ? "dir" : "file", is_dir: isDir };
+            if (path) payload.path = path;
+            return payload;
         }
 
         function quarkDirPayload(item = {}) {
@@ -503,7 +454,7 @@
 
         const QUARK_PREVIEW_MAX_DEPTH = 20;
 
-        function renderQuarkFilePreview(publicId, items, level = 0, parent = null, ancestors = null) {
+        function renderQuarkFilePreview(publicId, items, level = 0, parent = null, ancestors = null, pathBase = "") {
             const safeItems = Array.isArray(items) ? items : [];
             const branchAncestors = ancestors instanceof Set ? ancestors : new Set();
             return `
@@ -513,17 +464,18 @@
                         <small>${escapeHtml(quarkSelectionSummaryText(publicId))}</small>
                     </div>`}
                     <ol>
-                        ${safeItems.map((file) => renderQuarkFilePreviewItem(publicId, file, level, parent, branchAncestors)).join("")}
+                        ${safeItems.map((file) => renderQuarkFilePreviewItem(publicId, file, level, parent, branchAncestors, pathBase)).join("")}
                     </ol>
                 </div>
             `;
         }
 
-        function renderQuarkFilePreviewItem(publicId, file, level = 0, parent = null, ancestors = null) {
+        function renderQuarkFilePreviewItem(publicId, file, level = 0, parent = null, ancestors = null, pathBase = "") {
             const state = quarkSelectionState(publicId);
             const isDir = Boolean(file.is_dir);
             const fid = String(file.fid || "");
             const name = String(file.name || "-");
+            const itemPath = pathBase ? `${pathBase}/${name}` : name;
             const branchAncestors = ancestors instanceof Set ? ancestors : new Set();
             const cyclic = Boolean(fid && branchAncestors.has(fid));
             const depthLimited = level >= QUARK_PREVIEW_MAX_DEPTH;
@@ -537,7 +489,7 @@
             const rootChecked = Boolean(state.mode === "root_dirs" && state.rootDirs?.[fid]);
             const itemChecked = Boolean(state.mode === "subdir_items" && state.items?.[fid]);
             const rootSelectable = isRoot && isDir && fid;
-            const childSelectable = isBaseChildren && fid;
+            const childSelectable = state.mode === "subdir_items" && baseFid && fid && (parent?.fid === baseFid || branchAncestors.has(baseFid));
             const rowClasses = [
                 isDir ? "is-dir" : "",
                 open ? "open" : "",
@@ -549,7 +501,7 @@
             const checkbox = rootSelectable
                 ? `<input type="checkbox" ${rootChecked ? "checked" : ""} data-quark-select="root_dir" data-quark-public-id="${escapeHtml(publicId)}" data-quark-fid="${escapeHtml(fid)}" data-quark-name="${escapeHtml(name)}" data-quark-dir="1" title="保存此文件夹">`
                 : childSelectable
-                    ? `<input type="checkbox" ${itemChecked ? "checked" : ""} data-quark-select="subdir_item" data-quark-public-id="${escapeHtml(publicId)}" data-quark-fid="${escapeHtml(fid)}" data-quark-name="${escapeHtml(name)}" data-quark-dir="${isDir ? "1" : "0"}" title="保存此条目">`
+                    ? `<input type="checkbox" ${itemChecked ? "checked" : ""} data-quark-select="subdir_item" data-quark-public-id="${escapeHtml(publicId)}" data-quark-fid="${escapeHtml(fid)}" data-quark-name="${escapeHtml(name)}" data-quark-dir="${isDir ? "1" : "0"}" data-quark-path="${escapeHtml(itemPath)}" title="保存此条目">`
                     : `<span class="cloud-checkbox-placeholder quark-checkbox-placeholder" aria-hidden="true"></span>`;
             const metaText = isDir
                 ? cyclic
@@ -563,6 +515,7 @@
             const openAttrs = canExpand
                 ? `data-quark-open="1" data-quark-public-id="${escapeHtml(publicId)}" data-quark-fid="${escapeHtml(fid)}" data-quark-name="${escapeHtml(name)}" data-quark-dir="1" data-quark-level="${escapeHtml(level)}" role="button" tabindex="0" aria-expanded="${open ? "true" : "false"}"`
                 : "";
+            const childrenPathBase = state.mode === "subdir_items" && fid === baseFid ? "" : itemPath;
             return `
                 <li class="${rowClasses}">
                     <div class="file-preview-row cloud-file-row quark-file-row" ${openAttrs}>
@@ -570,12 +523,12 @@
                         <span>${isDir ? icon(open ? "folder-open" : "folder") : icon("file")}${escapeHtml(name)}</span>
                         <small>${escapeHtml(metaText)}</small>
                     </div>
-                    ${open ? renderQuarkFolderChildren(publicId, fid, childState, level + 1, { fid, name, is_dir: isDir }, branchAncestors) : ""}
+                    ${open ? renderQuarkFolderChildren(publicId, fid, childState, level + 1, { fid, name, is_dir: isDir }, branchAncestors, childrenPathBase) : ""}
                 </li>
             `;
         }
 
-        function renderQuarkFolderChildren(publicId, fid, state, level, parent, ancestors = null) {
+        function renderQuarkFolderChildren(publicId, fid, state, level, parent, ancestors = null, pathBase = "") {
             if (state.loading) {
                 return `<div class="folder-children loading">${icon("refresh")}正在读取目录...</div>`;
             }
@@ -588,7 +541,7 @@
             }
             const nextAncestors = new Set(ancestors instanceof Set ? ancestors : []);
             if (fid) nextAncestors.add(String(fid));
-            return `<div class="folder-children">${renderQuarkFilePreview(publicId, items, level, parent, nextAncestors)}</div>`;
+            return `<div class="folder-children">${renderQuarkFilePreview(publicId, items, level, parent, nextAncestors, pathBase)}</div>`;
         }
 
         async function ensureResourceFolderLoaded(publicId, fid) {
@@ -888,6 +841,117 @@
             };
         }
 
+        function tianyiSelectionState(publicId) {
+            const state = publicState.tianyiSelections[publicId];
+            if (state && typeof state === "object") return state;
+            return { mode: "items", files: {}, folders: {} };
+        }
+
+        function tianyiSelectionSummaryText(publicId) {
+            const state = tianyiSelectionState(publicId);
+            const fileCount = Object.values(state.files || {}).filter(Boolean).length;
+            const folderCount = Object.values(state.folders || {}).filter(Boolean).length;
+            const parts = [];
+            if (fileCount) parts.push(`${fileCount} 个文件`);
+            if (folderCount) parts.push(`${folderCount} 个文件夹`);
+            return parts.length ? `只保存已勾选的 ${parts.join("、")}` : "未勾选时默认保存整个分享";
+        }
+
+        function renderTianyiFilePreview(publicId, items, level = 0) {
+            const safeItems = Array.isArray(items) ? items : [];
+            return `
+                <div class="file-preview cloud-file-preview tianyi-file-preview ${level ? "nested" : ""}">
+                    ${level ? "" : `<div class="file-preview-title compact">
+                        <span>目录/文件预览（前 ${safeItems.length} 项）</span>
+                        <small>${escapeHtml(tianyiSelectionSummaryText(publicId))}</small>
+                    </div>`}
+                    <ol>
+                        ${safeItems.map((file) => renderTianyiFilePreviewItem(publicId, file, level)).join("")}
+                    </ol>
+                </div>
+            `;
+        }
+
+        function renderTianyiFilePreviewItem(publicId, file, level = 0) {
+            const state = tianyiSelectionState(publicId);
+            const isDir = Boolean(file.is_dir);
+            const fid = String(file.fid || file.id || "");
+            const name = String(file.name || fid || "-");
+            const path = String(file.path || "");
+            const checked = Boolean(isDir ? state.folders?.[fid] : state.files?.[fid]);
+            const canExpand = Boolean(isDir && file.can_expand && fid);
+            const childState = publicState.filePreviews[previewKey(publicId, fid)] || {};
+            const open = Boolean(canExpand && childState.open);
+            const displayLevel = Math.max(0, Number(file.level || level || 0) || 0);
+            const openAttrs = canExpand
+                ? `data-tianyi-open="1" data-file-public-id="${escapeHtml(publicId)}" data-file-fid="${escapeHtml(fid)}" role="button" tabindex="0" aria-expanded="${open ? "true" : "false"}"`
+                : "";
+            return `
+                <li class="${isDir ? "is-dir" : ""} ${open ? "open" : ""} ${checked ? "selected" : ""}" style="--preview-indent:${Math.min(displayLevel, 6)}">
+                    <div class="file-preview-row cloud-file-row tianyi-file-row" ${openAttrs}>
+                        ${fid ? `<input type="checkbox" ${checked ? "checked" : ""} data-tianyi-select="${isDir ? "folder" : "file"}" data-tianyi-public-id="${escapeHtml(publicId)}" data-tianyi-fid="${escapeHtml(fid)}" data-tianyi-name="${escapeHtml(name)}" data-tianyi-path="${escapeHtml(path)}" data-tianyi-dir="${isDir ? "1" : "0"}" title="保存此${isDir ? "文件夹" : "文件"}">` : `<span class="cloud-checkbox-placeholder quark-checkbox-placeholder" aria-hidden="true"></span>`}
+                        <span>${isDir ? icon(open ? "folder-open" : "folder") : icon("file")}${escapeHtml(name)}</span>
+                        <small>${escapeHtml(isDir ? "文件夹" : file.size_text || "-")}</small>
+                    </div>
+                    ${open ? renderTianyiFolderChildren(publicId, childState, level + 1) : ""}
+                </li>
+            `;
+        }
+
+        function renderTianyiFolderChildren(publicId, state, level) {
+            if (state.loading) {
+                return `<div class="folder-children loading">${icon("refresh")}正在读取目录...</div>`;
+            }
+            if (state.error) {
+                return `<div class="folder-children error">${escapeHtml(state.error)}</div>`;
+            }
+            const items = state.items || [];
+            if (!items.length) {
+                return `<div class="folder-children empty">该目录暂无可预览条目。</div>`;
+            }
+            return `<div class="folder-children">${renderTianyiFilePreview(publicId, items, level)}</div>`;
+        }
+
+        function tianyiItemPayloadFromDataset(dataset = {}) {
+            const fid = String(dataset.tianyiFid || "").trim();
+            const name = String(dataset.tianyiName || fid || "未命名文件").trim();
+            const path = String(dataset.tianyiPath || "").trim();
+            const isDir = dataset.tianyiDir === "1" || dataset.tianyiSelect === "folder";
+            return { fid, name, path, type: isDir ? "dir" : "file", is_dir: isDir };
+        }
+
+        function handleTianyiSelectionChange(input) {
+            const publicId = input.dataset.tianyiPublicId || "";
+            const item = tianyiItemPayloadFromDataset(input.dataset);
+            if (!publicId || !item.fid) return;
+            const current = tianyiSelectionState(publicId);
+            const files = { ...(current.files || {}) };
+            const folders = { ...(current.folders || {}) };
+            if (item.is_dir) {
+                if (input.checked) folders[item.fid] = item;
+                else delete folders[item.fid];
+            } else {
+                if (input.checked) files[item.fid] = item;
+                else delete files[item.fid];
+            }
+            publicState.tianyiSelections[publicId] = { mode: "items", files, folders };
+            refreshPublicResourceViews(publicId);
+        }
+
+        function tianyiSelectionPayload(publicId) {
+            const state = tianyiSelectionState(publicId);
+            const selectedFiles = Object.values(state.files || {}).filter((item) => item?.fid);
+            const selectedFolders = Object.values(state.folders || {}).filter((item) => item?.fid);
+            if (!selectedFiles.length && !selectedFolders.length) return {};
+            return {
+                tianyi_selection: {
+                    mode: "items",
+                    selected_files: selectedFiles,
+                    selected_folders: selectedFolders,
+                },
+            };
+        }
+
         const SIXPAN_MANUAL_KEY = "manual";
 
         function sixpanPublicKey(publicId) {
@@ -1057,6 +1121,21 @@
                         </div>
                         ${payload.error ? `<div class="notice-box warning">${icon("warning")}<span><strong>文件选择未完成</strong><small>${escapeHtml(publicMessageForDisplay(payload.error, "检测未通过", payload.error))}</small></span></div>` : ""}
                         ${items.length ? renderCloud139FilePreview(publicId, items) : renderEmptyManualPreview(inspection)}
+                    </div>
+                `;
+                bindPreviewInteractions(box);
+                return;
+            }
+            if (isTianyiCandidate(item || {}) || inspection.provider === "cloud189") {
+                box.innerHTML = `
+                    <div class="manual-preview-box">
+                        <div class="sixpan-parse-head">
+                            <div>
+                                <strong>预览并选择要入库的内容</strong>
+                                <small>${escapeHtml(tianyiSelectionSummaryText(publicId))}</small>
+                            </div>
+                        </div>
+                        ${items.length ? renderTianyiFilePreview(publicId, items) : renderEmptyManualPreview(inspection)}
                     </div>
                 `;
                 bindPreviewInteractions(box);
@@ -1344,8 +1423,6 @@
                 openSixpanSlowWarning(publicId);
                 return;
             }
-            const targets = await ensureStorageTargets();
-            renderPublicDestinationSelect(targets);
             const modal = $("publicSubmitConfirm");
             if (!modal) {
                 confirmPublicResourceSubmit(publicId, recommendedCategoryForItem(item)).catch((error) => toast(error.message, "error"));
@@ -1357,7 +1434,7 @@
                 || (publicState.manualPreview?.publicId === publicId
                 ? ($("manualPublicCategory")?.value || publicState.selectedCategory || recommendedCategoryForItem(item))
                 : recommendedCategoryForItem(item));
-            publicState.pendingSubmit = { publicId, item, category, destination_id: currentDestinationId() };
+            publicState.pendingSubmit = { publicId, item, category };
             if ($("publicConfirmResourceName")) $("publicConfirmResourceName").textContent = item.title || "未命名资源";
             if ($("publicConfirmCategory")) {
                 $("publicConfirmCategory").value = category;
@@ -1427,8 +1504,7 @@
             if (notification === null) return;
             setPublicConfirmError(null);
             if ($("publicConfirmSubmit")) $("publicConfirmSubmit").disabled = true;
-            const destinationId = currentDestinationId();
-            publicState.pendingSubmit = { ...(publicState.pendingSubmit || {}), publicId, category, destination_id: destinationId };
+            publicState.pendingSubmit = { ...(publicState.pendingSubmit || {}), publicId, category };
             try {
                 const quarkPayload = quarkSelectionPayload(publicId);
                 if (quarkPayload.error) {
@@ -1443,9 +1519,9 @@
                     toast(cloud139Payload.error, "error");
                     return;
                 }
+                const tianyiPayload = tianyiSelectionPayload(publicId);
                 showGlobalLoading("正在提交入库并检测资源有效性...");
-                const submitPayload = { public_id: publicId, category, note, ...sixpanPayload, ...quarkPayload, ...cloud139Payload, ...captcha.data, ...notification };
-                if (destinationId) submitPayload.destination_id = destinationId;
+                const submitPayload = { public_id: publicId, category, note, ...sixpanPayload, ...quarkPayload, ...cloud139Payload, ...tianyiPayload, ...captcha.data, ...notification };
                 const data = await api("/api/public/submit", {
                     method: "POST",
                     body: JSON.stringify(submitPayload),
@@ -1850,9 +1926,6 @@
 
         return Object.freeze({
             isPublicSubmitConfirmOpen,
-            ensureStorageTargets,
-            renderPublicDestinationSelect,
-            currentDestinationId,
             renderPublicResourceDetail,
             renderBtbtlaResourcePreview,
             btbtlaResolveKey,
@@ -1893,6 +1966,14 @@
             cloud139ItemPayloadFromDataset,
             handleCloud139SelectionChange,
             cloud139SelectionPayload,
+            tianyiSelectionState,
+            tianyiSelectionSummaryText,
+            renderTianyiFilePreview,
+            renderTianyiFilePreviewItem,
+            renderTianyiFolderChildren,
+            tianyiItemPayloadFromDataset,
+            handleTianyiSelectionChange,
+            tianyiSelectionPayload,
             sixpanPublicKey,
             sixpanParseState,
             setSixpanParseState,

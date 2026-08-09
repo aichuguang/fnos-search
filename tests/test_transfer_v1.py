@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from fnos_media_import.domain.models import ProviderCapabilities
 from fnos_media_import.transfer import (
@@ -26,6 +27,7 @@ from fnos_media_import.transfer import (
     PHASE_ACK_PENDING,
     PHASE_CANCELLED,
     PHASE_CANCEL_PENDING,
+    PHASE_CLEANUP_PENDING,
     PHASE_COMPLETED,
     PHASE_FAILED,
     PHASE_MANUAL_REVIEW,
@@ -38,6 +40,7 @@ from fnos_media_import.transfer import (
     TERMINAL_PHASES,
     TransferError,
     TransferOrchestrator,
+    TransferPlan,
     TransferVerifyResult,
     UploadOutcome,
     VisibilityStatus,
@@ -52,6 +55,7 @@ from fnos_media_import.transfer.mobile_relay_executor import (
     MobileRelayExecutor,
 )
 from fnos_media_import.transfer.native_executor import NativeTransferExecutor
+from fnos_media_import.transfer.rclone_adapter import RcloneOperationAdapter
 from fnos_media_import.transfer.rclone_executor import RcloneTransferExecutor
 from fnos_media_import.transfer.verifier import ListedFiles, TransferVerifier
 
@@ -77,25 +81,63 @@ def make_plan(
     delete_source_after_ack: bool = True,
     idempotency_key: str = "import:job-1",
 ) -> dict:
-    source_ns = f"openlist:ol_main:mount_{source_kind}"
-    dest_ns = f"openlist:ol_main:mount_{dest_kind}"
+    connection_id = "ol_main"
+    source_mount_id = f"mount_{source_kind}"
+    destination_mount_id = f"mount_{dest_kind}"
+    source_ns = f"openlist:{connection_id}:{source_mount_id}"
+    dest_ns = f"openlist:{connection_id}:{destination_mount_id}"
+    source_mount = {
+        "kind": "openlist",
+        "namespace_id": source_ns,
+        "mount_id": source_mount_id,
+        "mount_revision": 1,
+        "connection_id": connection_id,
+        "connection_revision": 1,
+        "storage_identity_id": f"storage:{source_kind}",
+        "identity_root": "/",
+    }
+    destination_mount = {
+        "kind": "openlist",
+        "namespace_id": dest_ns,
+        "mount_id": destination_mount_id,
+        "mount_revision": 1,
+        "connection_id": connection_id,
+        "connection_revision": 1,
+        "storage_identity_id": f"storage:{dest_kind}",
+        "identity_root": "/",
+    }
     paths: dict = {"organizer": None, "local_temp": None}
     if landing is not None:
-        paths["source_landing"] = {"namespace_id": source_ns, "path": landing}
+        paths["source_landing"] = {**source_mount, "path": landing}
     else:
         paths["source_landing"] = None
     if staging is not None:
-        paths["destination_staging"] = {"namespace_id": dest_ns, "path": staging}
+        paths["destination_staging"] = {**destination_mount, "path": staging}
     else:
         paths["destination_staging"] = None
     if final is not None:
-        paths["destination_final"] = {"namespace_id": dest_ns, "path": final}
+        paths["destination_final"] = {
+            "kind": "native" if strategy in {"native_save", "native_offline", "relay_upload_mobile"} else "openlist",
+            "namespace_id": f"native:{dest_kind}:{dest_kind}_lib" if strategy in {"native_save", "native_offline", "relay_upload_mobile"} else dest_ns,
+            "path": final,
+            **({} if strategy in {"native_save", "native_offline", "relay_upload_mobile"} else destination_mount),
+        }
     else:
-        paths["destination_final"] = None
+        paths["destination_final"] = (
+            {"namespace_id": f"native:{dest_kind}:{dest_kind}_lib", "path": "/电影"}
+            if strategy in {"native_save", "native_offline"}
+            else None
+        )
+    if organizer_enabled:
+        paths["organizer"] = {**destination_mount, "path": "/影视/整理完成"}
     if local_temp is not None:
-        paths["local_temp"] = {"namespace_id": "local:", "path": local_temp}
+        paths["local_temp"] = {
+            "kind": "relay",
+            "namespace_id": "local:relay",
+            "path": local_temp,
+        }
     return {
-        "version": 4,
+        "version": 1,
         "job_id": job_id,
         "created_at": "2026-08-07T00:00:00Z",
         "source": {
@@ -122,10 +164,20 @@ def make_plan(
             "delete_source_after_ack": delete_source_after_ack,
         },
         "bindings": {
-            "source_mount_id": f"mount_{source_kind}",
+            "source_mount_id": source_mount_id,
             "source_mount_revision": 1,
-            "destination_mount_id": f"mount_{dest_kind}",
+            "source_mount_namespace_id": source_ns,
+            "source_connection_id": connection_id,
+            "source_connection_revision": 1,
+            "source_mount_storage_identity_id": f"storage:{source_kind}",
+            "source_mount_identity_root": "/",
+            "destination_mount_id": destination_mount_id,
             "destination_mount_revision": 1,
+            "destination_mount_namespace_id": dest_ns,
+            "destination_connection_id": connection_id,
+            "destination_connection_revision": 1,
+            "destination_mount_storage_identity_id": f"storage:{dest_kind}",
+            "destination_mount_identity_root": "/",
         },
         "paths": paths,
         "verification": {
@@ -256,13 +308,29 @@ class _FakeRcloneService:
             return {"success": False, "message": "rclone 集成不可用"}
         return {"success": True, "message": "started", "run_id": "run-1"}
 
+    def start_copy(self, source, destination, operation_key, *, copy_run):
+        result = self.start(reason=operation_key, staging_run=copy_run)
+        if not result.get("success"):
+            raise RuntimeError(result.get("message") or "start failed")
+        return OperationReceipt(
+            operation_id=f"rclone:{operation_key}",
+            status="running",
+            provider_kind="rclone",
+            metadata={"run_id": result.get("run_id")},
+        )
+
     def status(self):
         self.status_calls += 1
         if self.events is not None:
             self.events.add("rclone_status")
         return {"running": self.running, "run_status": self.run_status}
 
-    def cancel(self, job_id, stop_running=True):
+    def poll(self, receipt):
+        return OperationStatus(
+            "running" if self.running else ("completed" if self.run_status == "success" else "unknown")
+        )
+
+    def cancel(self, *_args, **_kwargs):
         if self.events is not None:
             self.events.add("rclone_cancel")
         return {"success": True, "message": "stopped"}
@@ -280,18 +348,36 @@ class _ScriptedRcloneService:
         self.starts.append((reason, staging_run))
         return {"success": True, "run_id": "run-1"}
 
+    def start_copy(self, source, destination, operation_key, *, copy_run):
+        result = self.start(reason=operation_key, staging_run=copy_run)
+        return OperationReceipt(operation_id="rclone:run-1", status="running", provider_kind="rclone", metadata={"run_id": "run-1"})
+
     def status(self):
         self.status_calls += 1
         value = self.statuses.pop(0) if self.statuses else "success"
         return {"running": False, "run_status": value}
 
+    def poll(self, receipt):
+        value = self.status()["run_status"]
+        return OperationStatus("completed" if value == "success" else ("running" if value == "running" else "unknown"))
+
 
 class _FakeResolver:
-    def remote(self, *, namespace_id="", mount_id="", path=""):
-        return f"OL:{path}"
+    remote_name = "OL"
+
+    def resolve_frozen_remote(self, **values):
+        return f"{self.remote_name}:{values.get('path') or ''}"
+
+    @staticmethod
+    def split_remote_path(value):
+        remote, path = str(value).split(":", 1)
+        return remote, path
 
     def local(self, *, namespace_id="", path=""):
-        return f"/storage-targets/{path}"
+        return path
+
+    def relay(self, *, namespace_id="", path=""):
+        return path
 
 
 class _FakeMaterializer:
@@ -364,7 +450,12 @@ class _FakeOrganizer:
         self.calls += 1
         if self.events is not None:
             self.events.add("organize")
-        return OrganizeResult(self.status)
+        return OrganizeResult(self.status, final_path="/影视/整理完成" if self.status == "done" else "")
+
+
+class _FakeFinalizer:
+    def finalize(self, _plan):
+        return {"status": "done"}
 
 
 class _FakeCleanup:
@@ -626,7 +717,6 @@ class MagnetRestrictionTests(unittest.TestCase):
             source_form="magnet",
             dest_kind="sixpan",
             strategy="native_offline",
-            staging="/六盘离线区/job-1",
         )
         ack = _FakeAck(events=events)
         cleanup = _FakeCleanup(events=events)
@@ -672,7 +762,7 @@ class RcloneCopyTests(unittest.TestCase):
         )
         ack = _FakeAck(events=events)
         cleanup = _FakeCleanup(events=events)
-        orch = TransferOrchestrator(plan, {"rclone_copy": executor}, cleanup=cleanup, ack_service=ack)
+        orch = TransferOrchestrator(plan, {"rclone_copy": executor}, verifier=verifier, cleanup=cleanup, ack_service=ack, finalizer_service=_FakeFinalizer())
         return orch, rclone, lister, cleanup
 
     def test_rclone_copy_verify_ack_cleanup_ordering(self) -> None:
@@ -683,11 +773,11 @@ class RcloneCopyTests(unittest.TestCase):
         order = events.names()
         self.assertLess(order.index("materialize"), order.index("visibility"))
         self.assertLess(order.index("visibility"), order.index("rclone_start"))
-        self.assertLess(order.index("rclone_start"), order.index("rclone_status"))
-        self.assertLess(order.index("rclone_status"), order.index("target_list"))
+        self.assertLess(order.index("rclone_start"), order.index("target_list"))
+        self.assertEqual(order.count("target_list"), 2)
         self.assertLess(order.index("target_list"), order.index("ack"))
         self.assertLess(order.index("ack"), order.index("cleanup"))
-        self.assertEqual(len(lister.calls), 1)
+        self.assertEqual(len(lister.calls), 2)
         self.assertEqual(len(cleanup.calls), 1)
         self.assertTrue(cleanup.calls[0]["target_verified"])
         self.assertTrue(cleanup.calls[0]["app_acked"])
@@ -752,7 +842,7 @@ class RcloneCopyTests(unittest.TestCase):
         self.assertEqual(orch.state.phase, PHASE_CANCEL_PENDING)
         # 轮询确认取消
         _drive(orch)
-        self.assertEqual(orch.state.phase, PHASE_CANCELLED)
+        self.assertEqual(orch.state.phase, PHASE_CANCEL_PENDING)
 
     def test_cancel_transfer_direct_after_completed(self) -> None:
         rclone = _ScriptedRcloneService(["success"])
@@ -785,6 +875,109 @@ class RcloneCopyTests(unittest.TestCase):
         self.assertEqual(cancel.status, "cancelled")
         self.assertEqual(orch.state.phase, PHASE_CANCELLED)
 
+    def test_cancel_pending_normalizes_dict_poll_without_resubmitting(self) -> None:
+        class _Executor:
+            strategy = "rclone_copy"
+
+            def __init__(self) -> None:
+                self.plan = None
+                self.poll_calls = 0
+                self.cancel_calls = 0
+                self.submit_calls = 0
+
+            def bind(self, plan) -> None:
+                self.plan = plan
+
+            def poll(self, _receipt):
+                self.poll_calls += 1
+                return {"status": "cancelled", "message": "confirmed"}
+
+            def cancel(self, _receipt):
+                self.cancel_calls += 1
+                return CancelResult("cancelled", "confirmed")
+
+            def submit(self):
+                self.submit_calls += 1
+                raise AssertionError("cancel recovery must never resubmit")
+
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="tianyi",
+            strategy="rclone_copy",
+            landing="/_fnos_ingress/job-1",
+            staging="/影视/_fnos_staging/job-1",
+            final="/影视/电影",
+        )
+        executor = _Executor()
+        orch = TransferOrchestrator(plan, {"rclone_copy": executor})
+        orch.restore(
+            {
+                "phase": PHASE_CANCEL_PENDING,
+                "executor_strategy": "rclone_copy",
+                "receipt": {
+                    "operation_id": "rclone-copy:1",
+                    "status": "running",
+                    "provider_kind": "rclone",
+                },
+            }
+        )
+
+        result = orch.step()
+
+        self.assertEqual(result.phase, PHASE_CANCELLED)
+        self.assertEqual(executor.poll_calls, 1)
+        self.assertEqual(executor.cancel_calls, 0)
+        self.assertEqual(executor.submit_calls, 0)
+
+    def test_direct_cancel_normalizes_terminal_dict_poll_before_cancel(self) -> None:
+        class _Executor:
+            strategy = "rclone_copy"
+
+            def __init__(self) -> None:
+                self.plan = None
+                self.poll_calls = 0
+                self.cancel_calls = 0
+
+            def bind(self, plan) -> None:
+                self.plan = plan
+
+            def poll(self, _receipt):
+                self.poll_calls += 1
+                return {"status": "failed", "message": "provider task failed"}
+
+            def cancel(self, _receipt):
+                self.cancel_calls += 1
+                raise AssertionError("terminal provider task must not be cancelled again")
+
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="tianyi",
+            strategy="rclone_copy",
+            landing="/_fnos_ingress/job-1",
+            staging="/影视/_fnos_staging/job-1",
+            final="/影视/电影",
+        )
+        executor = _Executor()
+        orch = TransferOrchestrator(plan, {"rclone_copy": executor})
+        orch.restore(
+            {
+                "phase": PHASE_TRANSFERRING,
+                "executor_strategy": "rclone_copy",
+                "receipt": {
+                    "operation_id": "rclone-copy:1",
+                    "status": "running",
+                    "provider_kind": "rclone",
+                },
+            }
+        )
+
+        result = orch.cancel(direct=True)
+
+        self.assertEqual(result.status, "cancelled")
+        self.assertEqual(orch.state.phase, PHASE_CANCELLED)
+        self.assertEqual(executor.poll_calls, 1)
+        self.assertEqual(executor.cancel_calls, 0)
+
     def test_rclone_rejects_mobile_destination(self) -> None:
         plan = make_plan(
             source_kind="quark",
@@ -801,6 +994,79 @@ class RcloneCopyTests(unittest.TestCase):
         self.assertEqual(orch.state.error_code, ErrorCode.INVALID_PLAN)
 
 
+class RcloneReconcileFenceTests(unittest.TestCase):
+    class _Service:
+        def __init__(self, lookup_result=None, lookup_error: Exception | None = None) -> None:
+            self.lookup_result = lookup_result
+            self.lookup_error = lookup_error
+            self.lookup_calls = 0
+            self.start_calls = 0
+
+        def find_run_by_operation_key(self, operation_key: str):
+            self.lookup_calls += 1
+            if self.lookup_error is not None:
+                raise self.lookup_error
+            return self.lookup_result
+
+        def start_copy(self, source, destination, operation_key, *, copy_run):
+            self.start_calls += 1
+            return OperationReceipt(
+                operation_id="rclone:new-run",
+                status="running",
+                provider_kind="rclone",
+                metadata={"run_id": "new-run", "operation_key": operation_key},
+            )
+
+    @staticmethod
+    def _adapter(service):
+        return RcloneOperationAdapter(service, None).bind(SimpleNamespace(job_id=1))
+
+    def test_lookup_error_never_falls_through_to_submission(self) -> None:
+        service = self._Service(lookup_error=RuntimeError("database unavailable"))
+        adapter = self._adapter(service)
+        for _attempt in range(2):
+            with self.assertRaises(TransferError) as raised:
+                adapter.start_copy(
+                    {"kind": "openlist", "path": "/source"},
+                    {"kind": "local", "path": "/target"},
+                    "operation-key-1",
+                    copy_run={"job_id": 1},
+                )
+            self.assertEqual(raised.exception.code, ErrorCode.NETWORK_TRANSIENT)
+        self.assertEqual(service.lookup_calls, 2)
+        self.assertEqual(service.start_calls, 0)
+
+    def test_explicit_empty_lookup_submits_once(self) -> None:
+        service = self._Service(lookup_result=None)
+        receipt = self._adapter(service).start_copy(
+            {"kind": "openlist", "path": "/source"},
+            {"kind": "local", "path": "/target"},
+            "operation-key-1",
+            copy_run={"job_id": 1},
+        )
+        self.assertEqual(receipt.status, "running")
+        self.assertEqual(service.start_calls, 1)
+
+    def test_existing_lookup_result_is_reused(self) -> None:
+        service = self._Service(
+            lookup_result={
+                "operation_id": "rclone:existing",
+                "run_id": "existing-run",
+                "operation_key": "operation-key-1",
+                "job_id": 1,
+                "status": "running",
+            }
+        )
+        receipt = self._adapter(service).start_copy(
+            {"kind": "openlist", "path": "/source"},
+            {"kind": "local", "path": "/target"},
+            "operation-key-1",
+            copy_run={"job_id": 1},
+        )
+        self.assertEqual(receipt.operation_id, "rclone:existing")
+        self.assertEqual(service.start_calls, 0)
+
+
 class RelayMobileTests(unittest.TestCase):
     def _orchestrator(self, events: _EventLog, *, uploader_status: str = "done", auth_expired: bool = False):
         download = _FakeDownloadAdapter(events=events)
@@ -811,7 +1077,6 @@ class RelayMobileTests(unittest.TestCase):
             dest_kind="mobile",
             strategy="relay_upload_mobile",
             landing="/_fnos_ingress/job-1",
-            staging="/移动云/入库/job-1",
             final="/移动云/电影",
             local_temp="/data/relay/job-1",
         )
@@ -825,7 +1090,8 @@ class RelayMobileTests(unittest.TestCase):
         )
         ack = _FakeAck(events=events)
         cleanup = _FakeCleanup(events=events)
-        orch = TransferOrchestrator(plan, {"relay_upload_mobile": executor}, cleanup=cleanup, ack_service=ack)
+        verifier = TransferVerifier(target_lister=_FakeTargetLister(events=events))
+        orch = TransferOrchestrator(plan, {"relay_upload_mobile": executor}, verifier=verifier, cleanup=cleanup, ack_service=ack, finalizer_service=_FakeFinalizer())
         return orch, download, uploader, alert, cleanup
 
     def test_relay_only_mobile_destination(self) -> None:
@@ -834,7 +1100,8 @@ class RelayMobileTests(unittest.TestCase):
             dest_kind="tianyi",
             strategy="relay_upload_mobile",
             landing="/_fnos_ingress/job-1",
-            staging="/影视/_fnos_staging/job-1",
+            final="/影视/电影",
+            local_temp="/data/relay/job-1",
         )
         executor = MobileRelayExecutor(_FakeDownloadAdapter(), _FakeUploader(), source_materializer=_FakeMaterializer())
         orch = TransferOrchestrator(plan, {"relay_upload_mobile": executor})
@@ -876,7 +1143,6 @@ class RelayMobileTests(unittest.TestCase):
             dest_kind="mobile",
             strategy="relay_upload_mobile",
             landing="/_fnos_ingress/job-1",
-            staging="/移动云/入库/job-1",
             final="/移动云/电影",
             local_temp="/data/relay/job-1",
             delete_source_after_ack=False,
@@ -891,7 +1157,14 @@ class RelayMobileTests(unittest.TestCase):
             relay_root="/data/relay",
         )
         cleanup = _FakeCleanup()
-        orch = TransferOrchestrator(plan, {"relay_upload_mobile": executor}, cleanup=cleanup, ack_service=_FakeAck())
+        orch = TransferOrchestrator(
+            plan,
+            {"relay_upload_mobile": executor},
+            verifier=TransferVerifier(target_lister=_FakeTargetLister()),
+            cleanup=cleanup,
+            ack_service=_FakeAck(),
+            finalizer_service=_FakeFinalizer(),
+        )
         _drive(orch)
         self.assertEqual(orch.state.phase, PHASE_COMPLETED)
         self.assertEqual(len(cleanup.calls), 0, "delete_source_after_ack=False 时不做清理")
@@ -996,9 +1269,29 @@ class CleanupSafetyTests(unittest.TestCase):
         refused2 = ops.delete_tree({"kind": "local", "path": outside})
         self.assertTrue(refused2["refused"])
 
+    def test_cleanup_exception_stays_cleanup_pending_and_retryable(self) -> None:
+        class RaisingCleanup:
+            @staticmethod
+            def cleanup(*_args, **_kwargs):
+                raise RuntimeError("filesystem unavailable")
+
+        orchestrator = TransferOrchestrator(make_plan(), {}, cleanup=RaisingCleanup())
+        orchestrator.state.phase = PHASE_CLEANUP_PENDING
+        orchestrator.state.target_verified = True
+        orchestrator.state.app_acked = True
+
+        result = orchestrator.step()
+
+        self.assertEqual(result.phase, PHASE_CLEANUP_PENDING)
+        self.assertTrue(result.finished)
+        self.assertTrue(result.needs_wait)
+        self.assertFalse(orchestrator.state.cleanup["ok"])
+        self.assertEqual(orchestrator.state.error_code, ErrorCode.CLEANUP_FAILED)
+        self.assertIn("filesystem unavailable", orchestrator.state.cleanup["reason"])
+
 
 class UnsupportedPlanTests(unittest.TestCase):
-    def test_non_v4_plan_rejected(self) -> None:
+    def test_non_v1_plan_rejected(self) -> None:
         plan = make_plan(source_kind="quark", dest_kind="quark", strategy="native_save")
         plan["version"] = 3
         with self.assertRaises(TransferError) as ctx:
@@ -1026,6 +1319,91 @@ class UnsupportedPlanTests(unittest.TestCase):
         self.assertEqual(orch.state.phase, PHASE_FAILED)
         self.assertEqual(orch.state.error_code, ErrorCode.NO_EXECUTOR)
 
+    def test_relay_path_contract_does_not_require_destination_staging(self) -> None:
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="mobile",
+            strategy="relay_upload_mobile",
+            landing="/_fnos_ingress/job-1",
+            final="/移动云/电影",
+            local_temp="/data/relay/job-1",
+        )
+        self.assertIsNone(plan["paths"]["destination_staging"])
+        parsed = TransferPlan.from_dict(plan)
+        self.assertIsNone(parsed.destination_staging)
+        self.assertEqual(parsed.local_temp["namespace_id"], "local:relay")
+
+    def test_relay_path_contract_requires_local_temp_and_final(self) -> None:
+        missing_temp = make_plan(
+            source_kind="quark",
+            dest_kind="mobile",
+            strategy="relay_upload_mobile",
+            landing="/_fnos_ingress/job-1",
+            final="/移动云/电影",
+        )
+        with self.assertRaisesRegex(TransferError, "local_temp"):
+            TransferPlan.from_dict(missing_temp)
+
+        missing_final = make_plan(
+            source_kind="quark",
+            dest_kind="mobile",
+            strategy="relay_upload_mobile",
+            landing="/_fnos_ingress/job-1",
+            local_temp="/data/relay/job-1",
+        )
+        with self.assertRaisesRegex(TransferError, "destination_final"):
+            TransferPlan.from_dict(missing_final)
+
+    def test_rclone_path_contract_requires_destination_staging(self) -> None:
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="tianyi",
+            strategy="rclone_copy",
+            landing="/_fnos_ingress/job-1",
+            final="/影视/电影",
+        )
+        with self.assertRaisesRegex(TransferError, "destination_staging"):
+            TransferPlan.from_dict(plan)
+
+
+class RcloneReceiptRecoveryTests(unittest.TestCase):
+    class _Service:
+        def __init__(self, run):
+            self.run = run
+            self.requested_run_id = None
+
+        @staticmethod
+        def status():
+            return {"running": False, "current_run_id": None}
+
+        def get_run(self, run_id):
+            self.requested_run_id = run_id
+            return self.run
+
+    @staticmethod
+    def _receipt():
+        return OperationReceipt(
+            operation_id="rclone-copy:1:41",
+            status="running",
+            provider_kind="rclone",
+            metadata={"run_id": "41"},
+        )
+
+    def test_completed_run_is_recovered_from_durable_receipt(self) -> None:
+        service = self._Service({"status": "success"})
+        status = RcloneOperationAdapter(service, None).poll(self._receipt())
+        self.assertEqual(status.status, "completed")
+        self.assertEqual(service.requested_run_id, 41)
+
+    def test_failed_run_is_recovered_from_durable_receipt(self) -> None:
+        service = self._Service({"status": "failed", "error_message": "copy failed"})
+        status = RcloneOperationAdapter(service, None).poll(self._receipt())
+        self.assertEqual(status.status, "failed")
+        self.assertEqual(status.message, "copy failed")
+
+    def test_missing_receipt_run_fails_closed(self) -> None:
+        status = RcloneOperationAdapter(self._Service(None), None).poll(self._receipt())
+        self.assertEqual(status.status, "unknown")
 
 class OrganizerTests(unittest.TestCase):
     def test_organizer_gate_before_ack(self) -> None:
@@ -1043,6 +1421,7 @@ class OrganizerTests(unittest.TestCase):
             plan,
             {"native_save": executor},
             organizer_service=organizer,
+            verifier=TransferVerifier(target_lister=_FakeTargetLister()),
             ack_service=_FakeAck(events=events),
             cleanup=_FakeCleanup(events=events),
         )

@@ -150,7 +150,45 @@ def _media_asset_url(value: Any, base_url: str) -> str:
 
 
 def _media_target_path(category: dict[str, Any]) -> str:
-    return str(category.get("mobile_target_path") or category.get("cloud139_target_path") or category.get("quark_save_path") or "").strip()
+    """Return a display-only path from an explicit V1 locator.
+
+    Category dictionaries supplied by the V1 storage target API contain
+    locator objects, not the removed global ``*_target_path`` fields.  The
+    dashboard must never reconstruct a destination from those legacy values;
+    when no frozen locator is present it reports an empty display path.
+    """
+
+    if not isinstance(category, dict):
+        return ""
+    # ``native_locator`` is the canonical same-provider destination.  For a
+    # data-plane target the rclone/Organizer locator is the only safe display
+    # hint.  Do not use arbitrary ``path`` keys from request payloads.
+    for key in ("native_locator", "rclone_locator", "organizer_locator"):
+        locator = category.get(key)
+        if not isinstance(locator, dict):
+            continue
+        value = locator.get("value") if key == "native_locator" else (
+            locator.get("relative_path")
+            if key == "rclone_locator"
+            else locator.get("path")
+        )
+        path = _display_path(value)
+        if path:
+            return path
+    return ""
+
+
+def _display_path(value: Any) -> str:
+    """Normalize a frozen locator path for dashboard display only."""
+
+    text = str(value or "").strip().replace("\\", "/")
+    while "//" in text:
+        text = text.replace("//", "/")
+    if not text or "\x00" in text:
+        return ""
+    if any(part in {".", ".."} for part in text.split("/")):
+        return ""
+    return text
 
 
 def _media_task_matches(task: Any, guid: str, title: str) -> bool:

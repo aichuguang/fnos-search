@@ -10,6 +10,14 @@ from .openlist_client import basename, dirname, join_path
 
 
 EPISODIC_CATEGORIES = {"tv", "anime", "variety"}
+V1_DESTINATION_FINAL_FIELD = "_v1_destination_final"
+V1_DESTINATION_IS_RESOURCE_FIELD = "_v1_destination_is_resource"
+LEGACY_CATEGORY_TARGET_FIELDS = (
+    "openlist_root_path",
+    "cloud139_fnos_target_path",
+    "mobile_target_path",
+    "sixpan_fnos_target_path",
+)
 TECH_VERSION_PATTERN = re.compile(
     r"(?i)(2160p|1080p|720p|4k|8k|hdr10?|dv|dolby\s*vision|sdr|60fps|120fps|高码率|臻彩|remux|bluray|web-?dl|h\.?265|hevc|x265|h\.?264|x264)"
 )
@@ -494,18 +502,35 @@ def extract_version_tags(value: Any) -> str:
     return " ".join(tags[:4])
 
 
-def category_target_root(category: dict[str, Any]) -> str:
-    # 这里只能使用 OpenList/FNOS 可见路径，不能回退到 139 官方云端路径。
-    # 例如 139 官方保存路径可能是“博客/电影”，但 OpenList 里实际挂载为
-    # “移动云2/电影”。误用官方路径会触发 OpenList storage not found。
-    for key in ("openlist_root_path", "cloud139_fnos_target_path", "mobile_target_path", "sixpan_fnos_target_path"):
-        value = str(category.get(key) or "").strip()
-        if value and value.lower() not in {"none", "null", "undefined"}:
-            return "/" + value.strip("/")
-    label = str(category.get("label") or "媒体").strip()
-    if label.lower() in {"none", "null", "undefined"}:
-        label = "媒体"
-    return "/" + label.strip("/")
+def category_target_root(
+    category: dict[str, Any],
+    *,
+    allow_legacy_diagnostic: bool = False,
+) -> str:
+    """Return a target root only when it came from a frozen V1 plan.
+
+    Provider-specific category path fields predate the immutable execution
+    plan. They may still be displayed by migration diagnostics, but accepting
+    them in the normal code path would let an edited runtime config redirect an
+    already-created job. Callers that are *strictly read-only diagnostics* must
+    opt in explicitly.
+    """
+
+    value = str(category.get(V1_DESTINATION_FINAL_FIELD) or "").strip()
+    if value and value.lower() not in {"none", "null", "undefined"}:
+        root = posixpath.normpath("/" + value.strip("/"))
+        if root in {"", ".", "/"} or root.startswith("/../") or root == "/..":
+            raise ValueError("V1 paths.destination_final must be a non-root path")
+        return root
+    if allow_legacy_diagnostic:
+        for key in LEGACY_CATEGORY_TARGET_FIELDS:
+            value = str(category.get(key) or "").strip()
+            if value and value.lower() not in {"none", "null", "undefined"}:
+                return "/" + value.strip("/")
+        label = str(category.get("label") or "").strip()
+        if label and label.lower() not in {"none", "null", "undefined"}:
+            return "/" + label.strip("/")
+    raise ValueError("Organizer target root must come from V1 paths.destination_final")
 
 
 def standard_target_path(
@@ -519,8 +544,8 @@ def standard_target_path(
     ext: str = "",
     version: str = "",
 ) -> str:
-    resource_root = str(category.get("resource_root_path") or category.get("canonical_resource_root") or "").strip()
-    root = join_path(resource_root) if resource_root else category_target_root(category)
+    root = category_target_root(category)
+    resource_root = bool(category.get(V1_DESTINATION_IS_RESOURCE_FIELD, True))
     clean_title, detected_year = split_title_year(title)
     clean_title = clean_title or sanitize_candidate(title) or "未命名资源"
     year = str(year or detected_year or "").strip()

@@ -7,13 +7,102 @@ from pathlib import Path
 from fnos_media_import.app import _worker_dispatch_enabled_for_role
 from fnos_media_import.constants import JOB_DONE, JOB_REVIEW
 from fnos_media_import.database import Database
+from fnos_media_import.domain.models import SelectionSnapshot
 from fnos_media_import.organizer.service import OrganizerService, _utc_after_seconds, _utc_now_text
+from fnos_media_import.planning.job_plan import attach_plan_integrity, compute_operation_key
 from fnos_media_import.services.organizer_admin_service import (
     OrganizerAdminCommandDependencies,
     OrganizerAdminCommandService,
 )
 from fnos_media_import.services.organizer_dispatch_service import OrganizerDispatchService
 from fnos_media_import.services.worker_task_dispatcher import WorkerTaskDispatcher
+from tests._organizer_v1_fixtures import (
+    attach_organizer_v1_task,
+    bind_organizer_v1_execution_repository,
+    organizer_v1_job,
+)
+
+
+def _worker_schedule_plan(job_id: int) -> dict:
+    selection = SelectionSnapshot.from_payload("quark", {"share_id": "share-1"}).to_dict()
+    namespace = "openlist:main:media"
+    storage_identity_id = "provider:quark:account:acc-quark"
+    plan = {
+        "version": 1,
+        "plan_schema_version": 1,
+        "job_id": job_id,
+        "category": "movie",
+        "source": {
+            "provider_kind": "quark",
+            "source_form": "share",
+            "canonical_source_id": "quark:share:1",
+            "search_source_id": "pansou",
+            "record_id": "record-1",
+            "record_revision": 1,
+            "account_id": "acc-quark",
+            "account_revision": 1,
+            "account_selection_revision": 1,
+            "selection": selection,
+            "selection_hash": selection["selection_hash"],
+        },
+        "destination": {
+            "id": "native-main",
+            "provider_kind": "mobile",
+            "target_revision": 1,
+            "binding_id": "binding-1",
+            "binding_revision": 1,
+        },
+        "transfer": {
+            "strategy": "native_save",
+            "executor": "native",
+            "idempotency_key": "",
+        },
+        "bindings": {
+            "organizer_mount_id": "media",
+            "organizer_mount_revision": 2,
+            "organizer_mount_namespace_id": namespace,
+            "organizer_mount_storage_identity_id": storage_identity_id,
+            "organizer_mount_identity_root": "/入库",
+            "organizer_connection_id": "main",
+            "organizer_connection_revision": 3,
+        },
+        "paths": {
+            "destination_final": {
+                "kind": "native",
+                "namespace_id": "native:mobile:native-main",
+                "path": "/媒体",
+            },
+            "organizer": {
+                "kind": "openlist",
+                "namespace_id": namespace,
+                "path": f"/入库/job-{job_id}",
+                "mount_id": "media",
+                "mount_revision": 2,
+                "connection_id": "main",
+                "connection_revision": 3,
+                "storage_identity_id": storage_identity_id,
+                "identity_root": "/入库",
+            },
+        },
+        "target_category": {},
+        "routing": {
+            "assignment_id": "assignment-1",
+            "assignment_revision": 1,
+            "search_source_id": "pansou",
+            "category_key": "movie",
+            "destination_id": "native-main",
+            "enabled": True,
+        },
+        "verification": {
+            "minimum": ["file_count", "total_size"],
+            "expected_file_count": 1,
+            "expected_total_size": 1,
+            "selection_hash": selection["selection_hash"],
+        },
+        "postprocess": {"organizer_enabled": True},
+    }
+    plan["transfer"]["idempotency_key"] = compute_operation_key(plan)
+    return attach_plan_integrity(plan)
 
 
 class OrganizerDurableDispatchTests(unittest.TestCase):
@@ -176,15 +265,25 @@ class OrganizerWorkerRedispatchTests(unittest.TestCase):
 class OrganizerWorkerScheduleTests(unittest.TestCase):
     @staticmethod
     def _service(task: dict) -> tuple[OrganizerService, list[tuple[int, int | float]]]:
+        job_id = 701
+        plan = _worker_schedule_plan(job_id)
+        attach_organizer_v1_task(task, plan)
+        job = organizer_v1_job(plan)
+
         class FakeDatabase:
             @staticmethod
             def get_organizer_task(_task_id: int, include_children: bool = False) -> dict:
                 return task
 
+            @staticmethod
+            def get_job(_job_id: int) -> dict:
+                return job
+
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
         service.organizer_config = {"stable_window_seconds": 90}
         service._background_suspended = False
+        bind_organizer_v1_execution_repository(service, plan)
         scheduled: list[tuple[int, int | float]] = []
         service._schedule_task_after = lambda task_id, delay: scheduled.append((task_id, delay)) or True
         return service, scheduled

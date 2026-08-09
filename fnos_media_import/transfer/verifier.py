@@ -83,9 +83,17 @@ class TransferVerifier:
         expected_file_count: int | None = None,
         expected_total_size: int | None = None,
         checksum: str | None = None,
+        allow_empty: bool = False,
     ) -> TransferVerifyResult:
         if descriptor is None and plan is not None:
             descriptor = getattr(plan, "destination_staging", None) or getattr(plan, "destination_final", None)
+        if plan is not None and not allow_empty:
+            verification = getattr(plan, "verification", None)
+            if isinstance(verification, dict):
+                allow_empty = bool(
+                    verification.get("allow_empty")
+                    or verification.get("empty_folder_contract")
+                )
         if descriptor is None:
             return TransferVerifyResult("unknown", "缺少目标路径，无法校验", code=ErrorCode.RESULT_UNKNOWN)
         if self.target_lister is None:
@@ -102,10 +110,26 @@ class TransferVerifier:
                 listing.message or "目标目录不存在",
                 code=ErrorCode.VERIFY_MISMATCH,
             )
+        expected_count = None if expected_file_count is None else int(expected_file_count)
+        expected_size = None if expected_total_size is None else int(expected_total_size)
+        if (
+            not allow_empty
+            and expected_count is not None
+            and expected_size is not None
+            and expected_count <= 0
+            and expected_size <= 0
+        ):
+            return TransferVerifyResult(
+                "unknown",
+                "plan has no frozen file count or total size",
+                file_count=listing.file_count,
+                total_size=listing.total_size,
+                code=ErrorCode.RESULT_UNKNOWN,
+            )
         problems: list[str] = []
-        if expected_file_count is not None and int(expected_file_count) > 0 and listing.file_count != int(expected_file_count):
+        if expected_count is not None and (expected_count > 0 or allow_empty) and listing.file_count != expected_count:
             problems.append(f"文件数 {listing.file_count} != {expected_file_count}")
-        if expected_total_size is not None and int(expected_total_size) > 0 and listing.total_size != int(expected_total_size):
+        if expected_size is not None and (expected_size > 0 or allow_empty) and listing.total_size != expected_size:
             problems.append(f"总大小 {listing.total_size} != {expected_total_size}")
         if checksum and listing.checksum_ok is False:
             problems.append("校验和不一致")

@@ -12,7 +12,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
+import os
 import posixpath
+import tempfile
 from typing import Any
 
 from fnos_media_import.cmcc.auth import CmccAuthConfigError, CmccAuthExpired
@@ -53,6 +58,8 @@ class MobileRelayExecutor:
     strategy = "relay_upload_mobile"
     needs_source_landing = True
 
+    _GLOBAL_HALTED_ACCOUNT_IDS: set[str] = set()
+
     def __init__(
         self,
         rclone_adapter: Any,
@@ -60,23 +67,87 @@ class MobileRelayExecutor:
         *,
         source_materializer: Any = None,
         visibility_poller: Any = None,
-        relay_root: str = "/data/relay",
+        relay_root: str | None = None,
         alert_service: Any = None,
+        halted_account_ids: set[str] | None = None,
     ) -> None:
         self.rclone_adapter = rclone_adapter
         self.mobile_uploader = mobile_uploader
         self.source_materializer = source_materializer
         self.visibility_poller = visibility_poller
-        self.relay_root = str(relay_root or "/data/relay")
+        # Do not silently select a provider root.  Composition Root should
+        # inject this value; a plan may also carry an explicit task-local path
+        # and is checked against the injected root below.
+        self.relay_root = self._normalize_root(relay_root)
         self.alert_service = alert_service
-        self.halted_account_ids: set[str] = set()
+        # The dispatch service owns the circuit set and injects it into each
+        # short-lived executor.  Direct callers (and isolated jobs/tests) get
+        # an instance-local set, while a production dispatch service still
+        # preserves the account-level halt across durable worker steps without
+        # leaking state between independent compositions.
+        self.halted_account_ids = (
+            halted_account_ids
+            if isinstance(halted_account_ids, set)
+            else set()
+        )
 
     def bind(self, plan: TransferPlan) -> "MobileRelayExecutor":
         self.plan = plan
+        bind = getattr(self.rclone_adapter, "bind", None)
+        if callable(bind):
+            bind(plan)
         return self
 
+    @staticmethod
+    def _normalize_root(value: Any) -> str:
+        text = str(value or "").strip().replace("\\", "/")
+        while "//" in text:
+            text = text.replace("//", "/")
+        if not text:
+            return ""
+        return text.rstrip("/") or "/"
+
     def _relay_dir(self) -> str:
-        return f"{self.relay_root.rstrip('/')}/job-{self.plan.job_id}"
+        if getattr(self, "plan", None) is None:
+            raise TransferError(ErrorCode.INVALID_PLAN, "relay executor is not bound to a plan")
+        expected_name = f"job-{int(self.plan.job_id)}"
+        frozen = self.plan.local_temp
+        frozen_path = ""
+        if isinstance(frozen, dict):
+            # Planner freezes relay cache descriptors as ``kind=relay`` to
+            # distinguish them from user-configured local storage.  The
+            # namespace remains local (``local:relay``); older hand-built V1
+            # fixtures may omit ``kind`` and are treated as local.  Never
+            # accept a remote/native namespace here because this directory is
+            # used as a host filesystem path by rclone.
+            kind = str(frozen.get("kind") or "local").strip().lower()
+            if kind not in {"local", "relay"}:
+                raise TransferError(ErrorCode.INVALID_PLAN, "relay local_temp must be a local/relay target")
+            namespace_id = str(frozen.get("namespace_id") or "").strip().lower()
+            if namespace_id and not namespace_id.startswith("local:"):
+                raise TransferError(ErrorCode.INVALID_PLAN, "relay local_temp must use a local namespace")
+            frozen_path = self._normalize_root(frozen.get("path"))
+
+        if self.relay_root:
+            candidate = f"{self.relay_root}/{expected_name}"
+            if frozen_path and self._normalize_root(frozen_path) != candidate:
+                raise TransferError(
+                    ErrorCode.INVALID_PLAN,
+                    "frozen relay local_temp does not match the configured relay root",
+                )
+            return candidate
+
+        # An executor created without an injected root may only use a fully
+        # explicit plan path.  It must still be task-scoped; there is no
+        # fallback to /data/relay or to a provider root.
+        if not frozen_path:
+            raise TransferError(ErrorCode.INVALID_PLAN, "relay_root or plan.local_temp is required")
+        parts = [part for part in frozen_path.split("/") if part]
+        if not parts or parts[-1] != expected_name:
+            raise TransferError(ErrorCode.INVALID_PLAN, f"relay local_temp must end with {expected_name}")
+        if any(part in {".", ".."} for part in parts):
+            raise TransferError(ErrorCode.INVALID_PLAN, "relay local_temp contains traversal segments")
+        return frozen_path
 
     # -- 来源物化 --
     def materialize_source(self) -> OperationReceipt:
@@ -110,20 +181,28 @@ class MobileRelayExecutor:
         if landing is None:
             raise TransferError(ErrorCode.INVALID_PLAN, "relay_upload_mobile 需要来源落地区")
         local_dir = self._relay_dir()
+        operation_key = f"relay-dl:{self.plan.idempotency_key}"
         try:
             receipt = self.rclone_adapter.download(
                 source=landing,
                 local_dir=local_dir,
-                idempotency_key=f"relay-dl:{self.plan.idempotency_key}",
+                idempotency_key=operation_key,
             )
         except TransferError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise TransferError(ErrorCode.NETWORK_TRANSIENT, f"中继下载提交失败：{exc}", retryable=True) from exc
-        return normalize_receipt(receipt, provider_kind="rclone")
+        receipt = normalize_receipt(receipt, provider_kind="rclone")
+        receipt.metadata.setdefault("step", "download")
+        receipt.metadata.setdefault("operation_key", operation_key)
+        receipt.metadata.setdefault("idempotency_key", operation_key)
+        receipt.metadata.setdefault("local_dir", local_dir)
+        return receipt
 
     def poll(self, receipt: OperationReceipt) -> OperationStatus:
-        step = str((receipt.metadata or {}).get("step") or "download")
+        if not isinstance(receipt, OperationReceipt):
+            return OperationStatus("unknown", "relay receipt is invalid", error_code=ErrorCode.RESULT_UNKNOWN)
+        step = str((receipt.metadata or {}).get("step") or "download").strip().lower()
         if step == "download":
             try:
                 status = self._check_download(receipt)
@@ -132,31 +211,8 @@ class MobileRelayExecutor:
             except Exception as exc:  # noqa: BLE001
                 raise TransferError(ErrorCode.NETWORK_TRANSIENT, f"中继下载状态查询失败：{exc}", retryable=True) from exc
             if status.status == "completed":
-                outcome = self._upload()
-                if outcome.status == "auth_expired":
-                    self._on_auth_expired()
-                    return OperationStatus(
-                        "failed",
-                        outcome.message or "移动云认证已过期，暂停同账号上传任务",
-                        error_code=ErrorCode.AUTH_EXPIRED,
-                    )
-                if outcome.status in {"done", "completed"}:
-                    return OperationStatus(
-                        "completed",
-                        outcome.message or "移动云上传完成",
-                        expected_file_count=outcome.file_count,
-                        completed_file_count=outcome.file_count,
-                        total_size=outcome.total_size,
-                    )
-                if outcome.status == "unknown":
-                    return OperationStatus("unknown", outcome.message or "移动云上传结果未知")
-                if outcome.status == "failed":
-                    return OperationStatus(
-                        "failed",
-                        outcome.message or "移动云上传失败",
-                        error_code=outcome.error_code or ErrorCode.NETWORK_TRANSIENT,
-                    )
-                return OperationStatus("running", outcome.message or "移动云上传进行中")
+                outcome = self._upload(receipt)
+                return self._upload_status(outcome)
             if status.status == "failed":
                 return OperationStatus(
                     "failed",
@@ -167,23 +223,15 @@ class MobileRelayExecutor:
                 return OperationStatus("unknown", status.message or "中继下载结果未知")
             return OperationStatus("running", status.message or "中继下载进行中")
         # upload step（同步上传器一般直接返回终态；此处防御处理）
-        check = getattr(self.mobile_uploader, "check_upload", None)
-        if callable(check):
-            outcome = normalize_upload_outcome(check(receipt))
-            if outcome.status in {"done", "completed"}:
-                return OperationStatus("completed", outcome.message or "移动云上传完成", total_size=outcome.total_size)
-            if outcome.status == "auth_expired":
-                self._on_auth_expired()
-                return OperationStatus("failed", outcome.message or "移动云认证已过期", error_code=ErrorCode.AUTH_EXPIRED)
-            if outcome.status == "failed":
-                return OperationStatus("failed", outcome.message or "移动云上传失败", error_code=outcome.error_code or ErrorCode.NETWORK_TRANSIENT)
-            return OperationStatus("running", outcome.message or "移动云上传进行中")
-        return OperationStatus("running", "移动云上传进行中")
+        if step == "upload":
+            return self._poll_upload(receipt)
+        return OperationStatus("unknown", f"unknown relay receipt step: {step}", error_code=ErrorCode.RESULT_UNKNOWN)
+
 
     def _check_download(self, receipt: OperationReceipt) -> DownloadStatus:
         check = getattr(self.rclone_adapter, "check", None)
         if not callable(check):
-            return DownloadStatus("completed", "下载适配器无状态检查，按完成处理")
+            return DownloadStatus("unknown", "rclone adapter does not expose a scoped download status check", ErrorCode.RESULT_UNKNOWN)
         value = check(receipt)
         if isinstance(value, DownloadStatus):
             return value
@@ -197,27 +245,103 @@ class MobileRelayExecutor:
             return DownloadStatus(status, value)
         return DownloadStatus("running", "中继下载进行中")
 
-    def _upload(self) -> UploadOutcome:
+    def _upload(self, receipt: OperationReceipt) -> UploadOutcome:
         local_dir = self._relay_dir()
-        target = self.plan.destination_staging or {"namespace_id": "cmcc:api", "path": "/", "kind": "openlist"}
+        target = self._destination_target()
+        metadata = receipt.metadata
+        operation_key = f"relay-up:{self.plan.idempotency_key}"
+        account_id = self.plan.destination_account_id or self.plan.destination_id
+        if account_id in self.halted_account_ids:
+            return UploadOutcome("auth_expired", "移动云账号已被熔断，等待管理员重新检测")
+        # Set the fence before calling the external API.  The orchestrator
+        # persists this mutable metadata with the receipt.
+        metadata["step"] = "upload"
+        metadata.setdefault("upload_idempotency_key", operation_key)
+        fence = metadata.setdefault("upload_submission_fence", {})
+        if isinstance(fence, dict):
+            fence.setdefault("operation_key", operation_key)
+            fence.setdefault("state", "prepared")
+        previous = normalize_upload_outcome(metadata.get("upload_outcome")) if metadata.get("upload_outcome") else None
+        if previous is not None and previous.status in {"done", "completed", "auth_expired", "failed", "unknown"}:
+            return previous
         try:
             outcome = self.mobile_uploader.upload_local_dir(
                 local_dir=local_dir,
                 target_locator=target,
-                idempotency_key=f"relay-up:{self.plan.idempotency_key}",
+                idempotency_key=operation_key,
             )
         except CmccAuthExpired:
-            return UploadOutcome("auth_expired", "移动云认证已过期")
+            outcome = UploadOutcome("auth_expired", "mobile account authorization expired")
         except TransferError as exc:
-            return UploadOutcome("failed", exc.message, error_code=exc.code)
+            outcome = UploadOutcome("failed", exc.message, error_code=exc.code)
         except Exception as exc:  # noqa: BLE001
-            return UploadOutcome("failed", f"移动云上传异常：{exc}", error_code=ErrorCode.NETWORK_TRANSIENT)
-        return normalize_upload_outcome(outcome)
+            outcome = UploadOutcome("failed", f"mobile upload exception: {exc}", error_code=ErrorCode.NETWORK_TRANSIENT)
+        normalized = normalize_upload_outcome(outcome)
+        metadata["upload_outcome"] = _upload_outcome_dict(normalized)
+        if isinstance(fence, dict):
+            fence["state"] = normalized.status
+        return normalized
+
+    def _poll_upload(self, receipt: OperationReceipt) -> OperationStatus:
+        metadata = receipt.metadata
+        stored = metadata.get("upload_outcome")
+        outcome = normalize_upload_outcome(stored) if stored else None
+        check = getattr(self.mobile_uploader, "check_upload", None)
+        if (outcome is None or outcome.status == "running") and callable(check):
+            try:
+                outcome = normalize_upload_outcome(check(receipt))
+            except Exception as exc:  # noqa: BLE001
+                return OperationStatus("unknown", f"mobile upload status query failed: {exc}", error_code=ErrorCode.RESULT_UNKNOWN)
+            metadata["upload_outcome"] = _upload_outcome_dict(outcome)
+        if outcome is None:
+            return OperationStatus(
+                "unknown",
+                "upload receipt has no durable outcome or scoped checker",
+                error_code=ErrorCode.RESULT_UNKNOWN,
+            )
+        return self._upload_status(outcome)
+
+    def _upload_status(self, outcome: UploadOutcome) -> OperationStatus:
+        if outcome.status in {"done", "completed"}:
+            return OperationStatus(
+                "completed",
+                outcome.message or "mobile upload completed",
+                expected_file_count=outcome.file_count,
+                completed_file_count=outcome.file_count,
+                total_size=outcome.total_size,
+            )
+        if outcome.status == "auth_expired":
+            self._on_auth_expired()
+            return OperationStatus("failed", outcome.message or "mobile account authorization expired", error_code=ErrorCode.AUTH_EXPIRED)
+        if outcome.status == "failed":
+            return OperationStatus("failed", outcome.message or "mobile upload failed", error_code=outcome.error_code or ErrorCode.NETWORK_TRANSIENT)
+        if outcome.status == "unknown":
+            return OperationStatus("unknown", outcome.message or "mobile upload result is unknown", error_code=ErrorCode.RESULT_UNKNOWN)
+        return OperationStatus("running", outcome.message or "mobile upload is running")
+
+    def _destination_target(self) -> dict[str, str]:
+        """Return the frozen final destination for the relay upload.
+
+        Relay is a two-leg data plane (source landing -> local temp -> mobile
+        final).  It deliberately has no destination staging directory; using
+        one here would reintroduce the removed legacy contract.
+        """
+        target = self.plan.destination_final
+        if not isinstance(target, dict):
+            raise TransferError(ErrorCode.INVALID_PLAN, "relay_upload_mobile requires an explicit destination_final")
+        namespace_id = str(target.get("namespace_id") or "").strip()
+        path = str(target.get("path") or "").strip()
+        if not namespace_id or not path:
+            raise TransferError(ErrorCode.INVALID_PLAN, "destination_final must include namespace_id and path")
+        if not namespace_id.lower().startswith("native:"):
+            raise TransferError(ErrorCode.INVALID_PLAN, "relay destination_final must use a native namespace")
+        return dict(target)
 
     def _on_auth_expired(self) -> None:
         account_id = self.plan.destination_account_id or self.plan.destination_id
+        already_halted = account_id in self.halted_account_ids
         self.halted_account_ids.add(account_id)
-        if self.alert_service is not None:
+        if self.alert_service is not None and not already_halted:
             try:
                 self.alert_service(
                     account_id=account_id,
@@ -232,7 +356,11 @@ class MobileRelayExecutor:
         if not callable(verify_target):
             return TransferVerifyResult("unknown", "移动云上传器不支持目标校验", code=ErrorCode.RESULT_UNKNOWN)
         expected = self.plan.verification_expected()
-        target = self.plan.destination_staging or {"namespace_id": "cmcc:api", "path": "/", "kind": "openlist"}
+        try:
+            target = self._destination_target()
+        except TransferError as exc:
+            return TransferVerifyResult("unknown", exc.message, code=exc.code)
+
         try:
             value = verify_target(
                 target_locator=target,
@@ -276,24 +404,30 @@ class CmccMobileUploader:
         self.target_parent_path = str(target_parent_path or "")
         self.progress = progress
 
-    def _list_local_files(self, local_dir: str) -> list[tuple[str, int]]:
-        import os
-
+    def _list_local_files(self, local_dir: str) -> list[tuple[str, str, int]]:
         root = str(local_dir or "")
         if not root or not os.path.isdir(root):
             return []
-        result: list[tuple[str, int]] = []
-        for current, _dirs, files in os.walk(root):
+        root_real = os.path.realpath(root)
+        result: list[tuple[str, str, int]] = []
+        for current, _dirs, files in os.walk(root_real):
             for name in sorted(files):
-                full = os.path.join(current, name)
-                rel = posixpath.normpath(os.path.relpath(full, root))
-                if rel.startswith("..") or rel == ".":
+                # These are executor/uploader bookkeeping files, never source
+                # content.  Uploading them was a subtle relay corruption bug.
+                if name.startswith(".fnos-relay-upload-") or name.endswith(".fnos-cmcc-upload.json"):
                     continue
+                full = os.path.realpath(os.path.join(current, name))
                 try:
+                    if os.path.commonpath((root_real, full)) != root_real:
+                        continue
                     size = os.path.getsize(full)
-                except OSError:
-                    size = 0
-                result.append((full, size))
+                except (OSError, ValueError):
+                    continue
+                rel = os.path.relpath(full, root_real).replace(os.sep, "/")
+                rel = posixpath.normpath(rel)
+                if rel.startswith("../") or rel in {"..", "."}:
+                    continue
+                result.append((full, rel, int(size)))
         return result
 
     def upload_local_dir(
@@ -304,41 +438,198 @@ class CmccMobileUploader:
         idempotency_key: str = "",
         progress: Any = None,
     ) -> UploadOutcome:
-        del idempotency_key
+        operation_key = str(idempotency_key or "").strip()
+        if not operation_key:
+            return UploadOutcome("failed", "mobile relay upload requires an idempotency key", error_code=ErrorCode.INVALID_PLAN)
+        if not isinstance(target_locator, dict):
+            return UploadOutcome("failed", "mobile relay upload requires an explicit target locator", error_code=ErrorCode.INVALID_PLAN)
+        target_path = str(target_locator.get("path") or "").strip()
+        target_parent_id = str(
+            target_locator.get("parent_file_id")
+            or target_locator.get("parentFileId")
+            or ""
+        ).strip()
+        if not target_path and not target_parent_id:
+            return UploadOutcome("failed", "mobile relay target path or parent id is required", error_code=ErrorCode.INVALID_PLAN)
+
         files = self._list_local_files(local_dir)
         if not files:
-            return UploadOutcome("failed", f"中继目录为空或不存在：{local_dir}", error_code=ErrorCode.SOURCE_LANDING_UNAVAILABLE)
-        target_path = str(target_locator.get("path") or self.target_parent_path or "")
+            return UploadOutcome("failed", f"relay directory is empty or missing: {local_dir}", error_code=ErrorCode.SOURCE_LANDING_UNAVAILABLE)
+
+        manifest_path = self._operation_manifest_path(local_dir, operation_key)
+        manifest = self._read_operation_manifest(manifest_path)
+        target_fingerprint = json.dumps(
+            {"path": target_path, "parent_file_id": target_parent_id},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        fresh_manifest = (
+            manifest.get("idempotency_key") != operation_key
+            or manifest.get("target_fingerprint") != target_fingerprint
+        )
+        if fresh_manifest:
+            manifest = {
+                "version": 1,
+                "idempotency_key": operation_key,
+                "target_fingerprint": target_fingerprint,
+                "status": "uploading",
+                "files": {},
+            }
+        elif str(manifest.get("status") or "").lower() == "completed":
+            records = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+            return UploadOutcome(
+                "done",
+                "mobile upload already reconciled from durable manifest",
+                file_count=sum(1 for item in records.values() if isinstance(item, dict) and item.get("success")),
+                total_size=sum(int(item.get("size") or 0) for item in records.values() if isinstance(item, dict) and item.get("success")),
+            )
+        elif str(manifest.get("status") or "").lower() == "uploading":
+            # The previous process may have crashed after the Provider call
+            # but before recording its response.  Do not submit the same
+            # operation again; an operator/provider reconcile is required.
+            return UploadOutcome("unknown", "移动云上传 fence 存在但结果未知")
+        records = manifest.setdefault("files", {})
+        if not self._write_operation_manifest(manifest_path, manifest):
+            return UploadOutcome("unknown", "无法持久化移动云上传 fence", error_code=ErrorCode.RESULT_UNKNOWN)
         uploaded: list[CmccUploadResult] = []
-        for full_path, _size in files:
+        callback = progress or self.progress
+        for full_path, relative_path, size in files:
+            entry = records.get(relative_path)
+            if isinstance(entry, dict) and entry.get("success") and int(entry.get("size") or -1) == size:
+                uploaded.append(_cmcc_result_from_dict(entry.get("result"), relative_path, size))
+                continue
+            file_key = f"{operation_key}:file:{hashlib.sha256(relative_path.encode('utf-8')).hexdigest()[:24]}"
+            kwargs: dict[str, Any] = {
+                "local_file": full_path,
+                "target_parent_file_id": target_parent_id,
+                "target_parent_path": target_path,
+                "target_name": posixpath.basename(relative_path),
+                "target_relative_dir": posixpath.dirname(relative_path) if posixpath.dirname(relative_path) != "." else "",
+                "progress": callback,
+            }
             try:
-                result = self.uploader.upload_file(
-                    local_file=full_path,
-                    target_parent_path=target_path,
-                    target_name=posixpath.basename(full_path),
-                    progress=progress or self.progress,
-                )
+                result = self._call_upload_file(kwargs, file_key)
             except CmccAuthExpired:
-                return UploadOutcome("auth_expired", "移动云认证已过期")
+                return UploadOutcome("auth_expired", "mobile account authorization expired")
             except CmccAuthConfigError as exc:
-                return UploadOutcome("failed", f"移动云认证配置错误：{exc}", error_code=ErrorCode.AUTH_CONFIG)
+                return UploadOutcome("failed", f"mobile credential configuration error: {exc}", error_code=ErrorCode.AUTH_CONFIG)
             except CmccApiError as exc:
                 return UploadOutcome(
                     "auth_expired" if exc.auth_expired else "failed",
-                    f"移动云上传失败：{exc}",
+                    f"mobile upload failed: {exc}",
                     error_code=ErrorCode.AUTH_EXPIRED if exc.auth_expired else ErrorCode.NETWORK_TRANSIENT,
                 )
+            except TransferError as exc:
+                return UploadOutcome("failed", exc.message, error_code=exc.code)
             except Exception as exc:  # noqa: BLE001
-                return UploadOutcome("failed", f"移动云上传异常：{exc}", error_code=ErrorCode.NETWORK_TRANSIENT)
-            uploaded.append(result)
+                return UploadOutcome("failed", f"mobile upload exception: {exc}", error_code=ErrorCode.NETWORK_TRANSIENT)
+            result = _coerce_cmcc_result(result, relative_path, size)
+            records[relative_path] = {"success": bool(result.success), "size": size, "result": result.to_dict()}
+            manifest["status"] = "uploading"
+            if not self._write_operation_manifest(manifest_path, manifest):
+                return UploadOutcome("unknown", "无法持久化移动云逐文件回执", error_code=ErrorCode.RESULT_UNKNOWN)
             if not result.success:
                 return UploadOutcome(
                     "failed",
-                    f"移动云上传未完成：{result.message}",
+                    f"mobile upload incomplete: {result.message}",
+                    file_count=len(uploaded),
+                    total_size=sum(int(item.size or 0) for item in uploaded),
                     error_code=ErrorCode.NETWORK_TRANSIENT,
                 )
+            uploaded.append(result)
+
+        manifest["status"] = "completed"
+        if not self._write_operation_manifest(manifest_path, manifest):
+            return UploadOutcome("unknown", "无法持久化移动云完成回执", error_code=ErrorCode.RESULT_UNKNOWN)
         total_size = sum(int(item.size or 0) for item in uploaded)
-        return UploadOutcome("done", "移动云上传完成", file_count=len(uploaded), total_size=total_size)
+        return UploadOutcome("done", "mobile upload completed", file_count=len(uploaded), total_size=total_size)
+
+    def _call_upload_file(self, kwargs: dict[str, Any], file_key: str) -> Any:
+        method = getattr(self.uploader, "upload_file", None)
+        if not callable(method):
+            raise TransferError(ErrorCode.AUTH_CONFIG, "mobile uploader does not expose upload_file")
+        try:
+            params = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            params = {}
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if "target_relative_dir" not in params and not accepts_kwargs:
+            raise TransferError(ErrorCode.INVALID_PLAN, "mobile uploader must support target_relative_dir")
+        if "idempotency_key" in params or accepts_kwargs:
+            kwargs["idempotency_key"] = file_key
+        if not accepts_kwargs:
+            kwargs = {key: value for key, value in kwargs.items() if key in params}
+        return method(**kwargs)
+
+    @staticmethod
+    def _operation_manifest_path(local_dir: str, operation_key: str) -> str:
+        digest = hashlib.sha256(operation_key.encode("utf-8")).hexdigest()[:24]
+        return os.path.join(os.path.realpath(local_dir), f".fnos-relay-upload-{digest}.json")
+
+    @staticmethod
+    def _read_operation_manifest(path: str) -> dict[str, Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                value = json.load(handle)
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    @staticmethod
+    def _write_operation_manifest(path: str, value: dict[str, Any]) -> bool:
+        directory = os.path.dirname(path) or "."
+        try:
+            fd, temp_path = tempfile.mkstemp(prefix=".fnos-relay-upload-", suffix=".tmp", dir=directory)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+            return True
+        except OSError:
+            try:
+                if "temp_path" in locals() and os.path.exists(temp_path):
+                    os.unlink(temp_path)
+            except OSError:
+                pass
+            return False
+
+    def _list_all_files(self, parent_id: str) -> list[dict[str, Any]]:
+        """Recursively enumerate a Mobile Cloud directory when possible."""
+
+        client = self.uploader.client
+        for method_name in ("list_tree", "walk_dir", "list_recursive"):
+            method = getattr(client, method_name, None)
+            if callable(method):
+                try:
+                    value = method(parent_id)
+                    if isinstance(value, list):
+                        return [item for item in value if isinstance(item, dict)]
+                except Exception:
+                    # Fall back to the conservative recursive list below.
+                    pass
+        result: list[dict[str, Any]] = []
+        queue: list[tuple[str, int]] = [(str(parent_id), 0)]
+        visited: set[str] = set()
+        while queue and len(result) < 10000:
+            current, depth = queue.pop(0)
+            if current in visited or depth > 32:
+                continue
+            visited.add(current)
+            entries = client.list_dir(current)
+            if not isinstance(entries, list):
+                continue
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                if _item_is_dir(item):
+                    child = str(item.get("file_id") or item.get("fileId") or item.get("id") or "")
+                    if child:
+                        queue.append((child, depth + 1))
+                else:
+                    result.append(item)
+        return result
+
 
     def verify_target(
         self,
@@ -347,12 +638,18 @@ class CmccMobileUploader:
         expected_file_count: int,
         expected_total_size: int,
     ) -> TransferVerifyResult:
-        target_path = str(target_locator.get("path") or self.target_parent_path or "")
-        parent_id = self._resolve_readonly(target_path)
+        if not isinstance(target_locator, dict):
+            return TransferVerifyResult("unknown", "mobile relay target locator is missing", code=ErrorCode.INVALID_PLAN)
+        target_path = str(target_locator.get("path") or "").strip()
+        parent_id = str(target_locator.get("parent_file_id") or target_locator.get("parentFileId") or "").strip()
+        if not target_path and not parent_id:
+            return TransferVerifyResult("unknown", "mobile relay target path or parent id is required", code=ErrorCode.INVALID_PLAN)
+        if not parent_id:
+            parent_id = self._resolve_readonly(target_path)
         if not parent_id:
             return TransferVerifyResult("missing", f"移动云目标目录不存在：{target_path}", code=ErrorCode.VERIFY_MISMATCH)
         try:
-            items = self.uploader.client.list_dir(parent_id)
+            items = self._list_all_files(parent_id)
         except CmccAuthExpired:
             return TransferVerifyResult("unknown", "移动云认证已过期，无法确认目标", code=ErrorCode.RESULT_UNKNOWN)
         except CmccApiError as exc:
@@ -403,6 +700,43 @@ class CmccMobileUploader:
                 return ""
             current = str(exists["file_id"])
         return current
+
+
+
+def _upload_outcome_dict(outcome: UploadOutcome) -> dict[str, Any]:
+    return {
+        "status": outcome.status,
+        "message": outcome.message,
+        "file_count": int(outcome.file_count or 0),
+        "total_size": int(outcome.total_size or 0),
+        "error_code": outcome.error_code,
+    }
+
+
+def _coerce_cmcc_result(value: Any, relative_path: str, size: int) -> CmccUploadResult:
+    if isinstance(value, CmccUploadResult):
+        return value
+    if isinstance(value, dict):
+        payload = dict(value)
+        return CmccUploadResult(
+            bool(payload.get("success")),
+            str(payload.get("status") or ("done" if payload.get("success") else "failed")),
+            str(payload.get("message") or ""),
+            mode=str(payload.get("mode") or ""),
+            file_id=str(payload.get("file_id") or payload.get("fileId") or ""),
+            upload_id=str(payload.get("upload_id") or payload.get("uploadId") or ""),
+            parent_file_id=str(payload.get("parent_file_id") or payload.get("parentFileId") or ""),
+            target_name=str(payload.get("target_name") or posixpath.basename(relative_path)),
+            size=int(payload.get("size") or size),
+            sha256=str(payload.get("sha256") or ""),
+            manifest_path=str(payload.get("manifest_path") or ""),
+            raw=dict(payload.get("raw") or {}),
+        )
+    return CmccUploadResult(False, "failed", f"unsupported mobile upload result: {type(value).__name__}", target_name=relative_path, size=size)
+
+
+def _cmcc_result_from_dict(value: Any, relative_path: str, size: int) -> CmccUploadResult:
+    return _coerce_cmcc_result(value if isinstance(value, dict) else {}, relative_path, size)
 
 
 def _item_is_dir(item: dict[str, Any]) -> bool:

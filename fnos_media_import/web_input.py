@@ -83,12 +83,6 @@ def _config_bool(config: dict[str, Any], key: str, default: bool = False) -> boo
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _default_secret_key(value: Any) -> bool:
-    text = str(value or "").strip()
-    lowered = text.lower()
-    return not text or lowered.startswith("change-me") or lowered in {"secret", "default", "please-change-me"}
-
-
 def _strict_security_enabled(config: dict[str, Any] | None = None) -> bool:
     raw = config if isinstance(config, dict) else {}
     security = raw.get("security") if isinstance(raw.get("security"), dict) else {}
@@ -292,9 +286,9 @@ def _worker_dispatch_enabled_for_role(worker_config: dict[str, Any], process_rol
     """Enable durable producers automatically when this process cannot execute them.
 
     ``web`` and ``scheduler`` runtimes suspend Organizer background timers by
-    design.  Selecting either role therefore also opts the process into durable
-    dispatch, while the legacy ``all`` role continues to honor the explicit
-    configuration switch.
+    design. Selecting either role therefore also opts the process into durable
+    dispatch, while an ``all`` worker process honors the explicit producer
+    switch.
     """
 
     return not role_runs(process_role, "worker") or _config_bool(

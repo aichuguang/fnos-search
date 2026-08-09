@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from typing import Any
 
 from ..domain.models import (
@@ -25,6 +26,7 @@ from ..domain.models import (
     OpenListLocator,
     RcloneLocator,
     StorageTarget,
+    StorageTargetBinding,
     TargetCategory,
 )
 from ..time_utils import utc_now_iso
@@ -49,6 +51,13 @@ class TargetNotFoundError(TargetError):
 
 class TargetRevisionNotFoundError(TargetError):
     """目标修订不存在。"""
+
+
+class TargetConflictError(TargetError):
+    """目标在编辑期间被其他管理员修订。"""
+
+    code = "TARGET_CONFLICT"
+    status = 409
 
 
 class TargetInUseError(TargetError):
@@ -190,6 +199,8 @@ class StorageTargetService:
         audience: str = "admin",
         categories: dict[str, TargetCategory] | None = None,
         allow_mount_root: bool = False,
+        account_id: str | None = None,
+        binding_locator: dict[str, Any] | None = None,
     ) -> StorageTarget:
         destination_id = str(destination_id or "").strip()
         name = str(name or "").strip()
@@ -215,7 +226,12 @@ class StorageTargetService:
         categories = categories or {}
         if not categories:
             raise TargetValidationError("目标至少需要一个分类")
-        errors = self._validate_categories(categories, target_kind=target_kind, allow_mount_root=allow_mount_root)
+        errors = self._validate_categories(
+            categories,
+            target_kind=target_kind,
+            provider_kind=provider_kind,
+            allow_mount_root=allow_mount_root,
+        )
         if errors:
             raise TargetValidationError("；".join(errors))
 
@@ -241,6 +257,15 @@ class StorageTargetService:
                 display={"name": name, "audience": audience},
                 now=now,
             )
+            self._insert_binding(
+                conn,
+                destination_id=destination_id,
+                target_revision=1,
+                provider_kind=provider_kind,
+                account_id=account_id,
+                locator=binding_locator or {},
+                now=now,
+            )
         target = self.get_target(destination_id)
         if target is None:  # pragma: no cover - 防御
             raise TargetValidationError(f"创建失败：{destination_id}")
@@ -254,10 +279,23 @@ class StorageTargetService:
         audience: str | None = None,
         categories: dict[str, TargetCategory] | None = None,
         allow_mount_root: bool = False,
+        account_id: str | None = None,
+        binding_locator: dict[str, Any] | None = None,
+        expected_revision: int | None = None,
     ) -> StorageTarget:
         target = self.get_target(destination_id)
         if target is None:
             raise TargetNotFoundError(f"目标不存在：{destination_id}")
+        if expected_revision not in (None, ""):
+            try:
+                expected = int(expected_revision)
+            except (TypeError, ValueError) as exc:
+                raise TargetValidationError("expected_revision 必须是正整数") from exc
+            if expected <= 0 or expected != int(target.current_revision):
+                raise TargetConflictError(
+                    "目标已被其他管理员修改，请刷新后重试："
+                    f"expected={expected}, actual={target.current_revision}"
+                )
         if categories is None and name is None and audience is None:
             raise TargetValidationError("没有要修订的内容")
 
@@ -266,17 +304,41 @@ class StorageTargetService:
             if not categories:
                 errors.append("目标至少需要一个分类")
             errors.extend(
-                self._validate_categories(categories, target_kind=target.target_kind, allow_mount_root=allow_mount_root)
+                self._validate_categories(
+                    categories,
+                    target_kind=target.target_kind,
+                    provider_kind=target.provider_kind,
+                    allow_mount_root=allow_mount_root,
+                )
             )
+        if name is not None and not str(name).strip():
+            errors.append("目标名称不能为空")
+        if audience is not None and str(audience) not in _ALLOWED_AUDIENCES:
+            errors.append("audience 必须是 admin 或 guest")
         if errors:
             raise TargetValidationError("；".join(errors))
 
         new_name = name if name is not None else target.name
         new_audience = audience if audience is not None else target.audience
         new_categories = categories if categories is not None else target.categories
-        new_revision = target.current_revision + 1
         now = utc_now_iso()
         with self.database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current_row = conn.execute(
+                "SELECT current_revision FROM storage_targets WHERE destination_id=?",
+                (destination_id,),
+            ).fetchone()
+            if current_row is None:
+                raise TargetNotFoundError(f"目标不存在：{destination_id}")
+            actual_revision = int(current_row["current_revision"] or 0)
+            if expected_revision not in (None, "") and actual_revision != int(expected_revision):
+                raise TargetConflictError(
+                    "目标已被其他管理员修改，请刷新后重试："
+                    f"expected={expected_revision}, actual={actual_revision}"
+                )
+            if actual_revision != int(target.current_revision):
+                raise TargetConflictError("目标在编辑期间被其他管理员修改，请刷新后重试")
+            new_revision = actual_revision + 1
             self._insert_revision(
                 conn,
                 destination_id,
@@ -287,8 +349,31 @@ class StorageTargetService:
             )
             conn.execute(
                 "UPDATE storage_targets SET name = ?, audience = ?, current_revision = ?, updated_at = ? "
-                "WHERE destination_id = ?",
-                (new_name, new_audience, new_revision, now, destination_id),
+                "WHERE destination_id = ? AND current_revision = ?",
+                (new_name, new_audience, new_revision, now, destination_id, actual_revision),
+            )
+            if int(conn.execute("SELECT changes()").fetchone()[0] or 0) != 1:
+                raise TargetConflictError("目标在编辑期间被其他管理员修改，请刷新后重试")
+            previous_binding = self._binding_row(conn, destination_id, target.current_revision)
+            effective_account_id = account_id if account_id is not None else (
+                str(previous_binding["account_id"]) if previous_binding and previous_binding["account_id"] else None
+            )
+            effective_locator = binding_locator
+            if effective_locator is None and previous_binding is not None:
+                previous_revision = conn.execute(
+                    "SELECT locator_json FROM storage_target_binding_revisions "
+                    "WHERE binding_id=? AND revision=?",
+                    (previous_binding["binding_id"], previous_binding["current_revision"]),
+                ).fetchone()
+                effective_locator = json.loads(previous_revision["locator_json"] or "{}") if previous_revision else {}
+            self._insert_binding(
+                conn,
+                destination_id=destination_id,
+                target_revision=new_revision,
+                provider_kind=target.provider_kind,
+                account_id=effective_account_id,
+                locator=effective_locator or {},
+                now=now,
             )
         updated = self.get_target(destination_id)
         if updated is None:  # pragma: no cover - 防御
@@ -349,7 +434,7 @@ class StorageTargetService:
             raise TargetNotFoundError(f"目标不存在：{destination_id}")
         with self.database.connect() as conn:
             referenced = conn.execute(
-                "SELECT 1 FROM source_destination_rules WHERE destination_id = ? LIMIT 1",
+                "SELECT 1 FROM source_destination_assignments WHERE destination_id = ? LIMIT 1",
                 (destination_id,),
             ).fetchone()
             if referenced:
@@ -360,6 +445,13 @@ class StorageTargetService:
             ).fetchone()
             if job:
                 raise TargetInUseError(f"目标被入库任务引用，不能删除：{destination_id}")
+            binding_rows = conn.execute(
+                "SELECT binding_id FROM storage_target_account_bindings WHERE destination_id=?",
+                (destination_id,),
+            ).fetchall()
+            for binding in binding_rows:
+                conn.execute("DELETE FROM storage_target_binding_revisions WHERE binding_id=?", (binding["binding_id"],))
+            conn.execute("DELETE FROM storage_target_account_bindings WHERE destination_id=?", (destination_id,))
             conn.execute("DELETE FROM storage_target_revisions WHERE destination_id = ?", (destination_id,))
             conn.execute("DELETE FROM storage_targets WHERE destination_id = ?", (destination_id,))
         return True
@@ -413,6 +505,57 @@ class StorageTargetService:
             ).fetchall()
         return [{"revision": int(r["revision"]), "created_at": r["created_at"]} for r in rows]
 
+    def list_bindings(
+        self, destination_id: str, target_revision: int | None = None
+    ) -> list[StorageTargetBinding]:
+        target = self.get_target(destination_id, target_revision)
+        if target is None:
+            raise TargetNotFoundError(f"目标不存在：{destination_id}")
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM storage_target_account_bindings "
+                "WHERE destination_id=? AND target_revision=? ORDER BY binding_id",
+                (destination_id, target.current_revision),
+            ).fetchall()
+            return [self._decode_binding(connection, row) for row in rows]
+
+    def resolve_binding(
+        self, destination_id: str, target_revision: int
+    ) -> StorageTargetBinding:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM storage_target_account_bindings "
+                "WHERE destination_id=? AND target_revision=? AND enabled=1",
+                (destination_id, int(target_revision)),
+            ).fetchall()
+            if len(rows) != 1:
+                raise TargetValidationError(
+                    f"目标 {destination_id}@{target_revision} 必须有且只有一个启用的账号 binding"
+                )
+            return self._decode_binding(connection, rows[0])
+
+    def get_binding(
+        self, binding_id: str, binding_revision: int | None = None
+    ) -> StorageTargetBinding | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM storage_target_account_bindings WHERE binding_id=?",
+                (binding_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            requested = int(binding_revision or row["current_revision"])
+            revision = connection.execute(
+                "SELECT * FROM storage_target_binding_revisions "
+                "WHERE binding_id=? AND revision=?",
+                (binding_id, requested),
+            ).fetchone()
+            if revision is None:
+                return None
+            copied = dict(row)
+            copied["current_revision"] = requested
+            return self._decode_binding(connection, copied)
+
     def test_target(self, destination_id: str) -> dict[str, Any]:
         """按分类做结构检测：最终路径、三定位器、挂载引用与本地包含。"""
         target = self.get_target(destination_id)
@@ -421,7 +564,13 @@ class StorageTargetService:
         categories: dict[str, Any] = {}
         all_errors: list[str] = []
         for key, cat in target.categories.items():
-            cat_errors = self._validate_category(key, cat, target_kind=target.target_kind, allow_mount_root=False)
+            cat_errors = self._validate_category(
+                key,
+                cat,
+                target_kind=target.target_kind,
+                provider_kind=target.provider_kind,
+                allow_mount_root=False,
+            )
             categories[key] = {
                 "ok": not cat_errors,
                 "errors": cat_errors,
@@ -469,6 +618,103 @@ class StorageTargetService:
             ),
         )
 
+    def _insert_binding(
+        self,
+        conn: Any,
+        *,
+        destination_id: str,
+        target_revision: int,
+        provider_kind: str,
+        account_id: str | None,
+        locator: dict[str, Any],
+        now: str,
+    ) -> None:
+        account_revision: int | None = None
+        if provider_kind not in {"generic", "local"}:
+            if not account_id:
+                raise TargetValidationError(f"{provider_kind} 目标必须绑定一个 Provider 账号")
+            account = conn.execute(
+                "SELECT provider_kind, enabled, current_revision, last_test_status "
+                "FROM provider_accounts WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+            if account is None:
+                raise TargetValidationError(f"绑定账号不存在：{account_id}")
+            if str(account["provider_kind"]) != provider_kind:
+                raise TargetValidationError("目标 Provider 与绑定账号 Provider 不一致")
+            if not bool(account["enabled"]):
+                raise TargetValidationError("目标不能绑定已停用账号")
+            if str(account["last_test_status"] or "") != "ok":
+                raise TargetValidationError("目标不能绑定检测未通过的账号")
+            account_revision = int(account["current_revision"])
+        elif account_id:
+            raise TargetValidationError("generic/local 目标不能绑定 Provider 账号")
+        revision_row = conn.execute(
+            "SELECT categories_json FROM storage_target_revisions "
+            "WHERE destination_id=? AND revision=?",
+            (destination_id, int(target_revision)),
+        ).fetchone()
+        if revision_row is None:
+            raise TargetValidationError("目标修订不存在，无法创建 binding")
+        categories = decode_categories(json.loads(revision_row["categories_json"] or "{}"))
+        for category in categories.values():
+            for target_locator in (category.rclone_locator, category.organizer_locator):
+                if not isinstance(target_locator, (RcloneLocator, OpenListLocator)):
+                    continue
+                mount = conn.execute(
+                    "SELECT connection_id, provider_kind, account_id, identity_status, enabled "
+                    "FROM openlist_mounts WHERE mount_id=?",
+                    (target_locator.mount_id,),
+                ).fetchone()
+                if mount is None:
+                    raise TargetValidationError(f"binding 引用的 mount 不存在：{target_locator.mount_id}")
+                if str(mount["connection_id"]) != target_locator.connection_id:
+                    raise TargetValidationError("binding 的 connection 与 mount 不一致")
+                if not bool(mount["enabled"]) or str(mount["identity_status"]) not in {"verified", "declared"}:
+                    raise TargetValidationError("binding 引用的 mount 未启用或身份未确认")
+                if account_id and mount["account_id"] and str(mount["account_id"]) != account_id:
+                    raise TargetValidationError("目标 binding 账号与 OpenList mount 账号不一致")
+        binding_id = f"bind_{secrets.token_hex(8)}"
+        conn.execute(
+            "INSERT INTO storage_target_account_bindings "
+            "(binding_id, destination_id, target_revision, account_id, provider_kind, enabled, "
+            " current_revision, created_at, updated_at) VALUES (?,?,?,?,?,1,1,?,?)",
+            (binding_id, destination_id, target_revision, account_id, provider_kind, now, now),
+        )
+        conn.execute(
+            "INSERT INTO storage_target_binding_revisions "
+            "(binding_id, revision, locator_json, account_revision, created_at) VALUES (?,1,?,?,?)",
+            (binding_id, json.dumps(locator or {}, ensure_ascii=False, sort_keys=True), account_revision, now),
+        )
+
+    @staticmethod
+    def _binding_row(conn: Any, destination_id: str, target_revision: int) -> Any:
+        return conn.execute(
+            "SELECT * FROM storage_target_account_bindings "
+            "WHERE destination_id=? AND target_revision=? AND enabled=1",
+            (destination_id, int(target_revision)),
+        ).fetchone()
+
+    @staticmethod
+    def _decode_binding(conn: Any, row: Any) -> StorageTargetBinding:
+        revision = conn.execute(
+            "SELECT * FROM storage_target_binding_revisions WHERE binding_id=? AND revision=?",
+            (row["binding_id"], row["current_revision"]),
+        ).fetchone()
+        if revision is None:
+            raise TargetValidationError(f"binding 修订不存在：{row['binding_id']}")
+        return StorageTargetBinding(
+            binding_id=str(row["binding_id"]),
+            destination_id=str(row["destination_id"]),
+            target_revision=int(row["target_revision"]),
+            account_id=str(row["account_id"]) if row["account_id"] else None,
+            account_revision=int(revision["account_revision"]) if revision["account_revision"] else None,
+            provider_kind=str(row["provider_kind"] or ""),
+            locator=json.loads(revision["locator_json"] or "{}"),
+            enabled=bool(row["enabled"]),
+            current_revision=int(row["current_revision"]),
+        )
+
     def _row_to_target(self, row: Any, rev_row: Any) -> StorageTarget:
         try:
             display = json.loads(rev_row["display_json"] or "{}")
@@ -495,11 +741,20 @@ class StorageTargetService:
         categories: dict[str, TargetCategory],
         *,
         target_kind: str,
+        provider_kind: str,
         allow_mount_root: bool,
     ) -> list[str]:
         errors: list[str] = []
         for key, cat in categories.items():
-            errors.extend(self._validate_category(key, cat, target_kind=target_kind, allow_mount_root=allow_mount_root))
+            errors.extend(
+                self._validate_category(
+                    key,
+                    cat,
+                    target_kind=target_kind,
+                    provider_kind=provider_kind,
+                    allow_mount_root=allow_mount_root,
+                )
+            )
         return errors
 
     def _validate_category(
@@ -508,6 +763,7 @@ class StorageTargetService:
         category: TargetCategory,
         *,
         target_kind: str,
+        provider_kind: str,
         allow_mount_root: bool,
     ) -> list[str]:
         errors: list[str] = []
@@ -528,8 +784,10 @@ class StorageTargetService:
             if isinstance(loc, (RcloneLocator, OpenListLocator)):
                 if not loc.connection_id or not loc.mount_id:
                     errors.append(f"分类 {category_key} 的 OpenList 定位器缺少 connection_id 或 mount_id")
-                elif not self._mount_exists(loc.mount_id):
-                    errors.append(f"分类 {category_key} 引用不存在的挂载：{loc.mount_id}")
+                else:
+                    mount_error = self._validate_mount_locator(loc, provider_kind, target_kind)
+                    if mount_error:
+                        errors.append(f"分类 {category_key}：{mount_error}")
 
         final_path = _category_primary_path(category)
         if not final_path:
@@ -570,3 +828,22 @@ class StorageTargetService:
                 "SELECT 1 FROM openlist_mounts WHERE mount_id = ?", (mount_id,)
             ).fetchone()
         return row is not None
+
+    def _validate_mount_locator(self, locator: Any, provider_kind: str, target_kind: str) -> str:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT connection_id, provider_kind, enabled, identity_status FROM openlist_mounts WHERE mount_id=?",
+                (locator.mount_id,),
+            ).fetchone()
+        if row is None:
+            return f"引用不存在的挂载：{locator.mount_id}"
+        if str(row["connection_id"] or "") != str(locator.connection_id or ""):
+            return "OpenList connection_id 与 mount_id 不属于同一连接"
+        if not row["enabled"] or str(row["identity_status"] or "") not in {"verified", "declared"}:
+            return "OpenList mount 未启用或身份未确认"
+        mount_provider = str(row["provider_kind"] or "")
+        if target_kind == "openlist_generic" and mount_provider == "mobile":
+            return "移动云 mount 不允许包装成 generic 目标，跨盘写入必须走移动 API"
+        if provider_kind not in {"generic", "local"} and mount_provider and mount_provider != provider_kind:
+            return f"mount Provider {mount_provider} 与目标 Provider {provider_kind} 不一致"
+        return ""

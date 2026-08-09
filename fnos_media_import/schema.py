@@ -62,14 +62,21 @@ BASE_SCHEMA_SQL = r"""
                 CREATE TABLE IF NOT EXISTS rclone_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     trigger_reason TEXT,
+                    operation_key TEXT,
+                    job_id INTEGER,
+                    copy_descriptor_json TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
                     exit_code INTEGER,
-                    error_message TEXT
+                    error_message TEXT,
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(job_id) REFERENCES import_jobs(id) ON DELETE SET NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_rclone_runs_started_at ON rclone_runs(started_at);
+                -- The V1 operation/job indexes are created by migration 26 after
+                -- legacy rclone_runs tables have received their new columns.
 
                 CREATE TABLE IF NOT EXISTS rclone_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

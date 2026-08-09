@@ -58,8 +58,18 @@ class OpenListWebDAVClient:
             timeout = 15
         return text.rstrip("/"), str(username or ""), str(password or ""), timeout
 
+    def _build_url(self, path: str) -> str:
+        """拼接 base_url 与 WebDAV 路径，并对非 ASCII 做百分号编码。
+
+        urllib 不自动编码路径里的中文，直接放进 Request 会在 urlopen 时抛
+        ascii 编码错误；这里保留 / 与已编码的 %，仅转义中文等字符。
+        """
+        from urllib.parse import quote
+
+        return self.base_url + quote(normalize_openlist_path(path), safe="/%:@?&=+#")
+
     def _request(self, method: str, path: str, *, headers: dict[str, Any] | None = None, body: bytes | None = None) -> tuple[int, bytes]:
-        url = self.base_url + normalize_openlist_path(path)
+        url = self._build_url(path)
         request = urllib.request.Request(url, method=method, data=body, headers=dict(headers or {}))
         request.add_header("User-Agent", "fnos-openlist/1.0")
         if self.username or self.password:
@@ -99,7 +109,14 @@ class OpenListWebDAVClient:
             raise OpenListWebDAVError(f"创建目录失败：HTTP {status}")
 
     def put_bytes(self, path: str, content: bytes) -> None:
-        status, _ = self._request("PUT", path, body=content)
+        # urllib 默认把 data= 当表单提交（application/x-www-form-urlencoded），
+        # 部分 WebDAV 服务器对非文件上传的 Content-Type 返回 405；显式声明文件类型。
+        status, _ = self._request(
+            "PUT",
+            path,
+            body=content,
+            headers={"Content-Type": "application/octet-stream"},
+        )
         if status not in (200, 201, 204):
             raise OpenListWebDAVError(f"写入文件失败：HTTP {status}")
 
@@ -116,7 +133,7 @@ class OpenListWebDAVClient:
         return None
 
     def move(self, source: str, destination: str) -> None:
-        headers = {"Destination": self.base_url + normalize_openlist_path(destination)}
+        headers = {"Destination": self._build_url(destination)}
         status, _ = self._request("MOVE", source, headers=headers)
         if status not in (200, 201, 204):
             raise OpenListWebDAVError(f"移动文件失败：HTTP {status}")

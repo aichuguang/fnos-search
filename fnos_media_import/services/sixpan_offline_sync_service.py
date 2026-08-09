@@ -14,9 +14,13 @@ from ..constants import (
     JOB_REVIEW,
     JOB_SUBMITTED,
     JOB_WAITING_ORGANIZER,
-    ROUTE_SIXPAN_OFFLINE,
 )
-from .import_staging_service import staging_plan_from_job
+from ..planning.job_plan import plan_strategy
+from .execution_plan_guard import (
+    plan_requires_organizer,
+    reject_non_v1_job,
+    v1_plan_or_review,
+)
 
 
 MEDIA_REFRESH_CLAIM_TIMEOUT_SECONDS = 15 * 60
@@ -36,6 +40,7 @@ class SixPanOfflineSyncService:
         record_completed: Callable[..., dict[str, Any]],
         sync_guest_requests: Callable[..., None],
         now: Callable[[], datetime] | None = None,
+        execution_repository: Any = None,
     ) -> None:
         self.database = database
         self.importer = importer
@@ -45,6 +50,7 @@ class SixPanOfflineSyncService:
         self.record_completed = record_completed
         self.sync_guest_requests = sync_guest_requests
         self.now = now or (lambda: datetime.now(timezone.utc))
+        self.execution_repository = execution_repository
 
     def sync(self, trigger: str = "poller") -> dict[str, Any]:
         importer = self.importer()
@@ -64,6 +70,25 @@ class SixPanOfflineSyncService:
                 skipped += 1
                 continue
             checked += 1
+            plan, rejection = v1_plan_or_review(
+                self.database,
+                job,
+                context="轮询六盘离线任务时",
+                execution_repository=self.execution_repository,
+            )
+            if rejection:
+                reviewed += 1
+                continue
+            if plan_strategy(plan) != "native_offline":
+                reject_non_v1_job(
+                    self.database,
+                    job,
+                    context="轮询六盘离线任务时",
+                    error="V1 任务不是 native_offline 策略",
+                    execution_repository=self.execution_repository,
+                )
+                reviewed += 1
+                continue
             if not task_id:
                 message = "六盘离线任务缺少 external_task_id，无法继续轮询，已转人工检查"
                 if self._mark_review(
@@ -195,26 +220,28 @@ class SixPanOfflineSyncService:
                 "job_id": normalized_job_id,
                 "message": "六盘任务不存在",
             }
-        if str(job.get("target_route") or "").strip().lower() != ROUTE_SIXPAN_OFFLINE:
-            return {
-                "success": False,
-                "rejected": True,
-                "job_id": normalized_job_id,
-                "message": "仅六盘离线任务支持仅重试飞牛媒体库刷新",
-            }
+        plan, rejection = v1_plan_or_review(
+            self.database,
+            job,
+            context="重试六盘媒体库刷新时",
+            execution_repository=self.execution_repository,
+        )
+        if rejection:
+            return rejection
+        if plan_strategy(plan) != "native_offline":
+            return reject_non_v1_job(
+                self.database,
+                job,
+                context="重试六盘媒体库刷新时",
+                error="V1 任务不是 native_offline 策略",
+                execution_repository=self.execution_repository,
+            )
 
         raw = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
         completion = raw.get("completion") if isinstance(raw.get("completion"), dict) else {}
-        legacy_refresh = (
-            raw.get("sixpan_legacy_refresh")
-            if isinstance(raw.get("sixpan_legacy_refresh"), dict)
-            else {}
-        )
-        refresh_only = any(
-            bool(marker.get("provider_completed"))
-            and str(marker.get("retry_action") or "").strip().lower() == "media_refresh_only"
-            for marker in (completion, legacy_refresh)
-        )
+        refresh_only = bool(completion.get("provider_completed")) and str(
+            completion.get("retry_action") or ""
+        ).strip().lower() == "media_refresh_only"
         if not refresh_only:
             return {
                 "success": False,
@@ -294,11 +321,6 @@ class SixPanOfflineSyncService:
             }
             raw = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else recovered_raw
             completion = raw.get("completion") if isinstance(raw.get("completion"), dict) else completion
-            legacy_refresh = (
-                raw.get("sixpan_legacy_refresh")
-                if isinstance(raw.get("sixpan_legacy_refresh"), dict)
-                else legacy_refresh
-            )
             current_status = JOB_REVIEW
         if current_status != JOB_REVIEW:
             return {
@@ -377,11 +399,6 @@ class SixPanOfflineSyncService:
             if isinstance(latest_raw.get("completion"), dict)
             else completion
         )
-        latest_legacy_refresh = (
-            latest_raw.get("sixpan_legacy_refresh")
-            if isinstance(latest_raw.get("sixpan_legacy_refresh"), dict)
-            else legacy_refresh
-        )
         latest_retry = (
             latest_raw.get("sixpan_media_refresh_retry")
             if isinstance(latest_raw.get("sixpan_media_refresh_retry"), dict)
@@ -421,14 +438,6 @@ class SixPanOfflineSyncService:
                         "provider_completed": True,
                         "retryable": False,
                         "retry_action": retry_action,
-                    },
-                    "sixpan_legacy_refresh": {
-                        **latest_legacy_refresh,
-                        **refresh_result,
-                        "provider_completed": True,
-                        "retry_action": retry_action,
-                        "last_retry_trigger": trigger,
-                        "last_retry_at": retried_at,
                     },
                     "sixpan_media_refresh_retry": {
                         **latest_retry,
@@ -684,28 +693,84 @@ class SixPanOfflineSyncService:
         trigger: str,
         state_payload: dict[str, Any],
     ) -> bool:
+        plan, rejection = v1_plan_or_review(
+            self.database,
+            job,
+            context="处理六盘离线完成状态时",
+            execution_repository=self.execution_repository,
+        )
+        if rejection:
+            self.sync_guest_requests(
+                job_id,
+                JOB_REVIEW,
+                {"sixpan_task_id": task_id, "message": rejection["message"]},
+            )
+            return False
+        if plan_strategy(plan) != "native_offline":
+            rejection = reject_non_v1_job(
+                self.database,
+                job,
+                context="处理六盘离线完成状态时",
+                error="V1 任务不是 native_offline 策略",
+                execution_repository=self.execution_repository,
+            )
+            self.sync_guest_requests(
+                job_id,
+                JOB_REVIEW,
+                {"sixpan_task_id": task_id, "message": rejection["message"]},
+            )
+            return False
+
+        if not plan_requires_organizer(plan):
+            message = (
+                "六盘离线任务已完成，但该 V1 计划未冻结 Organizer 后处理；"
+                "旧媒体库刷新回退已禁用，请按当前配置重新创建任务"
+            )
+            rejection = reject_non_v1_job(
+                self.database,
+                job,
+                context="处理六盘离线完成状态时",
+                error=message,
+                execution_repository=self.execution_repository,
+            )
+            self.sync_guest_requests(
+                job_id,
+                JOB_REVIEW,
+                {
+                    "sixpan_task_id": task_id,
+                    "provider_completed": True,
+                    "message": rejection["message"],
+                },
+            )
+            return False
+
+        raw = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
+        completion = raw.get("completion") if isinstance(raw.get("completion"), dict) else {}
+        waiting_message = "六盘离线任务已完成，等待 V1 Organizer 标准化整理"
         if not self._update_job_if_status(
             job_id,
             {JOB_SUBMITTED},
             status=JOB_WAITING_ORGANIZER,
             error_message="",
             raw_data=_merge_raw(
-                job.get("raw_data"),
+                raw,
                 {
                     "sixpan_poll": state_payload,
                     "completion": {
+                        **completion,
                         "stage": COMPLETION_STAGE_WAITING_ORGANIZER,
                         "official_save_path": job.get("target_path") or "",
-                        "message": "六盘离线任务已完成，等待 Organizer 标准化整理与标准目录确认",
+                        "message": waiting_message,
+                        "provider_completed": True,
                     },
                 },
             ),
         ):
             return False
+
         latest_job = self.database.get_job(job_id) or job
         if str(latest_job.get("status") or "").strip().lower() != JOB_WAITING_ORGANIZER:
             return False
-        staging_required = bool(staging_plan_from_job(latest_job))
         try:
             organizer_result = self.enqueue_organizer(
                 {"success": True, "job": latest_job},
@@ -727,100 +792,26 @@ class SixPanOfflineSyncService:
         post_enqueue_status = str(post_enqueue_job.get("status") or "").strip().lower()
         if post_enqueue_status in {"cancelled", "done", "success", "skipped_existing"}:
             return False
-        if not organizer_queued and not staging_required:
-            fallback_job = post_enqueue_job
-            latest_raw = fallback_job.get("raw_data") if isinstance(fallback_job.get("raw_data"), dict) else {}
-            latest_completion = latest_raw.get("completion") if isinstance(latest_raw.get("completion"), dict) else {}
-            refresh_result = self._record_media_refresh(
-                fallback_job,
-                job_id,
-                trigger=f"sixpan_poll:{trigger}",
-            )
-            refresh_ok = refresh_result.get("success") is True
-            if refresh_ok:
-                message = "六盘离线任务已完成，已按旧流程触发媒体库刷新"
-                error_message = ""
-                completion_patch = {
-                    "stage": COMPLETION_STAGE_DONE,
-                    "message": message,
-                    "provider_completed": True,
-                    "retryable": False,
-                }
-            else:
-                refresh_detail = str(refresh_result.get("message") or "六盘媒体库刷新失败").strip()
-                message = (
-                    f"六盘离线任务已完成，但媒体库刷新失败：{refresh_detail}；"
-                    "网盘文件已经完成，请仅重试媒体库刷新，不要重复提交六盘离线任务"
-                )
-                error_message = message
-                completion_patch = {
-                    "stage": COMPLETION_STAGE_REVIEW,
-                    "message": message,
-                    "provider_completed": True,
-                    "retryable": False,
-                    "retry_action": "media_refresh_only",
-                }
-            # 旧流程回退只触发媒体库刷新、不建 Organizer 任务：必须把 job 从
-            # waiting_organizer 迁走，否则会永久卡住（启动恢复也会跳过无 plan 任务）。
-            updated = self._update_job_if_status(
-                job_id,
-                {JOB_WAITING_ORGANIZER},
-                # Provider 已经成功完成。刷新失败属于后置人工处理，不能标成可
-                # 重提 Provider 的普通 failed，否则旧任务会再次创建六盘离线任务。
-                status=JOB_DONE if refresh_ok else JOB_REVIEW,
-                error_message=error_message,
-                raw_data=_merge_raw(
-                    latest_raw,
-                    {
-                        "completion": {**latest_completion, **completion_patch},
-                        "sixpan_legacy_refresh": {
-                            **refresh_result,
-                            "provider_completed": True,
-                            "retry_action": "none" if refresh_ok else "media_refresh_only",
-                        },
-                    },
-                ),
-            )
-            if not updated:
-                return False
-            self.database.add_event(
-                job_id,
-                "info" if refresh_ok else "warn",
-                message,
-                {"sixpan": state_payload, "media_refresh": refresh_result, "organizer": organizer_result},
-            )
-            current_job = self.database.get_job(job_id) or latest_job
-            current_status = str(current_job.get("status") or JOB_WAITING_ORGANIZER)
-            self.sync_guest_requests(
-                job_id,
-                current_status,
-                {
-                    "sixpan_task_id": task_id,
-                    "legacy_refresh_fallback": True,
-                    "provider_completed": True,
-                    "retry_action": "none" if refresh_ok else "media_refresh_only",
-                },
-            )
-            return True
         if not organizer_queued:
-            current_job = self.database.get_job(job_id) or latest_job
-            current_raw = current_job.get("raw_data") if isinstance(current_job.get("raw_data"), dict) else {}
-            completion = current_raw.get("completion") if isinstance(current_raw.get("completion"), dict) else {}
+            current_raw = (
+                post_enqueue_job.get("raw_data")
+                if isinstance(post_enqueue_job.get("raw_data"), dict)
+                else {}
+            )
+            current_completion = (
+                current_raw.get("completion")
+                if isinstance(current_raw.get("completion"), dict)
+                else {}
+            )
             detail = str(
                 organizer_result.get("message")
                 if isinstance(organizer_result, dict)
-                else "Organizer 未返回可用的入队结果"
+                else "Organizer 未返回有效入队结果"
             ).strip() or "Organizer 未成功创建标准化任务"
             message = (
-                f"六盘离线任务已完成，但 Organizer 未成功接管：{detail}；"
-                "请在 Organizer 后台重试接管或人工创建整理任务，不要重复提交六盘离线"
+                f"六盘离线任务已完成，但 V1 Organizer 未成功接管：{detail}；"
+                "请在 Organizer 后台重试，不要重新提交六盘离线任务"
             )
-            failure = {
-                "success": False,
-                "retryable": True,
-                "message": message,
-                "organizer": organizer_result if isinstance(organizer_result, dict) else {},
-            }
             updated = self._update_job_if_status(
                 job_id,
                 {JOB_WAITING_ORGANIZER},
@@ -830,12 +821,21 @@ class SixPanOfflineSyncService:
                     current_raw,
                     {
                         "completion": {
-                            **completion,
+                            **current_completion,
                             "stage": COMPLETION_STAGE_REVIEW,
                             "message": message,
+                            "provider_completed": True,
                             "retryable": True,
+                            "retry_action": "organizer_retry",
                         },
-                        "sixpan_organizer_enqueue": failure,
+                        "sixpan_organizer_enqueue": {
+                            "success": False,
+                            "retryable": True,
+                            "message": message,
+                            "organizer": (
+                                organizer_result if isinstance(organizer_result, dict) else {}
+                            ),
+                        },
                     },
                 ),
             )
@@ -854,23 +854,15 @@ class SixPanOfflineSyncService:
             )
             return True
 
-        refresh_result = {
-            "success": True,
-            "skipped": True,
-            "deferred_to_organizer": True,
-            "message": "OpenList 标准化已启用，等待 Organizer 整理完成后刷新 OpenList 文件夹",
-        }
-        message = "六盘离线任务已完成，已移交 OpenList 标准化"
+        message = "六盘离线任务已完成，已移交 V1 Organizer 标准化处理"
         self.database.add_event(
             job_id,
             "info",
             message,
-            {"sixpan": state_payload, "media_refresh": refresh_result, "organizer": organizer_result},
+            {"sixpan": state_payload, "organizer": organizer_result},
         )
         current_job = self.database.get_job(job_id) or post_enqueue_job
         current_status = str(current_job.get("status") or JOB_WAITING_ORGANIZER).strip()
-        if current_status.lower() in {"cancelled", "done", "success", "skipped_existing"}:
-            return False
         self.sync_guest_requests(job_id, current_status, {"sixpan_task_id": task_id})
         return True
 

@@ -50,19 +50,31 @@ class UpdateCandidateImportService:
         payload.setdefault("url", candidate_row.get("source_url") or "")
         payload.setdefault("password", candidate_row.get("password") or "")
         payload.setdefault("category", subscription.get("category") or "movie")
-        subscription_raw = (
-            subscription.get("raw_data") if isinstance(subscription.get("raw_data"), dict) else {}
-        )
-        frozen_destination = str(subscription_raw.get("destination_id") or "").strip()
-        if frozen_destination:
-            # Subscription identity wins over discovery/cache payloads. A
-            # candidate is not allowed to redirect later episodes elsewhere.
-            payload["destination_id"] = frozen_destination
-        payload.setdefault("idempotency_key", f"update-candidate:{candidate_id}")
-        payload.setdefault("executor_id", "scheduler" if auto else "admin")
-        payload.setdefault("config_revision", 1)
-
-        result = self.import_service().create_import_job(payload)
+        # The candidate/subscription is not an infrastructure authority.
+        # Destination, account, mount and organizer paths are resolved again
+        # from the V1 source assignment when the import job is created.  Strip
+        # historical or cached fields instead of letting a scheduler payload
+        # override the current DB routing graph.
+        for field in (
+            "destination_id",
+            "target_path",
+            "target_path_override",
+            "cloud139_target_path_override",
+            "update_context",
+            "organizer_context",
+            "target_root_is_resource",
+            "mount_id",
+            "remote",
+            "executor_id",
+            "config_revision",
+            "idempotency_key",
+        ):
+            payload.pop(field, None)
+        imports = self.import_service()
+        creator = getattr(imports, "create_internal_import_job", None)
+        if not callable(creator):
+            creator = imports.create_import_job
+        result = creator(payload)
         job = result.get("job") if isinstance(result.get("job"), dict) else {}
         handler = self.import_handler()
         if handler:

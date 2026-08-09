@@ -14,6 +14,7 @@ class PublicResourceDependencies:
     btbtla_client: Any
     build_detail: Callable[..., dict[str, Any]]
     child_files: Callable[..., dict[str, Any]]
+    tianyi_importer: Any = None
 
 
 class PublicResourceService:
@@ -32,6 +33,7 @@ class PublicResourceService:
             sixpan_importer=self._deps.sixpan_importer,
             btbtla_client=self._deps.btbtla_client,
             hide_full_links=hide_full_links,
+            tianyi_importer=self._deps.tianyi_importer,
         )
         return {"success": True, "detail": detail}, 200
 
@@ -45,5 +47,6 @@ class PublicResourceService:
             routes=self._deps.routes,
             quark_importer=self._deps.quark_importer,
             cloud139_importer=self._deps.cloud139_importer,
+            tianyi_importer=self._deps.tianyi_importer,
         )
         return result, (200 if result.get("success", False) else 400)

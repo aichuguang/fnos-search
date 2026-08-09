@@ -14,28 +14,85 @@ from .constants import (
     CATEGORY_OTHER,
     CATEGORY_TV,
     CATEGORY_VARIETY,
-    ROUTE_CLOUD139_DIRECT,
-    ROUTE_CLOUD189_DIRECT,
-    ROUTE_QUARK_TO_MOBILE,
-    ROUTE_SIXPAN_OFFLINE,
-)
-from .storage_paths import (
-    cmcc_upload_root,
-    normalize_sixpan_path_sources,
-    normalize_storage_path,
-    openlist_root_for_upload,
 )
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CMCC_DEFAULT_HOST = "https://personal-kd-njs.yun.139.com/hcy"
-CMCC_DEFAULT_APP_ID = "2046144659771756544"
-CMCC_DEFAULT_APP_NAME = "MClaw空间"
-CMCC_DEFAULT_ACCESS_TOKEN_FILE = ""
-CMCC_DEFAULT_CHANNEL_BASE64 = "J/0voJP3L9EKbQyz0uxQHkBZjjbZrNBJFp9XbT4/b9U="
-CMCC_DEFAULT_TRACE_BASE64 = "7WokJK5IZVhod3UBMECBRA=="
 
 CATEGORY_KEYS = (CATEGORY_MOVIE, CATEGORY_TV, CATEGORY_ANIME, CATEGORY_VARIETY, CATEGORY_OTHER)
+
+_REMOVED_CONFIG_SECTIONS = frozenset({"quark", "cloud189", "cloud139", "cmcc_upload", "routes"})
+_REMOVED_APP_FIELDS = frozenset({"secret_key"})
+_REMOVED_OPENLIST_FIELDS = frozenset({"base_url", "token"})
+_REMOVED_STORAGE_FIELDS = frozenset({"targets", "default_target"})
+_REMOVED_SIXPAN_FIELDS = frozenset({
+    "api_url", "endpoint", "host", "fnos_mount_name", "openlist_mount_name",
+    "mount_name", "mount_path", "client_id", "client_secret", "oauth_client_id",
+    "access_token", "refresh_token", "token",
+})
+_REMOVED_CATEGORY_FIELDS = frozenset({
+    "mobile_target_path", "cloud139_target_path", "cloud139_fnos_target_path",
+    "cloud139_folder_id", "cmcc_parent_file_id", "cmcc_parent_path",
+    "sixpan_fnos_target_path", "sixpan_mount_path", "sixpan_fnos_dir_list",
+    "openlist_root_path", "quark_save_path", "sixpan_save_path",
+})
+
+# Environment aliases from the pre-V1 global credential/path model.  They are
+# intentionally rejected (rather than ignored) so an operator cannot mistake
+# a deployment that still exports old secrets for a configured V1 deployment.
+_REMOVED_ENV_NAMES = frozenset(
+    {
+        # V1 has one root key and derives purpose-specific keys from it.  The
+        # former account/notification key names must fail closed instead of
+        # being silently carried alongside a new deployment.
+        "FNOS_ACCOUNT_MASTER_KEY",
+        "NOTIFICATION_ENCRYPTION_KEY",
+        "QUARK_AUTO_SAVE_URL",
+        "QUARK_AUTO_SAVE_TOKEN",
+        "APP_SECRET_KEY",
+        "CLOUD189_AUTO_SAVE_URL",
+        "CLOUD189_AUTO_SAVE_TOKEN",
+        "CLOUD139_TARGET_ROOT_PATH",
+        "CLOUD139_CLOUD_ROOT_PATH",
+        "CLOUD139_FNOS_MOUNT_NAME",
+        "CLOUD139_MOUNT_NAME",
+        "CLOUD139_CHECK_BEFORE_SAVE",
+        "CLOUD139_CREATE_FOLDER_IF_MISSING",
+        "CLOUD139_REFRESH_AFTER_SUBMIT",
+        "CLOUD139_REFRESH_DELAY_SECONDS",
+        "CLOUD139_MARK_DONE_AFTER_SUBMIT",
+        "CMCC_UPLOAD_ENABLED",
+        "CMCC_UPLOAD_BACKEND",
+        "CMCC_UPLOAD_MODE",
+        "CMCC_UPLOAD_RENAME_MODE",
+        "CMCC_HOST",
+        "CMCC_WEB_HOST",
+        "CM_CLOUD_HOST",
+        "CMCC_AUTH_MODE",
+        "CMCC_ACCESS_TOKEN",
+        "CM_CLOUD_ACCESS_TOKEN",
+        "CMCC_PHONE",
+        "CM_CLOUD_PHONE",
+        "CMCC_UPLOAD_PUT_TIMEOUT",
+        "OPENLIST_BASE_URL",
+        "OPENLIST_TOKEN",
+        "CLOUD139_ROUTE_ENABLED",
+        "MAGNET_ROUTE_ENABLED",
+        "TORRENT_ROUTE_ENABLED",
+        "SIXPAN_ROUTE_ENABLED",
+        "SIXPAN_API_URL",
+        "SIXPAN_HOST",
+        "SIXPAN_FNOS_MOUNT_NAME",
+        "SIXPAN_OPENLIST_MOUNT_NAME",
+        "SIXPAN_MOUNT_NAME",
+        "SIXPAN_CLIENT_ID",
+        "SIXPAN_CLIENT_SECRET",
+        "SIXPAN_ACCESS_TOKEN",
+        "SIXPAN_TOKEN",
+        "SIXPAN_REFRESH_TOKEN",
+    }
+)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -116,6 +173,42 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return result
 
 
+def _reject_removed_config_fields(config: dict[str, Any]) -> None:
+    """Reject pre-V1 YAML/config-file fields instead of reviving them."""
+
+    if not isinstance(config, dict):
+        return
+    removed: list[str] = []
+    for section in _REMOVED_CONFIG_SECTIONS:
+        if section in config:
+            removed.append(section)
+    app = config.get("app")
+    if isinstance(app, dict):
+        removed.extend(f"app.{field}" for field in app if field in _REMOVED_APP_FIELDS)
+    openlist = config.get("openlist")
+    if isinstance(openlist, dict):
+        removed.extend(f"openlist.{field}" for field in openlist if field in _REMOVED_OPENLIST_FIELDS)
+    sixpan = config.get("sixpan")
+    if isinstance(sixpan, dict):
+        removed.extend(f"sixpan.{field}" for field in sixpan if field in _REMOVED_SIXPAN_FIELDS)
+    categories = config.get("categories")
+    if isinstance(categories, dict):
+        for category_key, category in categories.items():
+            if isinstance(category, dict):
+                removed.extend(
+                    f"categories.{category_key}.{field}"
+                    for field in category
+                    if field in _REMOVED_CATEGORY_FIELDS
+                )
+    storage = config.get("storage")
+    if isinstance(storage, dict):
+        removed.extend(f"storage.{field}" for field in storage if field in _REMOVED_STORAGE_FIELDS)
+    if removed:
+        preview = "、".join(sorted(set(removed))[:8])
+        suffix = " 等" if len(set(removed)) > 8 else ""
+        raise ValueError(f"配置包含已删除的旧版字段：{preview}{suffix}")
+
+
 def _default_config() -> dict[str, Any]:
     return {
         "app": {
@@ -124,7 +217,6 @@ def _default_config() -> dict[str, Any]:
             "port": 5251,
             "debug": False,
             "database_path": "data/app.db",
-            "secret_key": os.getenv("APP_SECRET_KEY", "change-me-in-production"),
         },
         "admin": {
             "username": os.getenv("ADMIN_USERNAME", "admin"),
@@ -163,7 +255,7 @@ def _default_config() -> dict[str, Any]:
             "max_token_length": _env_int("SECURITY_MAX_TOKEN_LENGTH", 80),
             "duplicate_check_enabled": _env_bool("SECURITY_DUPLICATE_CHECK_ENABLED", True),
             "duplicate_window_minutes": _env_int("SECURITY_DUPLICATE_WINDOW_MINUTES", 1440),
-            "ip_hash_salt": os.getenv("SECURITY_IP_HASH_SALT") or os.getenv("APP_SECRET_KEY", "change-me-in-production"),
+            "ip_hash_salt": os.getenv("SECURITY_IP_HASH_SALT", ""),
             "allowed_url_schemes": _env_csv("SECURITY_ALLOWED_URL_SCHEMES", ["http", "https", "magnet"]),
             "allowed_share_domains": _env_csv("SECURITY_ALLOWED_SHARE_DOMAINS", []),
             "block_private_hosts": _env_bool("SECURITY_BLOCK_PRIVATE_HOSTS", True),
@@ -233,40 +325,9 @@ def _default_config() -> dict[str, Any]:
             "bt_ai_failure_review": _env_bool("CONTENT_REVIEW_BT_AI_FAILURE_REVIEW", True),
             "max_files_for_ai": _env_int("CONTENT_REVIEW_MAX_FILES_FOR_AI", 80),
         },
-        "quark": {
-            "auto_save_url": os.getenv("QUARK_AUTO_SAVE_URL", "http://127.0.0.1:8015"),
-            "token": os.getenv("QUARK_AUTO_SAVE_TOKEN", ""),
-            "timeout": 20,
-            "check_before_save": True,
-            "run_immediately": True,
-        },
-        "cloud139": {
-            "target_root_path": os.getenv("CLOUD139_TARGET_ROOT_PATH", os.getenv("CLOUD139_CLOUD_ROOT_PATH", "")),
-            "fnos_mount_name": os.getenv("CLOUD139_FNOS_MOUNT_NAME", os.getenv("CLOUD139_MOUNT_NAME", "")),
-            "timeout": 20,
-            "check_before_save": _env_bool("CLOUD139_CHECK_BEFORE_SAVE", True),
-            "create_folder_if_missing": _env_bool("CLOUD139_CREATE_FOLDER_IF_MISSING", True),
-            "refresh_after_submit": _env_bool("CLOUD139_REFRESH_AFTER_SUBMIT", True),
-            "refresh_delay_seconds": _env_int("CLOUD139_REFRESH_DELAY_SECONDS", 90),
-            # 139 官方分享转存接口创建的是云端批处理任务，本项目没有独立的外部
-            # worker 可持续追踪该任务；保存接口成功返回后默认视为已提交成功并进入
-            # done，避免访客端长期停留在“处理中”。如需严格轮询可显式设为 false。
-            "mark_done_after_submit": _env_bool("CLOUD139_MARK_DONE_AFTER_SUBMIT", True),
-        },
-        "cmcc_upload": {
-            "enabled": _env_bool("CMCC_UPLOAD_ENABLED", True),
-            "backend": os.getenv("RCLONE_UPLOAD_BACKEND", os.getenv("CMCC_UPLOAD_BACKEND", "cmcc_api")),
-            "mode": os.getenv("CMCC_UPLOAD_MODE", "rapid_first"),
-            "rename_mode": os.getenv("CMCC_UPLOAD_RENAME_MODE", "auto_rename"),
-            "host": os.getenv("CMCC_HOST", os.getenv("CMCC_WEB_HOST", os.getenv("CM_CLOUD_HOST", CMCC_DEFAULT_HOST))),
-            "auth_mode": os.getenv("CMCC_AUTH_MODE", "web_basic"),
-            "access_token": os.getenv("CMCC_ACCESS_TOKEN", os.getenv("CM_CLOUD_ACCESS_TOKEN", "")),
-            "phone": os.getenv("CMCC_PHONE", os.getenv("CM_CLOUD_PHONE", "")),
-            "put_timeout": _env_int("CMCC_UPLOAD_PUT_TIMEOUT", 7200),
-        },
         "openlist": {
-            "base_url": os.getenv("OPENLIST_BASE_URL", "http://127.0.0.1:5244"),
-            "token": os.getenv("OPENLIST_TOKEN", ""),
+            # OpenList 连接、凭证和挂载均由 openlist_connections /
+            # openlist_mounts 管理。这里仅保留不含连接身份的通用客户端选项。
             "timeout": _env_int("OPENLIST_TIMEOUT", 30),
             "batch_timeout": _env_int("OPENLIST_BATCH_TIMEOUT", 600),
             "list_refresh_default": _env_bool("OPENLIST_LIST_REFRESH_DEFAULT", False),
@@ -348,23 +409,9 @@ def _default_config() -> dict[str, Any]:
             "youku_enabled": _env_bool("HOT_DISCOVERY_YOUKU_ENABLED", True),
             "youku_url": os.getenv("HOT_DISCOVERY_YOUKU_URL", "https://www.youku.com/ku/webhome"),
         },
-        "cloud189": {
-            "auto_save_url": os.getenv("CLOUD189_AUTO_SAVE_URL", ""),
-            "endpoint": os.getenv("CLOUD189_AUTO_SAVE_URL", ""),
-            "token": os.getenv("CLOUD189_AUTO_SAVE_TOKEN", ""),
-            "timeout": 20,
-            "refresh_after_submit": True,
-        },
         "sixpan": {
-            "api_url": os.getenv("SIXPAN_API_URL", os.getenv("SIXPAN_HOST", "openapi.2dland.cn")),
-            "endpoint": os.getenv("SIXPAN_API_URL", os.getenv("SIXPAN_HOST", "openapi.2dland.cn")),
-            "host": os.getenv("SIXPAN_HOST", os.getenv("SIXPAN_API_URL", "openapi.2dland.cn")),
-            "fnos_mount_name": os.getenv("SIXPAN_FNOS_MOUNT_NAME", os.getenv("SIXPAN_OPENLIST_MOUNT_NAME", os.getenv("SIXPAN_MOUNT_NAME", "\u6e05\u4e91"))),
-            "client_id": os.getenv("SIXPAN_CLIENT_ID", ""),
-            "client_secret": os.getenv("SIXPAN_CLIENT_SECRET", ""),
-            "access_token": os.getenv("SIXPAN_ACCESS_TOKEN", os.getenv("SIXPAN_TOKEN", "")),
-            "refresh_token": os.getenv("SIXPAN_REFRESH_TOKEN", ""),
-            "token": os.getenv("SIXPAN_ACCESS_TOKEN", os.getenv("SIXPAN_TOKEN", "")),
+            # 六盘账号端点、ClientID/Secret 和 OAuth Token 属于 Provider
+            # 账号修订；高级配置只保留解析、轮询等无凭证运行参数。
             "timeout": _env_int("SIXPAN_TIMEOUT", 20),
             "verify_tls": _env_bool("SIXPAN_VERIFY_TLS", True),
             "parse_before_add": _env_bool("SIXPAN_PARSE_BEFORE_ADD", True),
@@ -411,7 +458,7 @@ def _default_config() -> dict[str, Any]:
             "shell": os.getenv("RCLONE_SCRIPT_SHELL", "sh"),
             "python_bin": os.getenv("RCLONE_PYTHON_BIN", "python"),
             "remote_name": os.getenv("RCLONE_REMOTE_NAME", "MP"),
-            "upload_backend": os.getenv("RCLONE_UPLOAD_BACKEND", os.getenv("CMCC_UPLOAD_BACKEND", "cmcc_api")),
+            "upload_backend": os.getenv("RCLONE_UPLOAD_BACKEND", "cmcc_api"),
             "local_temp": os.getenv("RCLONE_LOCAL_TEMP", "/temp/fnos-media-import"),
             "buffer_size": os.getenv("RCLONE_BUFFER_SIZE", "128M"),
             "download_multi_thread": int(os.getenv("RCLONE_DOWNLOAD_MULTI_THREAD", "16")),
@@ -456,99 +503,34 @@ def _default_config() -> dict[str, Any]:
         },
         "storage": {
             "enabled": True,
-            "plan_version": 3,
-            "default_target": "mobile_main",
-            "targets": {},
+            "plan_version": 1,
         },
         "categories": {
             CATEGORY_MOVIE: {
                 "label": CATEGORY_LABELS[CATEGORY_MOVIE],
-                "quark_save_path": "/离线下载/电影",
-                "sixpan_save_path": os.getenv("SIXPAN_SAVE_MOVIE_PATH", "/电影"),
-                "sixpan_fnos_target_path": os.getenv("SIXPAN_FNOS_MOVIE_PATH", ""),
-                "sixpan_fnos_dir_list": _env_csv("SIXPAN_FNOS_MOVIE_DIR_LIST", []),
-                "mobile_target_path": "移动云盘A/电影",
-                "cloud139_target_path": os.getenv("CLOUD139_TARGET_MOVIE_PATH", CATEGORY_LABELS[CATEGORY_MOVIE]),
-                "cloud139_fnos_target_path": os.getenv("CLOUD139_FNOS_MOVIE_PATH", ""),
-                "cloud139_fnos_dir_list": _env_csv("CLOUD139_FNOS_MOVIE_DIR_LIST", []),
-                "cloud139_folder_id": os.getenv("CLOUD139_TARGET_MOVIE_FOLDER_ID", ""),
-                "cmcc_parent_file_id": os.getenv("CMCC_TARGET_MOVIE_PARENT_FILE_ID", ""),
-                "cmcc_parent_path": os.getenv("CMCC_TARGET_MOVIE_PARENT_PATH", ""),
                 "fnos_lib": "电影",
                 "fnos_dir_list": _env_csv("FNOS_MDB_MOVIE_DIR_LIST", _env_csv("FNOS_MOVIE_DIR_LIST", [])),
             },
             CATEGORY_TV: {
                 "label": CATEGORY_LABELS[CATEGORY_TV],
-                "quark_save_path": "/离线下载/电视剧",
-                "sixpan_save_path": os.getenv("SIXPAN_SAVE_TV_PATH", "/电视剧"),
-                "sixpan_fnos_target_path": os.getenv("SIXPAN_FNOS_TV_PATH", ""),
-                "sixpan_fnos_dir_list": _env_csv("SIXPAN_FNOS_TV_DIR_LIST", []),
-                "mobile_target_path": "移动云盘A/电视剧",
-                "cloud139_target_path": os.getenv("CLOUD139_TARGET_TV_PATH", CATEGORY_LABELS[CATEGORY_TV]),
-                "cloud139_fnos_target_path": os.getenv("CLOUD139_FNOS_TV_PATH", ""),
-                "cloud139_fnos_dir_list": _env_csv("CLOUD139_FNOS_TV_DIR_LIST", []),
-                "cloud139_folder_id": os.getenv("CLOUD139_TARGET_TV_FOLDER_ID", ""),
-                "cmcc_parent_file_id": os.getenv("CMCC_TARGET_TV_PARENT_FILE_ID", ""),
-                "cmcc_parent_path": os.getenv("CMCC_TARGET_TV_PARENT_PATH", ""),
                 "fnos_lib": "电视剧",
                 "fnos_dir_list": _env_csv("FNOS_MDB_TV_DIR_LIST", _env_csv("FNOS_TV_DIR_LIST", [])),
             },
             CATEGORY_ANIME: {
                 "label": CATEGORY_LABELS[CATEGORY_ANIME],
-                "quark_save_path": "/离线下载/动漫",
-                "sixpan_save_path": os.getenv("SIXPAN_SAVE_ANIME_PATH", "/动漫"),
-                "sixpan_fnos_target_path": os.getenv("SIXPAN_FNOS_ANIME_PATH", ""),
-                "sixpan_fnos_dir_list": _env_csv("SIXPAN_FNOS_ANIME_DIR_LIST", []),
-                "mobile_target_path": "移动云盘A/动漫",
-                "cloud139_target_path": os.getenv("CLOUD139_TARGET_ANIME_PATH", CATEGORY_LABELS[CATEGORY_ANIME]),
-                "cloud139_fnos_target_path": os.getenv("CLOUD139_FNOS_ANIME_PATH", ""),
-                "cloud139_fnos_dir_list": _env_csv("CLOUD139_FNOS_ANIME_DIR_LIST", []),
-                "cloud139_folder_id": os.getenv("CLOUD139_TARGET_ANIME_FOLDER_ID", ""),
-                "cmcc_parent_file_id": os.getenv("CMCC_TARGET_ANIME_PARENT_FILE_ID", ""),
-                "cmcc_parent_path": os.getenv("CMCC_TARGET_ANIME_PARENT_PATH", ""),
                 "fnos_lib": "动漫",
                 "fnos_dir_list": _env_csv("FNOS_MDB_ANIME_DIR_LIST", _env_csv("FNOS_ANIME_DIR_LIST", [])),
             },
             CATEGORY_VARIETY: {
                 "label": CATEGORY_LABELS[CATEGORY_VARIETY],
-                "quark_save_path": "/离线下载/综艺",
-                "sixpan_save_path": os.getenv("SIXPAN_SAVE_VARIETY_PATH", "/综艺"),
-                "sixpan_fnos_target_path": os.getenv("SIXPAN_FNOS_VARIETY_PATH", ""),
-                "sixpan_fnos_dir_list": _env_csv("SIXPAN_FNOS_VARIETY_DIR_LIST", []),
-                "mobile_target_path": "移动云盘A/综艺",
-                "cloud139_target_path": os.getenv("CLOUD139_TARGET_VARIETY_PATH", CATEGORY_LABELS[CATEGORY_VARIETY]),
-                "cloud139_fnos_target_path": os.getenv("CLOUD139_FNOS_VARIETY_PATH", ""),
-                "cloud139_fnos_dir_list": _env_csv("CLOUD139_FNOS_VARIETY_DIR_LIST", []),
-                "cloud139_folder_id": os.getenv("CLOUD139_TARGET_VARIETY_FOLDER_ID", ""),
-                "cmcc_parent_file_id": os.getenv("CMCC_TARGET_VARIETY_PARENT_FILE_ID", ""),
-                "cmcc_parent_path": os.getenv("CMCC_TARGET_VARIETY_PARENT_PATH", ""),
                 "fnos_lib": "综艺",
                 "fnos_dir_list": _env_csv("FNOS_MDB_VARIETY_DIR_LIST", _env_csv("FNOS_VARIETY_DIR_LIST", [])),
             },
             CATEGORY_OTHER: {
                 "label": CATEGORY_LABELS[CATEGORY_OTHER],
-                "quark_save_path": "/离线下载/其他",
-                "sixpan_save_path": os.getenv("SIXPAN_SAVE_OTHER_PATH", "/其他"),
-                "sixpan_fnos_target_path": os.getenv("SIXPAN_FNOS_OTHER_PATH", ""),
-                "sixpan_fnos_dir_list": _env_csv("SIXPAN_FNOS_OTHER_DIR_LIST", []),
-                "mobile_target_path": "移动云盘A/其他",
-                "cloud139_target_path": os.getenv("CLOUD139_TARGET_OTHER_PATH", CATEGORY_LABELS[CATEGORY_OTHER]),
-                "cloud139_fnos_target_path": os.getenv("CLOUD139_FNOS_OTHER_PATH", ""),
-                "cloud139_fnos_dir_list": _env_csv("CLOUD139_FNOS_OTHER_DIR_LIST", []),
-                "cloud139_folder_id": os.getenv("CLOUD139_TARGET_OTHER_FOLDER_ID", ""),
-                "cmcc_parent_file_id": os.getenv("CMCC_TARGET_OTHER_PARENT_FILE_ID", ""),
-                "cmcc_parent_path": os.getenv("CMCC_TARGET_OTHER_PARENT_PATH", ""),
                 "fnos_lib": "其他",
                 "fnos_dir_list": _env_csv("FNOS_MDB_OTHER_DIR_LIST", _env_csv("FNOS_OTHER_DIR_LIST", [])),
             },
-        },
-        "routes": {
-            "quark": {"enabled": True, "route": ROUTE_QUARK_TO_MOBILE},
-            "uc": {"enabled": False, "route": ROUTE_QUARK_TO_MOBILE},
-            "cloud139": {"enabled": _env_bool("CLOUD139_ROUTE_ENABLED", False), "route": ROUTE_CLOUD139_DIRECT},
-            "cloud189": {"enabled": False, "route": ROUTE_CLOUD189_DIRECT},
-            "magnet": {"enabled": _env_bool("MAGNET_ROUTE_ENABLED", _env_bool("SIXPAN_ROUTE_ENABLED", True)), "route": ROUTE_SIXPAN_OFFLINE},
-            "torrent": {"enabled": _env_bool("TORRENT_ROUTE_ENABLED", _env_bool("SIXPAN_ROUTE_ENABLED", True)), "route": ROUTE_SIXPAN_OFFLINE},
         },
     }
 
@@ -606,26 +588,6 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
         ("content_review", "bt_parse_failure_review"): "CONTENT_REVIEW_BT_PARSE_FAILURE_REVIEW",
         ("content_review", "bt_ai_failure_review"): "CONTENT_REVIEW_BT_AI_FAILURE_REVIEW",
         ("content_review", "max_files_for_ai"): "CONTENT_REVIEW_MAX_FILES_FOR_AI",
-        ("quark", "auto_save_url"): "QUARK_AUTO_SAVE_URL",
-        ("quark", "token"): "QUARK_AUTO_SAVE_TOKEN",
-        ("cloud139", "target_root_path"): "CLOUD139_TARGET_ROOT_PATH",
-        ("cloud139", "fnos_mount_name"): "CLOUD139_FNOS_MOUNT_NAME",
-        ("cloud139", "check_before_save"): "CLOUD139_CHECK_BEFORE_SAVE",
-        ("cloud139", "create_folder_if_missing"): "CLOUD139_CREATE_FOLDER_IF_MISSING",
-        ("cloud139", "refresh_after_submit"): "CLOUD139_REFRESH_AFTER_SUBMIT",
-        ("cloud139", "refresh_delay_seconds"): "CLOUD139_REFRESH_DELAY_SECONDS",
-        ("cloud139", "mark_done_after_submit"): "CLOUD139_MARK_DONE_AFTER_SUBMIT",
-        ("cmcc_upload", "enabled"): "CMCC_UPLOAD_ENABLED",
-        ("cmcc_upload", "backend"): "RCLONE_UPLOAD_BACKEND",
-        ("cmcc_upload", "mode"): "CMCC_UPLOAD_MODE",
-        ("cmcc_upload", "rename_mode"): "CMCC_UPLOAD_RENAME_MODE",
-        ("cmcc_upload", "host"): "CMCC_HOST",
-        ("cmcc_upload", "auth_mode"): "CMCC_AUTH_MODE",
-        ("cmcc_upload", "access_token"): "CM_CLOUD_ACCESS_TOKEN",
-        ("cmcc_upload", "phone"): "CM_CLOUD_PHONE",
-        ("cmcc_upload", "put_timeout"): "CMCC_UPLOAD_PUT_TIMEOUT",
-        ("openlist", "base_url"): "OPENLIST_BASE_URL",
-        ("openlist", "token"): "OPENLIST_TOKEN",
         ("openlist", "timeout"): "OPENLIST_TIMEOUT",
         ("openlist", "batch_timeout"): "OPENLIST_BATCH_TIMEOUT",
         ("openlist", "list_refresh_default"): "OPENLIST_LIST_REFRESH_DEFAULT",
@@ -695,21 +657,6 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
         ("hot_discovery", "iqiyi_version"): "HOT_DISCOVERY_IQIYI_VERSION",
         ("hot_discovery", "youku_enabled"): "HOT_DISCOVERY_YOUKU_ENABLED",
         ("hot_discovery", "youku_url"): "HOT_DISCOVERY_YOUKU_URL",
-        ("routes", "cloud139", "enabled"): "CLOUD139_ROUTE_ENABLED",
-        ("routes", "magnet", "enabled"): "MAGNET_ROUTE_ENABLED",
-        ("routes", "torrent", "enabled"): "TORRENT_ROUTE_ENABLED",
-        ("cloud189", "auto_save_url"): "CLOUD189_AUTO_SAVE_URL",
-        ("cloud189", "endpoint"): "CLOUD189_AUTO_SAVE_URL",
-        ("cloud189", "token"): "CLOUD189_AUTO_SAVE_TOKEN",
-        ("sixpan", "api_url"): "SIXPAN_API_URL",
-        ("sixpan", "endpoint"): "SIXPAN_API_URL",
-        ("sixpan", "host"): "SIXPAN_HOST",
-        ("sixpan", "fnos_mount_name"): "SIXPAN_FNOS_MOUNT_NAME",
-        ("sixpan", "client_id"): "SIXPAN_CLIENT_ID",
-        ("sixpan", "client_secret"): "SIXPAN_CLIENT_SECRET",
-        ("sixpan", "access_token"): "SIXPAN_ACCESS_TOKEN",
-        ("sixpan", "refresh_token"): "SIXPAN_REFRESH_TOKEN",
-        ("sixpan", "token"): "SIXPAN_ACCESS_TOKEN",
         ("sixpan", "timeout"): "SIXPAN_TIMEOUT",
         ("sixpan", "verify_tls"): "SIXPAN_VERIFY_TLS",
         ("sixpan", "parse_before_add"): "SIXPAN_PARSE_BEFORE_ADD",
@@ -737,7 +684,6 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
         ("fnos", "max_auth_retries"): "FNOS_MAX_AUTH_RETRIES",
         ("fnos", "retry_delay"): "FNOS_RETRY_DELAY",
         ("fnos", "verify_ssl"): "FNOS_VERIFY_SSL",
-        ("app", "secret_key"): "APP_SECRET_KEY",
         ("admin", "username"): "ADMIN_USERNAME",
         ("admin", "password"): "ADMIN_PASSWORD",
         ("submission", "mode"): "SUBMIT_MODE",
@@ -819,220 +765,84 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
             for section in path[:-1]:
                 current = current.setdefault(section, {})
             current[path[-1]] = _cloud_type_values(value) if env_name == "PANSOU_CLOUD_TYPES" else value
-    cmcc_alias_env_map = {
-        ("cmcc_upload", "backend"): "CMCC_UPLOAD_BACKEND",
-        ("cmcc_upload", "host"): "CM_CLOUD_HOST",
-        ("cmcc_upload", "access_token"): "CMCC_ACCESS_TOKEN",
-        ("cmcc_upload", "phone"): "CMCC_PHONE",
-    }
-    for path, env_name in cmcc_alias_env_map.items():
-        value = os.getenv(env_name)
-        if value is not None and value != "":
-            current = config
-            for section in path[:-1]:
-                current = current.setdefault(section, {})
-            current[path[-1]] = value
-    cloud139_root_path = os.getenv("CLOUD139_TARGET_ROOT_PATH") or os.getenv("CLOUD139_CLOUD_ROOT_PATH")
-    if cloud139_root_path:
-        config.setdefault("cloud139", {})["target_root_path"] = cloud139_root_path
-    sixpan_mount_name = os.getenv("SIXPAN_FNOS_MOUNT_NAME") or os.getenv("SIXPAN_OPENLIST_MOUNT_NAME") or os.getenv("SIXPAN_MOUNT_NAME")
-    if sixpan_mount_name:
-        config.setdefault("sixpan", {})["fnos_mount_name"] = sixpan_mount_name
+    # Provider credentials, OpenList connection identity and storage target
+    # paths are deliberately *not* read from environment aliases.  They are
+    # owned by the account/target databases and are resolved from frozen
+    # revisions at planning time.  Rejecting the old aliases is intentional:
+    # silently ignoring them would make a deployment appear configured while
+    # the new database model remained empty.
+    legacy_env_names = set(_REMOVED_ENV_NAMES)
+    legacy_env_names.update(
+        {
+            "RCLONE_SRC_MOVIE_DIR",
+            "RCLONE_SRC_TV_DIR",
+            "RCLONE_SRC_ANIME_DIR",
+            "RCLONE_SRC_VARIETY_DIR",
+            "RCLONE_SRC_OTHER_DIR",
+            "RCLONE_DST_MOVIE_DIR",
+            "RCLONE_DST_TV_DIR",
+            "RCLONE_DST_ANIME_DIR",
+            "RCLONE_DST_VARIETY_DIR",
+            "RCLONE_DST_OTHER_DIR",
+            "SIXPAN_SAVE_MOVIE_PATH",
+            "SIXPAN_SAVE_TV_PATH",
+            "SIXPAN_SAVE_ANIME_PATH",
+            "SIXPAN_SAVE_VARIETY_PATH",
+            "SIXPAN_SAVE_OTHER_PATH",
+        }
+    )
+    configured_legacy = sorted(name for name in legacy_env_names if str(os.getenv(name) or "").strip())
+    if configured_legacy:
+        raise ValueError(
+            "检测到已删除的旧版配置环境变量："
+            + "、".join(configured_legacy)
+            + "；请改用后台 V1 存储目标与 OpenList 挂载配置"
+        )
     category_env_map = {
         CATEGORY_MOVIE: (
-            "RCLONE_SRC_MOVIE_DIR",
-            "RCLONE_DST_MOVIE_DIR",
-            "SIXPAN_SAVE_MOVIE_PATH",
-            "SIXPAN_FNOS_MOVIE_PATH",
-            "SIXPAN_FNOS_MOVIE_DIR_LIST",
-            "CLOUD139_TARGET_MOVIE_PATH",
-            "CLOUD139_TARGET_MOVIE_FOLDER_ID",
-            "CLOUD139_FNOS_MOVIE_PATH",
-            "CLOUD139_FNOS_MOVIE_DIR_LIST",
             "FNOS_MDB_MOVIE_DIR_LIST",
             "FNOS_MOVIE_DIR_LIST",
         ),
         CATEGORY_TV: (
-            "RCLONE_SRC_TV_DIR",
-            "RCLONE_DST_TV_DIR",
-            "SIXPAN_SAVE_TV_PATH",
-            "SIXPAN_FNOS_TV_PATH",
-            "SIXPAN_FNOS_TV_DIR_LIST",
-            "CLOUD139_TARGET_TV_PATH",
-            "CLOUD139_TARGET_TV_FOLDER_ID",
-            "CLOUD139_FNOS_TV_PATH",
-            "CLOUD139_FNOS_TV_DIR_LIST",
             "FNOS_MDB_TV_DIR_LIST",
             "FNOS_TV_DIR_LIST",
         ),
         CATEGORY_ANIME: (
-            "RCLONE_SRC_ANIME_DIR",
-            "RCLONE_DST_ANIME_DIR",
-            "SIXPAN_SAVE_ANIME_PATH",
-            "SIXPAN_FNOS_ANIME_PATH",
-            "SIXPAN_FNOS_ANIME_DIR_LIST",
-            "CLOUD139_TARGET_ANIME_PATH",
-            "CLOUD139_TARGET_ANIME_FOLDER_ID",
-            "CLOUD139_FNOS_ANIME_PATH",
-            "CLOUD139_FNOS_ANIME_DIR_LIST",
             "FNOS_MDB_ANIME_DIR_LIST",
             "FNOS_ANIME_DIR_LIST",
         ),
         CATEGORY_VARIETY: (
-            "RCLONE_SRC_VARIETY_DIR",
-            "RCLONE_DST_VARIETY_DIR",
-            "SIXPAN_SAVE_VARIETY_PATH",
-            "SIXPAN_FNOS_VARIETY_PATH",
-            "SIXPAN_FNOS_VARIETY_DIR_LIST",
-            "CLOUD139_TARGET_VARIETY_PATH",
-            "CLOUD139_TARGET_VARIETY_FOLDER_ID",
-            "CLOUD139_FNOS_VARIETY_PATH",
-            "CLOUD139_FNOS_VARIETY_DIR_LIST",
             "FNOS_MDB_VARIETY_DIR_LIST",
             "FNOS_VARIETY_DIR_LIST",
         ),
         CATEGORY_OTHER: (
-            "RCLONE_SRC_OTHER_DIR",
-            "RCLONE_DST_OTHER_DIR",
-            "SIXPAN_SAVE_OTHER_PATH",
-            "SIXPAN_FNOS_OTHER_PATH",
-            "SIXPAN_FNOS_OTHER_DIR_LIST",
-            "CLOUD139_TARGET_OTHER_PATH",
-            "CLOUD139_TARGET_OTHER_FOLDER_ID",
-            "CLOUD139_FNOS_OTHER_PATH",
-            "CLOUD139_FNOS_OTHER_DIR_LIST",
             "FNOS_MDB_OTHER_DIR_LIST",
             "FNOS_OTHER_DIR_LIST",
         ),
     }
-    for (
-        category_key,
-        (
-            src_env,
-            dst_env,
-            sixpan_save_env,
-            sixpan_fnos_path_env,
-            sixpan_fnos_dirs_env,
-            cloud139_path_env,
-            cloud139_folder_id_env,
-            cloud139_fnos_path_env,
-            cloud139_fnos_dirs_env,
-            fnos_dirs_env,
-            fnos_dirs_alt_env,
-        ),
-    ) in category_env_map.items():
+    for category_key, (fnos_dirs_env, fnos_dirs_alt_env) in category_env_map.items():
         category = config.setdefault("categories", {}).setdefault(category_key, {})
-        src_value = _clean_remote_dir(os.getenv(src_env))
-        dst_value = _clean_remote_dir(os.getenv(dst_env))
-        sixpan_save_value = _clean_remote_dir(os.getenv(sixpan_save_env))
-        sixpan_fnos_path_value = str(os.getenv(sixpan_fnos_path_env) or "").strip()
-        sixpan_fnos_dir_list = _env_csv(sixpan_fnos_dirs_env, [])
-        cloud139_path_value = _clean_remote_dir(os.getenv(cloud139_path_env))
-        cloud139_folder_id = str(os.getenv(cloud139_folder_id_env) or "").strip()
-        cloud139_fnos_path_value = _clean_remote_dir(os.getenv(cloud139_fnos_path_env))
-        cloud139_fnos_dir_list = _env_csv(cloud139_fnos_dirs_env, [])
         fnos_dir_list = _env_csv(fnos_dirs_env, _env_csv(fnos_dirs_alt_env, []))
-        if src_value:
-            category["quark_save_path"] = f"/{src_value}"
-        if dst_value:
-            category["mobile_target_path"] = dst_value
-        if sixpan_save_value:
-            category["sixpan_save_path"] = f"/{sixpan_save_value.strip('/')}"
-        if sixpan_fnos_path_value:
-            category["sixpan_fnos_target_path"] = sixpan_fnos_path_value
-        if sixpan_fnos_dir_list:
-            category["sixpan_fnos_dir_list"] = sixpan_fnos_dir_list
-        if cloud139_path_value:
-            category["cloud139_target_path"] = cloud139_path_value
-        if cloud139_folder_id:
-            category["cloud139_folder_id"] = cloud139_folder_id
-        if cloud139_fnos_path_value:
-            category["cloud139_fnos_target_path"] = cloud139_fnos_path_value
-        if cloud139_fnos_dir_list:
-            category["cloud139_fnos_dir_list"] = cloud139_fnos_dir_list
         if fnos_dir_list:
             category["fnos_dir_list"] = fnos_dir_list
-    cmcc_category_env_map = {
-        CATEGORY_MOVIE: ("CMCC_TARGET_MOVIE_PARENT_FILE_ID", "CMCC_TARGET_MOVIE_PARENT_PATH"),
-        CATEGORY_TV: ("CMCC_TARGET_TV_PARENT_FILE_ID", "CMCC_TARGET_TV_PARENT_PATH"),
-        CATEGORY_ANIME: ("CMCC_TARGET_ANIME_PARENT_FILE_ID", "CMCC_TARGET_ANIME_PARENT_PATH"),
-        CATEGORY_VARIETY: ("CMCC_TARGET_VARIETY_PARENT_FILE_ID", "CMCC_TARGET_VARIETY_PARENT_PATH"),
-        CATEGORY_OTHER: ("CMCC_TARGET_OTHER_PARENT_FILE_ID", "CMCC_TARGET_OTHER_PARENT_PATH"),
-    }
-    for category_key, (parent_id_env, parent_path_env) in cmcc_category_env_map.items():
-        category = config.setdefault("categories", {}).setdefault(category_key, {})
-        parent_id = str(os.getenv(parent_id_env) or "").strip()
-        parent_path = _clean_remote_dir(os.getenv(parent_path_env))
-        if parent_id:
-            category["cmcc_parent_file_id"] = parent_id
-        if parent_path:
-            category["cmcc_parent_path"] = f"/{parent_path}"
     return config
 
 
-def _clean_remote_dir(value: str | None) -> str:
-    return str(value or "").strip().strip("/")
-
-
-def _materialize_mobile_main_target(raw: dict[str, Any]) -> dict[str, Any]:
-    """把旧版 cmcc_upload / cloud139 / categories 配置物化为只读 mobile_main 目标快照。
-
-    该目标作为 storage.targets 的默认兜底，路径语义与旧 storage_paths 函数保持一致，
-    保证启用 v3 前行为零变化。
-    """
-
-    cmcc = raw.get("cmcc_upload") if isinstance(raw.get("cmcc_upload"), dict) else {}
-    cloud139 = raw.get("cloud139") if isinstance(raw.get("cloud139"), dict) else {}
-    categories = raw.get("categories") if isinstance(raw.get("categories"), dict) else {}
-    mount = normalize_storage_path(cloud139.get("fnos_mount_name") or cloud139.get("mount_name"))
-    organizer_namespace = f"openlist:{mount}" if mount else "openlist:main"
-    target: dict[str, Any] = {
-        "name": "移动云主盘",
-        "driver": "cmcc_api",
-        "enabled": True,
-        "guest_selectable": True,
-        "namespace_id": "cmcc:primary",
-        "native_ingress": ROUTE_CLOUD139_DIRECT,
-        "host": str(cmcc.get("host") or CMCC_DEFAULT_HOST),
-        "auth_mode": str(cmcc.get("auth_mode") or "web_basic"),
-        "access_token": str(cmcc.get("access_token") or ""),
-        "phone": str(cmcc.get("phone") or ""),
-        "upload_mode": str(cmcc.get("mode") or "rapid_first"),
-        "rename_mode": str(cmcc.get("rename_mode") or "auto_rename"),
-        "categories": {},
-    }
-    for category_key in CATEGORY_KEYS:
-        category = categories.get(category_key)
-        if not isinstance(category, dict):
-            continue
-        final_root = cmcc_upload_root(category, cloud139)
-        organizer_root = openlist_root_for_upload(category, backend="cmcc_api", cloud139_config=cloud139)
-        target["categories"][category_key] = {
-            "final_root": final_root,
-            "organizer_namespace_id": organizer_namespace,
-            "organizer_root": organizer_root,
-        }
-    return target
-
-
 def _ensure_storage_config(raw: dict[str, Any]) -> None:
-    """确保 raw 里存在合法的 storage 段，并物化默认 mobile_main 目标。"""
+    """Ensure the optional declarative storage section has a stable shape.
+
+    Storage targets are now created and bound through the V1 storage/account
+    services.  In particular this function must never synthesize a
+    ``mobile_main`` target from old ``cmcc_upload``/``cloud139``/category
+    settings; doing so would re-introduce a second source of truth.
+    """
 
     storage = raw.setdefault("storage", {})
     if not isinstance(storage, dict):
         storage = {}
         raw["storage"] = storage
-    targets = storage.setdefault("targets", {})
-    if not isinstance(targets, dict):
-        targets = {}
-        storage["targets"] = targets
-    if "mobile_main" not in targets:
-        targets["mobile_main"] = _materialize_mobile_main_target(raw)
-    default_target = str(storage.get("default_target") or "").strip()
-    if not default_target or default_target not in targets:
-        storage["default_target"] = "mobile_main"
     storage.setdefault("enabled", True)
-    storage.setdefault("plan_version", 3)
+    storage.setdefault("plan_version", 1)
 
 
 @dataclass(frozen=True)
@@ -1072,7 +882,16 @@ class AppConfig:
         return categories.get(category_key) or categories[CATEGORY_MOVIE]
 
     def route_config(self, source_type: str) -> dict[str, Any]:
-        return self.raw.get("routes", {}).get(source_type, {"enabled": False, "route": "unsupported"})
+        """Return a neutral route view for legacy callers.
+
+        V1 routing is persisted in the database assignment workspace and is
+        resolved by the planning layer.  The process configuration no longer
+        has a global ``routes`` section, so this accessor must never recreate
+        one or consult user-provided legacy values.
+        """
+
+        del source_type
+        return {"enabled": False, "route": "unsupported"}
 
 
 def load_config(config_path: str | os.PathLike[str] | None = None) -> AppConfig:
@@ -1096,12 +915,12 @@ def load_config(config_path: str | os.PathLike[str] | None = None) -> AppConfig:
     else:
         merged = default
 
+    _reject_removed_config_fields(merged)
     merged = _apply_env_overrides(merged)
     if not merged.get("rclone", {}).get("app_callback_url"):
         port = int(merged.get("app", {}).get("port", 5251) or 5251)
         merged.setdefault("rclone", {})["app_callback_url"] = f"http://127.0.0.1:{port}/api/callback/rclone"
 
-    normalize_sixpan_path_sources(merged, materialize_category_paths=True)
     _ensure_storage_config(merged)
 
     return AppConfig(raw=merged)

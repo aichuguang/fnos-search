@@ -11,6 +11,12 @@ from typing import Any
 from fnos_media_import.database import Database
 from fnos_media_import.organizer.run_lease import OrganizerScanLease
 from fnos_media_import.organizer.service import OrganizerService
+from tests._organizer_v1_fixtures import (
+    attach_organizer_v1_task,
+    bind_task_openlist_resolver,
+    organizer_v1_job,
+    organizer_v1_plan,
+)
 
 
 class _DatabaseTestCase(unittest.TestCase):
@@ -126,11 +132,35 @@ class OrganizerCancellationCasTests(_DatabaseTestCase):
 
 
 class OrganizerScanRevisionTests(_DatabaseTestCase):
-    def test_skip_during_scan_fences_the_old_plan_writer(self) -> None:
+    def test_skip_during_scan_is_rejected_without_invalidating_owner(self) -> None:
+        job_id, created = self.database.create_job(
+            {
+                "title": "扫描期间跳过",
+                "category": "tv",
+                "category_label": "TV",
+                "source_type": "quark",
+                "source_url": f"source-record:scan-skip-{uuid.uuid4().hex}",
+                "target_route": "native_save",
+                "target_path": "/cloud/tv",
+                "status": "waiting_organizer",
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": f"organizer-scan-skip:{uuid.uuid4().hex}",
+            }
+        )
+        self.assertTrue(created)
+        plan = organizer_v1_plan(
+            job_id,
+            category="tv",
+            organizer_root="/cloud/staging/tv/job-1",
+            destination_final="/cloud/tv",
+        )
         task_id = self.database.create_organizer_task(
+            job_id=job_id,
             category="tv",
             openlist_root_path="/cloud/staging/tv/job-1",
             status="pending",
+            raw_data=attach_organizer_v1_task({}, plan)["raw_data"],
         )
         self.assertTrue(
             self.database.claim_organizer_task_for_scan(
@@ -145,15 +175,17 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
 
         service = OrganizerService.__new__(OrganizerService)
         service.db = self.database
+        bind_task_openlist_resolver(service, None, plan)
         skipped = service.skip_task(task_id)
 
-        self.assertTrue(skipped["success"])
+        self.assertFalse(skipped["success"])
+        self.assertTrue(skipped["conflict"])
         current = self.database.get_organizer_task(task_id, include_children=False)
-        self.assertEqual(current["status"], "skipped")
-        self.assertGreater(int(current["revision"]), revision)
-        self.assertIsNone(current["scan_owner"])
-        self.assertIsNone(current["scan_lease_expires_at"])
-        self.assertFalse(
+        self.assertEqual(current["status"], "scanning")
+        self.assertEqual(int(current["revision"]), revision)
+        self.assertEqual(current["scan_owner"], "scanner-a")
+        self.assertTrue(current["scan_lease_expires_at"])
+        self.assertTrue(
             self.database.replace_organizer_plan(
                 task_id,
                 files=[{"path": "/cloud/staging/tv/job-1/stale.mkv", "name": "stale.mkv"}],
@@ -163,7 +195,7 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
                 owner_id="scanner-a",
             )
         )
-        self.assertEqual(self.database.get_organizer_task(task_id)["files"], [])
+        self.assertEqual(len(self.database.get_organizer_task(task_id)["files"]), 1)
 
     def test_expired_scan_can_be_taken_over_but_old_revision_cannot_write(self) -> None:
         task_id = self.database.create_organizer_task(
@@ -309,12 +341,35 @@ class OrganizerRunRevisionTests(_DatabaseTestCase):
 
 class OrganizerPersistedOperationRecoveryTests(_DatabaseTestCase):
     def test_retry_after_crash_reuses_done_and_pending_operation_rows(self) -> None:
+        job_id, created = self.database.create_job(
+            {
+                "title": "持久化操作恢复",
+                "category": "tv",
+                "category_label": "TV",
+                "source_type": "quark",
+                "source_url": f"source-record:operation-recovery-{uuid.uuid4().hex}",
+                "target_route": "native_save",
+                "target_path": "/cloud/tv/show",
+                "status": "waiting_organizer",
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": f"organizer-operation-recovery:{uuid.uuid4().hex}",
+            }
+        )
+        self.assertTrue(created)
+        plan = organizer_v1_plan(
+            job_id,
+            category="tv",
+            organizer_root="/cloud/staging/tv/job-4",
+            destination_final="/cloud/tv/show",
+        )
         task_id = self.database.create_organizer_task(
+            job_id=job_id,
             category="tv",
             openlist_root_path="/cloud/staging/tv/job-4",
             status="manual_confirmed",
             evidence={},
-            raw_data={},
+            raw_data=attach_organizer_v1_task({}, plan)["raw_data"],
         )
         self.assertTrue(
             self.database.replace_organizer_plan(
@@ -373,6 +428,7 @@ class OrganizerPersistedOperationRecoveryTests(_DatabaseTestCase):
             return {"type": "move", "source_path": operation["target_path"], "target_path": operation["source_path"]}
 
         service._execute_operation = execute
+        bind_task_openlist_resolver(service, None, plan)
         before = self.database.get_organizer_task(task_id)
         done_id = int(next(item for item in before["operations"] if item["status"] == "done")["id"])
         pending_id = int(next(item for item in before["operations"] if item["status"] == "pending")["id"])
@@ -540,18 +596,27 @@ class OrganizerStrmCompletionTests(unittest.TestCase):
         self.assertTrue(completion["legacy_pending_reconciled"])
         self.assertEqual(cleanup_calls, [])
 
-    def test_startup_requeues_legacy_strm_pending_state_for_immediate_reconciliation(self) -> None:
-        task = {
-            "id": 7,
-            "status": "strm_pending",
-            "raw_data": {
-                "staging_plan": {"enabled": True},
-                "strm_completion": {
-                    "status": "pending",
-                    "next_retry_at": "2000-01-01T00:00:00Z",
+    def test_startup_requeues_v1_strm_pending_state_for_immediate_reconciliation(self) -> None:
+        plan = organizer_v1_plan(
+            7,
+            category="tv",
+            organizer_root="/cloud/staging/tv/job-7",
+            destination_final="/cloud/tv",
+        )
+        job = organizer_v1_job(plan, status="organizing")
+        task = attach_organizer_v1_task(
+            {
+                "id": 7,
+                "status": "strm_pending",
+                "raw_data": {
+                    "strm_completion": {
+                        "status": "pending",
+                        "next_retry_at": "2000-01-01T00:00:00Z",
+                    },
                 },
             },
-        }
+            plan,
+        )
 
         class FakeDatabase:
             @staticmethod
@@ -559,15 +624,19 @@ class OrganizerStrmCompletionTests(unittest.TestCase):
                 del limit, offset
                 return [task] if status == "strm_pending" else []
 
+            @staticmethod
+            def get_job(_job_id: int) -> dict[str, Any]:
+                return job
+
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
-        service.organizer_config = {"enabled": True, "staging_enabled": True}
+        service.organizer_config = {"enabled": True}
         service.openlist = SimpleNamespace(configured=True)
         service._task_abort_reason = lambda *_args, **_kwargs: ""
-        service._task_has_staging_plan = lambda _task: True
         service._sync_linked_job = lambda *_args, **_kwargs: None
         scheduled: list[tuple[int, int]] = []
         service._schedule_task_after = lambda task_id, delay: scheduled.append((task_id, delay)) or True
+        bind_task_openlist_resolver(service, None, plan)
 
         service._recover_transient_scan_tasks_on_startup(include_scanning=False)
 

@@ -21,9 +21,10 @@ def test_compose_supports_release_image_and_source_build() -> None:
         "TZ": "${TZ:-Asia/Shanghai}",
         "APP_ENV": "production",
         "SECURITY_STRICT": "true",
-        "APP_SECRET_KEY": "${APP_SECRET_KEY:-}",
-        "NOTIFICATION_ENCRYPTION_KEY": "${NOTIFICATION_ENCRYPTION_KEY:-}",
         "RCLONE_WORKER_CONTROL_TOKEN": "${RCLONE_WORKER_CONTROL_TOKEN:-}",
+        "FNOS_ROOT_KEY": "${FNOS_ROOT_KEY:-}",
+        "FNOS_RELAY_ROOT": "/data/relay",
+        "FNOS_LOCAL_TARGET_ROOT": "/storage-targets",
         "FNOS_PROCESS_ROLE": "web",
         "RCLONE_WORKER_URL": "http://fnos-rclone-worker:5251",
         "LOG_FILE": "/app/logs/web.log",
@@ -37,6 +38,7 @@ def test_compose_supports_release_image_and_source_build() -> None:
     assert "${APP_CONFIG_HOST_PATH:-./config}:/app/config" in app_volumes
     assert "${APP_DATA_HOST_PATH:-./data}:/app/data" in app_volumes
     assert "${APP_LOGS_HOST_PATH:-./logs}:/app/logs" in app_volumes
+    assert "${FNOS_RELAY_HOST_PATH:-./rclone/relay}:/data/relay" in app_volumes
     assert "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp" not in app_volumes
     assert not any("docker.sock" in value for value in app_volumes)
 
@@ -51,6 +53,7 @@ def test_compose_supports_release_image_and_source_build() -> None:
         "${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone",
         "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp",
         "${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache",
+        "${FNOS_RELAY_HOST_PATH:-./rclone/relay}:/data/relay",
     } <= {str(value) for value in rclone["volumes"]}
     assert all(
         "docker.sock" not in str(volume)
@@ -92,7 +95,8 @@ def test_optional_env_example_only_exposes_common_user_settings() -> None:
         "RCLONE_CONFIG_HOST_PATH",
         "RCLONE_CACHE_HOST_PATH",
         "RCLONE_TEMP_HOST_PATH",
-        "RCLONE_WORKER_CONTROL_TOKEN",
+        "FNOS_ROOT_KEY",
+        "FNOS_RELAY_HOST_PATH",
         "RCLONE_LOCAL_STORAGE_HOST_PATH",
     }
 
@@ -116,9 +120,12 @@ def test_data_mount_persists_database_and_generated_secrets() -> None:
     app_source = (ROOT / "fnos_media_import" / "app.py").read_text(encoding="utf-8")
 
     assert '"database_path": "data/app.db"' in config_source
-    assert '"/app/data/.secrets/notification_encryption_key"' in entrypoint_source
     assert '"/app/data/.secrets/rclone_worker_control_token"' in entrypoint_source
-    assert 'db.set_app_settings({"app.secret_key": generated})' in app_source
+    assert "_validate_root_key()" in entrypoint_source
+    assert "NOTIFICATION_ENCRYPTION_KEY" not in entrypoint_source
+    assert "app_session_key = derive_key(root_key, PURPOSE_APP_SESSION).hex()" in app_source
+    assert "app.secret_key = app_session_key" in app_source
+    assert 'db.set_app_settings({"app.secret_key": generated})' not in app_source
 
 
 def test_runtime_image_contains_rclone_without_docker_cli() -> None:

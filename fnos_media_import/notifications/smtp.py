@@ -68,7 +68,7 @@ def send_email(
         raise SmtpPermanentError("发件人地址未配置")
     if username and bool(config.get("_password_resolution_failed")):
         raise SmtpPermanentError(
-            "SMTP 密码无法解密；当前 NOTIFICATION_ENCRYPTION_KEY 与保存密码时使用的密钥不一致，请重新输入 SMTP 授权码并保存"
+            "SMTP 密码无法解密；当前 FNOS_ROOT_KEY 与保存密码时使用的根密钥不一致，请重新输入 SMTP 授权码并保存"
         )
     if username and not password:
         raise SmtpPermanentError("SMTP 密码或授权码未配置")

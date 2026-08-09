@@ -99,8 +99,10 @@ def detect_link(url: str, routes: dict | None = None, password: str = "") -> Lin
     supported = _as_bool(route_config.get("enabled", False))
     if route_config.get("route"):
         route = route_config["route"]
-    if not supported and source_type == SOURCE_QUARK and not route_config:
-        # 默认第一版支持 Quark，允许单元测试和默认配置直接工作。
+    if not supported and source_type in {SOURCE_QUARK, SOURCE_CLOUD189} and not route_config:
+        # V1 路由由 Provider 账号与管理员 assignment 决定，不再依赖已删除的
+        # 全局 routes 配置。Quark 与天翼均已有内置 Provider 实现；这里将
+        # ``supported`` 表示为“存在实现”，账号不可用则由详情/提交预检失败关闭。
         supported = True
 
     if source_type == SOURCE_UNKNOWN:

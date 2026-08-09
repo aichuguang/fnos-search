@@ -15,7 +15,6 @@ def create_media_blueprint(context: MediaRouteContext) -> Blueprint:
         ("/api/admin/media/running", "running", "GET"),
         ("/api/admin/media/refresh-logs", "refresh_logs", "GET"),
         ("/api/admin/media/refresh", "admin_refresh", "POST"),
-        ("/api/media/refresh", "legacy_refresh", "POST"),
     ]
     for rule, endpoint, method in routes:
         blueprint.add_url_rule(rule, endpoint=endpoint, view_func=context.admin_required(context.handlers[endpoint]), methods=[method])

@@ -69,11 +69,11 @@ class SchemaUpgradeCompatibilityTests(unittest.TestCase):
                         applied_at TEXT NOT NULL
                     );
                     INSERT INTO schema_migrations(version, name, applied_at)
-                    VALUES (23, 'future_schema', '2026-01-01T00:00:00Z');
+                    VALUES (28, 'future_schema', '2026-01-01T00:00:00Z');
                     """
                 )
 
-            with self.assertRaisesRegex(RuntimeError, "v23.*v22"):
+            with self.assertRaisesRegex(RuntimeError, "v28.*v27"):
                 Database(database_path).init_schema()
 
             with closing(sqlite3.connect(database_path)) as connection:
@@ -81,6 +81,141 @@ class SchemaUpgradeCompatibilityTests(unittest.TestCase):
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'import_jobs'"
                 ).fetchone()
             self.assertIsNone(import_jobs)
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                path = Path(f"{database_path}{suffix}")
+                if path.exists():
+                    path.unlink()
+
+    def test_provider_auth_session_polling_migration_adds_row_version(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        database_path = root / f"schema-auth-session-cas-{uuid.uuid4().hex}.db"
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at TEXT NOT NULL
+                    );
+                    CREATE TABLE provider_auth_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        provider_kind TEXT NOT NULL,
+                        auth_method TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        state_ciphertext BLOB NOT NULL,
+                        credential_key_id TEXT NOT NULL,
+                        public_json TEXT NOT NULL DEFAULT '{}',
+                        message TEXT NOT NULL DEFAULT '',
+                        account_id TEXT,
+                        expires_at TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                    [
+                        (version, f"applied_{version}", "2026-01-01T00:00:00Z")
+                        for version in range(1, 27)
+                    ],
+                )
+                connection.commit()
+
+            database = Database(database_path)
+            with patch.object(database, "_backup_before_pending_migrations"):
+                database.init_schema()
+            with closing(sqlite3.connect(database_path)) as connection:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(provider_auth_sessions)"
+                    )
+                }
+                migration = connection.execute(
+                    "SELECT name FROM schema_migrations WHERE version=27"
+                ).fetchone()
+            self.assertIn("row_version", columns)
+            self.assertEqual(("provider_auth_session_cas",), migration)
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                path = Path(f"{database_path}{suffix}")
+                if path.exists():
+                    path.unlink()
+
+    def test_init_schema_upgrades_legacy_rclone_runs_before_creating_v1_indexes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        database_path = root / f"schema-rclone-v1-upgrade-{uuid.uuid4().hex}.db"
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE rclone_runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        trigger_reason TEXT,
+                        status TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        finished_at TEXT,
+                        exit_code INTEGER,
+                        error_message TEXT
+                    );
+
+                    CREATE TABLE provider_auth_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        provider_kind TEXT NOT NULL,
+                        auth_method TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        state_ciphertext BLOB NOT NULL,
+                        credential_key_id TEXT NOT NULL,
+                        public_json TEXT NOT NULL DEFAULT '{}',
+                        message TEXT NOT NULL DEFAULT '',
+                        account_id TEXT,
+                        expires_at TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                    [
+                        (version, f"legacy_{version}", "2026-01-01T00:00:00Z")
+                        for version in range(1, 26)
+                    ],
+                )
+                connection.commit()
+
+            database = Database(database_path)
+            with patch.object(database, "_backup_before_pending_migrations"):
+                database.init_schema()
+                database.init_schema()
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(rclone_runs)")
+                }
+                indexes = {
+                    row[1] for row in connection.execute("PRAGMA index_list(rclone_runs)")
+                }
+                migration = connection.execute(
+                    "SELECT name FROM schema_migrations WHERE version=26"
+                ).fetchone()
+
+            self.assertTrue(
+                {"operation_key", "job_id", "copy_descriptor_json", "updated_at"}
+                <= columns
+            )
+            self.assertIn("idx_rclone_runs_operation_key", indexes)
+            self.assertIn("idx_rclone_runs_job_status", indexes)
+            self.assertEqual(("v1_scoped_rclone_runs",), migration)
         finally:
             for suffix in ("", "-wal", "-shm"):
                 path = Path(f"{database_path}{suffix}")

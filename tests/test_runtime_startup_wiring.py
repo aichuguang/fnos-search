@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from fnos_media_import.services.rclone_service import RcloneService
@@ -54,6 +55,51 @@ class RcloneStartupRecoveryActivationTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(attempts, 2)
+
+
+class RuntimeCompositionSourceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = (
+            Path(__file__).resolve().parents[1] / "fnos_media_import" / "app.py"
+        ).read_text(encoding="utf-8")
+
+    def test_v1_rclone_locator_is_shared_and_hot_reloaded_in_place(self) -> None:
+        start = self.source.index("locator_config = rclone_runtime_config(app_config)")
+        end = self.source.index("transfer_recovery_scanner =", start)
+        startup = self.source[start:end]
+        reload_start = self.source.index(
+            "locator_runtime_config = rclone_runtime_config(app_config)", end
+        )
+        reload_end = self.source.index(
+            "v1_transfer_dispatch.set_organizer_service", reload_start
+        )
+        reload_block = self.source[reload_start:reload_end]
+
+        self.assertIn(
+            "v1_rclone_locator = RcloneLocatorResolver(locator_config)", startup
+        )
+        self.assertIn("v1_rclone_locator.bind_revision_services(", startup)
+        self.assertIn("rclone_service.set_v1_locator_resolver(", startup)
+        self.assertIn("locator_resolver=v1_rclone_locator", startup)
+        self.assertIn(
+            "v1_rclone_locator.update_config(locator_runtime_config)", reload_block
+        )
+        self.assertNotIn("RcloneLocatorResolver(locator_runtime_config)", reload_block)
+
+    def test_v1_master_key_fails_closed_without_empty_key_fallback(self) -> None:
+        startup_start = self.source.index("root_key = master_key_from_env()")
+        startup_end = self.source.index("active_process_role =", startup_start)
+        startup_block = self.source[startup_start:startup_end]
+        provider_start = self.source.index("def _v1_master_key() -> bytes:")
+        provider_end = self.source.index("v1_accounts_service =", provider_start)
+        provider_block = self.source[provider_start:provider_end]
+
+        self.assertIn("raise RuntimeError(", startup_block)
+        self.assertIn("return root_key", provider_block)
+        self.assertNotIn('return b""', startup_block + provider_block)
+        self.assertNotIn("return b''", startup_block + provider_block)
+        self.assertNotIn("\n    _v1_master_key()\n", provider_block)
 
 
 class RuntimeOrganizerTransitionTests(unittest.TestCase):
@@ -161,7 +207,7 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
         )
         new_config = SimpleNamespace(
             raw={
-                "app": {"secret_key": "change-me-in-production"},
+                "app": {},
                 "update_scheduler": {},
                 "hot_discovery": {},
                 "rclone": {},
@@ -218,9 +264,11 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
         self.assertNotIn("suspend", events)
         self.assertNotIn("activate", events)
         self.assertNotIn("retire", events)
-        self.assertEqual(result.config.raw["app"]["secret_key"], "persisted-runtime-secret")
+        self.assertNotIn("secret_key", result.config.raw["app"])
         self.assertEqual(result.config.raw["security"]["ip_hash_salt"], "persisted-ip-salt")
-        self.assertEqual(rclone_apply_args[-1][-1], {"targets": {"mobile_backup": {"driver": "cmcc_api"}}})
+        # V1 runtime reload must not re-introduce the removed global storage
+        # registry, even when a stale in-memory config object still contains it.
+        self.assertEqual(rclone_apply_args[-1][-1], {})
 
 
 if __name__ == "__main__":

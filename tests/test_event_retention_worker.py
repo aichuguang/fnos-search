@@ -7,6 +7,9 @@ from pathlib import Path
 
 from fnos_media_import.database import Database
 from fnos_media_import.services.event_retention_worker import EventRetentionWorker
+from fnos_media_import.transfer.execution_repository import TransferExecutionRepository
+
+from tests._rclone_v1_fixtures import rclone_v1_job, rclone_v1_plan
 
 
 OLD_TIMESTAMP = "2000-01-01T00:00:00Z"
@@ -139,22 +142,28 @@ class EventRetentionWorkerTests(unittest.TestCase):
     def test_preserves_unmatched_file_event_that_can_recover_active_job(self) -> None:
         active_job_id = self._insert_job("waiting_transfer", "unmatched")
         job_root = f"/媒体/电视剧/job-{active_job_id}"
+        plan = rclone_v1_plan(
+            active_job_id,
+            category="tv",
+            staging_root="/媒体/电视剧",
+        )
+        job = rclone_v1_job(plan, status="waiting_transfer")
+        TransferExecutionRepository(self.database).create(
+            active_job_id,
+            plan,
+            phase="transferring",
+        )
         with self.database.connect() as connection:
             connection.execute(
-                "UPDATE import_jobs SET target_path = ?, raw_data = ? WHERE id = ?",
+                """
+                UPDATE import_jobs
+                SET target_path = ?, raw_data = ?, plan_version = 1, destination_id = ?
+                WHERE id = ?
+                """,
                 (
                     job_root,
-                    json.dumps(
-                        {
-                            "staging_plan": {
-                                "enabled": True,
-                                "job_id": active_job_id,
-                                "provider_target_path": job_root,
-                                "openlist_job_root": job_root,
-                            }
-                        },
-                        ensure_ascii=False,
-                    ),
+                    json.dumps(job["raw_data"], ensure_ascii=False),
+                    job["destination_id"],
                     active_job_id,
                 ),
             )

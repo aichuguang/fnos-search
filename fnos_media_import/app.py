@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -29,11 +30,18 @@ from flask import Flask, jsonify, redirect, render_template, request, session
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
 from .classifiers.link_classifier import detect_link
+from .accounts.crypto import (
+    MasterKeyError,
+    PURPOSE_APP_SESSION,
+    derive_key,
+    master_key_from_env,
+)
 from .config import load_config
 from .config_persistence import (
     ADVANCED_CONFIG_KEY,
     advanced_config_response,
     apply_persisted_config,
+    migrate_persisted_advanced_config_setting,
     normalize_advanced_config_payload,
 )
 from .content_guard import BT_SOURCE_TYPES, evaluate_submission_content_risk
@@ -59,22 +67,19 @@ from .importers.generic import GenericWebhookImporter
 from .importers.quark import QuarkImporter
 from .importers.sixpan import SixPanOfflineImporter
 from .media.fnos import FnosMediaRefresher
-from .blueprints import AdaptersRouteContext, AdminShellRouteContext, AuthRouteContext, CallbackRouteContext, CloudCompatRouteContext, DiagnosticsRouteContext, JobsRouteContext, LegacyApiRouteContext, MediaRouteContext, OrganizerRouteContext, PublicRouteContext, RcloneRouteContext, RcloneWorkerControlContext, RequestsRouteContext, SettingsRouteContext, SixPanRouteContext, SystemRouteContext, UpdatesRouteContext, create_adapters_blueprint, create_admin_shell_blueprint, create_auth_blueprint, create_callbacks_blueprint, create_cloud_compat_blueprint, create_diagnostics_blueprint, create_jobs_blueprint, create_legacy_api_blueprint, create_media_blueprint, create_organizer_blueprint, create_public_blueprint, create_rclone_blueprint, create_rclone_worker_control_blueprint, create_requests_blueprint, create_settings_blueprint, create_sixpan_blueprint, create_system_blueprint, create_updates_blueprint, preserve_legacy_endpoints
-from .organizer.openlist_client import VIDEO_EXTENSIONS
-from .organizer.service import OrganizerService
+from .blueprints import AdaptersRouteContext, AdminShellRouteContext, AuthRouteContext, CallbackRouteContext, DiagnosticsRouteContext, JobsRouteContext, MediaRouteContext, OrganizerRouteContext, PublicRouteContext, RcloneRouteContext, RcloneWorkerControlContext, RequestsRouteContext, SettingsRouteContext, SixPanRouteContext, SystemRouteContext, UpdatesRouteContext, create_adapters_blueprint, create_admin_shell_blueprint, create_auth_blueprint, create_callbacks_blueprint, create_diagnostics_blueprint, create_jobs_blueprint, create_media_blueprint, create_organizer_blueprint, create_public_blueprint, create_rclone_blueprint, create_rclone_worker_control_blueprint, create_requests_blueprint, create_settings_blueprint, create_sixpan_blueprint, create_system_blueprint, create_updates_blueprint
+from .organizer.openlist_client import VIDEO_EXTENSIONS, OpenListClient
+from .organizer.service import OrganizerService, build_frozen_openlist_client_resolver
 from .providers.btbtla import BtbtlaClient
 from .providers.hot_sources import IqiyiHotSource, TencentHotSource, YoukuHotSource
 from .services.import_service import ImportService
 from .services.import_staging_service import (
     map_execution_path_to_organizer,
-    map_staging_path_to_openlist,
-    staging_plan_from_job,
 )
 from .services.job_service import JobService
 from .services.rclone_service import RcloneService
 from .services.rclone_webdav_config_service import RcloneWebdavConfigError, RcloneWebdavConfigService
 from .services.rclone_worker_client import RcloneWorkerClient, RcloneWorkerRequestError
-from .storage_paths import map_upload_path_to_openlist, openlist_root_for_upload, upload_backend
 from .services.rclone_history_repair_worker import RcloneHistoryRepairWorker
 from .services.rclone_worker_runtime import RcloneWorkerRuntime
 from .services.search_cache_maintenance_worker import SearchCacheMaintenanceWorker
@@ -86,6 +91,7 @@ from .services.public_submission_service import PublicSubmissionDependencies, Pu
 from .services.guest_request_admin_service import GuestRequestAdminDependencies, GuestRequestAdminService
 from .services.job_admin_query_service import JobAdminQueryDependencies, JobAdminQueryService
 from .services.job_admin_command_service import JobAdminCommandDependencies, JobAdminCommandService
+from .services.import_job_service import V1PlanningError
 from .services.job_cancellation_service import JobCancellationDependencies, JobCancellationService
 from .services.request_review_command_service import RequestReviewCommandDependencies, RequestReviewCommandService
 from .services.request_approval_service import RequestApprovalDependencies, RequestApprovalService
@@ -110,7 +116,6 @@ from .services.external_diagnostics_service import ExternalDiagnosticsDependenci
 from .services.btbtla_proxy_diagnostics_service import BtbtlaProxyDiagnosticsService
 from .services.public_resource_service import PublicResourceDependencies, PublicResourceService
 from .services.settings_service import SettingsDependencies, SettingsService
-from .services.storage_target_probe_service import StorageTargetProbeService
 from .repositories.admin_profile_repository import AdminProfileRepository
 from .services.search_service import SearchService
 from .services.update_scheduler import UpdateScheduler
@@ -123,8 +128,7 @@ from .services.sixpan_offline_sync_service import SixPanOfflineSyncService
 from .services.import_completion_dispatcher import ImportCompletionDispatcher
 from .services.import_planner import (
     execution_plan_from_job,
-    resolve_destination_id,
-    validate_public_destination,
+    validated_execution_plan_from_job,
 )
 from .services.organizer_dispatch_service import OrganizerDispatchService
 from .services.job_completion_info_service import JobCompletionInfoService
@@ -161,9 +165,10 @@ from .services.public_bt_resolve_service import PublicBtResolveService
 from .services.public_sixpan_preview_service import PublicSixpanPreviewService
 from .services.update_service import UpdateService
 from .runtime import RuntimeServices, RuntimeSnapshot, install_request_runtime
-from .process_role import legacy_deployment_layout, resolve_process_role, role_runs
+from .process_role import resolve_process_role, role_runs
 from .runtime_builder import RuntimeBuilder, RuntimeRetirementQueue, rclone_runtime_config
 from .blueprints.trending import TrendingRouteContext, create_trending_blueprint
+from .transfer.recovery import TransferRecoveryRuntime, TransferRecoveryScanner
 
 # --- 兼容 re-export：以下纯 helper 的实现已迁至 media_serializers / path_planning /
 # public_web / web_input 四个模块，这里保留名字供 create_app 闭包与外部测试导入。 ---
@@ -249,6 +254,7 @@ from .public_web import (
     _safe_public_cloud139_selection,
     _safe_public_quark_selection,
     _safe_public_sixpan_selection,
+    _safe_public_tianyi_selection,
     _safe_public_string_list,
     _safe_search_preview,
     _short_text,
@@ -256,6 +262,7 @@ from .public_web import (
     _sixpan_media_type,
     _sixpan_parse_file_item,
     _sixpan_parse_summary,
+    _tianyi_inspection_summary,
     _submission_mode,
     _verify_password_hash,
     _verify_public_captcha,
@@ -266,7 +273,6 @@ from .web_input import (
     _config_bool,
     _config_int,
     _csv_values,
-    _default_secret_key,
     _extract_url_candidate,
     _limited_text,
     _merge_raw_data,
@@ -307,7 +313,6 @@ __all__ = [
     "_config_bool",
     "_config_int",
     "_csv_values",
-    "_default_secret_key",
     "_detail_capability_for_source",
     "_elapsed_ms",
     "_extract_file_rows",
@@ -378,6 +383,7 @@ __all__ = [
     "_safe_public_cloud139_selection",
     "_safe_public_quark_selection",
     "_safe_public_sixpan_selection",
+    "_safe_public_tianyi_selection",
     "_safe_public_string_list",
     "_safe_search_preview",
     "_safe_virtual_segment",
@@ -389,6 +395,7 @@ __all__ = [
     "_sixpan_media_type",
     "_sixpan_parse_file_item",
     "_sixpan_parse_summary",
+    "_tianyi_inspection_summary",
     "_sixpan_scan_filters_from_job",
     "_strict_security_enabled",
     "_strip_virtual_prefix",
@@ -497,25 +504,6 @@ def _install_file_log_handler(root_logger: logging.Logger, base_dir: Path) -> No
                         pass
             except (OSError, ValueError):
                 continue
-
-
-def _resolve_secret_key(config_value: str, db: Database) -> str:
-    """解析应用签名密钥：显式配置优先；否则用 DB 持久化的随机 key；都没有则生成并持久化。
-
-    默认值 change-me-in-production 是公开已知的，会让攻击者可伪造签名 session 提权
-    admin，因此弱默认值一律替换为随机 key（持久化到 app_settings，重启保持稳定）。
-    """
-    configured = str(config_value or "").strip()
-    if configured and not _default_secret_key(configured):
-        return configured
-    settings = db.get_app_settings() if callable(getattr(db, "get_app_settings", None)) else {}
-    persisted = str((settings or {}).get("app.secret_key") or "").strip()
-    if persisted and not _default_secret_key(persisted):
-        return persisted
-    generated = secrets.token_hex(32)
-    if callable(getattr(db, "set_app_settings", None)):
-        db.set_app_settings({"app.secret_key": generated})
-    return generated
 
 
 def _hot_title_key(value: Any) -> str:
@@ -640,7 +628,16 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     app_config = load_config(config_path)
-    deployment_degraded = legacy_deployment_layout(process_role)
+    try:
+        root_key = master_key_from_env()
+    except MasterKeyError as exc:
+        raise RuntimeError(
+            "FNOS_ROOT_KEY 未配置或无效；无法启动应用"
+        ) from exc
+    # Flask sessions use a purpose-isolated key derived from the one required
+    # application root key.  It is intentionally never persisted or accepted
+    # through YAML/environment compatibility fields.
+    app_session_key = derive_key(root_key, PURPOSE_APP_SESSION).hex()
     active_process_role = resolve_process_role(process_role)
     process_owner_id = f"{os.getenv('HOSTNAME') or os.getenv('COMPUTERNAME') or 'host'}:{os.getpid()}:{secrets.token_hex(6)}"
     db = Database(app_config.database_path)
@@ -653,36 +650,84 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         _verify_password_hash,
     )
     db.init_schema()
-    app_config = apply_persisted_config(app_config, db.get_app_settings())
+    persisted_settings, removed_advanced_paths = migrate_persisted_advanced_config_setting(db)
+    if removed_advanced_paths:
+        logging.getLogger(__name__).warning(
+            "已自动清理数据库中的旧版高级配置字段：%s",
+            "、".join(removed_advanced_paths[:20]),
+        )
+    app_config = apply_persisted_config(app_config, persisted_settings)
 
     def _store_sixpan_tokens(tokens: dict[str, Any]) -> bool:
         access_token = str(tokens.get("access_token") or "").strip()
         refresh_token = str(tokens.get("refresh_token") or "").strip()
         if not access_token and not refresh_token:
             return False
-
-        def merge_tokens(current: Any, _existed: bool) -> dict[str, Any]:
-            stored = json.loads(json.dumps(current, ensure_ascii=False)) if isinstance(current, dict) else {}
-            sixpan_config = stored.setdefault("sixpan", {})
-            if not isinstance(sixpan_config, dict):
-                sixpan_config = {}
-                stored["sixpan"] = sixpan_config
-            if access_token:
-                sixpan_config["access_token"] = access_token
-            if refresh_token:
-                sixpan_config["refresh_token"] = refresh_token
-            return stored
-
-        atomic_update = getattr(db, "update_app_setting_atomic", None)
-        if callable(atomic_update):
-            atomic_update(ADVANCED_CONFIG_KEY, merge_tokens)
-        else:  # pragma: no cover - Database always supports the atomic path
-            settings = db.get_app_settings()
-            current = settings.get(ADVANCED_CONFIG_KEY) if isinstance(settings.get(ADVANCED_CONFIG_KEY), dict) else {}
-            db.set_app_settings({ADVANCED_CONFIG_KEY: merge_tokens(current, ADVANCED_CONFIG_KEY in settings)})
+        # Token refreshes are Provider account revisions, never an advanced
+        # config patch.  The account service is wired later in this function;
+        # this callback is only invoked after runtime construction completes.
+        service = v1_accounts_service
+        if service is None:
+            return False
+        selection = service.get_selection("sixpan")
+        if selection is None:
+            return False
+        credentials = {}
+        if access_token:
+            credentials["access_token"] = access_token
+        if refresh_token:
+            credentials["refresh_token"] = refresh_token
+        service.refresh_runtime_credentials(
+            selection.account_id,
+            credentials,
+            expected_revision=selection.account_revision,
+        )
         return True
 
-    runtime_builder = RuntimeBuilder(db, _store_sixpan_tokens, owner_id=process_owner_id)
+    def _resolve_active_quark_importer() -> Any:
+        """Resolve the active Quark account at request/worker time.
+
+        Runtime builds happen before the V1 account services are fully wired
+        in this composition root.  A lazy closure lets the initial and hot
+        reloaded runtimes share the same DB-backed resolver without ever
+        reading the removed global ``quark`` cookie section.
+        """
+
+        service = v1_accounts_service
+        if service is None:
+            raise RuntimeError("夸克 Provider 账号服务尚未装配")
+        selection = service.get_selection("quark")
+        if selection is None:
+            raise RuntimeError("当前夸克账号未配置或未激活")
+        context = service.resolve_account_context(selection.account_id, selection.account_revision)
+        values = {
+            **dict(context.get("config") or {}),
+            **dict(context.get("credentials") or {}),
+        }
+        revision_state = {"value": int(selection.account_revision)}
+        revision_lock = threading.Lock()
+
+        def _persist_quark_cookie(patch: dict[str, Any]) -> bool:
+            with revision_lock:
+                updated = service.refresh_runtime_credentials(
+                    selection.account_id,
+                    patch,
+                    expected_revision=revision_state["value"],
+                )
+                revision_state["value"] = int(updated.current_revision)
+            return True
+
+        return QuarkImporter(
+            values,
+            cookie_update_callback=_persist_quark_cookie,
+        )
+
+    runtime_builder = RuntimeBuilder(
+        db,
+        _store_sixpan_tokens,
+        owner_id=process_owner_id,
+        quark_resolver=_resolve_active_quark_importer,
+    )
     runtime_build = runtime_builder.build(
         app_config,
         recover_background=role_runs(active_process_role, "worker"),
@@ -702,7 +747,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     organizer_service = runtime_build.organizer_service
     btbtla_proxy_diagnostics_service = BtbtlaProxyDiagnosticsService(
         current_config=lambda: app_config.raw.get("btbtla", {}),
-        current_routes=lambda: app_config.raw.get("routes", {}),
+        # Provider/source routing is V1 catalog data, not a mutable YAML
+        # ``routes`` section.  The legacy section is rejected at load time;
+        # keep low-level diagnostics on the neutral built-in classifier map.
+        current_routes=lambda: {},
     )
 
     job_service = JobService(db)
@@ -712,9 +760,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         app_config.raw["fnos"],
         db=db,
         categories=app_config.categories,
-        cmcc_upload_config=app_config.raw.get("cmcc_upload", {}),
-        cloud139_config=app_config.raw.get("cloud139", {}),
-        storage_config=app_config.raw.get("storage", {}),
+        # Credentials, mounts and targets are resolved from the V1 database
+        # graph.  These constructor slots are retained only for non-secret
+        # runtime tuning; never repopulate them from removed global sections.
+        cmcc_upload_config={},
+        cloud139_config={},
+        storage_config={},
         owner_id=process_owner_id,
         scheduler_allowed=role_runs(active_process_role, "worker"),
     )
@@ -775,8 +826,9 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     if _config_bool(hot_config, "iqiyi_enabled", True):
         iqiyi_device_id = str(hot_config.get("iqiyi_device_id") or "").strip()
         if not iqiyi_device_id:
-            app_secret = str((app_config.raw.get("app", {}) or {}).get("secret_key") or "")
-            iqiyi_device_id = hashlib.sha256(f"{app_secret}:{process_owner_id.split(':', 1)[0]}".encode("utf-8")).hexdigest()[:32]
+            iqiyi_device_id = hashlib.sha256(
+                f"{app_session_key}:{process_owner_id.split(':', 1)[0]}".encode("utf-8")
+            ).hexdigest()[:32]
         hot_sources.append(
             IqiyiHotSource(
                 {
@@ -1143,6 +1195,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         rclone_service=rclone_controller,
         category=lambda key: app_config.category(key) if key in app_config.categories else {},
         enqueue_organizer=lambda result, reason: _enqueue_organizer_from_completed_import(result, reason),
+        # Every completion path (native, relay and rclone) enters the same
+        # durable V1 transfer queue.  The execution repository is attached
+        # below once the V1 transfer composition root has been built.
+        enqueue_transfer=worker_task_dispatcher.import_transfer_execute,
     )
 
     def _start_rclone_for_job(job: dict[str, Any], reason: str) -> dict[str, Any] | None:
@@ -1161,8 +1217,15 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     def _organizer_plan_for_rclone_completed_item(item: dict[str, Any]) -> dict[str, Any] | None:
         job = item.get("job") if isinstance(item.get("job"), dict) else {}
-        staging_plan = staging_plan_from_job(job)
-        execution_plan = execution_plan_from_job(job)
+        try:
+            execution_plan = validated_execution_plan_from_job(
+                job,
+                execution_repository=getattr(
+                    app.extensions.get("v1_transfer_dispatch"), "executions", None
+                ),
+            )
+        except Exception:
+            return None
         category_key = str(item.get("category") or job.get("category") or "").strip()
         category = app_config.category(category_key) if category_key in app_config.categories else {}
         update_payload_extra = _update_organizer_payload_extra(job)
@@ -1186,7 +1249,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         openlist_transport_paths = [
             path
             for path in (
-                _map_category_path_to_openlist(path, category, staging_plan, execution_plan)
+                _map_category_path_to_openlist(path, category, execution_plan)
                 for path in target_paths
             )
             if path
@@ -1194,7 +1257,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         openlist_target_paths = [
             path
             for path in (
-                _map_category_path_to_openlist(path, category, staging_plan, execution_plan)
+                _map_category_path_to_openlist(path, category, execution_plan)
                 for path in video_target_paths
             )
             if path
@@ -1222,10 +1285,11 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             else {},
         )
         postprocess = execution_plan.get("postprocess") if isinstance(execution_plan.get("postprocess"), dict) else {}
+        execution_paths = execution_plan.get("paths") if isinstance(execution_plan.get("paths"), dict) else {}
+        final_ref = execution_paths.get("destination_final") if isinstance(execution_paths.get("destination_final"), dict) else {}
         category_openlist_root = (
             str(postprocess.get("organizer_final_root") or "").strip()
-            or str(staging_plan.get("openlist_final_category_root") or "").strip()
-            or _rclone_category_openlist_root(category)
+            or str(final_ref.get("path") or "").strip()
         )
         target_plan = _rclone_organizer_target_plan(category_openlist_root, preferred_root)
         return {
@@ -1242,7 +1306,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 "transport_file_count": len(_dedupe_strings(target_paths)),
                 "video_file_count": len(expected_target_paths),
                 "scan_filters": scan_filters,
-                "staging_plan": staging_plan,
                 "execution_plan": execution_plan,
                 **target_plan,
             },
@@ -1256,14 +1319,22 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     def _rclone_completed_openlist_root(category_key: str, category: dict[str, Any], item: dict[str, Any], *, preferred_root: str = "") -> str:
         job = item.get("job") if isinstance(item.get("job"), dict) else {}
-        staging_plan = staging_plan_from_job(job)
-        execution_plan = execution_plan_from_job(job)
+        try:
+            execution_plan = validated_execution_plan_from_job(
+                job,
+                execution_repository=getattr(
+                    app.extensions.get("v1_transfer_dispatch"), "executions", None
+                ),
+            )
+        except Exception:
+            return ""
         execution_paths = execution_plan.get("paths") if isinstance(execution_plan.get("paths"), dict) else {}
         organizer_ref = execution_paths.get("organizer") if isinstance(execution_paths.get("organizer"), dict) else {}
         execution_root = _safe_openlist_path(organizer_ref.get("path"))
         if execution_root:
             return execution_root
-        staged_job_root = _safe_openlist_path(staging_plan.get("openlist_job_root"))
+        staging_ref = execution_paths.get("destination_staging") if isinstance(execution_paths.get("destination_staging"), dict) else {}
+        staged_job_root = _safe_openlist_path(staging_ref.get("path"))
         if staged_job_root:
             return staged_job_root
         target_paths = [str(value or "").strip() for value in (item.get("target_paths") or []) if str(value or "").strip()]
@@ -1272,11 +1343,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         mapped_roots = []
         for target_path in target_paths:
             root = organizer_service._root_path_from_target(category_key, target_path)  # noqa: SLF001
-            mapped = _map_category_path_to_openlist(root, category, staging_plan, execution_plan)
+            mapped = _map_category_path_to_openlist(root, category, execution_plan)
             if mapped:
                 mapped_roots.append(mapped)
         common_root = _safe_openlist_path(_common_virtual_path(mapped_roots))
-        category_root = _rclone_category_openlist_root(category)
+        final_ref = execution_paths.get("destination_final") if isinstance(execution_paths.get("destination_final"), dict) else {}
+        category_root = _safe_openlist_path(final_ref.get("path"))
         preferred = _resource_root_for_import_mount(preferred_root, category_root) or _safe_openlist_path(preferred_root)
         if preferred and (not common_root or _same_virtual_path(common_root, category_root)):
             return preferred
@@ -1287,36 +1359,20 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def _map_category_path_to_openlist(
         path: str,
         category: dict[str, Any],
-        staging_plan: dict[str, Any] | None = None,
         execution_plan: dict[str, Any] | None = None,
     ) -> str:
+        del category
         value = _safe_openlist_path(path)
         if not value:
             return ""
         execution = execution_plan if isinstance(execution_plan, dict) else {}
-        if execution:
-            return _safe_openlist_path(map_execution_path_to_organizer(value, execution))
-        staged = _safe_openlist_path(map_staging_path_to_openlist(value, staging_plan))
-        if staged:
-            return staged
-        if _is_quark_staging_path(value, category):
+        if not execution:
             return ""
-        return _safe_openlist_path(
-            map_upload_path_to_openlist(
-                value,
-                category,
-                backend=upload_backend(rclone_service.config, rclone_service.cmcc_upload_config),
-                cloud139_config=rclone_service.cloud139_config,
-            )
-        )
+        return _safe_openlist_path(map_execution_path_to_organizer(value, execution))
 
     def _rclone_category_openlist_root(category: dict[str, Any]) -> str:
-        root = openlist_root_for_upload(
-            category,
-            backend=upload_backend(rclone_service.config, rclone_service.cmcc_upload_config),
-            cloud139_config=rclone_service.cloud139_config,
-        )
-        return _safe_openlist_path(root) or _category_openlist_root(category)
+        del category
+        return ""
 
     def _safe_openlist_path(value: Any) -> str:
         text = str(value or "").replace("\\", "/").strip()
@@ -1329,11 +1385,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return "/" + normalized
 
     def _category_openlist_root(category: dict[str, Any]) -> str:
-        for key in ("openlist_root_path", "cloud139_fnos_target_path", "mobile_openlist_root_path", "mobile_target_path", "sixpan_fnos_target_path"):
-            value = _safe_openlist_path(category.get(key))
-            if value:
-                return value
-        return _safe_openlist_path(category.get("label"))
+        del category
+        return ""
 
     def _same_virtual_path(left: Any, right: Any) -> bool:
         left_norm = _normalize_virtual_compare(left)
@@ -1413,7 +1466,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return normalized_path == normalized_root or normalized_path.startswith(f"{normalized_root}/")
 
     def _is_quark_staging_path(path: Any, category: dict[str, Any]) -> bool:
-        return _virtual_path_under(path, category.get("quark_save_path"))
+        del path, category
+        return False
 
     def _common_virtual_path(paths: list[str]) -> str:
         cleaned = [str(path or "").strip().strip("/") for path in paths if str(path or "").strip().strip("/")]
@@ -1490,14 +1544,14 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 rclone_target_path,
                 required=rclone_target_required,
                 success_message="rclone 将按后台分类配置搬运到该目录",
-                empty_message="分类 mobile_target_path 未配置，rclone 目标不明确",
+                empty_message="V1 execution_plan 未固化 rclone 目标路径",
             )
         _add("openlist_visible_path", "OpenList 可见路径", openlist_visible_path, required=openlist_required)
         _add("organizer_scan_path", "Organizer 扫描路径", organizer_scan_path, required=organizer_required)
         _add("organized_target_path", "标准整理目标路径", organized_target_path, required=False)
         if not organizer_service.enabled:
             checks.append({"name": "organizer_enabled", "label": "Organizer", "success": False, "message": "Organizer 未启用，不能确认完整整理入库"})
-        if not organizer_service.openlist.configured:
+        if not bool(organizer_service.status().get("openlist_configured")):
             checks.append({"name": "openlist_configured", "label": "OpenList", "success": False, "message": "OpenList 未配置，不能确认标准目录"})
         return checks
 
@@ -1553,45 +1607,30 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return db.get_job(job_id) or {**job, "status": status}
 
     def _sixpan_openlist_plan_for_job(job: dict[str, Any], category: dict[str, Any]) -> dict[str, Any]:
-        staging_plan = staging_plan_from_job(job)
-        if staging_plan:
-            scan_root = _safe_openlist_path(staging_plan.get("openlist_job_root"))
-            final_root = _safe_openlist_path(staging_plan.get("openlist_final_category_root"))
-            return {
-                "root_path": scan_root,
-                "target_root_path": final_root,
-                "scan_filters": _sixpan_scan_filters_from_job(job, root_path=scan_root),
-                "mount_name": "",
-                "save_path": str(staging_plan.get("provider_target_path") or job.get("target_path") or ""),
-                "common_dir": "",
-                "staging_plan": staging_plan,
-            }
-        sixpan_config = app_config.raw.get("sixpan", {}) if isinstance(app_config.raw.get("sixpan"), dict) else {}
-        mount_name = str(
-            sixpan_config.get("openlist_mount_name")
-            or sixpan_config.get("fnos_mount_name")
-            or sixpan_config.get("mount_name")
-            or sixpan_config.get("mount_path")
-            or "清云"
-        ).strip()
-        save_path = str(job.get("target_path") or category.get("sixpan_save_path") or category.get("label") or "").strip()
-        category_root = _join_virtual_path(mount_name, save_path)
-        filters = _sixpan_scan_filters_from_job(job)
-        common_dir = _common_top_directory(filters.get("expected_paths") or [])
-        if common_dir:
-            scan_root = _join_virtual_path(category_root, common_dir)
-        elif filters.get("expected_paths"):
-            scan_root = category_root
-        else:
-            title_dir = _safe_virtual_segment(job.get("title") or "")
-            scan_root = _join_virtual_path(category_root, title_dir) if title_dir else ""
+        del category
+        try:
+            plan = validated_execution_plan_from_job(
+                job,
+                execution_repository=getattr(
+                    app.extensions.get("v1_transfer_dispatch"), "executions", None
+                ),
+            )
+        except Exception:
+            return {}
+        paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
+        final_ref = paths.get("destination_final") if isinstance(paths.get("destination_final"), dict) else {}
+        organizer_ref = paths.get("organizer") if isinstance(paths.get("organizer"), dict) else {}
+        staging_ref = paths.get("destination_staging") if isinstance(paths.get("destination_staging"), dict) else {}
+        final_root = _safe_openlist_path(organizer_ref.get("path") or final_ref.get("path"))
+        scan_root = _safe_openlist_path(staging_ref.get("path") or final_root)
         return {
             "root_path": scan_root,
-            "target_root_path": category_root,
-            "scan_filters": filters,
-            "mount_name": mount_name,
-            "save_path": save_path,
-            "common_dir": common_dir,
+            "target_root_path": final_root,
+            "scan_filters": _sixpan_scan_filters_from_job(job, root_path=scan_root),
+            "mount_name": "",
+            "save_path": str(final_ref.get("path") or ""),
+            "common_dir": "",
+            "execution_plan": plan,
         }
 
     def _cloud139_openlist_plan_for_job(job: dict[str, Any], category: dict[str, Any], directory_plan: dict[str, Any]) -> dict[str, Any]:
@@ -1605,71 +1644,34 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         或 directory_plan.target_path 里的官方路径。
         """
 
-        staging_plan = staging_plan_from_job(job)
-        if staging_plan:
-            job_root = _safe_openlist_path(staging_plan.get("openlist_job_root"))
-            final_root = _safe_openlist_path(staging_plan.get("openlist_final_category_root"))
-            native_target = str(directory_plan.get("target_path") or job.get("target_path") or "").strip()
-            mapped_target = _safe_openlist_path(map_staging_path_to_openlist(native_target, staging_plan))
-            scan_root = mapped_target if mapped_target and _virtual_path_under(mapped_target, job_root) else job_root
-            return {
-                "root_path": scan_root,
-                "target_root_path": final_root,
-                "mount_name": "",
-                "official_root": "",
-                "real_folder_name": _cloud139_real_folder_name(job),
-                "staging_plan": staging_plan,
-                "scan_filters": _cloud139_scan_filters_from_job(job, root_path=job_root),
-            }
-
-        cloud139_config = app_config.raw.get("cloud139", {}) if isinstance(app_config.raw.get("cloud139"), dict) else {}
-        official_root = str(cloud139_config.get("target_root_path") or "").strip().strip("/")
-        mount_name = str(cloud139_config.get("fnos_mount_name") or "").strip().strip("/")
-        category_root = str(category.get("cloud139_fnos_target_path") or category.get("openlist_root_path") or "").strip()
-        real_folder_name = _cloud139_real_folder_name(job)
-        title_dir = _safe_virtual_segment(job.get("title") or directory_plan.get("resource_name") or "")
-        resource_dir_applied = not str(directory_plan.get("resource_dir_applied")).lower() == "false"
-        if category_root:
-            real_leaf = _safe_virtual_segment(str(real_folder_name or "").replace("\\", "/").strip("/").split("/")[-1])
-            if resource_dir_applied and (real_leaf or title_dir):
-                scan_root = _join_virtual_path(category_root, real_leaf or title_dir)
-            else:
-                scan_root = _join_virtual_path(category_root)
-            return {
-                "root_path": scan_root,
-                "target_root_path": _join_virtual_path(category_root),
-                "mount_name": "",
-                "official_root": "",
-                "real_folder_name": real_folder_name,
-            }
-        if not category_root:
-            suffix_source = str(category.get("cloud139_target_path") or directory_plan.get("target_path") or job.get("target_path") or category.get("label") or "").strip()
-            suffix = _strip_virtual_prefix(suffix_source, official_root)
-            category_root = _join_virtual_path(mount_name, suffix) if mount_name else str(category.get("mobile_target_path") or "").strip()
-        if not category_root:
-            category_root = str(category.get("mobile_target_path") or category.get("label") or "").strip()
-
-        mapped_real_folder = _map_cloud139_path_to_openlist(real_folder_name, mount_name, official_root)
-        if mapped_real_folder:
-            scan_root = mapped_real_folder
-        else:
-            target_path = _map_cloud139_path_to_openlist(
-                str(directory_plan.get("target_path") or job.get("target_path") or ""),
-                mount_name,
-                official_root,
+        del category, directory_plan
+        try:
+            plan = validated_execution_plan_from_job(
+                job,
+                execution_repository=getattr(
+                    app.extensions.get("v1_transfer_dispatch"), "executions", None
+                ),
             )
-            if target_path and title_dir and resource_dir_applied:
-                scan_root = target_path
-            elif category_root and title_dir:
-                scan_root = _join_virtual_path(category_root, title_dir)
-            else:
-                scan_root = target_path or category_root
+        except Exception:
+            return {}
+        paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
+        final_ref = paths.get("destination_final") if isinstance(paths.get("destination_final"), dict) else {}
+        organizer_ref = paths.get("organizer") if isinstance(paths.get("organizer"), dict) else {}
+        staging_ref = paths.get("destination_staging") if isinstance(paths.get("destination_staging"), dict) else {}
+        final_root = _safe_openlist_path(organizer_ref.get("path") or final_ref.get("path"))
+        job_root = _safe_openlist_path(staging_ref.get("path") or final_root)
         return {
-            "root_path": scan_root,
-            "target_root_path": category_root,
-            "mount_name": mount_name,
-            "official_root": official_root,
-            "real_folder_name": real_folder_name,
+            "root_path": job_root,
+            "target_root_path": final_root,
+            "mount_name": "",
+            "official_root": "",
+            "real_folder_name": _cloud139_real_folder_name(job),
+            "scan_filters": _cloud139_scan_filters_from_job(
+                job,
+                root_path=job_root,
+                execution_plan=plan,
+            ),
+            "execution_plan": plan,
         }
 
     job_completion_info_service = JobCompletionInfoService(
@@ -1682,6 +1684,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         sixpan_plan=_sixpan_openlist_plan_for_job,
         map_category_path=_map_category_path_to_openlist,
         path_health_checks=_path_health_checks,
+        plan_loader=lambda job: validated_execution_plan_from_job(
+            job,
+            execution_repository=getattr(
+                app.extensions.get("v1_transfer_dispatch"), "executions", None
+            ),
+        ),
     )
 
     def _organizer_plan_for_completed_import(job: dict[str, Any]) -> dict[str, Any] | None:
@@ -1704,7 +1712,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             payload_extra = {
                 **update_payload_extra,
                 "sixpan_openlist": sixpan_plan,
-                "staging_plan": sixpan_plan.get("staging_plan") or {},
                 "target_root_path": sixpan_resource_root or sixpan_plan.get("target_root_path") or "",
                 "canonical_resource_root": sixpan_resource_root or update_payload_extra.get("canonical_resource_root") or "",
                 "scan_filters": _merge_scan_filters(
@@ -1721,7 +1728,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             cloud139_plan = _cloud139_openlist_plan_for_job(job, category, directory_plan)
             root_path = str(
                 cloud139_plan.get("root_path")
-                if cloud139_plan.get("staging_plan")
+                if cloud139_plan.get("execution_plan")
                 else update_payload_extra.get("target_root_path") or cloud139_plan.get("root_path") or ""
             ).strip()
             cloud139_scan_filters = (
@@ -1732,7 +1739,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             payload_extra = {
                 **update_payload_extra,
                 "cloud139_openlist": cloud139_plan,
-                "staging_plan": cloud139_plan.get("staging_plan") or {},
                 "target_root_path": update_payload_extra.get("target_root_path") or cloud139_plan.get("target_root_path") or "",
                 "scan_filters": _merge_scan_filters(
                     cloud139_scan_filters,
@@ -1812,6 +1818,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         template_folder=str(app_config.base_dir / "templates"),
         static_folder=str(app_config.base_dir / "static"),
     )
+    # 让 JSON 响应直接输出 UTF-8 中文，而不是 \\uXXXX 转义（Flask 默认 ensure_ascii=True）。
+    app.json.ensure_ascii = False
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
     logging.getLogger().setLevel(logging.INFO)
     logging.getLogger("fnos_media_import").setLevel(logging.INFO)
@@ -1825,24 +1833,16 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             root_logger.removeHandler(handler)
     root_logger.addHandler(system_log_handler)
     _install_file_log_handler(root_logger, app_config.base_dir)
-    app.secret_key = _resolve_secret_key(str(app_config.raw.get("app", {}).get("secret_key") or ""), db)
-    app_config.raw.setdefault("app", {})["secret_key"] = app.secret_key
-    if _strict_security_enabled(app_config.raw) and _default_secret_key(app.secret_key):
-        raise RuntimeError("正式环境应用签名密钥初始化失败")
+    app.secret_key = app_session_key
     app.config["APP_CONFIG"] = app_config
     app.config["DATABASE"] = db
     app.config["PROCESS_ROLE"] = active_process_role
-    app.config["DEPLOYMENT_DEGRADED"] = deployment_degraded
-    if deployment_degraded:
-        app.logger.critical(
-            "检测到正式环境仍在使用未声明 FNOS_PROCESS_ROLE 的旧编排；已安全降级为 Web-only，请替换当前版本 docker-compose.yml"
-        )
     if Path("/var/run/docker.sock").exists():
         app.logger.critical(
             "检测到 Docker Socket 挂载；当前进程继续启动但 readiness 将保持失败，请替换为无 Socket 的当前编排"
         )
     security_config = app_config.raw.get("security", {})
-    if _default_secret_key(str(security_config.get("ip_hash_salt") or "")):
+    if not str(security_config.get("ip_hash_salt") or "").strip():
         security_config["ip_hash_salt"] = app.secret_key
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
@@ -1881,7 +1881,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         sanitize_string_list=lambda value: _safe_public_string_list(value, max_items=2000, max_length=512),
         sanitize_quark_selection=_safe_public_quark_selection,
         sanitize_cloud139_selection=_safe_public_cloud139_selection,
-        resolve_destination=lambda requested: resolve_destination_id(app_config.raw, requested),
+        resolve_destination=None,
     )
     app.extensions["trending_initial_import_service"] = trending_initial_import_service
     rate_limit_service = RateLimitService(
@@ -1926,6 +1926,11 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         advanced_config_key=ADVANCED_CONFIG_KEY,
     )
 
+    # Filled after the V1 composition graph is complete.  Runtime reloads
+    # build a fresh ImportService, so the immutable-plan guards and durable
+    # Worker callbacks must be rebound to that candidate before publication.
+    v1_runtime_rewire: Callable[[Any], None] | None = None
+
     def _reload_runtime_config() -> dict[str, Any]:
         nonlocal app_config, pansou, btbtla, quark_importer, cloud139_importer, generic_importers, fnos
         nonlocal search_service, import_service, security_config
@@ -1945,6 +1950,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         search_service = runtime_build.search_service
         import_service = runtime_build.import_service
         organizer_service = runtime_build.organizer_service
+        if callable(v1_runtime_rewire):
+            v1_runtime_rewire(runtime_build)
         app.config["APP_CONFIG"] = app_config
         finalize_organizer_runtime_transition(
             dispatcher=organizer_dispatch_service,
@@ -1966,29 +1973,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return outcome.response
 
     app.extensions["reload_runtime_config"] = _reload_runtime_config
-
-    def _persist_sixpan_tokens(tokens: dict[str, Any]) -> dict[str, Any]:
-        updated = _store_sixpan_tokens(tokens)
-        if not updated:
-            return {"updated": False, "reload": {}}
-        reload_result = _reload_runtime_config()
-        return {"updated": True, "reload": reload_result}
-
-    def _sixpan_oauth_state_message(state: str, authorized: bool = False) -> str:
-        normalized = str(state or "").strip().upper()
-        if authorized:
-            return "六盘授权成功，token 已保存到数据库"
-        if normalized == "AUTHORIZATION_SUCCESS":
-            return "六盘授权成功，但接口未返回 token，请重试检查或重新授权"
-        if normalized == "AUTHORIZATION_TOKEN_CREATED":
-            return "六盘授权已生成 token，正在保存"
-        if normalized == "AUTHORIZATION_PENDING_LOGIN":
-            return "等待你在六盘授权页面登录"
-        if normalized == "AUTHORIZATION_PENDING_CONFIRMATION":
-            return "等待你在六盘授权页面确认授权"
-        if normalized:
-            return f"六盘授权状态：{normalized}"
-        return "六盘授权状态未知"
 
     def admin_required(view):
         @wraps(view)
@@ -2028,10 +2012,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         raw_config=lambda: app_config.raw,
         settings=db.get_app_settings,
         strict_enabled=_strict_security_enabled,
-        default_secret=_default_secret_key,
         docker_socket_mounted=lambda: Path("/var/run/docker.sock").exists(),
         admin_profile_key=ADMIN_PROFILE_KEY,
-        deployment_degraded=lambda: deployment_degraded,
     )
 
     def _build_security_status() -> dict[str, Any]:
@@ -2420,15 +2402,88 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             "data": data_status,
         }
 
+    # V1 readiness is based on the database-owned account/mount graph and the
+    # single FNOS_ROOT_KEY.  The callbacks are intentionally lazy because the
+    # account services are wired a little later in this composition function.
+    v1_accounts_service: Any = None
+    v1_openlist_mounts: Any = None
+    v1_target_service: Any = None
+
+    def _readiness_root_key() -> bool:
+        try:
+            return bool(master_key_from_env())
+        except Exception:  # noqa: BLE001 - readiness must not expose key details
+            return False
+
+    def _readiness_active_provider_count() -> int:
+        service = v1_accounts_service
+        if service is not None:
+            count = 0
+            for selection in service.list_active_selections().values():
+                account = service.get_account(str(selection.get("account_id") or ""))
+                if account and account.enabled and str(account.last_test_status or "").lower() == "ok":
+                    count += 1
+            return count
+        with db.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                  FROM provider_account_selections s
+                  JOIN provider_accounts a ON a.account_id=s.account_id
+                 WHERE a.enabled=1 AND lower(a.last_test_status)='ok'
+                """
+            ).fetchone()
+        return int(row["count"] or 0) if row is not None else 0
+
+    def _readiness_openlist_required() -> bool:
+        organizer = app_config.raw.get("organizer", {}) if isinstance(app_config.raw.get("organizer"), dict) else {}
+        if bool(organizer.get("enabled")):
+            return True
+        # A cross-Provider rclone/relay route needs a readable source landing
+        # mount even when Organizer is disabled.
+        with db.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                  FROM storage_targets t
+                  JOIN provider_account_selections s ON s.account_id=t.account_scope
+                 WHERE t.enabled=1 AND t.provider_kind NOT IN ('local','generic','openlist_generic')
+                 LIMIT 1
+                """
+            ).fetchone()
+        return row is not None
+
+    def _readiness_valid_mount_count() -> int:
+        with db.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM openlist_mounts
+                 WHERE enabled=1 AND readable=1
+                   AND identity_status IN ('verified','declared')
+                """
+            ).fetchone()
+        return int(row["count"] or 0) if row is not None else 0
+
+    def _readiness_enabled_target_count() -> int:
+        with db.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM storage_targets WHERE enabled=1"
+            ).fetchone()
+        return int(row["count"] or 0) if row is not None else 0
+
     readiness_service = ReadinessService(
         process_role=active_process_role,
         database_probe=lambda: db.get_app_settings(),
-        deployment_degraded=lambda: deployment_degraded,
         docker_socket_mounted=lambda: Path("/var/run/docker.sock").exists(),
         remote_worker_status=(
             rclone_worker_client.system_status if rclone_worker_client is not None else None
         ),
         local_worker_status=_local_worker_system_status,
+        root_key_probe=_readiness_root_key,
+        active_provider_accounts_probe=_readiness_active_provider_count,
+        openlist_required=_readiness_openlist_required,
+        valid_openlist_mounts_probe=_readiness_valid_mount_count,
+        enabled_storage_targets_probe=_readiness_enabled_target_count,
     )
     app.extensions["readiness_service"] = readiness_service
 
@@ -2585,6 +2640,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 load_detail=job_service.get_job_with_events,
                 reconcile=_reconcile_cloud139_submitted_job,
                 decorate=_decorate_job_completion,
+                load_transfer_execution=_v1_execution_repository.get,
             )
         )
 
@@ -2655,6 +2711,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 worker_tasks=db.worker_tasks,
                 organizer=organizer_service,
                 sixpan_importer=lambda: generic_importers.get("sixpan"),
+                execution_repository=getattr(
+                    app.extensions.get("v1_transfer_dispatch"),
+                    "executions",
+                    None,
+                ),
+                enqueue_transfer=worker_task_dispatcher.import_transfer_execute,
             )
         )
 
@@ -3038,9 +3100,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 or raw_data.get("existing_openlist_root")
                 or raw_data.get("openlist_path")
             )
-        if not root:
-            category = app_config.category(str(item.get("category") or "movie")) if str(item.get("category") or "") in app_config.categories else {}
-            root = _clean_update_openlist_root(category.get("openlist_root_path") or category.get("fnos_target_path") or category.get("cloud139_fnos_target_path") or category.get("mobile_target_path") or "")
         snapshot = db.get_update_path_snapshot(subscription_id, root) if root else None
         return jsonify({"success": True, "item": item, "runs": runs, "candidates": candidates, "events": events, "snapshot": snapshot})
 
@@ -3322,9 +3381,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def _external_diagnostics_application() -> ExternalDiagnosticsService:
         return ExternalDiagnosticsService(ExternalDiagnosticsDependencies(organizer=organizer_service))
 
-    storage_target_probe_service = StorageTargetProbeService(
-        rclone_config=lambda: rclone_runtime_config(app_config)
-    )
     settings_service = SettingsService(
         SettingsDependencies(
             db=db,
@@ -3337,25 +3393,29 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             effective_settings=_effective_settings,
             payload_bool=_payload_bool,
             search_providers=search_service.describe_providers,
-            storage_probe=storage_target_probe_service.probe,
         )
     )
-    from .accounts.crypto import MasterKeyMissingError, master_key_from_env
     from .accounts.service import ProviderAccountService
     from .accounts.blueprint import accounts_blueprint_for_service
+    from .accounts.auth_sessions import (
+        ManagedAccountAuthHandler,
+        ProviderAuthSessionService,
+        QuarkQrAuthHandler,
+        SixpanDeviceCodeAuthHandler,
+        TianyiPasswordAuthHandler,
+    )
     from .openlist.connection_service import OpenListConnectionService
     from .openlist.mount_service import OpenListMountService
     from .openlist.blueprint import OpenListRouteContext, create_openlist_blueprint, default_handlers
     from .storage.target_service import StorageTargetService
-    from .storage.rules_service import DestinationRulesService
+    from .storage.assignment_service import SourceAssignmentService
     from .storage.blueprint import StorageBlueprintContext, create_storage_blueprint
+    from .storage.setup_blueprint import StorageSetupBlueprintContext, create_storage_setup_blueprint
+    from .storage.setup_service import StorageSetupService
+    from .services.source_record_service import SourceRecordService
 
     def _v1_master_key() -> bytes:
-        try:
-            return master_key_from_env()
-        except MasterKeyMissingError as exc:
-            app.logger.warning("V1.0 账号/OpenList 主密钥未配置：%s", exc)
-            return b""
+        return root_key
 
     v1_accounts_service = ProviderAccountService(db, _v1_master_key)
     v1_openlist_connections = OpenListConnectionService(db, _v1_master_key)
@@ -3366,34 +3426,353 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         if mount_id
         else [],
     )
-    v1_rules_service = DestinationRulesService(db, v1_target_service)
+    v1_rules_service = SourceAssignmentService(db, v1_target_service)
+    # Immutable, encrypted source access snapshots are part of the V1 plan
+    # contract.  The service is shared by planning, validation and transfer;
+    # no execution path may reconstruct a source from mutable job/config data.
+    v1_source_record_service = SourceRecordService(db, _v1_master_key)
     app.extensions["v1_accounts_service"] = v1_accounts_service
+    app.extensions["v1_openlist_connections"] = v1_openlist_connections
     app.extensions["v1_openlist_mounts"] = v1_openlist_mounts
     app.extensions["v1_target_service"] = v1_target_service
     app.extensions["v1_rules_service"] = v1_rules_service
+    app.extensions["v1_source_record_service"] = v1_source_record_service
+
+    def _resolve_organizer_openlist_client(
+        job: dict[str, Any],
+        plan: dict[str, Any],
+    ) -> OpenListClient:
+        """Build one Organizer client from the revisions frozen in ``plan``."""
+
+        runtime_openlist = (
+            app_config.raw.get("openlist", {})
+            if isinstance(app_config.raw.get("openlist"), dict)
+            else {}
+        )
+        resolver = build_frozen_openlist_client_resolver(
+            v1_openlist_mounts,
+            v1_openlist_connections,
+            runtime_openlist,
+        )
+        return resolver(job, plan)
+
+    # RuntimeBuilder is reused by hot reload.  Persist the resolver on the
+    # builder and also bind the already-created initial Organizer instance.
+    runtime_builder.set_organizer_openlist_client_resolver(
+        _resolve_organizer_openlist_client
+    )
+    organizer_service.set_openlist_client_resolver(
+        _resolve_organizer_openlist_client
+    )
+
+    v1_storage_setup_service = StorageSetupService(
+        accounts_service=v1_accounts_service,
+        connection_service=v1_openlist_connections,
+        mount_service=v1_openlist_mounts,
+        target_service=v1_target_service,
+        assignment_service=v1_rules_service,
+    )
+    app.extensions["v1_storage_setup_service"] = v1_storage_setup_service
+
+    def _resolve_update_destination(requested: Any) -> str | None:
+        """Validate a subscription destination against the V1 DB graph.
+
+        Update subscriptions may pin a destination identity, but they may not
+        read the removed YAML storage registry or category-specific provider
+        paths.  A target is usable only when its current revision and binding
+        are both enabled and resolvable; the immutable import plan will freeze
+        the exact revision again when an episode is submitted.
+        """
+
+        destination_id = str(requested or "").strip()
+        if not destination_id:
+            return None
+        target = v1_target_service.get_target(destination_id)
+        if target is None or not bool(target.enabled):
+            return None
+        try:
+            binding = v1_target_service.resolve_binding(
+                destination_id,
+                int(target.current_revision),
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not bool(getattr(binding, "enabled", True)):
+            return None
+        account_id = str(getattr(binding, "account_id", "") or "").strip()
+        if account_id:
+            account = v1_accounts_service.get_account(account_id)
+            if account is None or not bool(getattr(account, "enabled", False)):
+                return None
+            if str(getattr(account, "last_test_status", "") or "") != "ok":
+                return None
+            if not v1_accounts_service.has_revision(
+                account_id,
+                int(getattr(binding, "account_revision", 0) or 0),
+            ):
+                return None
+        return destination_id
+
+    update_service.set_destination_resolver(_resolve_update_destination)
+
+    def _resolve_update_openlist_session(
+        subscription: dict[str, Any],
+        category_key: str,
+    ) -> dict[str, Any] | None:
+        """Resolve an update scan client/root from the V1 target graph."""
+
+        raw_data = subscription.get("raw_data") if isinstance(subscription.get("raw_data"), dict) else {}
+        destination_id = str(raw_data.get("destination_id") or subscription.get("destination_id") or "").strip()
+        if not destination_id or not _resolve_update_destination(destination_id):
+            return None
+        target = v1_target_service.get_target(destination_id)
+        if target is None or not bool(target.enabled):
+            return None
+        category = target.category(str(category_key or "").strip())
+        locator = getattr(category, "organizer_locator", None) if category is not None else None
+        if locator is None:
+            return None
+        mount_id = str(getattr(locator, "mount_id", "") or "").strip()
+        connection_id = str(getattr(locator, "connection_id", "") or "").strip()
+        if not mount_id or not connection_id:
+            return None
+        mount = v1_openlist_mounts.get_mount(mount_id)
+        connection = v1_openlist_connections.get_connection(connection_id)
+        if not isinstance(mount, dict) or not isinstance(connection, dict):
+            return None
+        if str(mount.get("connection_id") or "") != connection_id:
+            return None
+        if not bool(mount.get("enabled")) or not bool(mount.get("readable")):
+            return None
+        if str(mount.get("identity_status") or "").strip().lower() not in {"verified", "declared"}:
+            return None
+        if not bool(connection.get("enabled")) or not bool(connection.get("credential_configured")):
+            return None
+        if str(connection.get("last_test_status") or "").strip().lower() != "ok":
+            return None
+        try:
+            credentials = v1_openlist_connections.resolve_credentials(connection_id)
+        except Exception:  # noqa: BLE001 - fail closed when the root key/credentials are unavailable
+            return None
+        options = app_config.raw.get("openlist", {}) if isinstance(app_config.raw.get("openlist"), dict) else {}
+        client = OpenListClient({**dict(options), **credentials})
+        mount_root = str(mount.get("webdav_root") or "").strip().replace("\\", "/")
+        relative_root = str(getattr(locator, "path", "") or "").strip().replace("\\", "/")
+        category_root = posixpath.normpath(
+            "/" + "/".join(part.strip("/") for part in (mount_root, relative_root) if part.strip("/"))
+        )
+        if category_root in {"", "/", "/.", "/.."}:
+            return None
+        return {
+            "client": client,
+            "category_root": category_root,
+            "destination_id": destination_id,
+            "mount_id": mount_id,
+            "connection_id": connection_id,
+            "namespace_id": str(mount.get("namespace_id") or ""),
+            "target_revision": int(target.current_revision),
+        }
+
+    update_service.set_openlist_session_resolver(_resolve_update_openlist_session)
+
+    def _tianyi_auth_importer(config: dict[str, Any]) -> Any:
+        from .importers.tianyi import TianyiImporter
+
+        return TianyiImporter(dict(config or {}))
+
+    def _account_context(account_id: str, revision: int, expected_provider: str = "") -> dict[str, Any]:
+        account_id = str(account_id or "").strip()
+        revision = int(revision or 0)
+        if not account_id or revision <= 0:
+            raise RuntimeError("Provider 账号修订身份不完整")
+        context = v1_accounts_service.resolve_account_context(account_id, revision)
+        provider_kind = str(context.get("provider_kind") or "").strip()
+        if expected_provider and provider_kind != expected_provider:
+            raise RuntimeError("Provider 账号类型与执行计划不一致")
+        return context
+
+    def _runtime_credential_persister(
+        account_id: str, revision: int
+    ) -> Callable[[dict[str, Any]], bool]:
+        revision_state = {"value": int(revision)}
+        revision_lock = threading.Lock()
+
+        def persist(patch: dict[str, Any]) -> bool:
+            if not isinstance(patch, dict) or not patch:
+                return False
+            try:
+                with revision_lock:
+                    updated = v1_accounts_service.refresh_runtime_credentials(
+                        account_id,
+                        patch,
+                        expected_revision=revision_state["value"],
+                    )
+                    revision_state["value"] = int(updated.current_revision)
+                return True
+            except Exception as exc:  # noqa: BLE001 - provider call remains successful
+                app.logger.warning(
+                    "Provider 运行时凭证持久化失败 account=%s revision=%s: %s",
+                    account_id,
+                    revision_state["value"],
+                    exc,
+                )
+                return False
+
+        return persist
+
+    def _provider_importer(provider_kind: str, account_id: str, revision: int) -> Any:
+        """Build an importer strictly from one frozen DB account revision."""
+
+        context = _account_context(account_id, revision, provider_kind)
+        config_values = dict(context.get("config") or {})
+        credentials = dict(context.get("credentials") or {})
+        values = {**config_values, **credentials}
+        persist_credentials = _runtime_credential_persister(account_id, revision)
+        if provider_kind == "quark":
+            return QuarkImporter(
+                values,
+                cookie_update_callback=persist_credentials,
+            )
+        if provider_kind == "tianyi":
+            from .importers.tianyi import TianyiImporter
+
+            return TianyiImporter(
+                values,
+                token_update_callback=persist_credentials,
+                cache_namespace=f"account:{account_id}",
+            )
+        if provider_kind == "mobile":
+            # 139 WebAPI Basic authorization is a Provider credential.  Keep
+            # non-secret tuning in the revision config and pass the merged
+            # account view only to this account-scoped importer.
+            return Cloud139Importer(config_values, cmcc_config=values)
+        if provider_kind == "sixpan":
+            return SixPanOfflineImporter(
+                values,
+                token_update_callback=persist_credentials,
+            )
+        raise RuntimeError(f"不支持的 Provider：{provider_kind}")
+
+    def _quark_importer_for_account(account_id: str, revision: int) -> Any:
+        return _provider_importer("quark", account_id, revision)
+
+    def _tianyi_importer_for_account(account_id: str, revision: int) -> Any:
+        return _provider_importer("tianyi", account_id, revision)
+
+    def _active_tianyi_importer() -> Any:
+        """Build one importer from the currently activated Tianyi revision."""
+
+        from .importers.tianyi import TianyiImporter
+
+        selection = v1_accounts_service.get_selection("tianyi")
+        if selection is None:
+            return TianyiImporter({})
+        try:
+            return _tianyi_importer_for_account(
+                selection.account_id,
+                selection.account_revision,
+            )
+        except Exception as exc:  # noqa: BLE001
+            app.logger.warning(
+                "event=tianyi_active_importer_unavailable account=%s revision=%s error=%s",
+                selection.account_id,
+                selection.account_revision,
+                str(exc)[:300],
+            )
+            return TianyiImporter({})
+
+    def _mobile_importer_for_account(account_id: str, revision: int) -> Any:
+        return _provider_importer("mobile", account_id, revision)
+
+    def _sixpan_importer_for_account(account_id: str, revision: int) -> Any:
+        return _provider_importer("sixpan", account_id, revision)
+
     from .planning.source_resolver import SourceResolver
     from .planning.destination_resolver import DestinationResolver
-    from .planning.planner import ImportPlannerV4
-    from .planning.plan_validator import PlanValidationDeps, validate_v4_plan
+    from .planning.planner import ImportPlanner
+    from .planning.plan_validator import PlanValidationDeps, validate_plan
     from .planning import DefaultAdapterRegistry
 
     v1_adapter_registry = DefaultAdapterRegistry()
     from .transfer.native_executor import LegacyNativeAdapter
 
     v1_adapter_registry.register(
-        LegacyNativeAdapter(cloud139_importer, "mobile", supports_native_save=True)
+        LegacyNativeAdapter(
+            cloud139_importer,
+            "mobile",
+            supports_native_save=True,
+            importer_factory=_mobile_importer_for_account,
+            source_record_service=v1_source_record_service,
+        )
     )
-    v1_adapter_registry.register(LegacyNativeAdapter(quark_importer, "quark", supports_native_save=True))
+    v1_adapter_registry.register(
+        LegacyNativeAdapter(
+            quark_importer,
+            "quark",
+            supports_native_save=True,
+            importer_factory=_quark_importer_for_account,
+            account_importer_factory=QuarkImporter,
+            source_record_service=v1_source_record_service,
+        )
+    )
+    from .importers.tianyi import TianyiImporter
+
+    v1_adapter_registry.register(
+        LegacyNativeAdapter(
+            TianyiImporter({}),
+            "tianyi",
+            supports_native_save=True,
+            importer_factory=_tianyi_importer_for_account,
+            source_record_service=v1_source_record_service,
+        )
+    )
     _sixpan_importer = generic_importers.get("sixpan")
     v1_adapter_registry.register(
-        LegacyNativeAdapter(_sixpan_importer, "sixpan", supports_native_offline=True)
+        LegacyNativeAdapter(
+            _sixpan_importer,
+            "sixpan",
+            supports_native_offline=True,
+            importer_factory=_sixpan_importer_for_account,
+            source_record_service=v1_source_record_service,
+        )
     )
+    v1_adapter_registry.load_entry_points(
+        {
+            "database": db,
+            "accounts_service": v1_accounts_service,
+            "source_record_service": v1_source_record_service,
+            "master_key_provider": _v1_master_key,
+        }
+    )
+    # Manifest、账号检测和搜索来源必须来自同一个运行时 registry。后续新增
+    # 115 等 Provider 只注册 Adapter/entry point，不再修改这些服务的硬编码列表。
+    v1_accounts_service.set_catalog_provider(v1_adapter_registry.manifests)
+    v1_accounts_service.set_tester(v1_adapter_registry.account_tester)
+    v1_rules_service.set_source_catalog_provider(v1_adapter_registry.search_sources)
+    app.extensions["v1_provider_registry"] = v1_adapter_registry
+    auth_handlers: dict[tuple[str, str], Any] = {
+        ("quark", "qrcode"): QuarkQrAuthHandler(v1_adapter_registry.account_tester),
+        ("tianyi", "password"): TianyiPasswordAuthHandler(_tianyi_auth_importer),
+        ("mobile", "managed_account"): ManagedAccountAuthHandler("mobile", lambda: {}),
+        ("sixpan", "device_code"): SixpanDeviceCodeAuthHandler(
+            lambda: {},
+            lambda config: SixPanOfflineImporter(config),
+        ),
+    }
+    provider_auth_sessions = ProviderAuthSessionService(
+        db,
+        _v1_master_key,
+        v1_accounts_service,
+        auth_handlers,
+    )
+    app.extensions["provider_auth_sessions"] = provider_auth_sessions
     v1_source_resolver = SourceResolver(
-        detect_link=lambda url, password="", **_kw: detect_link(url, app_config.raw.get("routes", {}), password=password),
+        detect_link=lambda url, password="", **_kw: detect_link(url, {}, password=password),
         config=app_config.raw,
+        source_catalog_provider=v1_adapter_registry.search_sources,
     )
     v1_destination_resolver = DestinationResolver(v1_rules_service, v1_target_service, v1_accounts_service)
-    v1_planner = ImportPlannerV4(
+    v1_planner = ImportPlanner(
         accounts_service=v1_accounts_service,
         target_service=v1_target_service,
         rules_service=v1_rules_service,
@@ -3407,6 +3786,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         target_service=v1_target_service,
         mount_service=v1_openlist_mounts,
         registry=v1_adapter_registry,
+        source_record_service=v1_source_record_service,
+        assignment_service=v1_rules_service,
         config=app_config.raw,
     )
 
@@ -3414,50 +3795,152 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return v1_planner.plan_import(**kwargs)
 
     def _v1_validate_plan(plan: dict[str, Any], job_record: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        return validate_v4_plan(plan, job_record, deps=v1_plan_deps, **kwargs)
+        return validate_plan(plan, job_record, deps=v1_plan_deps, **kwargs)
 
     from .transfer.dispatch import TransferDispatchService
     from .openlist.locator_resolver import RcloneLocatorResolver
 
+    locator_config = rclone_runtime_config(app_config)
+    locator_config["relay_root"] = os.getenv("FNOS_RELAY_ROOT", "/data/relay")
+    v1_rclone_locator = RcloneLocatorResolver(locator_config)
+    v1_rclone_locator.bind_revision_services(
+        v1_openlist_mounts,
+        v1_openlist_connections,
+    )
+    rclone_service.set_v1_locator_resolver(
+        v1_rclone_locator,
+        mount_service=v1_openlist_mounts,
+        connection_service=v1_openlist_connections,
+    )
     v1_transfer_dispatch = TransferDispatchService(
+        database=db,
         accounts_service=v1_accounts_service,
         target_service=v1_target_service,
         mount_service=v1_openlist_mounts,
         registry=v1_adapter_registry,
         rclone_service=rclone_service,
-        locator_resolver=RcloneLocatorResolver(rclone_runtime_config(app_config)),
+        locator_resolver=v1_rclone_locator,
         rclone_config=app_config.raw.get("rclone", {}),
+        source_record_service=v1_source_record_service,
+        assignment_service=v1_rules_service,
+        organizer_service=organizer_service,
     )
+    app.extensions["v1_rclone_locator"] = v1_rclone_locator
     app.extensions["v1_transfer_dispatch"] = v1_transfer_dispatch
+    organizer_service.set_execution_repository(v1_transfer_dispatch.executions)
 
-    def _dispatch_v4_job(job_id: int) -> None:
-        dispatch = app.extensions.get("v1_transfer_dispatch")
-        if dispatch is None:
-            return
-        job = db.get_job(job_id) if job_id > 0 else None
-        if not isinstance(job, dict):
-            return
-        try:
-            result = dispatch.dispatch(job)
-            if job_id:
-                db.add_event(
-                    job_id,
-                    "info" if result.get("success") else "warn",
-                    f"v4 执行编排阶段：{result.get('phase') or result.get('message') or '完成'}",
-                    {"dispatch": result},
-                )
-        except Exception as exc:  # noqa: BLE001
-            if job_id:
-                db.add_event(job_id, "warn", f"v4 执行编排失败：{exc}")
-    app.extensions["dispatch_v4_job"] = _dispatch_v4_job
+    transfer_recovery_scanner = TransferRecoveryScanner(
+        v1_transfer_dispatch.executions,
+        db.worker_tasks,
+        max_attempts=max(
+            1,
+            _config_int(
+                app_config.raw.get("worker", {})
+                if isinstance(app_config.raw.get("worker"), dict)
+                else {},
+                "transfer_max_attempts",
+                20,
+            ),
+        ),
+    )
+    transfer_recovery_runtime = TransferRecoveryRuntime(
+        transfer_recovery_scanner,
+        interval_seconds=max(
+            5,
+            _config_int(
+                app_config.raw.get("worker", {})
+                if isinstance(app_config.raw.get("worker"), dict)
+                else {},
+                "transfer_recovery_interval_seconds",
+                30,
+            ),
+        ),
+        batch_size=max(
+            1,
+            _config_int(
+                app_config.raw.get("worker", {})
+                if isinstance(app_config.raw.get("worker"), dict)
+                else {},
+                "transfer_recovery_batch_size",
+                100,
+            ),
+        ),
+        log=logging.getLogger("fnos_media_import.transfer_recovery").warning,
+    )
+    app.extensions["transfer_recovery_scanner"] = transfer_recovery_scanner
+    app.extensions["transfer_recovery_runtime"] = transfer_recovery_runtime
+    atexit.register(transfer_recovery_runtime.shutdown)
 
-    for service in (import_service.job_creation, getattr(import_service, "job_retry", None)):
-        if service is None:
-            continue
-        service.source_resolver = v1_source_resolver
-        service.destination_resolver = v1_destination_resolver
-        service.plan_import = _v1_plan_import
-        service.validate_v4_plan = _v1_validate_plan
+    _v1_execution_repository = v1_transfer_dispatch.executions
+    _v1_enqueue_transfer_with_connection = (
+        worker_task_dispatcher.import_transfer_execute_with_connection
+    )
+
+    def _wire_v1_runtime_build(build: Any) -> None:
+        """Bind every fresh runtime ImportService to the stable V1 graph."""
+
+        nonlocal v1_plan_deps
+        build.organizer_service.set_openlist_client_resolver(
+            _resolve_organizer_openlist_client
+        )
+        build.organizer_service.set_execution_repository(_v1_execution_repository)
+        v1_source_resolver.config = app_config.raw
+        v1_planner.config = app_config.raw
+        v1_plan_deps = PlanValidationDeps(
+            accounts_service=v1_accounts_service,
+            target_service=v1_target_service,
+            mount_service=v1_openlist_mounts,
+            registry=v1_adapter_registry,
+            source_record_service=v1_source_record_service,
+            assignment_service=v1_rules_service,
+            config=app_config.raw,
+        )
+        locator_runtime_config = rclone_runtime_config(app_config)
+        locator_runtime_config["relay_root"] = os.getenv("FNOS_RELAY_ROOT", "/data/relay")
+        v1_rclone_locator.update_config(locator_runtime_config)
+        v1_transfer_dispatch.locator_resolver = v1_rclone_locator
+        v1_transfer_dispatch.rclone_config = (
+            app_config.raw.get("rclone", {})
+            if isinstance(app_config.raw.get("rclone"), dict)
+            else {}
+        )
+        v1_transfer_dispatch.set_organizer_service(build.organizer_service)
+        current_import_service = build.import_service
+        for service in (
+            current_import_service.job_creation,
+            getattr(current_import_service, "job_retry", None),
+        ):
+            if service is None:
+                continue
+            service.source_resolver = v1_source_resolver
+            service.destination_resolver = v1_destination_resolver
+            service.plan_import = _v1_plan_import
+            service.validate_plan = _v1_validate_plan
+            service.execution_repository = _v1_execution_repository
+            service.plan_validation_deps = v1_plan_deps
+            service.enqueue_transfer = worker_task_dispatcher.import_transfer_execute
+            if hasattr(service, "enqueue_transfer_with_connection"):
+                service.enqueue_transfer_with_connection = _v1_enqueue_transfer_with_connection
+            if hasattr(service, "source_record_service"):
+                service.source_record_service = v1_source_record_service
+        import_completion_dispatcher.execution_repository = _v1_execution_repository
+
+    v1_runtime_rewire = _wire_v1_runtime_build
+    v1_runtime_rewire(runtime_build)
+    if role_runs(active_process_role, "worker"):
+        # The initial Organizer was constructed before the V1 connection and
+        # mount services existed, so its transient scan recovery was safely
+        # skipped.  Re-run that idempotent recovery after binding the frozen
+        # resolver; hot-reload candidates are activated by the transition hook.
+        organizer_service.activate_background_recovery(include_scanning=True)
+    # The durable runtime is created earlier so all process roles share one
+    # queue object; registering the handler now is safe because it is started
+    # only after the application has finished composing every V1 dependency.
+    durable_worker_runtime.register(
+        "import_transfer_execute",
+        v1_transfer_dispatch.handle_worker,
+    )
+
     notification_settings_service = NotificationSettingsService(
         db=db,
         public_base_url=lambda: request.host_url.rstrip("/"),
@@ -3518,21 +4001,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     def api_admin_settings_update_all():
         return _settings_response(settings_service.update_all(request.get_json(silent=True) or {}))
-
-    def api_admin_settings_storage_status():
-        return _settings_response(settings_service.storage_status())
-
-    def api_admin_settings_storage_test():
-        payload = request.get_json(silent=True) or {}
-        return _settings_response(settings_service.storage_test(payload.get("destination_id")))
-
-    def api_admin_settings_storage_update():
-        payload = request.get_json(silent=True) or {}
-        return _settings_response(settings_service.storage_update(payload))
-
-    def api_public_storage_targets():
-        # V1.0：访客不选择保存路径（由管理员按搜索源分配），该端点保持空响应。
-        return jsonify({"success": True, "targets": []}), 200
 
     def _notification_response(result: tuple[dict[str, Any], int]):
         body, status_code = result
@@ -3626,14 +4094,39 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return jsonify({"success": True, "message": "搜索别名词库已保存", "aliases": normalized_aliases})
 
     def api_admin_adapters():
-        return jsonify({"success": True, "items": _adapter_placeholders(app_config.raw, generic_importers, cloud139_importer=cloud139_importer)})
+        return jsonify(
+            {
+                "success": True,
+                "items": _adapter_placeholders(
+                    app_config.raw,
+                    generic_importers,
+                    cloud139_importer=cloud139_importer,
+                    quark_importer=quark_importer,
+                ),
+            }
+        )
 
     def api_admin_adapter_probe(adapter_key: str):
-        adapters = {item["key"]: item for item in _adapter_placeholders(app_config.raw, generic_importers, cloud139_importer=cloud139_importer)}
+        adapters = {
+            item["key"]: item
+            for item in _adapter_placeholders(
+                app_config.raw,
+                generic_importers,
+                cloud139_importer=cloud139_importer,
+                quark_importer=quark_importer,
+            )
+        }
         item = adapters.get(adapter_key)
         if not item:
             return jsonify({"success": False, "message": "线路适配器不存在"}), 404
-        importer = cloud139_importer if adapter_key == "cloud139" else generic_importers.get(adapter_key)
+        if adapter_key == "quark":
+            importer = quark_importer
+        elif adapter_key == "cloud139":
+            importer = cloud139_importer
+        elif adapter_key == "cloud189":
+            importer = _active_tianyi_importer()
+        else:
+            importer = generic_importers.get(adapter_key)
         if importer and hasattr(importer, "probe"):
             result = importer.probe()
             return jsonify(
@@ -3667,13 +4160,21 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 "success": True,
                 "app_name": app_config.app_name,
                 "categories": _public_categories(app_config.categories),
-                "routes": _public_routes(app_config.raw.get("routes", {})),
+                "routes": {},
                 "category_labels": CATEGORY_LABELS,
                 "security": _public_security_config(security_config),
                 "public": settings["public"],
                 "submission": settings["submission"],
                 "search": {"providers": search_service.describe_providers()},
-                "adapters": _public_adapter_capabilities(app_config.raw),
+                "adapters": _public_adapter_capabilities(
+                    app_config.raw,
+                    quark_importer=quark_importer,
+                    cloud139_importer=cloud139_importer,
+                    generic_importers={
+                        **generic_importers,
+                        "cloud189": _active_tianyi_importer(),
+                    },
+                ),
                 "notifications": {
                     "guest_email_available": _guest_email_subscription_available()
                 },
@@ -3845,13 +4346,19 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             password = _limited_text(payload.get("password"), "提取码", _config_int(security_config, "max_password_length", 32))
         except PublicInputError as exc:
             return jsonify({"success": False, "message": str(exc)}), 400
-        link = detect_link(url, app_config.raw.get("routes", {}), password=password)
+        link = detect_link(url, {}, password=password)
+        tianyi = _active_tianyi_importer()
         public_link = {
             "source_type": link.source_type,
             "supported": link.supported,
             "reason": "已识别资源类型，提交时会检测可用性" if link.supported else "当前资源暂不支持自动入库",
             "route": link.route,
-            "detail_capability": _detail_capability_for_source(link.source_type, cloud139_importer=cloud139_importer, sixpan_importer=generic_importers.get("sixpan")),
+            "detail_capability": _detail_capability_for_source(
+                link.source_type,
+                cloud139_importer=cloud139_importer,
+                sixpan_importer=generic_importers.get("sixpan"),
+                tianyi_importer=tianyi,
+            ),
         }
         return jsonify({"success": True, "link": public_link})
 
@@ -3859,7 +4366,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         cache=db,
         new_public_id=_new_public_id,
         detect_link=detect_link,
-        routes=lambda: app_config.raw.get("routes", {}),
+        routes=lambda: {},
         resource_detail=_public_resource_detail,
         present_item=_public_resource_item,
         detail_capability=_detail_capability_for_source,
@@ -3867,6 +4374,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         cloud139_importer=lambda: cloud139_importer,
         sixpan_importer=lambda: generic_importers.get("sixpan"),
         hide_full_links=lambda: _current_public_settings().get("hide_full_links", True),
+        tianyi_importer=_active_tianyi_importer,
     )
 
     def api_public_manual_preview():
@@ -3921,13 +4429,14 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return PublicResourceService(
             PublicResourceDependencies(
                 cache_get=db.get_search_cache,
-                routes=app_config.raw.get("routes", {}),
+                routes={},
                 quark_importer=quark_importer,
                 cloud139_importer=cloud139_importer,
                 sixpan_importer=generic_importers.get("sixpan"),
                 btbtla_client=btbtla,
                 build_detail=_public_resource_detail,
                 child_files=_public_resource_child_files,
+                tianyi_importer=_active_tianyi_importer(),
             )
         )
 
@@ -3936,7 +4445,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         importer=lambda: generic_importers.get("sixpan"),
         validate_url=lambda value: _validate_public_url(value, security_config),
         detect_link=detect_link,
-        routes=lambda: app_config.raw.get("routes", {}),
+        routes=lambda: {},
         summarize=_sixpan_parse_summary,
     )
 
@@ -3963,7 +4472,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         btbtla=lambda: btbtla,
         present_item=_public_resource_item,
         resource_detail=_public_resource_detail,
-        routes=lambda: app_config.raw.get("routes", {}),
+        routes=lambda: {},
         quark_importer=lambda: quark_importer,
         cloud139_importer=lambda: cloud139_importer,
         sixpan_importer=lambda: generic_importers.get("sixpan"),
@@ -4052,19 +4561,17 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         search_cache=db.get_search_cache,
         categories=lambda: app_config.categories,
         category=lambda key: app_config.category(key),
-        routes=lambda: app_config.raw.get("routes", {}),
+        routes=lambda: {},
         limited_text=_limited_text,
         validate_url=_validate_public_url,
         safe_string_list=_safe_public_string_list,
         safe_quark_selection=_safe_public_quark_selection,
         safe_cloud139_selection=_safe_public_cloud139_selection,
+        safe_tianyi_selection=_safe_public_tianyi_selection,
         detect_link=detect_link,
         security_config=lambda: security_config,
         config_int=_config_int,
-        validate_destination=lambda **kwargs: validate_public_destination(
-            raw_config=app_config.raw,
-            **kwargs,
-        ),
+        validate_destination=None,
     )
 
     def _cancel_unbound_public_import_job(
@@ -4108,14 +4615,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     def _guest_email_subscription_available() -> bool:
         try:
-            key = notification_secrets.key_bytes()
+            notification_secrets.key_bytes()
         except ValueError:
             return False
-        return (
-            notification_config.guest_email_available(notification_config.read_config(db))
-            and key is not None
-            and len(key) in {16, 24, 32}
-        )
+        return notification_config.guest_email_available(notification_config.read_config(db))
 
     def _prepare_guest_notification(
         payload: dict[str, Any],
@@ -4189,6 +4692,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             quark_importer=quark_importer,
             cloud139_importer=cloud139_importer,
             sixpan_importer=generic_importers.get("sixpan"),
+            tianyi_importer=_active_tianyi_importer(),
         ),
         new_token=_new_request_token,
         cached_item=_public_cached_item,
@@ -4347,7 +4851,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             {
                 "app_name": app_config.app_name,
                 "categories": app_config.categories,
-                "routes": _public_routes(app_config.raw.get("routes", {})),
+                "routes": {},
                 "public": settings["public"],
                 "submission": settings["submission"],
                 "search": {"providers": search_service.describe_providers()},
@@ -4395,18 +4899,23 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         if not url:
             return jsonify({"success": False, "message": "缺少资源链接"}), 400
         password = str(payload.get("password") or "").strip()
-        link = detect_link(url, app_config.raw.get("routes", {}), password=password)
+        link = detect_link(url, {}, password=password)
         return jsonify({"success": True, "link": link.to_dict()})
 
     def api_import():
         payload = request.get_json(silent=True) or {}
         if not str(payload.get("url") or payload.get("source_url") or "").strip():
             return jsonify({"success": False, "message": "缺少资源链接"}), 400
-        result = import_service.create_import_job(payload)
-        if result.get("created") and int((result.get("job") or {}).get("id") or 0) > 0:
-            job_id = int(result["job"]["id"])
-            threading.Timer(1.0, _dispatch_v4_job, args=(job_id,)).start()
-        _auto_start_rclone_for_import(result, "api_import")
+        try:
+            result = import_service.create_import_job(payload)
+        except V1PlanningError as exc:
+            return jsonify(
+                {
+                    "success": False,
+                    "error_code": str(exc.code or "PLANNING_FAILED"),
+                    "message": str(exc),
+                }
+            ), 400
         return jsonify({"success": bool(result.get("success", True)), **result})
 
     def api_jobs():
@@ -4537,103 +5046,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         result = importer.probe()
         return jsonify({"success": result.ok, "status": result.status, "message": result.message, "details": result.details})
 
-    def api_admin_sixpan_oauth_device_code():
-        payload = request.get_json(silent=True) or {}
-        credentials = payload.get("credentials")
-        save_body: dict[str, Any] = {}
-        if isinstance(credentials, dict):
-            credential_patch = {
-                "client_id": str(credentials.get("client_id") or "").strip(),
-                "client_secret": str(credentials.get("client_secret") or "").strip(),
-            }
-            save_body, save_status = settings_service.update_advanced(
-                {"config": {"sixpan": credential_patch}}
-            )
-            if save_status != 200:
-                return jsonify(save_body), save_status
-
-        importer = generic_importers.get("sixpan")
-        if not importer or not getattr(importer, "auth_configured", False):
-            return jsonify({"success": False, "message": "请填写六盘 ClientID/ClientSecret"}), 400
-        try:
-            auth = importer.start_device_authorization(
-                device=str(payload.get("device") or "fnos-media-import/1.0"),
-                scope=str(payload.get("scope") or ""),
-            )
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"success": False, "message": f"六盘授权入口创建失败：{exc}"}), 502
-
-        device_code = str(auth.get("device_code") or auth.get("deviceCode") or "").strip()
-        user_code = str(auth.get("user_code") or auth.get("userCode") or "").strip()
-        verification_uri = str(auth.get("verification_uri") or auth.get("verificationUri") or "").strip()
-        interval = _safe_int(auth.get("interval"), 5, 1, 120)
-        expires_in = _safe_int(auth.get("expires_in") or auth.get("expiresIn"), 0, 0, 86400)
-        if not device_code:
-            return jsonify({"success": False, "message": "六盘授权接口未返回 device_code", "raw": _redact_config(auth)}), 502
-
-        state = {
-            "device_code": device_code,
-            "user_code": user_code,
-            "verification_uri": verification_uri,
-            "interval": interval,
-            "expires_in": expires_in,
-            "created_at": utc_now_iso(),
-        }
-        db.set_app_settings({"sixpan.oauth.device_code": state})
-        return jsonify(
-            {
-                "success": True,
-                "message": "六盘授权入口已创建，请打开授权链接并输入验证码",
-                "auth": {**state, "device_code": "***"},
-                "raw": _redact_config(auth),
-                **{key: save_body[key] for key in ("config", "stored", "meta") if key in save_body},
-            }
-        )
-
-    def api_admin_sixpan_oauth_device_code_check():
-        importer = generic_importers.get("sixpan")
-        if not importer or not getattr(importer, "auth_configured", False):
-            return jsonify({"success": False, "message": "请先保存六盘 ClientID/ClientSecret"}), 400
-        payload = request.get_json(silent=True) or {}
-        settings = db.get_app_settings()
-        saved_state = settings.get("sixpan.oauth.device_code") if isinstance(settings.get("sixpan.oauth.device_code"), dict) else {}
-        device_code = str(payload.get("device_code") or saved_state.get("device_code") or "").strip()
-        user_code = str(payload.get("user_code") or saved_state.get("user_code") or "").strip()
-        if not device_code:
-            return jsonify({"success": False, "message": "没有可检查的六盘 device_code，请先点击开始授权"}), 400
-
-        try:
-            state = importer.check_device_authorization(device_code=device_code, user_code=user_code)
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"success": False, "message": f"六盘授权状态检查失败：{exc}"}), 502
-
-        tokens = importer.extract_tokens(state) if hasattr(importer, "extract_tokens") else {}
-        status_text = str(state.get("status") or "").strip()
-        authorized = bool(tokens.get("access_token") or tokens.get("refresh_token"))
-        persist_result = _persist_sixpan_tokens(tokens) if authorized else {"updated": False, "reload": {}}
-        sanitized_state = _redact_config(state)
-        next_state = dict(saved_state)
-        next_state.update(
-            {
-                "device_code": device_code,
-                "user_code": user_code,
-                "status": status_text,
-                "checked_at": utc_now_iso(),
-            }
-        )
-        db.set_app_settings({"sixpan.oauth.device_code": next_state})
-        return jsonify(
-            {
-                "success": True,
-                "authorized": authorized,
-                "status": status_text,
-                "message": _sixpan_oauth_state_message(status_text, authorized),
-                "state": sanitized_state,
-                "token_saved": bool(persist_result.get("updated")),
-                "reload": persist_result.get("reload") or {},
-            }
-        )
-
     def api_admin_sixpan_sync():
         result = sixpan_offline_sync.sync(trigger="admin_manual")
         return jsonify(result)
@@ -4654,6 +5066,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             callback_level=_rclone_callback_level,
             enqueue_organizer=_enqueue_organizer_from_rclone_completed_items,
             cancelled_status=JOB_CANCELLED,
+            execution_repository=v1_transfer_dispatch.executions,
         )
     )
 
@@ -4727,14 +5140,16 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 notifications_test=api_admin_notifications_test,
                 notifications_deliveries=api_admin_notifications_deliveries,
                 notifications_retry=api_admin_notifications_retry,
-                storage_status=api_admin_settings_storage_status,
-                storage_test=api_admin_settings_storage_test,
-                storage_update=api_admin_settings_storage_update,
-                public_storage_targets=api_public_storage_targets,
             )
         )
     )
-    app.register_blueprint(accounts_blueprint_for_service(v1_accounts_service, admin_required))
+    app.register_blueprint(
+        accounts_blueprint_for_service(
+            v1_accounts_service,
+            admin_required,
+            auth_sessions=provider_auth_sessions,
+        )
+    )
     app.register_blueprint(
         create_openlist_blueprint(
             OpenListRouteContext(
@@ -4748,7 +5163,15 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             StorageBlueprintContext(
                 admin_required=admin_required,
                 target_service=v1_target_service,
-                rules_service=v1_rules_service,
+                assignment_service=v1_rules_service,
+            )
+        )
+    )
+    app.register_blueprint(
+        create_storage_setup_blueprint(
+            StorageSetupBlueprintContext(
+                admin_required=admin_required,
+                service=v1_storage_setup_service,
             )
         )
     )
@@ -4905,17 +5328,9 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         "admin_refresh": api_admin_media_refresh,
         "legacy_refresh": api_media_refresh,
     })))
-    app.register_blueprint(create_cloud_compat_blueprint(CloudCompatRouteContext(admin_required=admin_required, handlers={
-        "quark_check": api_quark_check,
-        "quark_file_list": api_quark_file_list,
-        "cloud139_check": api_cloud139_check,
-        "cloud139_file_list": api_cloud139_file_list,
-    })))
     app.register_blueprint(create_sixpan_blueprint(SixPanRouteContext(admin_required=admin_required, handlers={
         "tasks": api_admin_sixpan_tasks,
         "probe": api_admin_sixpan_probe,
-        "oauth_device_code": api_admin_sixpan_oauth_device_code,
-        "oauth_device_code_check": api_admin_sixpan_oauth_device_code_check,
         "sync": api_admin_sixpan_sync,
         "retry_media_refresh": api_admin_sixpan_retry_media_refresh,
     })))
@@ -4929,153 +5344,22 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     })))
     app.register_blueprint(create_admin_shell_blueprint(AdminShellRouteContext(admin_required=admin_required, handlers={"login_page":admin_login_page,"admin_page":admin_page,"profile":api_admin_profile,"profile_update":api_admin_profile_update,"avatar":api_admin_profile_avatar,"site_logo":api_admin_site_logo})))
     app.register_blueprint(create_diagnostics_blueprint(DiagnosticsRouteContext(admin_required=admin_required, handlers={"system_logs":api_admin_system_logs,"system_events":api_admin_system_events,"task_logs":api_admin_task_logs,"btbtla_proxy_test":api_admin_btbtla_proxy_test,"openlist_test":api_admin_openlist_test,"openlist_dirs":api_admin_openlist_dirs,"tmdb_test":api_admin_tmdb_test,"tmdb_search":api_admin_tmdb_search,"tmdb_detail":api_admin_tmdb_detail,"ai_test":api_admin_ai_test})))
-    app.register_blueprint(create_legacy_api_blueprint(LegacyApiRouteContext(admin_required=admin_required, handlers={"public_config":public_config,"search":api_search,"detect":api_detect,"import_resource":api_import,"jobs":api_jobs})))
     app.register_blueprint(create_callbacks_blueprint(CallbackRouteContext(rclone_callback=api_rclone_callback)))
-    preserve_legacy_endpoints(
-        app,
-        {
-            "system.health": "health",
-            "system.livez": "livez",
-            "system.readyz": "readyz",
-            "system.dependencies": "dependencies",
-            "system.openapi_json": "openapi_json",
-            "system.swagger_docs": "swagger_docs",
-            "admin_auth.login": "api_admin_login",
-            "admin_auth.logout": "api_admin_logout",
-            "admin_auth.admin_session": "api_admin_session",
-            "admin_auth.security_status": "api_admin_security_status",
-            "settings.config": "api_admin_config",
-            "settings.history_summary": "api_admin_maintenance_history_summary",
-            "settings.cleanup_history": "api_admin_maintenance_cleanup_history",
-            "settings.advanced_config": "api_admin_advanced_config",
-            "settings.advanced_config_update": "api_admin_advanced_config_update",
-            "settings.settings": "api_admin_settings",
-            "settings.settings_update": "api_admin_settings_update",
-            "rclone_routes.admin_status": "api_admin_rclone_status",
-            "rclone_routes.admin_start": "api_admin_rclone_start",
-            "rclone_routes.admin_stop": "api_admin_rclone_stop",
-            "rclone_routes.admin_logs": "api_admin_rclone_logs",
-            "rclone_routes.admin_runs": "api_admin_rclone_runs",
-            "rclone_routes.admin_events": "api_admin_rclone_events",
-            "rclone_routes.admin_files": "api_admin_rclone_file_events",
-            "rclone_routes.admin_file_retry": "api_admin_rclone_file_retry",
-            "rclone_routes.admin_check": "api_admin_rclone_check",
-            "rclone_routes.admin_webdav_config": "api_admin_rclone_webdav_config",
-            "rclone_routes.admin_webdav_config_update": "api_admin_rclone_webdav_config_update",
-            "rclone_routes.admin_webdav_config_test": "api_admin_rclone_webdav_config_test",
-            "rclone_routes.legacy_status": "api_rclone_status",
-            "rclone_routes.legacy_start": "api_rclone_start",
-            "rclone_routes.legacy_stop": "api_rclone_stop",
-            "rclone_routes.legacy_logs": "api_rclone_logs",
-            "rclone_routes.legacy_runs": "api_rclone_runs",
-            "rclone_routes.legacy_events": "api_rclone_events",
-            "rclone_routes.legacy_files": "api_rclone_file_events",
-            "rclone_routes.legacy_check": "api_rclone_check",
-            "organizer_routes.tasks": "api_admin_organizer_tasks",
-            "organizer_routes.scan": "api_admin_organizer_scan",
-            "organizer_routes.task_detail": "api_admin_organizer_task_detail",
-            "organizer_routes.rebuild": "api_admin_organizer_rebuild",
-            "organizer_routes.mapping_update": "api_admin_organizer_mapping_update",
-            "organizer_routes.approve": "api_admin_organizer_approve",
-            "organizer_routes.apply": "api_admin_organizer_apply",
-            "organizer_routes.skip": "api_admin_organizer_skip",
-            "organizer_routes.retry": "api_admin_organizer_retry",
-            "organizer_routes.delete": "api_admin_organizer_delete",
-            "organizer_routes.runs": "api_admin_organizer_runs",
-            "organizer_routes.rollback": "api_admin_organizer_rollback",
-            "update_routes.subscriptions": "api_admin_update_subscriptions",
-            "update_routes.subscription_create": "api_admin_update_subscription_create",
-            "update_routes.subscription_detail": "api_admin_update_subscription_detail",
-            "update_routes.subscription_update": "api_admin_update_subscription_update",
-            "update_routes.subscription_delete": "api_admin_update_subscription_delete",
-            "update_routes.subscription_run": "api_admin_update_subscription_run",
-            "update_routes.subscription_refresh_snapshot": "api_admin_update_subscription_refresh_snapshot",
-            "update_routes.subscription_preview": "api_admin_update_subscription_preview",
-            "update_routes.subscription_pause": "api_admin_update_subscription_pause",
-            "update_routes.subscription_enable": "api_admin_update_subscription_enable",
-            "update_routes.runs": "api_admin_update_runs",
-            "update_routes.run_detail": "api_admin_update_run_detail",
-            "update_routes.candidates": "api_admin_update_candidates",
-            "update_routes.candidate_import": "api_admin_update_candidate_import",
-            "update_routes.candidate_reject": "api_admin_update_candidate_reject",
-            "update_routes.scheduler_run_due": "api_admin_update_scheduler_run_due",
-            "update_routes.scheduler_status": "api_admin_update_scheduler_status",
-            "request_routes.dashboard": "api_admin_dashboard",
-            "request_routes.requests": "api_admin_requests",
-            "request_routes.request_detail": "api_admin_request_detail",
-            "request_routes.request_approve": "api_admin_request_approve",
-            "request_routes.request_reject": "api_admin_request_reject",
-            "request_routes.request_cancel": "api_admin_request_cancel",
-            "job_routes.admin_jobs": "api_admin_jobs",
-            "job_routes.admin_job_detail": "api_admin_job_detail",
-            "job_routes.admin_job_retry": "api_admin_job_retry",
-            "job_routes.admin_job_cancel": "api_admin_job_cancel",
-            "job_routes.admin_job_delete": "api_admin_job_delete",
-            "job_routes.admin_jobs_batch_retry": "api_admin_jobs_batch_retry",
-            "job_routes.legacy_job_detail": "api_job_detail",
-            "job_routes.legacy_job_retry": "api_job_retry",
-            "public_routes.index": "index",
-            "public_routes.submit_page": "submit_page",
-            "public_routes.request_status_page": "request_status_page",
-            "public_routes.config": "api_public_config",
-            "public_routes.trending": "api_public_trending",
-            "public_routes.captcha": "api_public_captcha",
-            "public_routes.search": "api_public_search",
-            "public_routes.detect": "api_public_detect",
-            "public_routes.manual_preview": "api_public_manual_preview",
-            "public_routes.resource_detail": "api_public_resource_detail",
-            "public_routes.resource_files": "api_public_resource_files",
-            "public_routes.sixpan_parse": "api_public_sixpan_parse",
-            "public_routes.btbtla_resolve": "api_public_btbtla_resolve",
-            "public_routes.submit": "api_public_submit",
-            "public_routes.request": "api_public_request",
-            "media_routes.libraries": "api_admin_media_libraries",
-            "media_routes.running": "api_admin_media_running",
-            "media_routes.refresh_logs": "api_admin_media_refresh_logs",
-            "media_routes.admin_refresh": "api_admin_media_refresh",
-            "media_routes.legacy_refresh": "api_media_refresh",
-            "cloud_compat_routes.quark_check": "api_quark_check",
-            "cloud_compat_routes.quark_file_list": "api_quark_file_list",
-            "cloud_compat_routes.cloud139_check": "api_cloud139_check",
-            "cloud_compat_routes.cloud139_file_list": "api_cloud139_file_list",
-            "sixpan_routes.tasks": "api_admin_sixpan_tasks",
-            "sixpan_routes.probe": "api_admin_sixpan_probe",
-            "sixpan_routes.oauth_device_code": "api_admin_sixpan_oauth_device_code",
-            "sixpan_routes.oauth_device_code_check": "api_admin_sixpan_oauth_device_code_check",
-            "sixpan_routes.sync": "api_admin_sixpan_sync",
-            "sixpan_routes.retry_media_refresh": "api_admin_sixpan_retry_media_refresh",
-            "adapter_routes.search_providers": "api_admin_search_providers",
-            "adapter_routes.search_providers_update": "api_admin_search_providers_update",
-            "adapter_routes.search_aliases": "api_admin_search_aliases",
-            "adapter_routes.search_aliases_update": "api_admin_search_aliases_update",
-            "adapter_routes.adapters": "api_admin_adapters",
-            "adapter_routes.adapter_probe": "api_admin_adapter_probe",
-            "admin_shell_routes.login_page": "admin_login_page",
-            "admin_shell_routes.admin_page": "admin_page",
-            "admin_shell_routes.profile": "api_admin_profile",
-            "admin_shell_routes.profile_update": "api_admin_profile_update",
-            "admin_shell_routes.avatar": "api_admin_profile_avatar",
-            "admin_shell_routes.site_logo": "api_admin_site_logo",
-            "diagnostic_routes.system_logs": "api_admin_system_logs",
-            "diagnostic_routes.system_events": "api_admin_system_events",
-            "diagnostic_routes.task_logs": "api_admin_task_logs",
-            "diagnostic_routes.btbtla_proxy_test": "api_admin_btbtla_proxy_test",
-            "diagnostic_routes.openlist_test": "api_admin_openlist_test",
-            "diagnostic_routes.openlist_dirs": "api_admin_openlist_dirs",
-            "diagnostic_routes.tmdb_test": "api_admin_tmdb_test",
-            "diagnostic_routes.tmdb_search": "api_admin_tmdb_search",
-            "diagnostic_routes.tmdb_detail": "api_admin_tmdb_detail",
-            "diagnostic_routes.ai_test": "api_admin_ai_test",
-            "legacy_api_routes.public_config": "public_config",
-            "legacy_api_routes.search": "api_search",
-            "legacy_api_routes.detect": "api_detect",
-            "legacy_api_routes.import_resource": "api_import",
-            "legacy_api_routes.jobs": "api_jobs",
-            "callback_routes.rclone_callback": "api_rclone_callback",
-        },
-    )
     if role_runs(active_process_role, "worker"):
         rclone_worker_runtime.start()
+        # The queue is only a wake-up channel.  Reconcile the durable
+        # transfer table before consuming new tasks so a crash between plan
+        # persistence and enqueue (or a lost queue row) cannot strand work.
+        try:
+            recovery_result = transfer_recovery_scanner.scan_once()
+            if recovery_result.errors:
+                app.logger.warning(
+                    "transfer recovery startup completed with errors: %s",
+                    recovery_result.to_dict(),
+                )
+        except Exception:  # noqa: BLE001
+            app.logger.exception("transfer recovery startup scan failed")
+        transfer_recovery_runtime.start()
         durable_worker_runtime.start()
         search_cache_maintenance_worker.start()
         event_retention_worker.start()

@@ -36,6 +36,7 @@ class PublicResourceDetailService:
         sixpan_importer: Any | None = None,
         btbtla_client: Any | None = None,
         hide_full_links: bool = True,
+        tianyi_importer: Any | None = None,
     ) -> dict[str, Any]:
         raw = cached.get("raw_data") if isinstance(cached.get("raw_data"), dict) else {}
         source_url = str(cached.get("source_url") or raw.get("url") or raw.get("source_url") or "")
@@ -65,6 +66,7 @@ class PublicResourceDetailService:
             quark_importer=quark_importer,
             cloud139_importer=cloud139_importer,
             sixpan_importer=sixpan_importer,
+            tianyi_importer=tianyi_importer,
         )
         return {
             "public_id": cached.get("public_id"),
@@ -82,6 +84,7 @@ class PublicResourceDetailService:
                 link.source_type,
                 cloud139_importer=cloud139_importer,
                 sixpan_importer=sixpan_importer,
+                tianyi_importer=tianyi_importer,
             ),
             "link": {
                 "source_type": link.source_type,

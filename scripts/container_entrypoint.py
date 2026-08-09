@@ -85,6 +85,19 @@ def _ensure_runtime_secret(name: str, path: Path, uid: int, gid: int) -> None:
     os.environ[name] = value
 
 
+def _validate_root_key() -> None:
+    name = "FNOS_ROOT_KEY"
+    value = str(os.getenv(name) or "").strip()
+    if not value:
+        raise RuntimeError("FNOS_ROOT_KEY is required")
+    try:
+        decoded = bytes.fromhex(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a 64-character hex key") from exc
+    if len(decoded) != 32:
+        raise RuntimeError(f"{name} must be a 64-character hex key")
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         raise RuntimeError("container entrypoint requires an application command")
@@ -92,9 +105,12 @@ def main() -> None:
     uid = _numeric_env("APP_UID", 10001)
     gid = _numeric_env("APP_GID", 10001)
     configured_role = str(os.getenv("FNOS_PROCESS_ROLE") or "").strip().lower()
-    runtime_role = configured_role or (
-        "web" if str(os.getenv("APP_ENV") or "").strip().lower() == "production" else "all"
-    )
+    if configured_role not in {"all", "web", "scheduler", "worker"}:
+        raise RuntimeError(
+            "FNOS_PROCESS_ROLE is required and must be one of all, web, scheduler, worker"
+        )
+    runtime_role = configured_role
+    _validate_root_key()
     if _running_as_root():
         # config/data/logs 里保存应用配置和数据，需要修复已有文件。
         for value in ("/app/config", "/app/data", "/app/logs", "/home/app"):
@@ -110,13 +126,6 @@ def main() -> None:
             os.chown(rclone_config, uid, gid)
             os.chmod(rclone_config, stat.S_IMODE(rclone_config.stat().st_mode) | 0o660)
 
-    secret_path = Path(
-        os.getenv(
-            "NOTIFICATION_ENCRYPTION_KEY_FILE",
-            "/app/data/.secrets/notification_encryption_key",
-        )
-    )
-    _ensure_runtime_secret("NOTIFICATION_ENCRYPTION_KEY", secret_path, uid, gid)
     worker_token_path = Path(
         os.getenv(
             "RCLONE_WORKER_CONTROL_TOKEN_FILE",

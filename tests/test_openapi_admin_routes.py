@@ -39,6 +39,16 @@ class OpenApiAdminRouteTests(unittest.TestCase):
         self.assertEqual(dependencies["security"], [{"cookieAuth": []}])
         self.assertIn("401", dependencies["responses"])
 
+    def test_legacy_tianyi_routes_are_not_documented(self) -> None:
+        paths = get_openapi_spec()["paths"]
+        self.assertNotIn("/api/tianyi/check", paths)
+        self.assertNotIn("/api/tianyi/file-list", paths)
+
+    def test_legacy_sixpan_oauth_routes_are_not_documented(self) -> None:
+        paths = get_openapi_spec()["paths"]
+        self.assertNotIn("/api/admin/sixpan/oauth/device-code", paths)
+        self.assertNotIn("/api/admin/sixpan/oauth/device-code/check", paths)
+
     def test_settings_blueprint_does_not_expose_sensitive_export_via_get(self) -> None:
         app = Flask(__name__)
 
@@ -90,8 +100,6 @@ class OpenApiAdminRouteTests(unittest.TestCase):
                     handlers={
                         "tasks": ok,
                         "probe": ok,
-                        "oauth_device_code": ok,
-                        "oauth_device_code_check": ok,
                         "sync": ok,
                         "retry_media_refresh": ok,
                     },
@@ -105,6 +113,12 @@ class OpenApiAdminRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(calls, [])
+        self.assertEqual(
+            app.test_client()
+            .post("/api/admin/sixpan/oauth/device-code")
+            .status_code,
+            404,
+        )
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ const publicState = {
     btbtlaDetails: {},
     quarkSelections: {},
     cloud139Selections: {},
+    tianyiSelections: {},
     manualLink: null,
     manualPreview: null,
     pendingSlowSubmit: null,
@@ -294,6 +295,7 @@ function getPublicSearchModule() {
         handleQuarkFolderOpen,
         handleQuarkSelectionChange,
         handleCloud139SelectionChange,
+        handleTianyiSelectionChange,
         submitPublicResource,
         renderPublicResourceDetail,
         isPublicSubmitConfirmOpen,
@@ -372,6 +374,10 @@ function isQuarkCandidate(...args) {
 
 function isCloud139Candidate(...args) {
     return getPublicSearchModule().isCloud139Candidate(...args);
+}
+
+function isTianyiCandidate(...args) {
+    return getPublicSearchModule().isTianyiCandidate(...args);
 }
 
 function sortPublicResources(...args) {
@@ -545,6 +551,7 @@ function getPublicSubmitModule() {
         isSixpanCandidate,
         isQuarkCandidate,
         isCloud139Candidate,
+        isTianyiCandidate,
         recommendedCategoryForItem,
         isResourceInvalid,
         ensurePublicResourceDetail,
@@ -725,6 +732,26 @@ function handleCloud139SelectionChange(...args) {
 
 function cloud139SelectionPayload(...args) {
     return getPublicSubmitModule().cloud139SelectionPayload(...args);
+}
+
+function tianyiSelectionState(...args) {
+    return getPublicSubmitModule().tianyiSelectionState(...args);
+}
+
+function tianyiSelectionSummaryText(...args) {
+    return getPublicSubmitModule().tianyiSelectionSummaryText(...args);
+}
+
+function renderTianyiFilePreview(...args) {
+    return getPublicSubmitModule().renderTianyiFilePreview(...args);
+}
+
+function handleTianyiSelectionChange(...args) {
+    return getPublicSubmitModule().handleTianyiSelectionChange(...args);
+}
+
+function tianyiSelectionPayload(...args) {
+    return getPublicSubmitModule().tianyiSelectionPayload(...args);
 }
 
 function sixpanPublicKey(...args) {

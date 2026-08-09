@@ -1,6 +1,6 @@
-"""V1.0 多链路 Import Planner v4 计划包。
+"""V1.0 多链路 Import Planner。
 
-系统只创建、校验并执行 v4 计划（``EXECUTION_PLAN_VERSION == 4``）。生成器与
+系统只创建、校验并执行 schema version 1 计划。生成器与
 校验器必须执行相同的安全约束；任何字段缺失、修订被非法删除或身份不一致都
 失败关闭，绝不根据当前后台配置“补全”计划，也绝不把旧 v2/v3 计划当作可执行计划。
 
@@ -8,7 +8,7 @@
 
 - ``source_resolver``    从服务端可信资源记录解析来源（不信任客户端 provider 字段）。
 - ``destination_resolver`` 按管理员规则解析来源的目标与账号。
-- ``planner``            冻结唯一执行策略与任务级路径，返回不可变 v4 计划。
+- ``planner``            冻结唯一执行策略与任务级路径，返回不可变 V1 计划。
 - ``plan_validator``     按 §12.4 校验冻结计划与任务身份一致，失败关闭。
 """
 
@@ -18,13 +18,14 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ..domain.models import (
-    EXECUTION_PLAN_VERSION,  # noqa: F401  # re-export：本包统一使用 v4
+    EXECUTION_PLAN_VERSION,  # noqa: F401  # re-export：本包统一使用 V1
     AccountSelection,
     OpenListMount,
     ProviderAccount,
     ProviderCapabilities,
     StorageTarget,
 )
+from ..providers.registry import ProviderRegistry, ProviderRegistryError
 
 # ---- 传输策略常量（§3.3 / §12.3） ------------------------------------------
 
@@ -60,10 +61,6 @@ STAGING_DIR = "_fnos_staging"
 
 # 允许的来源形态（§3.3 SourceDescriptor.source_form）。
 VALID_SOURCE_FORMS = frozenset({"share", "magnet", "local", "http"})
-
-# 已知的 v4 Provider 种类。未知 Provider 一律拒绝，不允许回落到通用 rclone。
-KNOWN_PROVIDER_KINDS = frozenset({"mobile", "quark", "tianyi", "sixpan", "local", "generic"})
-
 
 @dataclass(frozen=True)
 class CapabilityDecision:
@@ -254,38 +251,37 @@ class AdapterRegistry(Protocol):
 class AccountsService(Protocol):
     def get_selection(self, provider_kind: str, scope: str = "default") -> AccountSelection | None: ...
 
+    def get_selection_revision(
+        self, provider_kind: str, scope: str, selection_revision: int
+    ) -> AccountSelection | None: ...
+
     def get_account(self, account_id: str) -> ProviderAccount | None: ...
 
     def has_revision(self, account_id: str, revision: int) -> bool: ...
 
 
 class TargetService(Protocol):
-    def get(self, destination_id: str) -> StorageTarget | None: ...
+    def get_target(self, destination_id: str, revision: int | None = None) -> StorageTarget | None: ...
 
-    def get_revision(self, destination_id: str, revision: int) -> StorageTarget | None: ...
+    def resolve_binding(self, destination_id: str, target_revision: int) -> Any: ...
+
+    def get_binding(self, binding_id: str, binding_revision: int | None = None) -> Any: ...
 
 
 class RulesService(Protocol):
     """来源 -> 目标规则。规则是目标选择的唯一真源。"""
 
-    def resolve_default(
+    def resolve_destination(
         self,
-        *,
-        source_provider_kind: str,
+        search_source_id: str,
         source_form: str,
         category_key: str,
-        audience: str,
+        audience: str = "guest",
     ) -> str | None: ...
 
-    def is_allowed(
-        self,
-        *,
-        source_provider_kind: str,
-        source_form: str,
-        category_key: str,
-        destination_id: str,
-        audience: str,
-    ) -> bool: ...
+    def get_assignment(self, search_source_id: str, category_key: str) -> Any: ...
+
+    def get_revision(self, assignment_id: str, revision: int) -> Any: ...
 
 
 class MountService(Protocol):
@@ -299,13 +295,23 @@ class MountService(Protocol):
         readable: bool = True,
     ) -> OpenListMount | None: ...
 
+    def get_revision(self, mount_id: str, revision: int) -> Any: ...
+
 
 # 底部再导入子模块，避免循环导入：异常/常量先定义，子模块用 ``from . import``
 # 引用它们时 __init__ 已部分初始化。
 from .source_resolver import SourceResolver  # noqa: E402
 from .destination_resolver import DestinationResolver  # noqa: E402
-from .planner import ImportPlannerV4  # noqa: E402
-from .plan_validator import PlanValidationDeps, PlanValidator, validate_v4_plan  # noqa: E402
+from .planner import ImportPlanner  # noqa: E402
+from .plan_validator import PlanValidationDeps, PlanValidator, validate_plan  # noqa: E402
+from .job_plan import (  # noqa: E402
+    JobPlanError,
+    job_plan_reason,
+    plan_path,
+    plan_strategy,
+    validated_v1_execution_plan_from_job,
+    v1_execution_plan_from_job,
+)
 
 __all__ = [
     "EXECUTION_PLAN_VERSION",
@@ -320,7 +326,6 @@ __all__ = [
     "INGRESS_DIR",
     "STAGING_DIR",
     "VALID_SOURCE_FORMS",
-    "KNOWN_PROVIDER_KINDS",
     "CapabilityDecision",
     "PlanningError",
     "SourceResolutionError",
@@ -356,26 +361,48 @@ __all__ = [
     "MountService",
     "SourceResolver",
     "DestinationResolver",
-    "ImportPlannerV4",
+    "ImportPlanner",
     "PlanValidationDeps",
     "PlanValidator",
-    "validate_v4_plan",
+    "validate_plan",
+    "JobPlanError",
+    "job_plan_reason",
+    "plan_path",
+    "plan_strategy",
+    "validated_v1_execution_plan_from_job",
+    "v1_execution_plan_from_job",
+    "DefaultAdapterRegistry",
 ]
 
 
-class DefaultAdapterRegistry:
-    """最小可用注册表：按 provider_kind 返回 Adapter，缺失即失败关闭。"""
+class DefaultAdapterRegistry(ProviderRegistry):
+    """V1 唯一 Provider 注册表，同时服务 Planner、账号和来源目录。
 
-    def __init__(self, adapters: dict[str, ProviderAdapter] | None = None) -> None:
-        self._adapters = dict(adapters or {})
+    名称保留是为了不让 Composition Root 出现第二套注册表实现；行为已经完全
+    委托给严格的 :class:`ProviderRegistry`。新增 Provider 只需注册 Adapter 或
+    加载 ``fnos_media_import.providers`` entry point。
+    """
+
+    def __init__(
+        self,
+        adapters: dict[str, ProviderAdapter] | None = None,
+    ) -> None:
+        values = list((adapters or {}).values()) if isinstance(adapters, dict) else adapters
+        try:
+            super().__init__(values)
+        except ProviderRegistryError as exc:
+            raise PlanningError(str(exc), code="PROVIDER_REGISTRY_INVALID") from exc
 
     def register(self, adapter: ProviderAdapter) -> None:
-        self._adapters[adapter.kind] = adapter
+        try:
+            super().register(adapter)
+        except ProviderRegistryError as exc:
+            raise PlanningError(str(exc), code="PROVIDER_REGISTRY_INVALID") from exc
 
     def get(self, provider_kind: str) -> ProviderAdapter:
         try:
-            return self._adapters[provider_kind]
-        except KeyError as exc:
+            return super().get(provider_kind)  # type: ignore[return-value]
+        except ProviderRegistryError as exc:
             raise PlanningError(
                 f"未注册 Provider Adapter：{provider_kind}", code="PROVIDER_UNAVAILABLE"
             ) from exc

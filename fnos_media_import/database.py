@@ -86,6 +86,12 @@ class Database(DatabaseDomainMixin):
                 Migration(20, "reserved_organizer_multi_resource_movies", lambda connection: None),
                 Migration(21, "storage_destination_columns", self._apply_storage_destination_migration),
                 Migration(22, "v1_accounts_openlist_targets_rules", self._apply_v1_accounts_openlist_migration),
+                Migration(23, "v1_multilink_execution_model", self._apply_v1_multilink_execution_migration),
+                Migration(24, "v1_assignments_and_binding_revisions", self._apply_v1_assignment_binding_migration),
+                Migration(25, "provider_auth_sessions", self._apply_provider_auth_session_migration),
+                Migration(26, "v1_scoped_rclone_runs", self._apply_v1_scoped_rclone_run_migration),
+                Migration(27, "provider_auth_session_cas", self._apply_provider_auth_session_cas_migration),
+                Migration(28, "openlist_mount_native_locator_column", self._apply_openlist_mount_native_locator_migration),
             )
         )
 
@@ -234,24 +240,232 @@ class Database(DatabaseDomainMixin):
               FOREIGN KEY (destination_id) REFERENCES storage_targets(destination_id)
             );
 
-            CREATE TABLE IF NOT EXISTS source_destination_rules (
-              rule_id TEXT PRIMARY KEY,
-              source_provider_kind TEXT NOT NULL,
-              source_form TEXT NOT NULL,
-              category_key TEXT NOT NULL,
-              destination_id TEXT NOT NULL,
-              guest_allowed INTEGER NOT NULL DEFAULT 0,
-              admin_allowed INTEGER NOT NULL DEFAULT 1,
-              is_default INTEGER NOT NULL DEFAULT 0,
-              priority INTEGER NOT NULL DEFAULT 100,
-              enabled INTEGER NOT NULL DEFAULT 1,
-              FOREIGN KEY (destination_id) REFERENCES storage_targets(destination_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_rules_source ON source_destination_rules(source_provider_kind, source_form);
             """
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_storage_targets_provider ON storage_targets(provider_kind)"
+        )
+
+    def _apply_openlist_mount_native_locator_migration(self, conn: sqlite3.Connection) -> None:
+        """迁移 23 曾在此列加入前被旧库应用过，现有库需要单独补列。"""
+        self._ensure_column(conn, "openlist_mounts", "native_locator_json", "TEXT NOT NULL DEFAULT '{}'")
+
+    def _apply_v1_multilink_execution_migration(self, conn: sqlite3.Connection) -> None:
+        """Install the only supported V1 planning and durable execution model."""
+
+        self._ensure_column(conn, "openlist_mounts", "storage_identity_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "openlist_mounts", "identity_root", "TEXT NOT NULL DEFAULT '/'")
+        self._ensure_column(conn, "openlist_mounts", "probe_root", "TEXT NOT NULL DEFAULT '/_fnos_probe'")
+        self._ensure_column(conn, "openlist_mounts", "native_locator_json", "TEXT NOT NULL DEFAULT '{}'")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS provider_account_selection_revisions (
+              provider_kind TEXT NOT NULL,
+              scope TEXT NOT NULL,
+              selection_revision INTEGER NOT NULL,
+              account_id TEXT NOT NULL,
+              account_revision INTEGER NOT NULL,
+              selected_at TEXT NOT NULL,
+              PRIMARY KEY (provider_kind, scope, selection_revision),
+              FOREIGN KEY (account_id, account_revision)
+                REFERENCES provider_account_revisions(account_id, revision)
+            );
+
+            CREATE TABLE IF NOT EXISTS openlist_connection_revisions (
+              connection_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              config_json TEXT NOT NULL,
+              password_ciphertext BLOB NOT NULL,
+              credential_key_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (connection_id, revision),
+              FOREIGN KEY (connection_id) REFERENCES openlist_connections(connection_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS openlist_mount_revisions (
+              mount_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              config_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (mount_id, revision),
+              FOREIGN KEY (mount_id) REFERENCES openlist_mounts(mount_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS storage_target_account_bindings (
+              binding_id TEXT PRIMARY KEY,
+              destination_id TEXT NOT NULL,
+              target_revision INTEGER NOT NULL,
+              account_id TEXT,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              current_revision INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (destination_id, target_revision)
+                REFERENCES storage_target_revisions(destination_id, revision),
+              FOREIGN KEY (account_id) REFERENCES provider_accounts(account_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_target_binding_account
+              ON storage_target_account_bindings(destination_id, target_revision, IFNULL(account_id, ''));
+
+            CREATE TABLE IF NOT EXISTS storage_target_binding_revisions (
+              binding_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              locator_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (binding_id, revision),
+              FOREIGN KEY (binding_id) REFERENCES storage_target_account_bindings(binding_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS source_records (
+              source_record_id TEXT PRIMARY KEY,
+              search_source_id TEXT NOT NULL,
+              provider_kind TEXT NOT NULL,
+              source_form TEXT NOT NULL,
+              canonical_source_id TEXT NOT NULL,
+              current_revision INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_source_record_canonical
+              ON source_records(search_source_id, canonical_source_id);
+
+            CREATE TABLE IF NOT EXISTS source_record_revisions (
+              source_record_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              access_payload_ciphertext BLOB NOT NULL,
+              credential_key_id TEXT NOT NULL,
+              selected_items_json TEXT NOT NULL,
+              selected_items_hash TEXT NOT NULL,
+              expected_file_count INTEGER,
+              expected_total_bytes INTEGER,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (source_record_id, revision),
+              FOREIGN KEY (source_record_id) REFERENCES source_records(source_record_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS import_execution_plans (
+              job_id INTEGER PRIMARY KEY,
+              schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+              plan_json TEXT NOT NULL,
+              plan_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (job_id) REFERENCES import_jobs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS transfer_executions (
+              job_id INTEGER PRIMARY KEY,
+              strategy TEXT NOT NULL,
+              phase TEXT NOT NULL,
+              snapshot_json TEXT NOT NULL DEFAULT '{}',
+              receipt_json TEXT,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              resume_at TEXT,
+              organizer_task_id INTEGER,
+              staging_verified INTEGER NOT NULL DEFAULT 0,
+              final_verified INTEGER NOT NULL DEFAULT 0,
+              app_acked INTEGER NOT NULL DEFAULT 0,
+              cleanup_json TEXT NOT NULL DEFAULT '{}',
+              last_error_code TEXT NOT NULL DEFAULT '',
+              last_error_message TEXT NOT NULL DEFAULT '',
+              row_version INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (job_id) REFERENCES import_jobs(id) ON DELETE CASCADE,
+              FOREIGN KEY (organizer_task_id) REFERENCES organizer_tasks(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_transfer_execution_phase_resume
+              ON transfer_executions(phase, resume_at, job_id);
+            """
+        )
+        self._ensure_column(conn, "source_record_revisions", "access_payload_hash", "TEXT NOT NULL DEFAULT ''")
+
+    def _apply_v1_assignment_binding_migration(self, conn: sqlite3.Connection) -> None:
+        """Install the canonical V1 admin routing and target binding model."""
+
+        self._ensure_column(conn, "storage_target_account_bindings", "provider_kind", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "storage_target_binding_revisions", "account_revision", "INTEGER")
+        conn.execute("DROP TABLE IF EXISTS source_destination_rules")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS source_destination_assignments (
+              search_source_id TEXT NOT NULL,
+              category_key TEXT NOT NULL,
+              destination_id TEXT NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              revision INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (search_source_id, category_key),
+              FOREIGN KEY (destination_id) REFERENCES storage_targets(destination_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_source_assignments_destination
+              ON source_destination_assignments(destination_id);
+            """
+        )
+
+    def _apply_provider_auth_session_migration(self, conn: sqlite3.Connection) -> None:
+        """Durable, encrypted login sessions for Provider accounts."""
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS provider_auth_sessions (
+              session_id TEXT PRIMARY KEY,
+              provider_kind TEXT NOT NULL,
+              auth_method TEXT NOT NULL,
+              status TEXT NOT NULL,
+              state_ciphertext BLOB NOT NULL,
+              credential_key_id TEXT NOT NULL,
+              public_json TEXT NOT NULL DEFAULT '{}',
+              message TEXT NOT NULL DEFAULT '',
+              account_id TEXT,
+              expires_at TEXT,
+              row_version INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (account_id) REFERENCES provider_accounts(account_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_auth_sessions_status
+              ON provider_auth_sessions(status, updated_at);
+            """
+        )
+
+    def _apply_provider_auth_session_cas_migration(self, conn: sqlite3.Connection) -> None:
+        """Add the optimistic-lock token used to serialize Provider polling."""
+
+        self._ensure_column(
+            conn,
+            "provider_auth_sessions",
+            "row_version",
+            "INTEGER NOT NULL DEFAULT 1",
+        )
+
+    def _apply_v1_scoped_rclone_run_migration(self, conn: sqlite3.Connection) -> None:
+        """Make every V1 rclone receipt address one durable run.
+
+        The previous table only described a process-global invocation, so a
+        worker could not safely poll or cancel the copy it submitted.  V1
+        freezes the operation key, job and copy descriptor before the thread
+        starts; process restarts can therefore reconcile the exact run rather
+        than consulting global in-memory status.
+        """
+
+        self._ensure_column(conn, "rclone_runs", "operation_key", "TEXT")
+        self._ensure_column(conn, "rclone_runs", "job_id", "INTEGER")
+        self._ensure_column(
+            conn,
+            "rclone_runs",
+            "copy_descriptor_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        self._ensure_column(conn, "rclone_runs", "updated_at", "TEXT NOT NULL DEFAULT ''")
+        conn.executescript(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rclone_runs_operation_key
+              ON rclone_runs(operation_key)
+              WHERE operation_key IS NOT NULL AND operation_key <> '';
+            CREATE INDEX IF NOT EXISTS idx_rclone_runs_job_status
+              ON rclone_runs(job_id, status, id);
+            """
         )
 
     def _apply_worker_task_migration(self, conn: sqlite3.Connection) -> None:
@@ -1030,8 +1244,50 @@ class Database(DatabaseDomainMixin):
     def count_rclone_runs(self) -> int:
         return self.rclone.count_rclone_runs()
 
+    def create_scoped_rclone_run(
+        self,
+        *,
+        trigger_reason: str,
+        operation_key: str,
+        job_id: int,
+        copy_descriptor: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        return self.rclone.create_scoped_rclone_run(
+            trigger_reason=trigger_reason,
+            operation_key=operation_key,
+            job_id=job_id,
+            copy_descriptor=copy_descriptor,
+        )
+
+    def find_rclone_run_by_operation_key(self, operation_key: str) -> dict[str, Any] | None:
+        return self.rclone.find_rclone_run_by_operation_key(operation_key)
+
+    def list_recoverable_scoped_rclone_runs(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self.rclone.list_recoverable_scoped_rclone_runs(limit)
+
+    def mark_scoped_rclone_run_started(self, run_id: int) -> bool:
+        return self.rclone.mark_scoped_rclone_run_started(run_id)
+
+    def mark_scoped_rclone_run_status(
+        self,
+        run_id: int,
+        status: str,
+        *,
+        error_message: str = "",
+        terminal: bool = False,
+    ) -> bool:
+        return self.rclone.mark_scoped_rclone_run_status(
+            run_id,
+            status,
+            error_message=error_message,
+            terminal=terminal,
+        )
+
     def list_rclone_runs(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         return self.rclone.list_rclone_runs(limit=limit, offset=offset)
+
+    def get_rclone_run(self, run_id: int) -> dict[str, Any] | None:
+        return self.rclone.get_rclone_run(run_id)
 
     def list_rclone_events(self, run_id: int | None = None, limit: int = 200) -> list[dict[str, Any]]:
         return self.rclone.list_rclone_events(run_id=run_id, limit=limit)

@@ -577,12 +577,18 @@ class CmccClient:
             data["parentFileId"] = parent_id
         return data
 
-    def list_dir(self, parent_file_id: str, *, page_size: int = 100) -> list[dict[str, Any]]:
+    def list_dir(
+        self,
+        parent_file_id: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 100,
+    ) -> list[dict[str, Any]]:
         parent_id = str(parent_file_id or "/").strip() or "/"
         cursor: Any = ""
         items: list[dict[str, Any]] = []
         seen_cursors: set[str] = set()
-        for _ in range(100):
+        for _ in range(max(1, min(int(max_pages or 1), 100))):
             cursor_key = str(cursor or "__FIRST__")
             if cursor_key in seen_cursors:
                 break

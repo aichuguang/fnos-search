@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from .organizer.openlist_client import VIDEO_EXTENSIONS
+from .planning.job_plan import plan_path, validated_v1_execution_plan_from_job
 from .public_web import _sixpan_parse_summary
-from .services.import_staging_service import map_staging_path_to_openlist, staging_plan_from_job
 
 
 def _join_virtual_path(*parts: Any) -> str:
@@ -188,7 +188,12 @@ def _sixpan_scan_filters_from_job(job: dict[str, Any], *, root_path: str = "") -
     }
 
 
-def _cloud139_scan_filters_from_job(job: dict[str, Any], *, root_path: str = "") -> dict[str, Any]:
+def _cloud139_scan_filters_from_job(
+    job: dict[str, Any],
+    *,
+    root_path: str = "",
+    execution_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """从 139 勾选结果中提取本次入库的视频文件名。
 
     单集追更或直接勾选文件时，139 可能把文件直接保存到分类根目录。
@@ -206,7 +211,18 @@ def _cloud139_scan_filters_from_job(job: dict[str, Any], *, root_path: str = "")
     expected_paths: list[str] = []
     expected_count = 0
     seen_items: set[str] = set()
-    staging_plan = staging_plan_from_job(job)
+    # Only a persisted V1 plan may provide a destination namespace/path.  Do
+    # not rebuild a path from legacy staging metadata or current categories.
+    # Scan filters are consumed by Organizer/OpenList helpers.  Do not let a
+    # partially migrated envelope provide a destination root: only the same
+    # validated V1 plan accepted by the transfer worker may contribute paths.
+    if execution_plan is None:
+        try:
+            execution_plan = validated_v1_execution_plan_from_job(job)
+        except Exception:  # noqa: BLE001 - malformed/legacy jobs have no frozen root
+            execution_plan = {}
+    destination_ref = plan_path(execution_plan, "destination_final")
+    destination_root = str(destination_ref.get("path") or "").strip()
     for container in containers:
         rows = []
         for key in ("selected_files", "files"):
@@ -237,10 +253,12 @@ def _cloud139_scan_filters_from_job(job: dict[str, Any], *, root_path: str = "")
                 if root_path and key in {"relative_path", "path"}:
                     continue
                 scoped_path = _scope_scan_filter_path(root_path, path)
-                if not scoped_path and staging_plan:
+                if not scoped_path and destination_root and path:
                     scoped_path = _scope_scan_filter_path(
                         root_path,
-                        map_staging_path_to_openlist(path, staging_plan),
+                        f"{destination_root.rstrip('/')}/{path.lstrip('/')}"
+                        if not path.startswith("/")
+                        else path,
                     )
                 if scoped_path and scoped_path not in expected_paths:
                     expected_paths.append(scoped_path)

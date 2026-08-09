@@ -21,9 +21,10 @@ x-app-environment: &app-environment
   TZ: ${TZ:-Asia/Shanghai}
   APP_ENV: production
   SECURITY_STRICT: "true"
-  APP_SECRET_KEY: "${APP_SECRET_KEY:-}"
-  NOTIFICATION_ENCRYPTION_KEY: "${NOTIFICATION_ENCRYPTION_KEY:-}"
   RCLONE_WORKER_CONTROL_TOKEN: "${RCLONE_WORKER_CONTROL_TOKEN:-}"
+  FNOS_ROOT_KEY: "${FNOS_ROOT_KEY:-}"
+  FNOS_RELAY_ROOT: /data/relay
+  FNOS_LOCAL_TARGET_ROOT: /storage-targets
 
 services:
   fnos-media-import:
@@ -43,6 +44,7 @@ services:
       - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
       - "${APP_DATA_HOST_PATH:-./data}:/app/data"
       - "${APP_LOGS_HOST_PATH:-./logs}:/app/logs"
+      - "${FNOS_RELAY_HOST_PATH:-./rclone/relay}:/data/relay"
 
   fnos-rclone-worker:
     <<: *app-common
@@ -60,6 +62,7 @@ services:
       - "${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone"
       - "${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache"
       - "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp"
+      - "${FNOS_RELAY_HOST_PATH:-./rclone/relay}:/data/relay"
       # 可选：本地目录存储目标（local folder storage target）。
       # 启用前先在 .env 中把 RCLONE_LOCAL_STORAGE_HOST_PATH 指向已挂载的目录，
       # 再取消下一行注释；容器内映射到 /storage-targets。

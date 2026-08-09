@@ -5,38 +5,56 @@ from types import SimpleNamespace
 
 from fnos_media_import.constants import JOB_REVIEW, ROUTE_QUARK_TO_MOBILE
 from fnos_media_import.organizer.openlist_client import OpenListError, OpenListItem, OpenListTransientError
+from fnos_media_import.organizer.parser import (
+    V1_DESTINATION_FINAL_FIELD,
+    V1_DESTINATION_IS_RESOURCE_FIELD,
+)
 from fnos_media_import.organizer.service import OrganizerService, SkipOperation
-from tests.test_rclone_persisted_staging_plan import _persisted_plan
+from tests._organizer_v1_fixtures import (
+    attach_organizer_v1_task,
+    bind_task_openlist_resolver,
+    organizer_v1_job,
+    organizer_v1_plan,
+)
 
 
 JOB_ROOT = "/旧挂载/_入库暂存/电视剧/job-42"
 FINAL_ROOT = "/旧挂载/电视剧"
 RESOURCE_ROOT = f"{FINAL_ROOT}/藏海传 (2025)"
 SEASON_ROOT = f"{RESOURCE_ROOT}/Season 01"
+PLAN = organizer_v1_plan(
+    42,
+    category="tv",
+    organizer_root=JOB_ROOT,
+    destination_final=FINAL_ROOT,
+)
+JOB = organizer_v1_job(PLAN, status="waiting_organizer")
+
+
+class _PlanDatabase:
+    @staticmethod
+    def get_job(_job_id: int) -> dict:
+        return JOB
 
 
 def _task(**raw_overrides: object) -> dict:
-    raw_data = {
-        "staging_plan": _persisted_plan(42),
-        "target_root_path": FINAL_ROOT,
-        **raw_overrides,
-    }
-    return {
-        "id": 8,
-        "job_id": 42,
-        "category": "tv",
-        "openlist_root_path": JOB_ROOT,
-        "raw_data": raw_data,
-    }
+    return attach_organizer_v1_task(
+        {
+            "id": 8,
+            "raw_data": dict(raw_overrides),
+        },
+        PLAN,
+    )
 
 
 def _service(*, existing_paths: set[str] | None = None) -> OrganizerService:
     service = OrganizerService.__new__(OrganizerService)
-    service.db = None
+    service.db = _PlanDatabase()
     service.organizer_config = {"max_scan_depth": 8, "max_files_per_task": 500}
-    service.categories = {"tv": {"label": "电视剧", "openlist_root_path": FINAL_ROOT}}
+    service.categories = {"tv": {"label": "电视剧"}}
     paths = existing_paths or set()
     service.openlist = SimpleNamespace(exists=lambda path: path in paths)
+    bind_task_openlist_resolver(service, None, PLAN)
     return service
 
 
@@ -55,7 +73,6 @@ def _video_mapping() -> dict:
 
 class _ApplyBoundaryDatabase:
     def __init__(self, mapping: dict) -> None:
-        plan = _persisted_plan(42)
         self.task = {
             **_task(),
             "status": "manual_confirmed",
@@ -63,14 +80,7 @@ class _ApplyBoundaryDatabase:
             "operations": [],
             "evidence": {},
         }
-        self.job = {
-            "id": 42,
-            "category": "tv",
-            "target_route": ROUTE_QUARK_TO_MOBILE,
-            "status": "waiting_organizer",
-            "target_path": plan["storage_job_root"],
-            "raw_data": {"staging_plan": plan},
-        }
+        self.job = {**JOB, "target_route": ROUTE_QUARK_TO_MOBILE}
         self.run_updates: list[tuple[int, str, dict]] = []
         self.events: list[tuple] = []
 
@@ -234,8 +244,9 @@ class StagingCompanionMappingTests(unittest.TestCase):
         service = _service()
         category = {
             "label": "电视剧",
-            "openlist_root_path": FINAL_ROOT,
             "source_category_root_path": JOB_ROOT,
+            V1_DESTINATION_FINAL_FIELD: FINAL_ROOT,
+            V1_DESTINATION_IS_RESOURCE_FIELD: False,
         }
         video = _video_mapping()
         subtitle = {
@@ -425,26 +436,27 @@ class StagingBoundaryTests(unittest.TestCase):
         self.assertEqual(database.run_updates[-1][0:2], (71, "failed"))
         self.assertTrue(all(item["status"] == "pending" for item in database.task["operations"]))
 
-    def test_scan_root_must_stay_within_persisted_job_root(self) -> None:
+    def test_scan_root_must_exactly_match_frozen_organizer_root(self) -> None:
         service = _service()
         target_category = service._target_category_for_task(
             _task(),
             service.categories["tv"],
         )
 
-        service._validate_staging_task_boundaries(
+        service._validate_v1_task_boundaries(
             _task(),
-            scan_root=f"{JOB_ROOT}/资源目录",
+            scan_root=JOB_ROOT,
             target_category=target_category,
         )
-        with self.assertRaises(OpenListError):
-            service._validate_staging_task_boundaries(
-                _task(),
-                scan_root=FINAL_ROOT,
-                target_category=target_category,
-            )
+        for unsafe_root in (f"{JOB_ROOT}/资源目录", FINAL_ROOT):
+            with self.subTest(scan_root=unsafe_root), self.assertRaises(OpenListError):
+                service._validate_v1_task_boundaries(
+                    _task(),
+                    scan_root=unsafe_root,
+                    target_category=target_category,
+                )
 
-    def test_target_root_must_stay_within_persisted_final_category(self) -> None:
+    def test_runtime_target_root_override_is_ignored_by_frozen_plan(self) -> None:
         service = _service()
         unsafe_task = _task(target_root_path="/其它挂载/电视剧")
         target_category = service._target_category_for_task(
@@ -452,28 +464,27 @@ class StagingBoundaryTests(unittest.TestCase):
             service.categories["tv"],
         )
 
-        with self.assertRaises(OpenListError):
-            service._validate_staging_task_boundaries(
-                unsafe_task,
-                scan_root=JOB_ROOT,
-                target_category=target_category,
-            )
+        self.assertEqual(target_category[V1_DESTINATION_FINAL_FIELD], FINAL_ROOT)
+        service._validate_v1_task_boundaries(
+            unsafe_task,
+            scan_root=JOB_ROOT,
+            target_category=target_category,
+        )
 
-    def test_enabled_but_invalid_plan_cannot_fall_back_to_normal_scan(self) -> None:
+    def test_legacy_staging_plan_without_task_ref_cannot_fall_back(self) -> None:
         service = _service()
-        invalid_task = _task(
-            staging_plan={**_persisted_plan(42), "openlist_job_root": "/错误目录/job-42"}
-        )
-        target_category = service._target_category_for_task(
-            invalid_task,
-            service.categories["tv"],
-        )
+        invalid_task = {
+            "id": 8,
+            "job_id": 42,
+            "category": "tv",
+            "openlist_root_path": JOB_ROOT,
+            "raw_data": {"staging_plan": {"enabled": True}},
+        }
 
-        with self.assertRaisesRegex(OpenListError, "校验失败"):
-            service._validate_staging_task_boundaries(
+        with self.assertRaisesRegex(OpenListError, "frozen V1 execution_plan"):
+            service._target_category_for_task(
                 invalid_task,
-                scan_root=JOB_ROOT,
-                target_category=target_category,
+                service.categories["tv"],
             )
 
     def test_apply_rejects_admin_tampered_target_outside_final_category_root(self) -> None:
@@ -482,7 +493,7 @@ class StagingBoundaryTests(unittest.TestCase):
                 **_video_mapping(),
                 "target_path": "/其它挂载/电视剧/藏海传 (2025)/Season 01/藏海传 (2025) - S01E01.mkv",
             },
-            "映射目标路径越界",
+            "target path escaped frozen destination_final",
         )
 
     def test_apply_rejects_skipped_mapping_source_outside_job_root(self) -> None:
@@ -492,7 +503,7 @@ class StagingBoundaryTests(unittest.TestCase):
                 "source_path": f"{FINAL_ROOT}/其它资源/越界文件.mkv",
                 "status": "skipped_existing",
             },
-            "映射源路径越界",
+            "source path escaped frozen organizer root",
         )
 
     def test_apply_requires_file_paths_below_staging_roots_not_the_roots_themselves(self) -> None:
@@ -502,7 +513,7 @@ class StagingBoundaryTests(unittest.TestCase):
                     **_video_mapping(),
                     "source_path": JOB_ROOT,
                 },
-                "映射源路径越界",
+                "source path escaped frozen organizer root",
             )
         with self.subTest(path="target_root"):
             self._assert_apply_rejects_mapping(
@@ -510,7 +521,7 @@ class StagingBoundaryTests(unittest.TestCase):
                     **_video_mapping(),
                     "target_path": FINAL_ROOT,
                 },
-                "映射目标路径越界",
+                "target path escaped frozen destination_final",
             )
 
 

@@ -15,7 +15,6 @@ const adminState = {
     mediaSummary: {},
     mediaRunning: [],
     mediaDiagnostics: {},
-    sixpanOAuth: {},
     organizerTasks: [],
     organizerRuns: [],
     organizerStatus: {},
@@ -64,25 +63,13 @@ const ADVANCED_CLOUD_TYPES = [
     ["magnet", "磁链"],
 ];
 
-const ADVANCED_ROUTE_LABELS = {
-    quark: "夸克",
-    uc: "UC",
-    cloud139: "139 移动云",
-    magnet: "磁链",
-    torrent: "种子",
-};
-
 const ADVANCED_SECRET_FIELDS = {
     advPansouPassword: "pansou.password",
     advPansouDefaultToken: "pansou.default_token",
     advBtbtlaProxyUrl: "btbtla.proxy_url",
-    advOpenlistToken: "openlist.token",
     advTmdbToken: "tmdb.token",
     advTmdbProxyUrl: "tmdb.proxy_url",
     advAiApiKey: "ai.api_key",
-    advQuarkToken: "quark.token",
-    advSixpanClientSecret: "sixpan.client_secret",
-    advCmccAccessToken: "cmcc_upload.access_token",
     advFnosPassword: "fnos.password",
     advFnosApiKey: "fnos.api_key",
     advFnosSecret: "fnos.secret",
@@ -93,18 +80,39 @@ const ADVANCED_SECRET_LABELS = {
     "pansou.password": "PanSou 密码",
     "pansou.default_token": "PanSou 默认 Token",
     "btbtla.proxy_url": "BT 独立代理",
-    "openlist.token": "OpenList Token",
     "tmdb.token": "TMDB Token",
     "tmdb.proxy_url": "TMDB 独立代理",
     "ai.api_key": "AI API Key",
-    "quark.token": "Quark Token",
-    "sixpan.client_secret": "6盘 ClientSecret",
-    "cmcc_upload.access_token": "移动云授权凭据",
     "fnos.password": "飞牛密码",
     "fnos.api_key": "飞牛 API Key",
     "fnos.secret": "飞牛 Secret",
     "fnos.token": "飞牛 Token",
 };
+
+// Advanced configuration writes use the V1 document envelope exclusively.
+// Keeping the envelope construction in one place prevents individual forms
+// (including the unified settings transaction and secret manager) from
+// accidentally sending the removed pre-V1 bare patch shape.
+const ADVANCED_CONFIG_FORMAT = "fnos-media-import/advanced-config";
+const ADVANCED_CONFIG_VERSION = 1;
+
+function advancedConfigEnvelope(stored = {}) {
+    return {
+        format: ADVANCED_CONFIG_FORMAT,
+        version: ADVANCED_CONFIG_VERSION,
+        stored: stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {},
+    };
+}
+
+function advancedConfigUpdatePayload(stored = {}, options = {}) {
+    const { mode = "merge", scope = "stored", ...rest } = options;
+    return {
+        ...rest,
+        config: advancedConfigEnvelope(stored),
+        mode,
+        scope,
+    };
+}
 
 const ADVANCED_CATEGORY_ORDER = [
     ["movie", "电影"],
@@ -344,17 +352,6 @@ async function withButtonBusy(button, label, callback) {
     }
 }
 
-let adminCsrfToken = "";
-
-async function ensureAdminCsrfToken() {
-    if (adminCsrfToken) return adminCsrfToken;
-    const response = await fetch("/api/admin/session", { credentials: "same-origin" });
-    if (!response.ok) return "";
-    const data = await response.json().catch(() => ({}));
-    adminCsrfToken = String(data.csrf_token || "");
-    return adminCsrfToken;
-}
-
 async function api(path, options = {}) {
     const {
         allowFailure = false,
@@ -366,26 +363,16 @@ async function api(path, options = {}) {
         skipButtonLoading = false,
         ...fetchOptions
     } = options;
-    const body = fetchOptions.body;
-    const isFormData = typeof FormData !== "undefined" && body instanceof FormData;
     const requestHeaders = { ...headers };
-    if (!isFormData && !Object.keys(requestHeaders).some((key) => key.toLowerCase() === "content-type")) {
-        requestHeaders["Content-Type"] = "application/json";
-    }
     const method = String(fetchOptions.method || "GET").toUpperCase();
-    if (!["GET", "HEAD", "OPTIONS"].includes(method) && path.startsWith("/api/admin/")) {
-        const csrfToken = await ensureAdminCsrfToken();
-        if (csrfToken && !Object.keys(requestHeaders).some((key) => key.toLowerCase() === "x-csrf-token")) {
-            requestHeaders["X-CSRF-Token"] = csrfToken;
-        }
-    }
     const feedbackMessage = loadingMessage || (method === "GET" ? "正在加载数据..." : "正在提交操作...");
     const fallbackButtonLabel = method === "GET" ? "加载中..." : "处理中...";
     const feedbackToken = silentLoading ? null : beginRequestFeedback(feedbackMessage);
     const busyButton = skipButtonLoading ? null : (button || recentActionButton());
     const buttonToken = busyButton ? beginButtonBusy(busyButton, buttonLabel || fallbackButtonLabel) : null;
     try {
-        return await window.FnosUI.requestJson(path, {
+        const requester = window.FnosUI.requestAdminJson || window.FnosUI.requestJson;
+        return await requester(path, {
             allowFailure,
             credentials: "same-origin",
             headers: requestHeaders,
@@ -616,10 +603,10 @@ function getAdminBootstrapModule() {
         startRclone, stopRclone, checkRclone, loadRclone, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer,
         loadAdapters, loadMediaLibraries, refreshAllMedia, saveSettings, saveAllSettingsTransaction, saveProfile, uploadSiteLogo, saveSearchProviders,
         loadAdvancedConfig, saveAdvancedConfig, loadRcloneWebdavConfig, saveRcloneWebdavConfig, testRcloneWebdavConfig,
-        exportAdvancedConfig, importAdvancedConfig, applyCategoryTemplate, renderCategoryTemplatePreview,
+        exportAdvancedConfig, importAdvancedConfig,
         loadSecurityStatus, openAdvancedSecretManager, loadHistoryMaintenanceSummary, cleanupHistoryRecords,
         loadNotificationSettings, bindNotificationSettings,
-        startSixpanDeviceAuth, checkSixpanDeviceAuth, probeSixpan, testBtbtlaProxy, testOrganizerEndpoint, syncAdvancedDependencies,
+        probeSixpan, testBtbtlaProxy, testOrganizerEndpoint, syncAdvancedDependencies,
         closeRawLogModal, startRcloneLivePolling,
     });
     return adminBootstrapModule;
@@ -1126,7 +1113,6 @@ function rollbackOrganizerRun(...args) {
 
 async function testOrganizerEndpoint(kind) {
     const pathMap = {
-        openlist: "/api/admin/openlist/test",
         tmdb: "/api/admin/tmdb/test",
         ai: "/api/admin/ai/test",
     };
@@ -1263,18 +1249,6 @@ function renderSearchProviders(...args) {
 
 function saveSearchProviders(...args) {
     return getAdminAdaptersModule().saveSearchProviders(...args);
-}
-
-function renderSixpanAuthStatus(...args) {
-    return getAdminAdaptersModule().renderSixpanAuthStatus(...args);
-}
-
-function startSixpanDeviceAuth(...args) {
-    return getAdminAdaptersModule().startSixpanDeviceAuth(...args);
-}
-
-function checkSixpanDeviceAuth(...args) {
-    return getAdminAdaptersModule().checkSixpanDeviceAuth(...args);
 }
 
 function probeSixpan(...args) {
@@ -1464,16 +1438,15 @@ function renderAdvancedConfig() {
     setSecret("advBtbtlaProxyUrl", btbtla.proxy_url);
     if ($("advBtbtlaProxyUrl")) $("advBtbtlaProxyUrl").disabled = !btbtla.proxy_enabled;
 
-    const routes = config.routes || {};
-    renderAdvancedRoutes(routes);
-
     const updateScheduler = config.update_scheduler || {};
     setChecked("advUpdateSchedulerEnabled", updateScheduler.enabled, true);
     setNumber("advUpdateSchedulerTmdbProbeLeadMinutes", updateScheduler.tmdb_probe_lead_minutes ?? 0);
 
+    // OpenList identity (URL, account and token) is a V1 connection/mount
+    // resource managed by the storage setup workspace.  The advanced form
+    // only owns process-wide transport behaviour and must never recreate a
+    // global credential fallback.
     const openlist = config.openlist || {};
-    setValue("advOpenlistBaseUrl", openlist.base_url);
-    setSecret("advOpenlistToken", openlist.token);
     setNumber("advOpenlistTimeout", openlist.timeout ?? 30);
     setChecked("advOpenlistListRefreshDefault", openlist.list_refresh_default, false);
     setChecked("advOpenlistVerifyTls", openlist.verify_tls, true);
@@ -1508,37 +1481,6 @@ function renderAdvancedConfig() {
     setValue("advOrganizerStrmRefreshPrefixVariety", organizer.strm_refresh_prefix_variety || organizer.strm_refresh_prefix_tv || organizer.strm_refresh_prefix || "");
     setValue("advOrganizerLocalStrmRoot", organizer.local_strm_root || "");
 
-    const quark = config.quark || {};
-    setValue("advQuarkAutoSaveUrl", quark.auto_save_url);
-    setSecret("advQuarkToken", quark.token);
-    setChecked("advQuarkCheckBeforeSave", quark.check_before_save, true);
-    setChecked("advQuarkRunImmediately", quark.run_immediately, true);
-
-    const sixpan = config.sixpan || {};
-    setValue("advSixpanHost", sixpan.host || sixpan.api_url || "openapi.2dland.cn");
-    setValue("advSixpanClientId", sixpan.client_id);
-    setSecret("advSixpanClientSecret", sixpan.client_secret);
-    setNumber("advSixpanTimeout", sixpan.timeout ?? 20);
-    setNumber("advSixpanPollInterval", sixpan.poll_interval_seconds ?? 60);
-    setNumber("advSixpanTaskPollLimit", sixpan.task_poll_limit ?? 200);
-    setChecked("advSixpanVerifyTls", sixpan.verify_tls, true);
-    setChecked("advSixpanParseBeforeAdd", sixpan.parse_before_add, true);
-    setChecked("advSixpanParseRequired", sixpan.parse_required, false);
-    setChecked("advSixpanPollEnabled", sixpan.poll_enabled, true);
-    renderSixpanAuthStatus(sixpan);
-
-    const cmcc = config.cmcc_upload || {};
-    setValue("advCmccMode", cmcc.mode || "rapid_first");
-    setValue("advCmccRenameMode", cmcc.rename_mode || "auto_rename");
-    let cmccHost = String(cmcc.host || "https://personal-kd-njs.yun.139.com/hcy");
-    if (cmccHost.includes("miniapp.yun.139.com")) {
-        cmccHost = "https://personal-kd-njs.yun.139.com/hcy";
-    } else if (cmccHost.replace(/\/+$/, "") === "https://personal-kd-njs.yun.139.com") {
-        cmccHost = "https://personal-kd-njs.yun.139.com/hcy";
-    }
-    setValue("advCmccHost", cmccHost);
-    setSecret("advCmccAccessToken", cmcc.access_token);
-    setValue("advCmccPhone", cmcc.phone);
 
     const fnos = config.fnos || {};
     setValue("advFnosServerUrl", fnos.server_url);
@@ -1551,14 +1493,6 @@ function renderAdvancedConfig() {
     const rclone = config.rclone || {};
     setChecked("advRcloneEnabled", rclone.enabled, true);
     setValue("advRcloneRemoteName", rclone.remote_name || "MP");
-    renderAdvancedCategories(config.categories || {});
-    const sixpanMountName = sixpan.fnos_mount_name
-        || sixpan.openlist_mount_name
-        || sixpan.mount_name
-        || sixpan.mount_path
-        || inferCategoryRoot(config.categories || {}, "sixpan_fnos_target_path", "清云");
-    syncCategoryTemplateFromCategories(config.categories || {}, sixpanMountName);
-    renderCategoryTemplatePreview();
     syncAdvancedDependencies();
     syncAdvancedSecretManager();
     adminState.advancedFormBaseline = collectAdvancedConfig();
@@ -1638,7 +1572,10 @@ async function clearAdvancedSecret(path, button, options = {}) {
     try {
         const data = await api("/api/admin/advanced-config", {
             method: "POST",
-            body: JSON.stringify({ config: {}, clear_secrets: [path] }),
+            body: JSON.stringify(advancedConfigUpdatePayload({}, {
+                mode: "merge",
+                clear_secrets: [path],
+            })),
         });
         adminState.advancedConfig = data.config || {};
         adminState.advancedStoredConfig = data.stored || {};
@@ -1660,158 +1597,6 @@ function renderAdvancedCloudTypes(values) {
     `).join("");
 }
 
-function renderAdvancedRoutes(routes) {
-    const box = $("advancedRouteChecks");
-    if (!box) return;
-    box.innerHTML = Object.entries(ADVANCED_ROUTE_LABELS).map(([key, label]) => {
-        const route = routes[key] || {};
-        return `<label class="mini-check"><input type="checkbox" data-adv-route="${escapeHtml(key)}" ${route.enabled ? "checked" : ""}>${escapeHtml(label)}</label>`;
-    }).join("");
-}
-
-function renderAdvancedCategories(categories) {
-    const body = $("advancedCategoryRows");
-    if (!body) return;
-    const rows = ADVANCED_CATEGORY_ORDER.map(([key, fallbackLabel]) => {
-        const item = categories[key] || {};
-        const label = item.label || fallbackLabel;
-        const dirName = inferCategoryDir(item, label);
-        return `
-            <tr data-adv-category="${escapeHtml(key)}">
-                <td><span class="category-rule-pill">${escapeHtml(fallbackLabel)}</span></td>
-                <td><input data-cat-field="label" type="text" value="${escapeHtml(label)}" aria-label="${escapeHtml(fallbackLabel)} 分类显示名"></td>
-                <td><input data-cat-field="dir" type="text" value="${escapeHtml(dirName)}" placeholder="${escapeHtml(fallbackLabel)}" aria-label="${escapeHtml(fallbackLabel)} 目录名"></td>
-                <td class="category-rule-preview" data-category-row-preview="${escapeHtml(key)}">-</td>
-            </tr>
-        `;
-    }).join("");
-    body.innerHTML = `
-        <div class="category-rules-table-wrap">
-            <table class="category-rules-table">
-                <thead>
-                    <tr>
-                        <th>内置分类</th>
-                        <th>前台显示名</th>
-                        <th>目录名</th>
-                        <th>自动整理位置</th>
-                    </tr>
-                </thead>
-                <tbody>${rows}</tbody>
-            </table>
-        </div>
-    `;
-    body.querySelectorAll('[data-cat-field="label"], [data-cat-field="dir"]').forEach((input) => {
-        input.addEventListener("input", renderCategoryTemplatePreview);
-    });
-    renderCategoryTemplatePreview();
-}
-
-function inferCategoryDir(item = {}, fallbackLabel = "") {
-    return window.FnosAdminSettings.inferCategoryDir(item, fallbackLabel);
-}
-
-function categoryLabelFor(key, fallback = "") {
-    const item = ADVANCED_CATEGORY_ORDER.find(([categoryKey]) => categoryKey === key);
-    return item?.[1] || fallback || key;
-}
-
-function normalizeTemplateRoot(value, { leadingSlash = false } = {}) {
-    return window.FnosAdminSettings.normalizeTemplateRoot(value, { leadingSlash });
-}
-
-function joinTemplatePath(root, label, { leadingSlash = false } = {}) {
-    return window.FnosAdminSettings.joinTemplatePath(root, label, { leadingSlash });
-}
-
-function inferCategoryRoot(categories, field, fallback = "", { leadingSlash = false } = {}) {
-    return window.FnosAdminSettings.inferCategoryRoot(categories, field, fallback, {
-        leadingSlash,
-        order: ADVANCED_CATEGORY_ORDER,
-    });
-}
-
-function syncCategoryTemplateFromCategories(categories, sixpanMountFallback = "清云") {
-    const setValue = (id, value) => {
-        const el = $(id);
-        if (el) el.value = value;
-    };
-    setValue("categoryTemplateQuarkRoot", inferCategoryRoot(categories, "quark_save_path", "/离线下载", { leadingSlash: true }));
-    setValue("categoryTemplateCloud139Root", inferCategoryRoot(categories, "cloud139_target_path", "博客"));
-    setValue("categoryTemplateCloud139FnosRoot", inferCategoryRoot(categories, "cloud139_fnos_target_path", "移动云2"));
-    setValue("categoryTemplateSixpanRoot", inferCategoryRoot(categories, "sixpan_save_path", "/", { leadingSlash: true }));
-    setValue("categoryTemplateSixpanFnosRoot", normalizeTemplateRoot(sixpanMountFallback || "清云"));
-}
-
-function categoryTemplateValues() {
-    return {
-        quarkRoot: $("categoryTemplateQuarkRoot")?.value || "/离线下载",
-        cloud139Root: $("categoryTemplateCloud139Root")?.value || "",
-        cloud139FnosRoot: $("categoryTemplateCloud139FnosRoot")?.value || "",
-        sixpanRoot: $("categoryTemplateSixpanRoot")?.value || "/",
-        sixpanFnosRoot: $("categoryTemplateSixpanFnosRoot")?.value || "",
-    };
-}
-
-function buildCategoryTemplateRows() {
-    const template = categoryTemplateValues();
-    return ADVANCED_CATEGORY_ORDER.map(([key, fallbackLabel]) => {
-        const row = document.querySelector(`[data-adv-category="${key}"]`);
-        const label = row?.querySelector('[data-cat-field="label"]')?.value?.trim() || fallbackLabel;
-        const dir = row?.querySelector('[data-cat-field="dir"]')?.value?.trim() || label;
-        const cloud139FnosTargetPath = template.cloud139FnosRoot ? joinTemplatePath(template.cloud139FnosRoot, dir) : "";
-        return {
-            key,
-            label,
-            dir,
-            quark_save_path: joinTemplatePath(template.quarkRoot, dir, { leadingSlash: true }),
-            cloud139_target_path: joinTemplatePath(template.cloud139Root, dir),
-            cloud139_fnos_target_path: cloud139FnosTargetPath,
-            openlist_root_path: cloud139FnosTargetPath,
-            sixpan_save_path: joinTemplatePath(template.sixpanRoot, dir, { leadingSlash: true }),
-            sixpan_fnos_target_path: template.sixpanFnosRoot ? joinTemplatePath(template.sixpanFnosRoot, dir) : "",
-        };
-    });
-}
-
-function renderCategoryTemplatePreview() {
-    const box = $("categoryTemplatePreview");
-    const rows = buildCategoryTemplateRows();
-    rows.forEach((row) => {
-        const preview = document.querySelector(`[data-category-row-preview="${row.key}"]`);
-        if (preview) {
-            preview.innerHTML = `
-                <span>官方云端：<code>${escapeHtml(row.cloud139_target_path || "-")}</code></span>
-                <span>OpenList：<code>${escapeHtml(row.cloud139_fnos_target_path || "-")}</code></span>
-                <span>6盘：<code>${escapeHtml(row.sixpan_fnos_target_path || "-")}</code></span>
-            `;
-        }
-    });
-    if (!box) return;
-    box.innerHTML = `
-        <table class="category-template-table">
-            <thead><tr><th>分类</th><th>夸克离线</th><th>移动云官方目录（直转/API 上传）</th><th>移动云 OpenList 整理位置</th><th>6盘离线</th><th>6盘整理位置</th></tr></thead>
-            <tbody>
-                ${rows.map((row) => `
-                    <tr>
-                        <td>${escapeHtml(row.label)}</td>
-                        <td><code>${escapeHtml(row.quark_save_path)}</code></td>
-                        <td><code>${escapeHtml(row.cloud139_target_path)}</code></td>
-                        <td><code>${escapeHtml(row.cloud139_fnos_target_path || "-")}</code></td>
-                        <td><code>${escapeHtml(row.sixpan_save_path)}</code></td>
-                        <td><code>${escapeHtml(row.sixpan_fnos_target_path || "-")}</code></td>
-                    </tr>
-                `).join("")}
-            </tbody>
-        </table>
-        <p>移动云 API 上传和官方转存写入官方目录，Organizer 会自动映射到对应的 OpenList 整理位置。</p>
-    `;
-}
-
-function applyCategoryTemplate() {
-    renderCategoryTemplatePreview();
-    toast("路径预览已更新，确认无误后保存配置。", "success");
-}
-
 async function saveAdvancedConfig(options = {}) {
     const { silent = false } = options;
     const collected = collectAdvancedConfig();
@@ -1825,7 +1610,7 @@ async function saveAdvancedConfig(options = {}) {
         if (!silent) toast("配置没有变化", "info");
         return { skipped: true };
     }
-    const payload = { config };
+    const payload = advancedConfigUpdatePayload(config, { mode: "merge" });
     const data = await api("/api/admin/advanced-config", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -1858,7 +1643,7 @@ async function saveAllSettingsTransaction() {
             search: {
                 providers: window.FnosAdminSettings.collectSearchProviders(adminState.searchProviders),
             },
-            advanced: { config: advancedPatch },
+                advanced: advancedConfigUpdatePayload(advancedPatch, { mode: "merge" }),
         }),
     });
     adminState.settings = data.settings || {};
@@ -1915,6 +1700,14 @@ async function importAdvancedConfig(file) {
         toast("配置文件格式不正确", "error");
         return;
     }
+    if (config.format !== ADVANCED_CONFIG_FORMAT || Number(config.version) !== ADVANCED_CONFIG_VERSION) {
+        toast(`仅支持 ${ADVANCED_CONFIG_FORMAT} v${ADVANCED_CONFIG_VERSION} 配置文件，请重新导出后再导入`, "error");
+        return;
+    }
+    if (!config.stored || typeof config.stored !== "object" || Array.isArray(config.stored)) {
+        toast("配置文件缺少有效的 stored 配置", "error");
+        return;
+    }
     const confirmed = await confirmDialog({
         message: "导入将使用文件中的 stored 配置完整覆盖数据库高级配置；文件未包含的数据库字段和旧密钥会被清除（环境变量/YAML 不受影响）。确定继续？",
         tone: "danger",
@@ -1932,9 +1725,6 @@ async function importAdvancedConfig(file) {
         adminState.advancedConfigMeta = data.meta || {};
         renderAdvancedConfig();
         toast(data.message || "配置已导入", "success");
-        if (Array.isArray(data.warnings) && data.warnings.length) {
-            toast(data.warnings.join("；"), "warning");
-        }
         await Promise.all([loadSearchProviders(), loadMediaLibraries(), loadOrganizer(), loadSecurityStatus()]);
     } finally {
         if (saveBtn) saveBtn.disabled = false;
@@ -1942,23 +1732,12 @@ async function importAdvancedConfig(file) {
 }
 
 function collectAdvancedConfig() {
-    const existingConfig = adminState.advancedConfig || {};
     const reader = window.FnosAdminSettings.createFormReader();
     const value = reader.value.bind(reader);
     const numberValue = reader.number.bind(reader);
     const checked = reader.checked.bind(reader);
-    const configBool = window.FnosAdminSettings.toBoolean;
     const cloudTypes = Array.from(document.querySelectorAll("[data-adv-cloud-type]:checked")).map((input) => input.dataset.advCloudType);
-    const routes = {};
-    document.querySelectorAll("[data-adv-route]").forEach((input) => {
-        routes[input.dataset.advRoute] = { enabled: Boolean(input.checked) };
-    });
     // 只生成页面可编辑字段的 patch，运行时发现的 folder id / 真实目录由后端保留。
-    const categories = window.FnosAdminSettings.buildCategoryPatch(buildCategoryTemplateRows());
-    const template = categoryTemplateValues();
-    const existingCloud139 = existingConfig.cloud139 || {};
-    const existingCloud139Delay = Number(existingCloud139.refresh_delay_seconds);
-    const cmccBackend = "cmcc_api";
     return {
         pansou: {
             base_url: value("advPansouBaseUrl"),
@@ -1989,14 +1768,11 @@ function collectAdvancedConfig() {
             proxy_enabled: checked("advBtbtlaProxyEnabled"),
             proxy_url: value("advBtbtlaProxyUrl"),
         },
-        routes,
         update_scheduler: {
             enabled: checked("advUpdateSchedulerEnabled"),
             tmdb_probe_lead_minutes: numberValue("advUpdateSchedulerTmdbProbeLeadMinutes", 0),
         },
         openlist: {
-            base_url: value("advOpenlistBaseUrl"),
-            token: value("advOpenlistToken"),
             timeout: numberValue("advOpenlistTimeout", 30),
             list_refresh_default: checked("advOpenlistListRefreshDefault"),
             verify_tls: checked("advOpenlistVerifyTls"),
@@ -2030,41 +1806,6 @@ function collectAdvancedConfig() {
             strm_refresh_prefix_variety: value("advOrganizerStrmRefreshPrefixVariety"),
             local_strm_root: value("advOrganizerLocalStrmRoot"),
         },
-        quark: {
-            auto_save_url: value("advQuarkAutoSaveUrl"),
-            token: value("advQuarkToken"),
-            check_before_save: checked("advQuarkCheckBeforeSave"),
-            run_immediately: checked("advQuarkRunImmediately"),
-        },
-        cloud139: {
-            refresh_delay_seconds: Number.isFinite(existingCloud139Delay) ? existingCloud139Delay : 90,
-            check_before_save: configBool(existingCloud139.check_before_save, true),
-            refresh_after_submit: configBool(existingCloud139.refresh_after_submit, true),
-            mark_done_after_submit: configBool(existingCloud139.mark_done_after_submit, true),
-        },
-        sixpan: {
-            host: value("advSixpanHost") || "openapi.2dland.cn",
-            fnos_mount_name: normalizeTemplateRoot(template.sixpanFnosRoot),
-            client_id: value("advSixpanClientId"),
-            client_secret: value("advSixpanClientSecret"),
-            timeout: numberValue("advSixpanTimeout", 20),
-            verify_tls: checked("advSixpanVerifyTls"),
-            parse_before_add: checked("advSixpanParseBeforeAdd"),
-            parse_required: checked("advSixpanParseBeforeAdd") && checked("advSixpanParseRequired"),
-            poll_enabled: checked("advSixpanPollEnabled"),
-            poll_interval_seconds: numberValue("advSixpanPollInterval", 60),
-            task_poll_limit: numberValue("advSixpanTaskPollLimit", 200),
-        },
-        cmcc_upload: {
-            enabled: true,
-            backend: cmccBackend,
-            mode: value("advCmccMode") || "rapid_first",
-            rename_mode: value("advCmccRenameMode") || "auto_rename",
-            host: value("advCmccHost") || "https://personal-kd-njs.yun.139.com/hcy",
-            auth_mode: "web_basic",
-            access_token: value("advCmccAccessToken"),
-            phone: value("advCmccPhone"),
-        },
         fnos: {
             server_url: value("advFnosServerUrl"),
             username: value("advFnosUsername"),
@@ -2076,9 +1817,7 @@ function collectAdvancedConfig() {
         rclone: {
             enabled: checked("advRcloneEnabled"),
             remote_name: value("advRcloneRemoteName"),
-            upload_backend: cmccBackend,
         },
-        categories,
     };
 }
 

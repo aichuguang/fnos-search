@@ -290,10 +290,9 @@ class RcloneWebdavRouteAndUiTests(unittest.TestCase):
             [{"cookieAuth": []}],
         )
 
-    def test_admin_page_has_complete_webdav_configuration_controls(self) -> None:
+    def test_admin_page_uses_storage_setup_as_the_only_webdav_configuration_surface(self) -> None:
         template = Path("templates/admin.html").read_text(encoding="utf-8")
-        script = Path("static/admin.js").read_text(encoding="utf-8")
-        bootstrap = Path("static/admin-bootstrap.js").read_text(encoding="utf-8")
+        setup_script = Path("static/admin-storage-v1.js").read_text(encoding="utf-8")
 
         for element_id in (
             "rcloneWebdavUrl",
@@ -303,12 +302,8 @@ class RcloneWebdavRouteAndUiTests(unittest.TestCase):
             "saveRcloneWebdavBtn",
             "testRcloneWebdavBtn",
         ):
-            self.assertIn(f'id="{element_id}"', template)
-        self.assertIn("password_set ? \"已保存，留空则保留\"", script)
-        self.assertIn('api("/api/admin/rclone/webdav-config"', script)
-        self.assertIn('api("/api/admin/rclone/webdav-config/test"', script)
-        self.assertIn('$("saveRcloneWebdavBtn")?.addEventListener', bootstrap)
-        self.assertIn('$("testRcloneWebdavBtn")?.addEventListener', bootstrap)
+            self.assertNotIn(f'id="{element_id}"', template)
+        self.assertIn("/api/admin/storage-setup/openlist", setup_script)
 
 
 if __name__ == "__main__":

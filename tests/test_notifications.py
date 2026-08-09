@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import hmac
@@ -411,7 +410,7 @@ class NotificationTests(unittest.TestCase):
 
         with (
             mock.patch.object(smtp_channel, "_IPv4FirstSMTPSSL") as constructor,
-            self.assertRaisesRegex(SmtpPermanentError, "NOTIFICATION_ENCRYPTION_KEY"),
+            self.assertRaisesRegex(SmtpPermanentError, "FNOS_ROOT_KEY"),
         ):
             smtp_channel.send_email(
                 resolved,
@@ -1029,53 +1028,69 @@ class NotificationTests(unittest.TestCase):
             )
 
     def test_secrets_roundtrip(self) -> None:
-        key = base64.urlsafe_b64encode(b"0123456789abcdef").decode("ascii")
+        key = "01" * 32
         encrypted = secret_store.encrypt("smtp-pass", key=key)
-        self.assertTrue(encrypted.startswith("enc:"))
+        self.assertTrue(encrypted.startswith("enc:v2:"))
         self.assertEqual(secret_store.resolve(encrypted, key=key), "smtp-pass")
         self.assertEqual(secret_store.resolve("env:SMTP_PASSWORD"), os.environ.get("SMTP_PASSWORD", ""))
 
-    def test_arbitrary_encryption_passphrase_roundtrip(self) -> None:
-        key = "用户随便输入的口令-2026"
+    def test_root_key_writes_v2_notification_ciphertext(self) -> None:
+        root = "ab" * 32
+        with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": root}, clear=True):
+            encrypted = secret_store.encrypt("smtp-pass")
+            self.assertTrue(encrypted.startswith("enc:v2:"))
+            self.assertEqual(secret_store.resolve(encrypted), "smtp-pass")
+
+        with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": "cd" * 32}, clear=True):
+            self.assertEqual(secret_store.resolve(encrypted), "")
+
+    def test_legacy_notification_ciphertext_is_rejected(self) -> None:
+        self.assertFalse(secret_store.is_encrypted("enc:old-payload"))
+        self.assertEqual(secret_store.resolve("enc:old-payload"), "")
+
+        with mock.patch.dict(
+            os.environ,
+            {"NOTIFICATION_ENCRYPTION_KEY": "legacy-notification-passphrase"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                secret_store.encrypt("smtp-pass")
+
+    def test_explicit_root_override_roundtrip(self) -> None:
+        key = "02" * 32
         encrypted = secret_store.encrypt("smtp-pass", key=key)
 
         self.assertEqual(secret_store.resolve(encrypted, key=key), "smtp-pass")
-        self.assertEqual(secret_store.resolve(encrypted, key="另一条口令"), "")
-        self.assertEqual(32, len(secret_store.key_bytes(key) or b""))
+        self.assertEqual(secret_store.resolve(encrypted, key="03" * 32), "")
 
-    def test_legacy_raw_aes_key_derivation_is_unchanged(self) -> None:
-        key = "0123456789abcdef"
-
-        self.assertEqual(key.encode("utf-8"), secret_store.key_bytes(key))
-
-    def test_invalid_prefixed_base64_key_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "解码后必须是"):
-            secret_store.key_bytes("base64:c2hvcnQ=")
+    def test_invalid_explicit_root_key_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            secret_store.encrypt("smtp-pass", key="not-a-hex-root")
 
     def test_config_redact_masks_encrypted_secret(self) -> None:
-        key = base64.urlsafe_b64encode(b"0123456789abcdef").decode("ascii")
+        key = "01" * 32
         # 未配置密钥时，真实密码会被拒绝保存（抛 ValueError）
         with self.assertRaises(ValueError):
             notify_config.normalize(
                 {"smtp": {"password": "realsecret"}},
                 current=copy.deepcopy(notify_config.DEFAULT_NOTIFICATIONS_CONFIG),
             )
-        with mock.patch.dict(os.environ, {"NOTIFICATION_ENCRYPTION_KEY": key}):
+        with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": key}):
             encrypted_config = notify_config.normalize(
                 {"smtp": {"password": "realsecret"}},
                 current=copy.deepcopy(notify_config.DEFAULT_NOTIFICATIONS_CONFIG),
             )
-            self.assertTrue(encrypted_config["smtp"]["password"].startswith("enc:"))
+            self.assertTrue(encrypted_config["smtp"]["password"].startswith("enc:v2:"))
             self.assertEqual(notify_config.redact(encrypted_config)["smtp"]["password"], "********")
 
     def test_webhook_url_is_encrypted_and_redacted(self) -> None:
-        key = "base64:" + base64.urlsafe_b64encode(b"0123456789abcdef").decode("ascii")
-        with mock.patch.dict(os.environ, {"NOTIFICATION_ENCRYPTION_KEY": key}):
+        key = "01" * 32
+        with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": key}):
             config = notify_config.normalize(
                 {"webhook": {"url": "https://example.com/private-hook"}},
                 current=copy.deepcopy(notify_config.DEFAULT_NOTIFICATIONS_CONFIG),
             )
-            self.assertTrue(config["webhook"]["url"].startswith("enc:"))
+            self.assertTrue(config["webhook"]["url"].startswith("enc:v2:"))
             self.assertEqual(notify_config.redact(config)["webhook"]["url"], "********")
             self.assertEqual(
                 notify_config.webhook_config(config)["url"],
@@ -1083,11 +1098,11 @@ class NotificationTests(unittest.TestCase):
             )
 
     def test_guest_subscription_verify_and_unsubscribe_tokens_are_one_way(self) -> None:
-        key = "base64:" + base64.urlsafe_b64encode(b"0123456789abcdef").decode("ascii")
+        key = "01" * 32
         request_id = self._create_request("guest-mail")
         verify_token = "verify-token"
         unsubscribe_token = "unsubscribe-token"
-        with mock.patch.dict(os.environ, {"NOTIFICATION_ENCRYPTION_KEY": key}):
+        with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": key}):
             self.database.create_guest_notification_subscription(
                 request_id=request_id,
                 email_encrypted=secret_store.store("guest@example.com"),
@@ -1158,10 +1173,10 @@ class NotificationTests(unittest.TestCase):
         )
 
     def test_terminal_subscription_is_anonymized_after_retention(self) -> None:
-        key = "base64:" + base64.urlsafe_b64encode(b"0123456789abcdef").decode("ascii")
+        key = "01" * 32
         db = self.database
         request_id = self._create_request("anon-sub")
-        with mock.patch.dict(os.environ, {"NOTIFICATION_ENCRYPTION_KEY": key}):
+        with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": key}):
             db.create_guest_notification_subscription(
                 request_id=request_id,
                 email_encrypted=secret_store.store("guest@example.com"),
@@ -1180,7 +1195,7 @@ class NotificationTests(unittest.TestCase):
             )
         # 仍在处理中的申请不应被匿名化
         fresh_id = self._create_request("anon-fresh")
-        with mock.patch.dict(os.environ, {"NOTIFICATION_ENCRYPTION_KEY": key}):
+        with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": key}):
             db.create_guest_notification_subscription(
                 request_id=fresh_id,
                 email_encrypted=secret_store.store("fresh@example.com"),

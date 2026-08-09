@@ -13,6 +13,9 @@ test-output
 .tmp*
 tmp_openlist_*
 codex_tmp
+audit_tmp_local
+_codex_test_tmp*
+_tmp_run
 __pycache__
 **/__pycache__
 *.pyc

@@ -1,6 +1,6 @@
 (function () {
     function create(context) {
-        const { state, getElement, api, toast, captureActionButton, loadOverview, loadRequests, loadJobs, loadUpdates, openUpdateEditor, runDueUpdates, loadTrending, runTrending, openTrendingScheduler, startRclone, stopRclone, checkRclone, loadRclone, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer, loadAdapters, loadMediaLibraries, refreshAllMedia, saveSettings, saveAllSettingsTransaction, saveProfile, uploadSiteLogo, saveSearchProviders, loadAdvancedConfig, saveAdvancedConfig, loadRcloneWebdavConfig, saveRcloneWebdavConfig, testRcloneWebdavConfig, exportAdvancedConfig, importAdvancedConfig, applyCategoryTemplate, renderCategoryTemplatePreview, loadSecurityStatus, openAdvancedSecretManager, loadHistoryMaintenanceSummary, cleanupHistoryRecords, loadNotificationSettings, bindNotificationSettings, startSixpanDeviceAuth, checkSixpanDeviceAuth, probeSixpan, testBtbtlaProxy, testOrganizerEndpoint, syncAdvancedDependencies, closeRawLogModal, startRcloneLivePolling } = context;
+        const { state, getElement, api, toast, captureActionButton, loadOverview, loadRequests, loadJobs, loadUpdates, openUpdateEditor, runDueUpdates, loadTrending, runTrending, openTrendingScheduler, startRclone, stopRclone, checkRclone, loadRclone, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer, loadAdapters, loadMediaLibraries, refreshAllMedia, saveSettings, saveAllSettingsTransaction, saveProfile, uploadSiteLogo, saveSearchProviders, loadAdvancedConfig, saveAdvancedConfig, loadRcloneWebdavConfig, saveRcloneWebdavConfig, testRcloneWebdavConfig, exportAdvancedConfig, importAdvancedConfig, loadSecurityStatus, openAdvancedSecretManager, loadHistoryMaintenanceSummary, cleanupHistoryRecords, loadNotificationSettings, bindNotificationSettings, probeSixpan, testBtbtlaProxy, testOrganizerEndpoint, syncAdvancedDependencies, closeRawLogModal, startRcloneLivePolling } = context;
         const adminState = state;
         const $ = getElement;
 
@@ -329,26 +329,12 @@
                 if (file) importAdvancedConfig(file).catch((error) => toast(error.message, "error"));
                 event.target.value = "";
             });
-            $("applyCategoryTemplateBtn")?.addEventListener("click", applyCategoryTemplate);
-            [
-                "categoryTemplateQuarkRoot",
-                "categoryTemplateCloud139Root",
-                "categoryTemplateCloud139FnosRoot",
-                "categoryTemplateSixpanRoot",
-                "categoryTemplateSixpanFnosRoot",
-            ].forEach((id) => {
-                $(id)?.addEventListener("input", renderCategoryTemplatePreview);
-                $(id)?.addEventListener("change", renderCategoryTemplatePreview);
-            });
             $("manageAdvancedSecretsBtn")?.addEventListener("click", openAdvancedSecretManager);
             $("securityStatusRefreshBtn")?.addEventListener("click", () => loadSecurityStatus().catch((error) => toast(error.message, "error")));
             $("historySummaryRefreshBtn")?.addEventListener("click", () => loadHistoryMaintenanceSummary().catch((error) => toast(error.message, "error")));
             $("cleanupHistoryBtn")?.addEventListener("click", () => cleanupHistoryRecords().catch((error) => toast(error.message, "error")));
-            $("sixpanStartAuthBtn")?.addEventListener("click", () => startSixpanDeviceAuth().catch((error) => toast(error.message, "error")));
-            $("sixpanCheckAuthBtn")?.addEventListener("click", () => checkSixpanDeviceAuth().catch((error) => toast(error.message, "error")));
             $("sixpanProbeBtn")?.addEventListener("click", () => probeSixpan().catch((error) => toast(error.message, "error")));
             $("btbtlaProxyTestBtn")?.addEventListener("click", () => testBtbtlaProxy().catch((error) => toast(error.message, "error")));
-            $("openlistTestBtn")?.addEventListener("click", () => testOrganizerEndpoint("openlist").catch((error) => toast(error.message, "error")));
             $("tmdbTestBtn")?.addEventListener("click", () => testOrganizerEndpoint("tmdb").catch((error) => toast(error.message, "error")));
             $("aiTestBtn")?.addEventListener("click", () => testOrganizerEndpoint("ai").catch((error) => toast(error.message, "error")));
             ["advAiEnabled", "advOrganizerEnabled", "advOrganizerRefreshFnosAfterApply", "advSixpanParseBeforeAdd", "advRcloneEnabled"].forEach((id) => {

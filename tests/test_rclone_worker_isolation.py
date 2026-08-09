@@ -24,6 +24,7 @@ from fnos_media_import.services.rclone_file_retry_service import (
     RcloneFileRetryService,
 )
 from fnos_media_import.services.rclone_service import RcloneService
+from fnos_media_import.openlist.locator_resolver import RcloneLocatorResolver
 from fnos_media_import.services.rclone_webdav_config_service import RcloneWebdavConfigService
 from fnos_media_import.services.rclone_worker_client import (
     RcloneWorkerClient,
@@ -285,6 +286,15 @@ class LocalRcloneExecutionTests(unittest.TestCase):
             "config_path": "/config/rclone/rclone.conf",
             "cache_dir": "/cache",
         }
+        # V1 cleanup commands must use the same managed locator as transfer
+        # execution; do not reintroduce the removed global-config fallback.
+        service._v1_locator_resolver = RcloneLocatorResolver(
+            {
+                "remote_name": "MP",
+                "config_path": "/config/rclone/rclone.conf",
+                "local_target_root": "/storage-targets",
+            }
+        )
 
         self.assertEqual(service._cleanup_container_command("rm", "-f", "/temp/file"), ["rm", "-f", "/temp/file"])
         command = service._cleanup_rclone_command("deletefile", "MP:path/file")

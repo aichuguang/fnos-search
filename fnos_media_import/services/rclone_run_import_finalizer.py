@@ -24,6 +24,7 @@ class RcloneRunImportFinalizer:
         feasibility: Callable[[dict[str, Any], list[dict[str, Any]], int], dict[str, Any]],
         finish_ready: Callable[..., dict[str, Any]],
         dispatch_ready: Callable[[dict[str, Any], dict[str, Any]], Any],
+        execution_repository: Any = None,
     ) -> None:
         self.database = database
         self.categories = categories
@@ -31,6 +32,7 @@ class RcloneRunImportFinalizer:
         self.feasibility = feasibility
         self.finish_ready = finish_ready
         self.dispatch_ready = dispatch_ready
+        self.execution_repository = execution_repository
 
     def finalize(self, run_id: int, exit_code: int) -> None:
         if not self.database:
@@ -78,6 +80,18 @@ class RcloneRunImportFinalizer:
         for job_id, _current_run_events in grouped.items():
             job = jobs.get(job_id)
             if not job:
+                continue
+            if self._is_v1_managed(job_id):
+                # Run-end fallback is retained for legacy diagnostics only.
+                # A V1 execution has its own durable phase machine; allowing
+                # this callback to finish it would bypass frozen plans,
+                # receipts and ACK/cleanup gates.
+                self.database.add_rclone_event(
+                    run_id,
+                    EVENT_INFO,
+                    f"任务 #{job_id} 已由 V1 durable transfer 接管，跳过旧 run finalizer",
+                    {"job_id": job_id, "delegated_to_v1_worker": True},
+                )
                 continue
             status = str(job.get("status") or "")
             if status == "cancelled":
@@ -130,6 +144,22 @@ class RcloneRunImportFinalizer:
             category_key = str(job.get("category") or "movie")
             ready.setdefault(category_key, []).append((job, terminal_events, verdict))
         return ready
+
+    def _is_v1_managed(self, job_id: int) -> bool:
+        repository = self.execution_repository
+        if repository is None:
+            return False
+        for method_name in ("get", "plan"):
+            method = getattr(repository, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                value = method(int(job_id))
+            except Exception:  # noqa: BLE001 - old fallback must remain best-effort
+                continue
+            if value is not None:
+                return True
+        return False
 
 
 def _group_by_job(events: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:

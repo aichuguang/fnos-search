@@ -39,12 +39,13 @@ class PublicSubmissionPreparationService:
         detect_link: Callable[..., Any],
         security_config: Callable[[], dict[str, Any]],
         config_int: Callable[[dict[str, Any], str, int], int],
+        safe_tianyi_selection: Callable[[Any], Any] | None = None,
         validate_destination: Callable[..., str | None] | None = None,
     ) -> None:
         # ``validate_destination`` is deprecated in v4: the guest no longer
         # selects a destination.  It is kept in the constructor only for
         # callers that still pass it (app.py); the preparation service ignores
-        # it and the server resolves the target from source_destination_rules.
+        # it and the server resolves the target from source_destination_assignments.
         self.search_cache = search_cache
         self.categories = categories
         self.category = category
@@ -54,6 +55,7 @@ class PublicSubmissionPreparationService:
         self.safe_string_list = safe_string_list
         self.safe_quark_selection = safe_quark_selection
         self.safe_cloud139_selection = safe_cloud139_selection
+        self.safe_tianyi_selection = safe_tianyi_selection or (lambda _value: {})
         self.detect_link = detect_link
         self.security_config = security_config
         self.config_int = config_int
@@ -84,8 +86,8 @@ class PublicSubmissionPreparationService:
         cached = self.search_cache(public_id) if public_id else None
         prepared = dict(payload)
         # 访客不选择保存位置：payload 不得携带目标或任何基础设施字段。
-        # 目标由服务端按来源 + 分类从 source_destination_rules 解析。
-        for field in (
+        # 目标由服务端按来源 + 分类从 source_destination_assignments 解析。
+        forbidden_fields = (
             "destination_id",
             "account_id",
             "provider_kind",
@@ -103,8 +105,13 @@ class PublicSubmissionPreparationService:
             "update_context",
             "organizer_context",
             "target_root_is_resource",
-        ):
-            prepared.pop(field, None)
+        )
+        forbidden = sorted(field for field in forbidden_fields if field in prepared)
+        if forbidden:
+            raise PublicSubmissionPreparationError(
+                f"保存位置由管理员配置，提交不得包含：{', '.join(forbidden)}",
+                400,
+            )
         if cached:
             self._apply_cached_resource(prepared, cached, manual_title, manual_password)
         elif not prepared.get("url"):
@@ -136,6 +143,7 @@ class PublicSubmissionPreparationService:
         )
         prepared["quark_selection"] = self.safe_quark_selection(prepared.get("quark_selection"))
         prepared["cloud139_selection"] = self.safe_cloud139_selection(prepared.get("cloud139_selection"))
+        prepared["tianyi_selection"] = self.safe_tianyi_selection(prepared.get("tianyi_selection"))
         if sixpan_selection is not None or prepared["ignore_files"]:
             prepared["sixpan_selection"] = {
                 **(sixpan_selection or {}),
@@ -166,6 +174,7 @@ class PublicSubmissionPreparationService:
             scoped_selection=bool(
                 prepared.get("quark_selection")
                 or prepared.get("cloud139_selection")
+                or prepared.get("tianyi_selection")
                 or prepared.get("sixpan_selection")
                 or prepared.get("ignore_files")
             ),

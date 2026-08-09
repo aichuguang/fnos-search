@@ -67,7 +67,8 @@
 | 服务 | 是否必需 | 用途 |
 |---|---|---|
 | PanSou | 使用搜索功能时需要 | 搜索夸克、移动云、磁链等资源 |
-| Quark Auto Save | 使用夸克线路时需要 | 把夸克分享保存到自己的网盘 |
+| 内置夸克 Provider | 使用夸克线路时需要，在后台使用夸克 APP 扫码登录（自动提取并加密保存 Cookie） | 通过夸克官方网页 API 检查分享并原生转存 |
+| 内置天翼 Provider | 使用天翼线路时需要，在后台使用账号密码登录；风控时输入图片验证码 | 自动维护 Token，通过天翼网页 API 获取分享目录、原生转存并轮询校验 |
 | OpenList | 使用目录整理或 STRM 时需要 | 统一访问网盘、整理真实目录、生成 STRM |
 | 139 移动云认证 | 使用移动云线路时需要 | 官方直转或上传文件 |
 | 6盘账号 | 使用磁链离线下载时需要 | 解析磁链并创建离线任务 |
@@ -75,9 +76,16 @@
 | AI 接口 | 可选 | 仅用于低置信识别建议 |
 | 飞牛媒体库接口 | 可选 | 整理完成后触发媒体库刷新 |
 
+天翼账号默认通过后台的“账号密码登录”接入。系统按天翼登录协议对账号密码做 RSA 加密；若天翼触发风控，会在登录弹窗中显示图片验证码并等待输入。登录成功后 `accessToken`、`refreshToken` 和过期时间会加密保存，运行时优先使用 Access Token，失效后自动刷新并写入新的账号修订。Refresh Token 不可用时再回退到已保存的 SSON 或账号密码；后台无人值守重登若再次触发验证码，会要求管理员重新登录。SSON 仍可作为恢复凭证，支持只填 Cookie 值或填写 `SSON=...`。私密分享访问码随资源提交，不写入账号凭证。
+
+夸克运行时只使用后台“网盘入库 → 云盘账号”中激活的 Provider 账号。系统不再读取全局
+`quark` Cookie、高级配置 Token 或环境变量回退；账号无法解密、登录态过期或凭证为空时会明确
+提示当前账号不可用，需要在账号工作区重新登录或切换账号。
+
 ### 磁盘空间
 
-数据库、自动生成的密钥和后台配置默认保存在 `data`，日志默认保存在 `logs`。
+数据库、后台配置和自动生成的进程认证令牌默认保存在 `data`，日志默认保存在 `logs`。
+浏览器会话签名密钥由 `FNOS_ROOT_KEY` 按 `app-session` 用途派生，不单独配置或持久化。
 `rclone/temp` 可能临时保存完整视频文件，如果系统盘空间有限，应在 `.env` 中把
 `RCLONE_TEMP_HOST_PATH` 改到容量较大的存储盘。
 
@@ -90,6 +98,9 @@
 ```bash
 git clone https://github.com/aichuguang/fnos-search.git
 cd fnos-search
+cp .env.example .env
+openssl rand -hex 32
+# 把上一行生成的 64 位 hex 填入 .env 的 FNOS_ROOT_KEY
 docker compose up -d
 ```
 
@@ -99,7 +110,7 @@ docker compose up -d
 - 启动 Web 容器和独立的 rclone Worker 容器。
 - 创建数据库和全部表结构。
 - 创建默认持久化目录。
-- 生成应用签名密钥、通知加密密钥和 Worker 控制令牌。
+- 校验你提供的 `FNOS_ROOT_KEY`，派生应用会话签名密钥，并生成 Worker 控制令牌。
 
 查看运行状态：
 
@@ -113,7 +124,8 @@ docker compose logs -f fnos-media-import
 1. 打开 NAS 的 Docker 管理页面。
 2. 新建 Compose 或“项目”。
 3. 上传项目目录，或把 `docker-compose.yml` 和需要的宿主机目录放在同一个项目目录。
-4. 需要自定义存储位置时，根据 `.env.example` 创建 `.env`，建议在 NAS 上填写绝对路径。
+4. 根据 `.env.example` 创建 `.env`（或在面板中添加环境变量），至少填写一条 64 位 hex 的
+   `FNOS_ROOT_KEY`；需要自定义存储位置时，建议同时填写绝对路径。
 5. 启动项目。
 6. 浏览器打开 `http://NAS-IP:5251/admin/login`。
 
@@ -170,11 +182,15 @@ docker exec fnos-rclone-worker rclone lsd "MP:" --config /config/rclone/rclone.c
 
 1. 在“个人设置”修改管理员密码。
 2. 在“搜索与线路”填写 PanSou 地址。
-3. 在“网盘服务”配置实际使用的夸克、移动云或 6盘。
-4. 在“OpenList/TMDB/AI”配置 OpenList 和 TMDB。
-5. 在“分类路径”确认电影、电视剧、动漫和综艺目录。
-6. 需要自动整理时再开启 Organizer。
-7. 需要通知时配置 SMTP 或 Webhook。
+3. 在“网盘入库 → 云盘账号”登录夸克、天翼、移动云或 6盘账号。
+4. 在“网盘入库 → OpenList”创建连接并检测挂载。
+5. 在“网盘入库 → 保存位置 / 入库规则”选择目标并生成分类目录。
+6. 在“OpenList/TMDB/AI”中仅调整通用运行参数、TMDB 和 AI；OpenList 身份凭证不在高级配置中保存。
+7. 需要自动整理时再开启 Organizer，需要通知时配置 SMTP 或 Webhook。
+
+高级配置的保存与导入统一使用 `fnos-media-import/advanced-config`、`version: 1` 的版本化文档。
+后台导出的 JSON 可以重新导入；裸 `config` 对象、旧版全局网盘凭证和旧分类路径字段会被直接拒绝，
+不会自动迁移或静默回退。
 
 配置完成后，建议先提交一个小资源测试完整流程，再开始批量使用。
 
@@ -192,7 +208,7 @@ cp .env.example .env
 
 #### 正式部署变量
 
-以下是 `docker-compose.yml` 支持的全部用户配置变量。所有变量都有默认值，不填写也能启动。
+以下是 `docker-compose.yml` 支持的全部用户配置变量。新部署只需生成一把根密钥。
 
 | 变量 | 默认值 | 是否建议配置 | 说明 |
 | --- | --- | --- | --- |
@@ -200,14 +216,14 @@ cp .env.example .env
 | `APP_PORT` | `5251` | 按需 | Web 页面映射到宿主机的端口。只填写端口数字，例如 `5251`。 |
 | `TZ` | `Asia/Shanghai` | 按需 | 应用和 rclone 容器使用的时区。 |
 | `APP_CONFIG_HOST_PATH` | `./config` | 按需 | 可选 `config.yaml` 所在的宿主机目录。 |
-| `APP_DATA_HOST_PATH` | `./data` | 强烈建议确认 | SQLite 数据库、后台设置、数据库备份和自动生成密钥的持久化目录。必须是当前 NAS 的本地文件系统，重新编排必须继续使用原目录。 |
+| `APP_DATA_HOST_PATH` | `./data` | 强烈建议确认 | SQLite 数据库、后台设置、数据库备份和 Worker 控制令牌的持久化目录。必须是当前 NAS 的本地文件系统，重新编排必须继续使用原目录。 |
 | `APP_LOGS_HOST_PATH` | `./logs` | 按需 | 应用运行日志目录，分别保存 `web.log` 和 `worker.log`。 |
 | `RCLONE_CONFIG_HOST_PATH` | `./rclone/config` | 强烈建议确认 | `rclone.conf` 持久化目录，保存 OpenList WebDAV Remote 配置。 |
 | `RCLONE_CACHE_HOST_PATH` | `./rclone/cache` | 按需 | rclone 缓存目录，可清理，但运行中不要删除。 |
 | `RCLONE_TEMP_HOST_PATH` | `./rclone/temp` | 建议配置 | 搬运完整媒体文件的临时目录，应放在空间充足的磁盘。 |
+| `FNOS_RELAY_HOST_PATH` | `./rclone/relay` | 建议配置 | 跨盘到移动云时的共享中继目录，Web 与 Worker 都挂载到 `/data/relay`。应放在空间充足的磁盘。 |
 | `RCLONE_LOCAL_STORAGE_HOST_PATH` | `./rclone/local-storage` | 按需 | 本地存储目标的宿主机挂载目录，挂载到 Worker 的 `/storage-targets`。仅当使用本地文件夹目标时配置，必须指向预先挂载的独立目录，不能复用 `APP_DATA_HOST_PATH`。 |
-| `APP_SECRET_KEY` | 空，自动生成 | 新部署不要填写 | Flask 会话签名密钥。留空时首次启动自动生成并保存到 `app.db`；旧部署显式配置过时必须保持原值。 |
-| `NOTIFICATION_ENCRYPTION_KEY` | 空，自动生成 | 新部署不要填写 | SMTP、Webhook 等通知凭据的加密密钥。留空时生成并保存到数据目录的 `.secrets`；旧部署显式配置过时必须保持原值。 |
+| `FNOS_ROOT_KEY` | 无 | 必填 | 唯一的 32 字节根密钥，填写 64 位 hex。程序通过 HKDF-SHA256 为 Flask 会话、账号、OpenList、授权会话、来源快照和通知派生隔离子密钥。可用 `openssl rand -hex 32` 生成。 |
 | `RCLONE_WORKER_CONTROL_TOKEN` | 空，自动生成 | 新部署不要填写 | Web 与独立 rclone Worker 之间的内部 Bearer Token。留空时生成并保存到 `APP_DATA_HOST_PATH/.secrets/rclone_worker_control_token`，重新编排会继续使用原值。 |
 
 NAS 面板示例：
@@ -223,6 +239,8 @@ APP_LOGS_HOST_PATH=/你的目录/fnos-search/logs
 RCLONE_CONFIG_HOST_PATH=/你的目录/fnos-search/rclone/config
 RCLONE_CACHE_HOST_PATH=/你的目录/fnos-search/rclone/cache
 RCLONE_TEMP_HOST_PATH=/你的大容量目录/fnos-search/temp
+FNOS_RELAY_HOST_PATH=/你的大容量目录/fnos-search/relay
+FNOS_ROOT_KEY=请填写64位hex根密钥
 ```
 
 面板中只添加需要覆盖的变量即可，不必逐项填写。相对路径以 Compose 项目目录为基准；NAS
@@ -251,16 +269,20 @@ curl -fsS "http://127.0.0.1:${APP_PORT:-5251}/readyz"
 ```
 
 `--remove-orphans` 只有在新编排已经生效后，才能识别并删除旧版辅助容器。若仍使用旧编排，
-新镜像会以 Web-only 安全降级模式启动，管理页面可访问，但 rclone 和后台调度不可用，
-`/readyz` 会返回 503 并提示替换编排。
+新镜像不会再兼容旧角色变量，也不会以 Web-only 模式降级；旧编排缺少显式
+`FNOS_PROCESS_ROLE` 时容器会直接启动失败，因此必须先替换编排再更新镜像。
 
 数据库会在原文件上自动升级。发生数据库迁移时，程序会在
 `APP_DATA_HOST_PATH/backups` 中自动创建迁移前备份。
 
-应用签名密钥首次启动时生成并保存到 `app.db`；通知加密密钥和 Worker 控制令牌保存到
-`APP_DATA_HOST_PATH/.secrets`。正常的 `pull`、`up -d`、删除容器或重新编排不会改变它们。
-只有删除/更换 `APP_DATA_HOST_PATH`，或显式修改 `APP_SECRET_KEY`、
-`NOTIFICATION_ENCRYPTION_KEY`、`RCLONE_WORKER_CONTROL_TOKEN` 时，才会造成对应密钥变化。
+`FNOS_ROOT_KEY` 不写入数据库，必须与数据备份分开保存；修改或丢失后，新版敏感数据将无法解密，
+现有浏览器登录会话也会全部失效。应用签名密钥由根密钥按 `app-session` 用途稳定派生，不写入
+`app.db`；Worker 控制令牌仍保存到 `APP_DATA_HOST_PATH/.secrets`。
+
+硬切换升级前，把现有账号主密钥的值原样改名为 `FNOS_ROOT_KEY`，不要同时保留两个变量名，
+也不能临时生成另一条值。程序只接受新版 `v2:<purpose>` 密文；旧 `v1`、`ol:v1` 和旧通知
+密文不会自动迁移或回退解密，相关账号、OpenList 连接或通知凭据必须在后台重新登录/保存。
+根密钥轮换需要先执行密文迁移，不能直接替换环境变量。
 
 如果需要从源码构建：
 
@@ -335,11 +357,11 @@ Worker 核心线程持续异常时会主动退出当前应用进程，由 Gunico
 Docker 重启策略恢复。短暂重启期间，Web 查询会自动进行有限重试；启动、停止、取消等有副作用
 命令不会自动重试，以免重复执行。
 
-### OpenList 路径必须对应
+### OpenList 挂载与保存位置必须对应
 
-夸克保存目录、移动云实际目录、OpenList 挂载目录和 STRM 目录可能是不同路径。
-后台“分类路径”中的配置必须与 OpenList 真实目录一致，否则可能出现找不到文件、整理失败或
-刷新了错误目录。
+夸克、移动云等 Provider 的原生目录、OpenList 挂载和最终媒体目录可能位于不同命名空间。
+请在“网盘入库”的 OpenList、保存位置和入库规则中完成绑定并执行完整预检；不要再通过
+`quark_save_path`、`sixpan_save_path`、`cloud139_target_path` 等旧分类字段手工拼接路径。
 
 不确定时先关闭 Organizer，确认资源能够正常转存后，再单独测试整理功能。
 
@@ -348,10 +370,12 @@ Docker 重启策略恢复。短暂重启期间，Web 查询会自动进行有限
 遇到电影合集、错误标题或无法确定的文件，建议进入 Organizer 人工审核并选择“跳过整理”。
 系统会保留原文件名，只把内容移动到正确分类目录，后续交给 OpenList 或媒体库自行刮削。
 
-### 密钥由系统自动管理
+### 一把根密钥，按用途派生
 
-新部署会在持久化数据目录中自动生成应用签名密钥、通知加密密钥和 Worker 控制令牌，用户无需填写。迁移或重装时
-必须完整保留 `data/`，否则已经加密保存的 SMTP 密码和 Webhook 凭据将无法解密。
+应用只接受 `FNOS_ROOT_KEY`。程序通过 HKDF-SHA256 派生 Flask 会话、账号、OpenList、授权会话、
+来源快照和通知等用途隔离子密钥；不再配置或持久化第二把应用签名密钥。Worker 控制令牌只用于
+进程间认证，不是数据加密主密钥。迁移或重装时必须同时保留 `data/` 和原 `FNOS_ROOT_KEY`；
+任一丢失都会导致已加密凭据无法解密，替换根密钥还会使现有浏览器会话失效。
 
 ### 固定版本更适合长期使用
 

@@ -15,8 +15,8 @@ from flask import session
 from .classifiers.link_classifier import detect_link
 from .constants import CATEGORY_LABELS
 from .importers.cloud139 import Cloud139Importer
-from .importers.generic import GenericWebhookImporter
 from .importers.sixpan import SixPanOfflineImporter
+from .importers.tianyi import TianyiImporter
 from .services.public_resource_detail_service import PublicResourceDetailService
 from .services.public_submission_preflight_service import PublicSubmissionPreflightService
 from .web_input import _clip_text, _config_bool, _config_int, _safe_int_value
@@ -69,12 +69,16 @@ def _safe_public_quark_selection(value: Any) -> dict[str, Any]:
             return None
         type_text = str(raw.get("type") or raw.get("kind") or "").strip().lower()
         is_dir = bool(raw.get("is_dir") or raw.get("dir") or type_text in {"dir", "folder", "directory"})
-        return {
+        path = _clip_text(raw.get("path"), 1024)
+        entry: dict[str, Any] = {
             "fid": fid,
             "name": name or fid,
             "type": "dir" if is_dir else "file",
             "is_dir": is_dir,
         }
+        if path:
+            entry["path"] = path
+        return entry
 
     def _entry_list(raw: Any, max_items: int = 100) -> list[dict[str, Any]]:
         rows = raw if isinstance(raw, list) else []
@@ -140,6 +144,103 @@ def _safe_public_cloud139_selection(value: Any) -> dict[str, Any]:
     return {"mode": "items", "selected_files": selected_files, "selected_folders": selected_folders}
 
 
+def _safe_public_tianyi_selection(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    mode = str(value.get("mode") or "").strip()
+    if mode != "items":
+        return {}
+
+    def _item_rows(raw_rows: Any, *, is_dir: bool, max_items: int) -> list[dict[str, Any]]:
+        rows = raw_rows if isinstance(raw_rows, list) else []
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in rows[:max_items]:
+            if not isinstance(raw, dict):
+                continue
+            fid = _clip_text(
+                raw.get("fid") or raw.get("file_id") or raw.get("fileId") or raw.get("id"),
+                256,
+            )
+            if not fid or fid in seen:
+                continue
+            seen.add(fid)
+            name = (
+                _clip_text(
+                    raw.get("name") or raw.get("file_name") or raw.get("fileName"),
+                    240,
+                )
+                or fid
+            )
+            path = _clip_text(raw.get("path"), 1024)
+            selected.append(
+                {
+                    "fid": fid,
+                    "name": name,
+                    "type": "dir" if is_dir else "file",
+                    "is_dir": is_dir,
+                    **({"path": path} if path else {}),
+                }
+            )
+        return selected
+
+    selected_files = _item_rows(value.get("selected_files"), is_dir=False, max_items=300)
+    selected_folders = _item_rows(value.get("selected_folders"), is_dir=True, max_items=100)
+    if not selected_files and not selected_folders:
+        # Compatibility with clients that send one combined list.
+        combined = value.get("selected_items") if isinstance(value.get("selected_items"), list) else []
+        file_rows = [
+            item
+            for item in combined
+            if isinstance(item, dict)
+            and not bool(
+                item.get("is_dir")
+                or item.get("directory")
+                or item.get("type") in {"dir", "folder"}
+            )
+        ]
+        folder_rows = [
+            item
+            for item in combined
+            if isinstance(item, dict)
+            and bool(
+                item.get("is_dir")
+                or item.get("directory")
+                or item.get("type") in {"dir", "folder"}
+            )
+        ]
+        selected_files = _item_rows(file_rows, is_dir=False, max_items=300)
+        selected_folders = _item_rows(folder_rows, is_dir=True, max_items=100)
+    if not selected_files and not selected_folders:
+        return {}
+    return {
+        "mode": "items",
+        "selected_files": selected_files,
+        "selected_folders": selected_folders,
+    }
+
+
+def _importer_configured(importer: Any | None) -> bool:
+    if importer is None:
+        return False
+    configured = getattr(importer, "configured", None)
+    if configured is not None:
+        try:
+            return bool(configured)
+        except Exception:  # noqa: BLE001
+            return False
+    checker = getattr(importer, "check_configuration", None)
+    if not callable(checker):
+        return True
+    try:
+        result = checker()
+    except Exception:  # noqa: BLE001
+        return False
+    if isinstance(result, dict):
+        return bool(result.get("ok"))
+    return bool(getattr(result, "ok", result))
+
+
 def _safe_public_sixpan_selection(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -193,9 +294,21 @@ def _adapter_placeholders(
     config: dict[str, Any],
     generic_importers: dict[str, Any],
     cloud139_importer: Cloud139Importer | None = None,
+    quark_importer: Any | None = None,
 ) -> list[dict[str, Any]]:
-    routes = config.get("routes", {})
-    quark_config = config.get("quark", {})
+    quark_configured = False
+    quark_status = "unconfigured"
+    quark_message = "夸克 Provider 账号未激活"
+    if quark_importer is not None:
+        checker = getattr(quark_importer, "check_configuration", None)
+        if callable(checker):
+            try:
+                result = checker()
+                quark_configured = bool(getattr(result, "ok", False))
+                quark_status = "implemented" if quark_configured else "unconfigured"
+                quark_message = str(getattr(result, "message", "") or quark_message)
+            except Exception as exc:  # noqa: BLE001
+                quark_message = f"夸克 Provider 账号检测失败：{exc}"
 
     items = [
         {
@@ -203,18 +316,25 @@ def _adapter_placeholders(
             "name": "Quark 自动转存",
             "source_types": ["quark", "uc"],
             "route": "quark_to_mobile",
-            "adapter_type": "quark_auto_save",
-            "enabled": bool(routes.get("quark", {}).get("enabled", True)),
-            "configured": bool(quark_config.get("auto_save_url") and quark_config.get("token")),
-            "status": "implemented",
-            "message": "当前主链路已接入",
+            "adapter_type": "quark_provider",
+            "enabled": quark_configured,
+            "configured": quark_configured,
+            "status": quark_status,
+            "message": quark_message,
             "capabilities": {"submit": True, "task_poll": False, "direct_refresh": False},
         }
     ]
 
     if cloud139_importer:
         description = cloud139_importer.describe()
-        route_enabled = _config_bool(routes.get("cloud139", {}), "enabled", False)
+        cloud139_capabilities = (
+            description.get("capabilities")
+            if isinstance(description.get("capabilities"), dict)
+            else {}
+        )
+        route_enabled = bool(
+            description.get("configured") and cloud139_capabilities.get("submit")
+        )
         items.append(
             {
                 "key": "cloud139",
@@ -226,28 +346,48 @@ def _adapter_placeholders(
                 "configured": bool(description.get("configured")),
                 "status": "implemented" if description.get("configured") else "unconfigured",
                 "message": "已接入 139 移动云官方直转，复用移动云官方上传 CMCC 认证" if description.get("configured") else "139 官方直转未配置，请在“移动云官方上传”中维护 CMCC Basic 认证",
-                "capabilities": description.get("capabilities", {}),
+                "capabilities": cloud139_capabilities,
                 "config": description.get("config", {}),
             }
         )
 
     placeholder_specs = [
-        ("cloud189", "天翼云", ["cloud189"], "cloud189_direct", "后续接天翼云专用适配器；当前仅保留通用 Webhook 入口"),
-        ("sixpan", "磁链 / 种子离线", ["magnet", "torrent"], "sixpan_offline", "后续接 6盘或其他离线下载适配器；当前仅保留通用 Webhook 入口"),
+        ("cloud189", "天翼云", ["cloud189"], "cloud189_direct", "请在 Provider 账号中激活天翼云账号"),
+        ("sixpan", "磁链 / 种子离线", ["magnet", "torrent"], "sixpan_offline", "请在 Provider 账号中激活六盘账号"),
     ]
     for key, name, source_types, route, message in placeholder_specs:
-        route_enabled = any(_config_bool(routes.get(source_type, {}), "enabled", False) for source_type in source_types)
         importer = generic_importers.get(key)
         description = importer.describe() if importer and hasattr(importer, "describe") else {}
+        if importer and not description:
+            checker = getattr(importer, "check_configuration", None)
+            if callable(checker):
+                try:
+                    check = checker()
+                    description = {
+                        "adapter_type": f"{key}_provider",
+                        "configured": bool(getattr(check, "ok", False)),
+                        "capabilities": {"submit": bool(getattr(check, "ok", False))},
+                        "message": str(getattr(check, "message", "") or ""),
+                    }
+                except Exception:  # noqa: BLE001
+                    description = {"adapter_type": f"{key}_provider", "configured": False}
         adapter_type = str(description.get("adapter_type") or "placeholder_webhook")
         configured = bool(description.get("configured"))
-        implemented = adapter_type == "sixpan_offline" or (
+        implemented = adapter_type in {"sixpan_offline", f"{key}_provider"} or (
             adapter_type == "generic_webhook" and configured
         )
+        capabilities = (
+            description.get("capabilities")
+            if isinstance(description.get("capabilities"), dict)
+            else {}
+        )
+        route_enabled = bool(implemented and configured and capabilities.get("submit"))
         if adapter_type == "sixpan_offline":
             item_message = "已接入六盘 OpenAPI 离线任务适配器"
+        elif adapter_type == f"{key}_provider" and configured:
+            item_message = str(description.get("message") or f"{name} Provider 账号已配置")
         elif adapter_type == "generic_webhook" and configured:
-            item_message = "已配置天翼云通用 Webhook；当前尚未接入专用平台 API"
+            item_message = "已配置通用 Webhook；请迁移到对应 Provider 账号"
         else:
             item_message = message
         items.append(
@@ -262,9 +402,9 @@ def _adapter_placeholders(
                 "status": "implemented" if implemented and configured else ("unconfigured" if importer else "placeholder"),
                 "message": item_message,
                 "capabilities": {
-                    "submit": bool(description.get("capabilities", {}).get("submit")),
-                    "task_poll": bool(description.get("capabilities", {}).get("task_poll")),
-                    "direct_refresh": bool(description.get("capabilities", {}).get("refresh_after_submit")),
+                    "submit": bool(capabilities.get("submit")),
+                    "task_poll": bool(capabilities.get("task_poll")),
+                    "direct_refresh": bool(capabilities.get("refresh_after_submit")),
                 },
                 "config": description.get("config", {}),
             }
@@ -272,7 +412,13 @@ def _adapter_placeholders(
     return items
 
 
-def _public_adapter_capabilities(config: dict[str, Any]) -> list[dict[str, Any]]:
+def _public_adapter_capabilities(
+    config: dict[str, Any],
+    *,
+    quark_importer: Any | None = None,
+    cloud139_importer: Cloud139Importer | None = None,
+    generic_importers: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     public_names = {
         "cloud139": "快速入库",
         "quark": "网盘自动入库",
@@ -280,13 +426,15 @@ def _public_adapter_capabilities(config: dict[str, Any]) -> list[dict[str, Any]]
         "cloud189": "天翼云入库",
     }
     public_items = []
-    cloud139_importer = Cloud139Importer(config.get("cloud139", {}), cmcc_config=config.get("cmcc_upload", {}))
-    sixpan_importer = SixPanOfflineImporter(config.get("sixpan", {}))
-    cloud189_importer = GenericWebhookImporter("天翼云", config.get("cloud189", {}))
+    cloud139_importer = cloud139_importer or Cloud139Importer({}, cmcc_config={})
+    importer_map = generic_importers if isinstance(generic_importers, dict) else {}
+    cloud189_importer = importer_map.get("cloud189") or TianyiImporter({})
+    sixpan_importer = importer_map.get("sixpan") or SixPanOfflineImporter(config.get("sixpan", {}))
     for item in _adapter_placeholders(
         config,
         {"sixpan": sixpan_importer, "cloud189": cloud189_importer},
         cloud139_importer=cloud139_importer,
+        quark_importer=quark_importer,
     ):
         capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
         usable = bool(item.get("enabled") and item.get("configured") and capabilities.get("submit"))
@@ -425,6 +573,7 @@ def _public_resource_detail(
     sixpan_importer: Any | None = None,
     btbtla_client: Any | None = None,
     hide_full_links: bool = True,
+    tianyi_importer: Any | None = None,
 ) -> dict[str, Any]:
     service = PublicResourceDetailService(
         detect_link=detect_link,
@@ -444,6 +593,7 @@ def _public_resource_detail(
         sixpan_importer=sixpan_importer,
         btbtla_client=btbtla_client,
         hide_full_links=hide_full_links,
+        tianyi_importer=tianyi_importer,
     )
 
 
@@ -453,6 +603,7 @@ def _public_resource_child_files(
     routes: dict[str, Any],
     quark_importer: Any,
     cloud139_importer: Cloud139Importer,
+    tianyi_importer: Any | None = None,
 ) -> dict[str, Any]:
     raw = cached.get("raw_data") if isinstance(cached.get("raw_data"), dict) else {}
     source_url = str(cached.get("source_url") or raw.get("url") or raw.get("source_url") or "")
@@ -467,6 +618,58 @@ def _public_resource_child_files(
         return {
             "success": success,
             "message": summary.get("message") or ("目录读取完成" if success else "目录读取失败"),
+            "items": summary.get("items") or [],
+            "summary": summary.get("summary") or {},
+        }
+
+    if source == "cloud189":
+        if not _importer_configured(tianyi_importer):
+            return {
+                "success": False,
+                "message": "\u5929\u7ffc\u4e91\u8d26\u53f7\u672a\u914d\u7f6e\u6216\u672a\u6fc0\u6d3b\uff0c\u65e0\u6cd5\u8bfb\u53d6\u76ee\u5f55",
+                "items": [],
+            }
+        try:
+            ok, share_data = tianyi_importer.check_share(
+                link.url,
+                title,
+                str(link.password or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            ok, share_data = False, {"success": False, "message": str(exc)}
+        if not ok:
+            inspection = _tianyi_inspection_summary(
+                False,
+                share_data,
+                fallback_size=raw.get("size") or raw.get("size_text") or "",
+            )
+            return {
+                "success": False,
+                "message": inspection.get("message")
+                or "\u5929\u7ffc\u4e91\u8d44\u6e90\u68c0\u6d4b\u5931\u8d25\uff0c\u65e0\u6cd5\u5c55\u5f00\u76ee\u5f55",
+                "items": [],
+                "inspection": inspection,
+            }
+        share = share_data if isinstance(share_data, dict) else {}
+        share_id = str(share.get("share_id") or "").strip()
+        if not share_id:
+            return {
+                "success": False,
+                "message": "\u5929\u7ffc\u4e91\u5206\u4eab\u4fe1\u606f\u7f3a\u5c11 share_id\uff0c\u65e0\u6cd5\u5c55\u5f00\u76ee\u5f55",
+                "items": [],
+            }
+        data = tianyi_importer.list_files(
+            share_id=share_id,
+            file_id=fid,
+            share_mode=_safe_int_value(share.get("share_mode"), 0),
+            password=str(link.password or ""),
+        )
+        success = bool(isinstance(data, dict) and data.get("success", True) is not False)
+        summary = _tianyi_inspection_summary(success, data)
+        return {
+            "success": success,
+            "message": summary.get("message")
+            or ("\u76ee\u5f55\u8bfb\u53d6\u5b8c\u6210" if success else "\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25"),
             "items": summary.get("items") or [],
             "summary": summary.get("summary") or {},
         }
@@ -496,7 +699,12 @@ def _public_resource_child_files(
     }
 
 
-def _detail_capability_for_source(source_type: str, cloud139_importer: Cloud139Importer | None = None, sixpan_importer: Any | None = None) -> dict[str, Any]:
+def _detail_capability_for_source(
+    source_type: str,
+    cloud139_importer: Cloud139Importer | None = None,
+    sixpan_importer: Any | None = None,
+    tianyi_importer: Any | None = None,
+) -> dict[str, Any]:
     source = str(source_type or "").strip().lower()
     if source in {"quark", "uc"}:
         return {"available": True, "provider": "quark", "message": "正在检测资源是否可用"}
@@ -509,7 +717,17 @@ def _detail_capability_for_source(source_type: str, cloud139_importer: Cloud139I
             "message": "正在检测资源是否支持快速入库" if configured else "快速入库服务未配置，请联系管理员",
         }
     if source == "cloud189":
-        return {"available": False, "provider": "cloud189", "reserved": True, "message": "该来源暂不支持详情预览"}
+        configured = _importer_configured(tianyi_importer)
+        return {
+            "available": configured,
+            "provider": "cloud189",
+            "reserved": not configured,
+            "message": (
+                "\u6b63\u5728\u8bfb\u53d6\u5929\u7ffc\u4e91\u5206\u4eab\u5185\u5bb9"
+                if configured
+                else "\u5929\u7ffc\u4e91\u8d26\u53f7\u672a\u914d\u7f6e\u6216\u672a\u6fc0\u6d3b\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458"
+            ),
+        }
     if source in {"magnet", "torrent"}:
         configured = bool(sixpan_importer and getattr(sixpan_importer, "configured", False))
         return {
@@ -528,6 +746,7 @@ def _inspect_public_resource(
     quark_importer: Any,
     cloud139_importer: Cloud139Importer,
     sixpan_importer: Any | None = None,
+    tianyi_importer: Any | None = None,
 ) -> dict[str, Any]:
     source = str(getattr(link, "source_type", "") or "").strip().lower()
     if source in {"quark", "uc"}:
@@ -536,7 +755,26 @@ def _inspect_public_resource(
     if source == "cloud139" and cloud139_importer.configured:
         ok, data = cloud139_importer.check_share(getattr(link, "url", ""), title=title, password=str(getattr(link, "password", "") or ""))
         return _cloud139_inspection_summary(ok, data, fallback_size=raw.get("size") or raw.get("size_text") or "")
-    capability = _detail_capability_for_source(source, cloud139_importer=cloud139_importer, sixpan_importer=sixpan_importer)
+    if source == "cloud189" and _importer_configured(tianyi_importer):
+        try:
+            ok, data = tianyi_importer.check_share(
+                getattr(link, "url", ""),
+                title,
+                str(getattr(link, "password", "") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            ok, data = False, {"success": False, "message": str(exc)}
+        return _tianyi_inspection_summary(
+            ok,
+            data,
+            fallback_size=raw.get("size") or raw.get("size_text") or "",
+        )
+    capability = _detail_capability_for_source(
+        source,
+        cloud139_importer=cloud139_importer,
+        sixpan_importer=sixpan_importer,
+        tianyi_importer=tianyi_importer,
+    )
     return {
         "provider": capability["provider"],
         "status": "reserved",
@@ -599,10 +837,12 @@ def _preflight_public_submission(
     quark_importer: Any,
     cloud139_importer: Cloud139Importer,
     sixpan_importer: Any | None = None,
+    tianyi_importer: Any | None = None,
 ) -> dict[str, Any]:
     return PublicSubmissionPreflightService(
         quark_summary=_quark_inspection_summary,
         cloud139_summary=_cloud139_inspection_summary,
+        tianyi_summary=_tianyi_inspection_summary,
         detail_capability=_detail_capability_for_source,
         format_size=_format_size,
     ).check(
@@ -612,6 +852,7 @@ def _preflight_public_submission(
         quark_importer=quark_importer,
         cloud139_importer=cloud139_importer,
         sixpan_importer=sixpan_importer,
+        tianyi_importer=tianyi_importer,
     )
 
 
@@ -684,6 +925,47 @@ def _cloud139_inspection_summary(ok: bool, data: Any, fallback_size: Any = "") -
             "ok": payload.get("ok"),
             "code": payload.get("code"),
             "share_status": share.get("status") or share.get("state") or body.get("status") or body.get("state") or "",
+            "file_count": file_count,
+        },
+    }
+
+
+def _tianyi_inspection_summary(ok: bool, data: Any, fallback_size: Any = "") -> dict[str, Any]:
+    payload = data if isinstance(data, dict) else {"data": data}
+    rows = payload.get("items") if isinstance(payload.get("items"), list) else []
+    items = [_public_file_item(row) for row in rows[:200] if isinstance(row, dict)]
+    total_size = sum(
+        max(0, _safe_int_value(row.get("size"), 0))
+        for row in rows
+        if isinstance(row, dict) and not bool(row.get("is_folder") or row.get("is_dir"))
+    )
+    file_count: Any = len(rows)
+    if ok and not rows and payload.get("file_name") and not bool(payload.get("is_folder")):
+        file_count = 1
+    size_value: Any = total_size or fallback_size
+    message = str(payload.get("message") or payload.get("msg") or "").strip()
+    if not message:
+        message = (
+            "\u5929\u7ffc\u4e91\u8d44\u6e90\u6709\u6548\uff0c\u53ef\u7ee7\u7eed\u63d0\u4ea4"
+            if ok
+            else "\u5929\u7ffc\u4e91\u8d44\u6e90\u53ef\u80fd\u5df2\u5931\u6548\uff0c\u8bf7\u68c0\u67e5\u5206\u4eab\u94fe\u63a5\u548c\u63d0\u53d6\u7801"
+        )
+    return {
+        "provider": "cloud189",
+        "status": "ok" if ok else "failed",
+        "success": bool(ok),
+        "message": message,
+        "summary": {
+            "title": payload.get("file_name") or payload.get("title") or "",
+            "share_status": "available" if ok else str(payload.get("error_code") or "failed"),
+            "file_count": file_count,
+            "total_size_text": _format_size(size_value),
+        },
+        "items": items,
+        "raw_excerpt": {
+            "success": payload.get("success"),
+            "error_code": payload.get("error_code") or "",
+            "share_mode": payload.get("share_mode") if ok else "",
             "file_count": file_count,
         },
     }
@@ -1249,6 +1531,7 @@ def _public_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
         }
     quark_selection = _safe_public_quark_selection(payload.get("quark_selection"))
     cloud139_selection = _safe_public_cloud139_selection(payload.get("cloud139_selection"))
+    tianyi_selection = _safe_public_tianyi_selection(payload.get("tianyi_selection"))
     # v4: 访客不选择保存位置，payload 不携带 destination_id。
     return {
         "public_id": payload.get("public_id") or payload.get("resource_id") or "",
@@ -1260,6 +1543,7 @@ def _public_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "sixpan_selection": sixpan_selection,
         "quark_selection": quark_selection,
         "cloud139_selection": cloud139_selection,
+        "tianyi_selection": tianyi_selection,
     }
 
 

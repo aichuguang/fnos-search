@@ -1,30 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .import_job_service import V4PlanningError
-
-
-def _v4_guest_idempotency_base(payload: dict[str, Any]) -> str:
-    """Derive the guest idempotency base from the resource + category.
-
-    v4 has no guest-chosen destination suffix.  The creation service refines
-    this base with the server-resolved canonical source, selection hash,
-    destination and account revisions to form the durable job identity.
-    """
-
-    identity_source = str(
-        payload.get("public_id")
-        or payload.get("resource_id")
-        or payload.get("url")
-        or payload.get("source_url")
-        or ""
-    ).strip()
-    category = str(payload.get("category") or "").strip()
-    digest = hashlib.sha256(f"v4|{identity_source}|{category}".encode("utf-8", "ignore")).hexdigest()
-    return f"v4:{digest}"
+from .import_job_service import V1PlanningError
 
 
 @dataclass(frozen=True)
@@ -120,13 +99,6 @@ class PublicImportJobCoordinator:
         except (TypeError, ValueError):
             compensation_retry_job_id = 0
         payload = dict(submit_payload)
-        # v4 idempotency identity derives from canonical source + category
-        # (no guest destination suffix).  The creation service refines the
-        # base with the resolved destination/accounts and returns the durable
-        # key on the result.
-        payload["idempotency_key"] = _v4_guest_idempotency_base(payload)
-        payload["config_revision"] = payload.get("config_revision") or self.runtime_revision()
-        payload["executor_id"] = payload.get("executor_id") or self.executor_id()
         submissions = self.submission_service()
         execution_allowed = getattr(submissions, "worker_execution_allowed", None)
         compensation_request = None
@@ -151,27 +123,6 @@ class PublicImportJobCoordinator:
                         rclone_start=None,
                     )
                 if not compensation_retry_job_id:
-                    try:
-                        # v4 下任务的持久化键是 create 服务细化后的资源身份键；
-                        # 这里用基键做尽力而为的查找（已绑定请求在
-                        # ``_request_job_id`` 分支提前返回），找不到时按取消处理。
-                        existing_job = self._existing_idempotent_job(
-                            str(payload["idempotency_key"])
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        return self._retryable_recovery_failure(
-                            result={"success": False, "cancelled": False},
-                            job={},
-                            request_item=current_request,
-                            message=f"访客请求已取消，但同 key 正式任务查询失败：{exc}",
-                            bind_outcome="cancelled_job_lookup_failed",
-                        )
-                    if existing_job:
-                        return self._cancelled_request_existing_job(
-                            job=existing_job,
-                            request_item=current_request,
-                            reason=reason,
-                        )
                     return PublicImportJobResult(
                         result={
                             "success": False,
@@ -189,11 +140,12 @@ class PublicImportJobCoordinator:
                 compensation_request = current_request
         try:
             imports = self.import_service()
-            result = imports.create_import_job(payload)
+            creator = getattr(imports, "create_internal_import_job", None)
+            if not callable(creator):
+                creator = imports.create_import_job
+            result = creator(payload)
             job = result.get("job") if isinstance(result.get("job"), dict) else {}
-            # The creation service returns the durable v4 identity key (canonical
-            # source + category + destination + account revisions).  Ownership is
-            # proven by that returned key, not by a guest-sent destination.
+            # The creation service returns the server-generated durable identity.
             expected_idempotency_key = str(
                 result.get("idempotency_key") or job.get("idempotency_key") or ""
             )
@@ -427,7 +379,7 @@ class PublicImportJobCoordinator:
                 bind_outcome=bind_outcome,
                 rclone_start=rclone_start,
             )
-        except V4PlanningError as exc:
+        except V1PlanningError as exc:
             # Fail closed: no job was created (e.g. no admin-assigned
             # destination).  The guest request is marked failed with the
             # planning reason; there is no default-drive fallback.
@@ -464,7 +416,7 @@ class PublicImportJobCoordinator:
         *,
         guest_request_id: int,
         request_item: dict[str, Any] | None,
-        error: V4PlanningError,
+        error: V1PlanningError,
         mark_failure: bool,
     ) -> PublicImportJobResult:
         failed_request = request_item

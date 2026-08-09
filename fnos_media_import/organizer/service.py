@@ -9,10 +9,11 @@ import re
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from ..constants import (
     CATEGORY_LABELS,
@@ -31,7 +32,18 @@ from ..constants import (
 from ..database import Database
 from ..media.fnos import FnosMediaRefresher
 from ..media_path_rules import sanitize_resource_dir_name, split_title_year
-from ..services.import_staging_service import validated_staging_plan_from_job
+from ..planning.job_plan import (
+    JobPlanError,
+    compute_plan_hash,
+    plan_path,
+    plan_strategy,
+    validated_v1_execution_plan_from_job,
+)
+from ..services.execution_plan_guard import (
+    plan_requires_organizer,
+    reject_non_v1_job,
+    require_v1_execution_plan,
+)
 from .ai import AiCalibrator
 from .openlist_client import (
     VIDEO_EXTENSIONS,
@@ -44,7 +56,18 @@ from .openlist_client import (
     join_path,
     normalize_path,
 )
-from .parser import EPISODIC_CATEGORIES, category_target_root, evidence_title, extract_season_from_title, extract_version_tags, parse_file_name, sanitize_candidate, standard_target_path
+from .parser import (
+    EPISODIC_CATEGORIES,
+    V1_DESTINATION_FINAL_FIELD,
+    V1_DESTINATION_IS_RESOURCE_FIELD,
+    category_target_root,
+    evidence_title,
+    extract_season_from_title,
+    extract_version_tags,
+    parse_file_name,
+    sanitize_candidate,
+    standard_target_path,
+)
 from .run_lease import OrganizerRunLease, OrganizerRunLeaseLost, OrganizerScanLease, OrganizerScanLeaseLost
 from .tmdb import TmdbClient, score_tmdb_result
 
@@ -60,8 +83,323 @@ LINKED_JOB_IMMUTABLE_STATUSES = frozenset(
 logger = logging.getLogger(__name__)
 
 
+# A resolver is deliberately task-scoped.  It receives the linked Job and its
+# already validated immutable V1 plan, and must return a client built from the
+# mount/connection revisions recorded in that plan.  The Organizer never calls
+# a resolver with the current category configuration or a mutable runtime
+# destination.
+OpenListClientResolver = Callable[[dict[str, Any], dict[str, Any]], OpenListClient]
+
+_OPENLIST_RUNTIME_TUNING_KEYS = (
+    "timeout",
+    "batch_timeout",
+    "verify_tls",
+    "list_refresh_default",
+    "use_env_proxy",
+    "request_retries",
+    "retry_backoff_seconds",
+)
+
+
 class OrganizerTaskCancelled(RuntimeError):
     """Raised when an Organizer side-effect must stop for a cancelled/skipped task."""
+
+
+class FrozenOpenListResolutionError(OpenListError):
+    """The immutable V1 OpenList identity cannot be resolved safely."""
+
+
+def _openlist_runtime_tuning(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Copy deployment-level OpenList knobs without copying identity fields.
+
+    ``base_url``, ``username``, ``password`` and ``token`` are intentionally
+    excluded.  Those values belong to a frozen OpenList connection revision;
+    accepting them from the process configuration would re-introduce the
+    mutable global connection fallback this resolver is meant to prevent.
+    """
+
+    source = config if isinstance(config, dict) else {}
+    return {
+        key: source[key]
+        for key in _OPENLIST_RUNTIME_TUNING_KEYS
+        if key in source and source[key] not in (None, "")
+    }
+
+
+def _openlist_api_base_url(value: Any) -> str:
+    """Convert a frozen WebDAV endpoint to the matching OpenList API root."""
+
+    base_url = str(value or "").strip().rstrip("/")
+    if base_url.casefold().endswith("/dav"):
+        return base_url[:-4].rstrip("/")
+    return base_url
+
+
+def _plan_openlist_identity(plan: dict[str, Any]) -> dict[str, Any]:
+    """Return and validate the frozen Organizer OpenList identity.
+
+    The planner deliberately repeats mount/connection identity on both the
+    ``paths.organizer`` reference and ``bindings``.  This function treats the
+    redundancy as a tamper-evident contract and rejects any disagreement
+    before a resolver (and therefore before an OpenList network call) runs.
+    Database-backed revision existence/readability is checked by
+    :func:`build_frozen_openlist_client_resolver` below.
+    """
+
+    if not isinstance(plan, dict):
+        raise FrozenOpenListResolutionError("V1 execution_plan 不是对象")
+    paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
+    bindings = plan.get("bindings") if isinstance(plan.get("bindings"), dict) else {}
+    ref = paths.get("organizer") if isinstance(paths.get("organizer"), dict) else {}
+    if not ref:
+        raise FrozenOpenListResolutionError("V1 paths.organizer 缺失")
+
+    def text(value: Any) -> str:
+        return str(value or "").strip()
+
+    def positive(value: Any, label: str) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise FrozenOpenListResolutionError(f"{label} 必须是正整数") from exc
+        if number <= 0:
+            raise FrozenOpenListResolutionError(f"{label} 必须是正整数")
+        return number
+
+    kind = text(ref.get("kind")).lower()
+    if kind != "openlist":
+        raise FrozenOpenListResolutionError("V1 paths.organizer.kind 必须为 openlist")
+    path = text(ref.get("path"))
+    namespace = text(ref.get("namespace_id"))
+    if not path or not namespace:
+        raise FrozenOpenListResolutionError("V1 paths.organizer 缺少 namespace_id 或 path")
+    if not namespace.lower().startswith("openlist:"):
+        raise FrozenOpenListResolutionError("V1 paths.organizer 必须使用 openlist namespace")
+
+    mount_id = text(bindings.get("organizer_mount_id"))
+    mount_revision = positive(bindings.get("organizer_mount_revision"), "organizer_mount_revision")
+    binding_namespace = text(bindings.get("organizer_mount_namespace_id"))
+    connection_id = text(bindings.get("organizer_connection_id"))
+    connection_revision = positive(
+        bindings.get("organizer_connection_revision"),
+        "organizer_connection_revision",
+    )
+    storage_identity_id = text(bindings.get("organizer_mount_storage_identity_id"))
+    identity_root = text(bindings.get("organizer_mount_identity_root")) or "/"
+    if not mount_id or not connection_id or not storage_identity_id:
+        raise FrozenOpenListResolutionError(
+            "V1 Organizer bindings 缺少 mount/connection/storage identity"
+        )
+    expected_namespace = f"openlist:{connection_id}:{mount_id}"
+    if binding_namespace != expected_namespace or namespace != expected_namespace:
+        raise FrozenOpenListResolutionError(
+            "Organizer namespace 与冻结 connection/mount bindings 不一致"
+        )
+
+    path_identity = {
+        "mount_id": text(ref.get("mount_id")),
+        "mount_revision": positive(ref.get("mount_revision"), "paths.organizer.mount_revision"),
+        "connection_id": text(ref.get("connection_id")),
+        "connection_revision": positive(
+            ref.get("connection_revision"),
+            "paths.organizer.connection_revision",
+        ),
+        "storage_identity_id": text(ref.get("storage_identity_id")),
+        "identity_root": text(ref.get("identity_root")) or "/",
+    }
+    expected = {
+        "mount_id": mount_id,
+        "mount_revision": mount_revision,
+        "connection_id": connection_id,
+        "connection_revision": connection_revision,
+        "storage_identity_id": storage_identity_id,
+        "identity_root": identity_root,
+    }
+    for key in ("mount_id", "mount_revision", "connection_id", "connection_revision", "storage_identity_id"):
+        if path_identity[key] != expected[key]:
+            raise FrozenOpenListResolutionError(
+                f"paths.organizer.{key} 与冻结 bindings 不一致"
+            )
+    try:
+        if normalize_path(path_identity["identity_root"]) != normalize_path(identity_root):
+            raise FrozenOpenListResolutionError(
+                "paths.organizer.identity_root 与冻结 bindings 不一致"
+            )
+    except OpenListError as exc:
+        raise FrozenOpenListResolutionError(
+            f"paths.organizer.identity_root 无效：{exc}"
+        ) from exc
+
+    return {
+        "namespace_id": expected_namespace,
+        "path": path,
+        **expected,
+    }
+
+
+def build_frozen_openlist_client_resolver(
+    mount_service: Any,
+    connection_service: Any | None = None,
+    runtime_config: dict[str, Any] | None = None,
+) -> OpenListClientResolver:
+    """Build the resolver used by Organizer V1 task execution.
+
+    The callback intentionally accepts ``(job, plan)`` rather than a task or
+    category.  It reads only the frozen Organizer path/bindings from ``plan``;
+    mount and connection *current* rows are never consulted as a credential or
+    path fallback.  ``runtime_config`` may contain deployment tuning knobs,
+    but identity and credentials always come from the requested revisions.
+    """
+
+    if mount_service is None or not callable(getattr(mount_service, "get_revision", None)):
+        raise ValueError("build_frozen_openlist_client_resolver requires mount_service.get_revision")
+    connection_service = connection_service or getattr(mount_service, "connection_service", None)
+    if connection_service is None:
+        raise ValueError("build_frozen_openlist_client_resolver requires connection_service")
+    if not callable(getattr(connection_service, "get_revision", None)):
+        raise ValueError("connection_service.get_revision is required")
+    if not callable(getattr(connection_service, "resolve_credentials", None)):
+        raise ValueError("connection_service.resolve_credentials is required")
+    tuning = _openlist_runtime_tuning(runtime_config)
+
+    def resolve(job: dict[str, Any], plan: dict[str, Any]) -> OpenListClient:
+        if isinstance(job, dict) and job.get("id") not in (None, ""):
+            try:
+                if int(job.get("id") or 0) != int(plan.get("job_id") or 0):
+                    raise FrozenOpenListResolutionError(
+                        "关联 Job id 与 frozen V1 execution_plan.job_id 不一致"
+                    )
+            except (TypeError, ValueError) as exc:
+                raise FrozenOpenListResolutionError("关联 Job id 无效") from exc
+        identity = _plan_openlist_identity(plan)
+        mount_id = identity["mount_id"]
+        mount_revision = identity["mount_revision"]
+        connection_id = identity["connection_id"]
+        connection_revision = identity["connection_revision"]
+        try:
+            mount = mount_service.get_revision(mount_id, mount_revision)
+        except Exception as exc:  # noqa: BLE001
+            raise FrozenOpenListResolutionError(
+                f"读取冻结 OpenList mount 修订失败：{mount_id}@{mount_revision}：{exc}"
+            ) from exc
+        if not isinstance(mount, dict):
+            raise FrozenOpenListResolutionError(
+                f"冻结 OpenList mount 修订不存在：{mount_id}@{mount_revision}"
+            )
+
+        def mount_text(key: str) -> str:
+            return str(mount.get(key) or "").strip()
+
+        try:
+            actual_mount_revision = int(mount.get("revision") or mount_revision)
+        except (TypeError, ValueError) as exc:
+            raise FrozenOpenListResolutionError("冻结 mount revision 无效") from exc
+        try:
+            actual_connection_revision = int(mount.get("connection_revision") or 0)
+        except (TypeError, ValueError) as exc:
+            raise FrozenOpenListResolutionError("冻结 mount 缺少 connection_revision") from exc
+        if (
+            mount_text("mount_id") not in {"", mount_id}
+            or actual_mount_revision != mount_revision
+            or mount_text("connection_id") != connection_id
+            or actual_connection_revision != connection_revision
+            or mount_text("namespace_id") != identity["namespace_id"]
+            or mount_text("storage_identity_id") != identity["storage_identity_id"]
+        ):
+            raise FrozenOpenListResolutionError(
+                "冻结 mount 修订与 Organizer plan bindings 不一致"
+            )
+        try:
+            if normalize_path(mount.get("identity_root") or "/") != normalize_path(identity["identity_root"]):
+                raise FrozenOpenListResolutionError(
+                    "冻结 mount identity_root 与 Organizer plan 不一致"
+                )
+        except OpenListError as exc:
+            raise FrozenOpenListResolutionError(f"冻结 mount identity_root 无效：{exc}") from exc
+        if not bool(mount.get("enabled")) or not bool(mount.get("readable")) or not bool(mount.get("writable")):
+            raise FrozenOpenListResolutionError("冻结 OpenList mount 未启用或不具备读写能力")
+        if mount_text("identity_status") not in {"verified", "declared"}:
+            raise FrozenOpenListResolutionError("冻结 OpenList mount 身份尚未确认")
+
+        try:
+            connection = connection_service.get_revision(connection_id, connection_revision)
+        except Exception as exc:  # noqa: BLE001
+            raise FrozenOpenListResolutionError(
+                f"读取冻结 OpenList connection 修订失败：{connection_id}@{connection_revision}：{exc}"
+            ) from exc
+        if not isinstance(connection, dict):
+            raise FrozenOpenListResolutionError(
+                f"冻结 OpenList connection 修订不存在：{connection_id}@{connection_revision}"
+            )
+        try:
+            actual_connection_revision = int(connection.get("revision") or connection_revision)
+        except (TypeError, ValueError) as exc:
+            raise FrozenOpenListResolutionError("冻结 connection revision 无效") from exc
+        if (
+            str(connection.get("connection_id") or connection_id).strip() != connection_id
+            or actual_connection_revision != connection_revision
+            or not bool(connection.get("enabled", True))
+        ):
+            raise FrozenOpenListResolutionError(
+                "冻结 connection 修订与 Organizer plan/mount 不一致或已停用"
+            )
+        try:
+            credentials = connection_service.resolve_credentials(connection_id, connection_revision)
+        except Exception as exc:  # noqa: BLE001
+            raise FrozenOpenListResolutionError(
+                f"解析冻结 OpenList connection 凭证失败：{connection_id}@{connection_revision}：{exc}"
+            ) from exc
+        if not isinstance(credentials, dict):
+            raise FrozenOpenListResolutionError("冻结 OpenList connection 凭证无效")
+        try:
+            credentials_revision = int(credentials.get("revision") or 0)
+        except (TypeError, ValueError) as exc:
+            raise FrozenOpenListResolutionError("OpenList 凭证 revision 无效") from exc
+        if (
+            str(credentials.get("connection_id") or "").strip() != connection_id
+            or credentials_revision != connection_revision
+            or not str(credentials.get("base_url") or "").strip()
+            or not str(credentials.get("username") or "").strip()
+            or not str(credentials.get("password") or "")
+            or not bool(credentials.get("enabled", True))
+        ):
+            raise FrozenOpenListResolutionError(
+                "冻结 OpenList connection 凭证缺少完整身份信息"
+            )
+        revision_base_url = str(connection.get("base_url") or "").strip().rstrip("/")
+        credential_base_url = str(credentials.get("base_url") or "").strip().rstrip("/")
+        revision_username = str(connection.get("username") or "").strip()
+        credential_username = str(credentials.get("username") or "").strip()
+        if (
+            not revision_base_url
+            or credential_base_url != revision_base_url
+            or not revision_username
+            or credential_username != revision_username
+        ):
+            raise FrozenOpenListResolutionError(
+                "冻结 OpenList credentials 与 connection revision 不一致"
+            )
+        client_config = {
+            **tuning,
+            "base_url": _openlist_api_base_url(credentials["base_url"]),
+            "username": str(credentials["username"]).strip(),
+            "password": str(credentials["password"]),
+        }
+        client = OpenListClient(client_config)
+        # Keep an inspectable, non-secret identity marker for diagnostics and
+        # concurrency tests.  Never put credentials in this marker.
+        client._fnos_frozen_identity = {
+            "namespace_id": identity["namespace_id"],
+            "mount_id": mount_id,
+            "mount_revision": mount_revision,
+            "connection_id": connection_id,
+            "connection_revision": connection_revision,
+            "storage_identity_id": identity["storage_identity_id"],
+            "identity_root": identity["identity_root"],
+        }
+        return client
+
+    return resolve
 
 
 class OrganizerService:
@@ -80,7 +418,13 @@ class OrganizerService:
         self.categories = categories or {}
         self.fnos = fnos
         self.owner_id = str(owner_id or f"organizer:{os.getpid()}:{id(self)}")
+        # The process-level client is retained for admin diagnostics and
+        # enqueue/status checks only.  Task execution always installs a
+        # resolver-produced client in the thread-local scope below.
         self.openlist = OpenListClient(self.config.get("openlist", {}))
+        self._openlist_client_resolver: OpenListClientResolver | None = None
+        self._execution_repository: Any = None
+        self._openlist_context = threading.local()
         self.tmdb = TmdbClient(self.config.get("tmdb", {}))
         self.ai = AiCalibrator(self.config.get("ai", {}))
         self.organizer_config = self.config.get("organizer", {})
@@ -103,6 +447,248 @@ class OrganizerService:
     def enabled(self) -> bool:
         return bool(self.organizer_config.get("enabled", False))
 
+    @property
+    def openlist(self) -> OpenListClient:
+        """Return the task-scoped client, or the diagnostics-only default.
+
+        A property (rather than mutating a shared ``self.openlist`` field) is
+        important here: Organizer workers may execute jobs bound to different
+        OpenList connections concurrently.  ``threading.local`` keeps those
+        clients isolated without changing the large collection of internal
+        helpers that already call ``self.openlist``.
+        """
+
+        context = getattr(self, "_openlist_context", None)
+        stack = getattr(context, "stack", None) if context is not None else None
+        if stack:
+            return stack[-1][1]
+        return getattr(self, "_default_openlist", None)
+
+    @openlist.setter
+    def openlist(self, value: OpenListClient) -> None:
+        # Tests and embedders historically assigned a lightweight fake client
+        # directly.  Keep that diagnostic injection seam, while never using it
+        # as an execution fallback when a V1 task has no resolver.
+        self._default_openlist = value
+
+    def set_openlist_client_resolver(
+        self,
+        resolver: OpenListClientResolver | None,
+    ) -> None:
+        """Bind the frozen-plan OpenList client resolver.
+
+        RuntimeBuilder/app must call this on every newly built OrganizerService
+        (including hot-reload replacements).  Passing ``None`` deliberately
+        disables task execution; it does not restore the process-level default
+        connection as a fallback.
+        """
+
+        self._openlist_client_resolver = resolver if callable(resolver) else None
+
+    def set_execution_repository(self, repository: Any) -> None:
+        """Bind the immutable execution-plan repository used by all tasks."""
+
+        self._execution_repository = repository
+
+    def _validated_job_plan(self, job: dict[str, Any] | None) -> dict[str, Any]:
+        # A few lightweight embedders/tests construct a service via ``__new__``
+        # to exercise pure plan-boundary helpers.  Treat an absent optional
+        # repository attribute exactly like an explicitly unbound repository;
+        # never fall back to mutable runtime metadata.
+        execution_repository = getattr(self, "_execution_repository", None)
+        if execution_repository is None:
+            raise JobPlanError("Organizer 未绑定 import_execution_plans 仓储")
+        return require_v1_execution_plan(
+            job,
+            execution_repository=execution_repository,
+        )
+
+    @staticmethod
+    def _execution_plan_ref(job: dict[str, Any] | None, plan: dict[str, Any]) -> dict[str, Any]:
+        raw_data = job.get("raw_data") if isinstance(job, dict) and isinstance(job.get("raw_data"), dict) else {}
+        existing = raw_data.get("execution_plan_ref") if isinstance(raw_data.get("execution_plan_ref"), dict) else {}
+        return {
+            "schema_version": 1,
+            "job_id": _safe_positive_int((job or {}).get("id")),
+            "plan_hash": str(existing.get("plan_hash") or compute_plan_hash(plan)),
+            "strategy": plan_strategy(plan),
+        }
+
+    def _openlist_scope_stack(self) -> list[tuple[int, OpenListClient]]:
+        context = getattr(self, "_openlist_context", None)
+        if context is None:
+            context = threading.local()
+            self._openlist_context = context
+        stack = getattr(context, "stack", None)
+        if not isinstance(stack, list):
+            stack = []
+            context.stack = stack
+        return stack
+
+    def _reject_frozen_openlist_task(
+        self,
+        task: dict[str, Any],
+        *,
+        context: str,
+        error: Exception | str,
+    ) -> dict[str, Any]:
+        """Move a task to review when its frozen OpenList identity is unusable."""
+
+        message = f"{context} requires a resolvable frozen V1 OpenList binding; moved to manual review: {error}"
+        task_id = _safe_positive_int(task.get("id"))
+        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
+        marker = {
+            "state": "manual_review",
+            "reason": "frozen_openlist_unavailable",
+            "message": message,
+            "recorded_at": _utc_now_text(),
+        }
+        updated = False
+        if task_id and str(task.get("status") or "").strip().lower() not in ORGANIZER_CANCELLATION_TERMINAL_STATUSES:
+            try:
+                updated = self._update_organizer_task_from_snapshot(
+                    task,
+                    status="waiting_review",
+                    error_message=message,
+                    raw_data={**raw_data, "openlist_client_guard": marker},
+                    clear_scan_lease=True,
+                    bump_revision=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "mark frozen OpenList task review failed task_id=%s",
+                    task_id,
+                    exc_info=True,
+                )
+        job = self._linked_job(task)
+        if isinstance(job, dict):
+            try:
+                self._sync_linked_job(
+                    task,
+                    status=JOB_REVIEW,
+                    stage="review",
+                    message=message,
+                    level=EVENT_WARN,
+                    error_message=message,
+                    extra={"openlist_client_guard": marker},
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "mark frozen OpenList linked job review failed job_id=%s",
+                    job.get("id"),
+                    exc_info=True,
+                )
+        return {
+            "success": False,
+            "skipped": True,
+            "manual_review": True,
+            "task_id": task_id,
+            "status": "waiting_review",
+            "message": message,
+            "status_updated": updated,
+        }
+
+    def _resolve_task_openlist_client(
+        self,
+        task: dict[str, Any],
+        plan: dict[str, Any],
+        *,
+        context: str,
+    ) -> OpenListClient:
+        """Resolve one task's client without ever falling back to defaults."""
+
+        task_id = _safe_positive_int(task.get("id")) or 0
+        stack = self._openlist_scope_stack()
+        for active_task_id, active_client in reversed(stack):
+            if active_task_id == task_id:
+                return active_client
+        try:
+            identity = _plan_openlist_identity(plan)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, FrozenOpenListResolutionError):
+                raise
+            raise FrozenOpenListResolutionError(str(exc)) from exc
+        resolver = getattr(self, "_openlist_client_resolver", None)
+        if not callable(resolver):
+            raise FrozenOpenListResolutionError(
+                "Organizer 未绑定 frozen OpenList client resolver"
+            )
+        job = self._linked_job(task)
+        if not isinstance(job, dict):
+            raise FrozenOpenListResolutionError("Organizer 关联 Job 不存在，无法解析 frozen OpenList client")
+        try:
+            client = resolver(job, plan)
+        except FrozenOpenListResolutionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise FrozenOpenListResolutionError(
+                f"{context} 解析 frozen OpenList client 失败：{exc}"
+            ) from exc
+        if client is None:
+            raise FrozenOpenListResolutionError("frozen OpenList client resolver 返回空值")
+        default_client = getattr(self, "_default_openlist", None)
+        if default_client is not None and client is default_client:
+            raise FrozenOpenListResolutionError(
+                "frozen OpenList client resolver 返回了进程默认 client，已拒绝回退"
+            )
+        configured = getattr(client, "configured", True)
+        if configured is False:
+            raise FrozenOpenListResolutionError("frozen OpenList client 未配置 base_url")
+        # Keep the identity available to diagnostics without requiring callers
+        # to inspect the plan again.  The callback may already provide a richer
+        # marker (the factory above does); never overwrite it.
+        if not hasattr(client, "_fnos_frozen_identity"):
+            try:
+                client._fnos_frozen_identity = identity
+            except Exception:  # noqa: BLE001
+                pass
+        return client
+
+    @contextmanager
+    def _task_openlist_scope(
+        self,
+        task: dict[str, Any],
+        plan: dict[str, Any],
+        *,
+        context: str,
+    ) -> Iterator[OpenListClient]:
+        """Install a resolver-produced client for the current thread only."""
+
+        stack = self._openlist_scope_stack()
+        task_id = _safe_positive_int(task.get("id")) or 0
+        existing = next(
+            (client for active_task_id, client in reversed(stack) if active_task_id == task_id),
+            None,
+        )
+        if existing is not None:
+            yield existing
+            return
+        client = self._resolve_task_openlist_client(task, plan, context=context)
+        stack.append((task_id, client))
+        try:
+            yield client
+        finally:
+            # Remove only our own frame.  A defensive identity check prevents
+            # an exception in a nested helper from corrupting another task's
+            # client stack.
+            if stack and stack[-1][1] is client:
+                stack.pop()
+            else:
+                for index in range(len(stack) - 1, -1, -1):
+                    if stack[index][1] is client:
+                        del stack[index]
+                        break
+            closer = getattr(client, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "close task-scoped OpenList client failed task_id=%s",
+                        task_id,
+                        exc_info=True,
+                    )
+
     def _recover_stale_runs_on_startup(self) -> None:
         try:
             try:
@@ -124,6 +710,12 @@ class OrganizerService:
                 if str(job.get("status") or "") in {JOB_DONE, JOB_REVIEW, JOB_CANCELLED}:
                     continue
                 task = self.db.get_organizer_task(task_id, include_children=False) or {}
+                _job, _plan, rejection = self._task_v1_plan(
+                    task,
+                    context="Organizer stale-run recovery",
+                )
+                if rejection:
+                    continue
                 self._sync_linked_job(
                     task,
                     status=JOB_REVIEW,
@@ -155,6 +747,13 @@ class OrganizerService:
                         if not task_id or not job_id:
                             continue
                         job = self.db.get_job(job_id) or {}
+                        _validated_job, _validated_plan, rejection = self._task_v1_plan(
+                            task,
+                            context="Organizer startup completion recovery",
+                        )
+                        if rejection:
+                            failed_task_ids.append(task_id)
+                            continue
                         current_status = str(job.get("status") or "").strip().lower()
                         if not current_status:
                             continue
@@ -228,20 +827,14 @@ class OrganizerService:
 
     @staticmethod
     def _skipped_task_has_completion_evidence(task: dict[str, Any]) -> bool:
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        staging_plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        if not staging_plan.get("enabled"):
-            return True
         evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
-        confirmation = (
-            evidence.get("completion_confirmation")
-            if isinstance(evidence.get("completion_confirmation"), dict)
-            else {}
-        )
-        return confirmation.get("success") is True
+        confirmation = evidence.get("completion_confirmation")
+        if isinstance(confirmation, dict) and confirmation:
+            return confirmation.get("success") is True
+        return True
 
     def _recover_transient_scan_tasks_on_startup(self, *, include_scanning: bool = True) -> None:
-        if not self.enabled or not self.openlist.configured:
+        if not self.enabled or not callable(getattr(self, "_openlist_client_resolver", None)):
             return
         try:
             tasks: list[dict[str, Any]] = []
@@ -257,14 +850,18 @@ class OrganizerService:
                         break
                     offset += len(page)
             for task in tasks:
+                _job, _plan, rejection = self._task_v1_plan(
+                    task,
+                    context="Organizer startup scan recovery",
+                )
+                if rejection:
+                    continue
                 abort_reason = self._task_abort_reason(task)
                 if abort_reason and "关联入库任务已取消" in abort_reason:
                     self._cancel_task_for_cancelled_job(task, abort_reason)
                     continue
-                # 启用新任务暂存后，只自动恢复带固化 staging_plan 的新任务。
-                # 历史 Organizer 任务仍可人工处理，但服务重启不能主动重新扫描。
-                if self.organizer_config.get("staging_enabled", True) and not self._task_has_staging_plan(task):
-                    continue
+                # Startup recovery is V1-only. Unlinked/legacy tasks are kept
+                # as read-only migration evidence and are never rescheduled.
                 status = str(task.get("status") or "").strip().lower()
                 if status == "strm_pending":
                     raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
@@ -339,7 +936,12 @@ class OrganizerService:
             "enabled": self.enabled,
             "staging_enabled": staging_enabled,
             "staging_dir_name": str(self.organizer_config.get("staging_dir_name") or "_入库暂存").strip(),
-            "openlist_configured": self.openlist.configured,
+            # Execution readiness is determined by the frozen-plan resolver,
+            # not by the diagnostics-only process default client.
+            "openlist_configured": callable(getattr(self, "_openlist_client_resolver", None)),
+            "openlist_diagnostic_configured": bool(
+                getattr(getattr(self, "_default_openlist", None), "configured", False)
+            ),
             "tmdb_configured": self.tmdb.configured,
             "ai_configured": self.ai.configured,
             "strm_refresh_enabled": bool(self.organizer_config.get("strm_refresh_after_apply") or staging_enabled),
@@ -683,31 +1285,14 @@ class OrganizerService:
         return self.db.list_organizer_runs(limit=limit, offset=offset)
 
     def create_manual_task(self, payload: dict[str, Any], *, defer_process: bool = False) -> dict[str, Any]:
-        if not self.openlist.configured:
-            return {"success": False, "message": "OpenList 未配置，无法扫描目录"}
-        category_key = str(payload.get("category") or "movie").strip()
-        category = self.categories.get(category_key, {})
-        root_path = normalize_path(payload.get("openlist_root_path") or payload.get("path") or category_target_root(category))
-        task_id = self.db.create_organizer_task(
-            category=category_key,
-            category_label=str(category.get("label") or CATEGORY_LABELS.get(category_key, category_key)),
-            title=str(payload.get("title") or "").strip(),
-            source_keyword=str(payload.get("source_keyword") or payload.get("keyword") or "").strip(),
-            openlist_root_path=root_path,
-            trigger_type="admin_manual",
-            status="pending",
-            evidence={"manual_payload": payload},
-            raw_data=payload,
-        )
-        if defer_process:
-            return {
-                "success": True,
-                "queued": True,
-                "task_id": task_id,
-                "status": "pending",
-                "message": "已创建 OpenList 标准化任务，等待后台生成整理计划",
-            }
-        return self.process_task(task_id, auto_apply=bool(payload.get("auto_apply", False)))
+        _ = payload, defer_process
+        return {
+            "success": False,
+            "skipped": True,
+            "manual_review": True,
+            "code": "V1_JOB_REQUIRED",
+            "message": "手工路径 Organizer 已停用；请先创建带冻结 V1 execution_plan 的入库任务",
+        }
 
     def enqueue_from_rclone_callback(
         self,
@@ -720,13 +1305,29 @@ class OrganizerService:
         target_path: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        guarded_job, v1_plan, rejection = self._guard_enqueue_job(
+            job,
+            context='Organizer rclone callback',
+            allowed_strategies={"rclone_copy"},
+        )
+        if rejection:
+            return rejection
+        job = guarded_job
+        organizer_root = self._plan_path_text(v1_plan or {}, "organizer")
+        if not organizer_root:
+            return {"success": False, "skipped": True, "manual_review": True, "message": "V1 execution_plan has no organizer path"}
         if not self.enabled:
             return {"success": True, "skipped": True, "message": "Organizer 未启用"}
-        if not self.openlist.configured:
-            return {"success": False, "skipped": True, "message": "OpenList 未配置，无法创建标准化任务"}
-        category_key = str((job or {}).get("category") or "").strip() or self._category_from_label_or_path(category_label, target_path)
+        if not callable(getattr(self, "_openlist_client_resolver", None)):
+            return {
+                "success": False,
+                "skipped": True,
+                "manual_review": True,
+                "message": "Organizer 未绑定 frozen OpenList client resolver，无法创建标准化任务",
+            }
+        category_key = str((job or {}).get("category") or "").strip()
         category = self.categories.get(category_key, {})
-        root_path = self._root_path_from_target(category_key, target_path)
+        root_path = organizer_root
         if not root_path:
             return {"success": False, "skipped": True, "message": "缺少 target_path，无法定位 OpenList 目录"}
         job_id = int((job or {}).get("id") or 0) or None
@@ -737,13 +1338,9 @@ class OrganizerService:
                 job=job,
                 requested_root=root_path,
             )
-        existing = self.db.find_recent_organizer_task(root_path, category_key)
         # 关联 Job 必须拥有自己的 Organizer task。复用同根目录下另一个 Job
         # 的任务会导致后者完成时只同步原 Job，当前 Job 永久停在 waiting。
-        # 真正执行阶段已有 root/category 锁负责串行化，因此这里只保留无 Job
-        # 的旧手工/回调任务去重语义。
-        if existing and not job_id and not self._allows_same_root_task(payload, job):
-            return {"success": True, "queued": True, "task_id": existing["id"], "message": "已存在待处理标准化任务"}
+        # 真正执行阶段已有 root/category 锁负责串行化。
         guest_requests = self.db.list_guest_requests_by_job(job_id) if job_id else []
         request_id = int(guest_requests[0]["id"]) if guest_requests else None
         title = str((job or {}).get("title") or payload.get("title") or filename or "").strip()
@@ -765,7 +1362,7 @@ class OrganizerService:
                 "job": {"id": (job or {}).get("id"), "title": (job or {}).get("title"), "source_type": (job or {}).get("source_type")},
                 "naming_plan": payload.get("naming_plan"),
             },
-            raw_data=payload,
+            raw_data={**payload, "execution_plan_ref": self._execution_plan_ref(job, v1_plan)},
         )
         if not created:
             same_job_task = self._existing_task_for_job(job_id) or {}
@@ -787,14 +1384,36 @@ class OrganizerService:
         payload: dict[str, Any] | None = None,
         trigger_type: str = "direct_import_done",
     ) -> dict[str, Any]:
+        guarded_job, v1_plan, rejection = self._guard_enqueue_job(
+            job,
+            context='Organizer completed-directory enqueue',
+            allowed_strategies={"native_save", "native_offline", "rclone_copy", "relay_upload_mobile"},
+        )
+        if rejection:
+            return rejection
+        job = guarded_job
+        organizer_root = self._plan_path_text(v1_plan or {}, "organizer")
+        if not organizer_root:
+            return {"success": False, "skipped": True, "manual_review": True, "message": "V1 execution_plan has no organizer path"}
         if not self.enabled:
             return {"success": True, "skipped": True, "message": "Organizer 未启用"}
-        if not self.openlist.configured:
-            return {"success": False, "skipped": True, "message": "OpenList 未配置，无法创建标准化任务"}
+        if not callable(getattr(self, "_openlist_client_resolver", None)):
+            return {
+                "success": False,
+                "skipped": True,
+                "manual_review": True,
+                "message": "Organizer 未绑定 frozen OpenList client resolver，无法创建标准化任务",
+            }
         payload = payload if isinstance(payload, dict) else {}
-        category_key = str((job or {}).get("category") or "").strip() or self._category_from_label_or_path(category_label, root_path)
+        category_key = str((job or {}).get("category") or "").strip()
         category = self.categories.get(category_key, {})
-        normalized_root = normalize_path(root_path)
+        requested_root = normalize_path(root_path)
+        normalized_root = organizer_root
+        if requested_root and requested_root.casefold() != normalized_root.casefold():
+            error = JobPlanError(
+                f"callback root does not match V1 paths.organizer: requested={requested_root}, plan={normalized_root}"
+            )
+            return reject_non_v1_job(self.db, job, context="Organizer completed-directory enqueue", error=error)
         job_id = int((job or {}).get("id") or 0) or None
         if job_id:
             get_job = getattr(self.db, "get_job", None)
@@ -814,9 +1433,6 @@ class OrganizerService:
                 job=job,
                 requested_root=normalized_root,
             )
-        existing = self.db.find_recent_organizer_task(normalized_root, category_key)
-        if existing and not job_id and not self._allows_same_root_task(payload, job):
-            return {"success": True, "queued": True, "task_id": existing["id"], "message": "已存在待处理标准化任务"}
         guest_requests = self.db.list_guest_requests_by_job(job_id) if job_id else []
         request_id = int(guest_requests[0]["id"]) if guest_requests else None
         title = _title_from_update_payload(payload, job or {}, normalized_root)
@@ -831,7 +1447,7 @@ class OrganizerService:
             request_id=request_id,
             status="stabilizing",
             evidence={"root_path": normalized_root, "job": {"id": job_id, "title": title, "source_type": (job or {}).get("source_type")}},
-            raw_data=payload,
+            raw_data={**payload, "execution_plan_ref": self._execution_plan_ref(job, v1_plan)},
         )
         if not created:
             same_job_task = self._existing_task_for_job(job_id) or {}
@@ -867,8 +1483,10 @@ class OrganizerService:
         return {"success": True, "queued": True, "task_id": task_id, "root_path": normalized_root, "message": "已创建 OpenList 标准化任务"}
 
     def _get_or_create_organizer_task(self, *, job_id: int | None, **task_values: Any) -> tuple[int, bool]:
+        if not _safe_positive_int(job_id):
+            raise JobPlanError("Organizer task creation requires a linked V1 import job")
         atomic_creator = getattr(self.db, "get_or_create_organizer_task_for_job", None)
-        if job_id and callable(atomic_creator):
+        if callable(atomic_creator):
             return atomic_creator(job_id=int(job_id), **task_values)
         return self.db.create_organizer_task(job_id=job_id, **task_values), True
 
@@ -888,7 +1506,7 @@ class OrganizerService:
         job: dict[str, Any] | None,
         requested_root: str,
     ) -> dict[str, Any]:
-        mismatch = self._staging_task_reuse_mismatch(task, job=job, requested_root=requested_root)
+        mismatch = self._v1_task_reuse_mismatch(task, job=job, requested_root=requested_root)
         task_id = int(task.get("id") or 0)
         if mismatch:
             try:
@@ -933,8 +1551,8 @@ class OrganizerService:
             "message": "该入库任务已存在标准化任务",
         }
 
-    @staticmethod
-    def _staging_task_reuse_mismatch(
+    def _v1_task_reuse_mismatch(
+        self,
         task: dict[str, Any],
         *,
         job: dict[str, Any] | None,
@@ -942,50 +1560,25 @@ class OrganizerService:
     ) -> str:
         job = job if isinstance(job, dict) else {}
         try:
-            current_plan = validated_staging_plan_from_job(job)
-        except (TypeError, ValueError) as exc:
-            return f"当前入库任务的 staging_plan 校验失败，拒绝复用既有 Organizer 任务：{exc}"
-        if not current_plan:
-            return ""
-
-        task_raw = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        task_plan = task_raw.get("staging_plan") if isinstance(task_raw.get("staging_plan"), dict) else {}
-        validation_job = {
-            "id": job.get("id"),
-            "category": job.get("category"),
-            "target_route": job.get("target_route"),
-            "raw_data": {"staging_plan": task_plan},
-        }
-        try:
-            validated_task_plan = validated_staging_plan_from_job(validation_job)
-        except (TypeError, ValueError):
-            validated_task_plan = {}
-        if not validated_task_plan:
-            return "既有 Organizer 任务缺少与当前入库任务一致的有效 staging_plan，已拒绝静默复用"
-
-        expected_root = normalize_path(requested_root)
+            current_plan = self._validated_job_plan(job)
+            if not plan_requires_organizer(current_plan):
+                return "linked V1 execution_plan does not enable Organizer"
+            expected_root = self._plan_path_text(current_plan, "organizer")
+            self._assert_task_v1_paths(task, current_plan)
+        except (TypeError, ValueError, JobPlanError) as exc:
+            return f"existing Organizer task failed V1 plan validation: {exc}"
         existing_root = normalize_path(task.get("openlist_root_path") or "")
+        requested = normalize_path(requested_root)
+        if existing_root.casefold() != requested.casefold():
+            return f"existing Organizer root differs from requested V1 root: existing={existing_root}, requested={requested}"
         if existing_root.casefold() != expected_root.casefold():
-            return f"既有 Organizer 任务扫描目录与当前暂存任务不一致：existing={existing_root}，expected={expected_root}"
-
-        if _staging_plan_identity(validated_task_plan) != _staging_plan_identity(current_plan):
-            return "既有 Organizer 任务的 staging_plan 与当前入库任务不一致，已拒绝静默复用"
+            return f"existing Organizer root differs from paths.organizer: existing={existing_root}, plan={expected_root}"
+        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
+        task_ref = raw_data.get("execution_plan_ref") if isinstance(raw_data.get("execution_plan_ref"), dict) else {}
+        expected_hash = compute_plan_hash(current_plan)
+        if task_ref and str(task_ref.get("plan_hash") or "") != expected_hash:
+            return "existing Organizer task execution_plan_ref differs from linked job plan"
         return ""
-
-    @staticmethod
-    def _allows_same_root_task(payload: dict[str, Any], job: dict[str, Any] | None = None) -> bool:
-        if _flag_enabled(payload.get("allow_same_root_task")):
-            return True
-        contexts: list[dict[str, Any]] = [payload]
-        job_raw = (job or {}).get("raw_data") if isinstance((job or {}).get("raw_data"), dict) else {}
-        request_payload = job_raw.get("request") if isinstance(job_raw.get("request"), dict) else {}
-        contexts.extend([job_raw, request_payload])
-        for container in contexts:
-            for key in ("update_context", "organizer_context"):
-                context = container.get(key) if isinstance(container.get(key), dict) else {}
-                if context.get("subscription_id") or context.get("canonical_resource_root") or context.get("canonical_openlist_root"):
-                    return True
-        return False
 
     def _schedule(self, task_id: int) -> None:
         delay = max(0, int(self.organizer_config.get("stable_window_seconds") or 0))
@@ -1030,6 +1623,12 @@ class OrganizerService:
 
     def shutdown(self) -> None:
         self.suspend_background()
+        closer = getattr(getattr(self, "_default_openlist", None), "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                logger.debug("close Organizer diagnostic OpenList client failed", exc_info=True)
 
     def _schedule_initial_openlist_visibility_wait(self, task_id: int) -> bool:
         task = self.db.get_organizer_task(task_id, include_children=False) or {}
@@ -1107,103 +1706,214 @@ class OrganizerService:
                 delays.append(min(number, 3600))
         return delays or [120, 300, 600]
 
-    def _task_waits_for_openlist_visibility(self, task: dict[str, Any]) -> bool:
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
-        if raw_data.get("cloud139_openlist"):
-            return True
-        staging_plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        if staging_plan.get("enabled") and isinstance(raw_data.get("sixpan_openlist"), dict):
-            return True
-        job = raw_data.get("job") if isinstance(raw_data.get("job"), dict) else {}
-        evidence_job = evidence.get("job") if isinstance(evidence.get("job"), dict) else {}
-        source_type = str(job.get("source_type") or evidence_job.get("source_type") or "").strip().lower()
-        job_raw = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        provider = str(job_raw.get("provider") or raw_data.get("provider") or "").strip().lower()
-        return source_type == "cloud139" or provider == "cmcc_native"
-
-    def _task_has_staging_plan(self, task: dict[str, Any]) -> bool:
-        return bool(self._validated_task_staging_plan(task))
-
-    def _validated_task_staging_plan(self, task: dict[str, Any]) -> dict[str, Any]:
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        if not plan.get("enabled"):
-            return {}
-        job_id = _safe_positive_int(task.get("job_id") or plan.get("job_id"))
-        if not job_id:
-            return {}
-        database = getattr(self, "db", None)
-        getter = getattr(database, "get_job", None)
-        linked_job = getter(job_id) if callable(getter) else None
-        if callable(getter) and not isinstance(linked_job, dict):
-            return {}
-        validation_job = dict(linked_job or {})
-        validation_job.update(
-            {
-                "id": job_id,
-                "category": validation_job.get("category") or task.get("category") or plan.get("category"),
-                "target_route": validation_job.get("target_route") or plan.get("route"),
-                "raw_data": {"staging_plan": plan},
-            }
-        )
+    def _linked_job(self, task: dict[str, Any] | None) -> dict[str, Any] | None:
+        job_id = _safe_positive_int((task or {}).get("job_id"))
+        getter = getattr(self.db, "get_job", None)
+        if not job_id or not callable(getter):
+            return None
         try:
-            return validated_staging_plan_from_job(validation_job)
-        except (TypeError, ValueError):
-            return {}
+            value = getter(job_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("organizer linked job lookup failed job_id=%s", job_id, exc_info=True)
+            return None
+        return value if isinstance(value, dict) else None
 
-    def _validate_staging_task_boundaries(
+    @staticmethod
+    def _plan_path_text(plan: dict[str, Any], name: str) -> str:
+        ref = plan_path(plan, name)
+        return normalize_path(ref.get("path") or "") if ref else ""
+
+    def _task_v1_plan(
+        self,
+        task: dict[str, Any] | None,
+        *,
+        context: str = "Organizer",
+        reject: bool = True,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        """Load only the immutable V1 plan for a linked import task."""
+
+        if not isinstance(task, dict):
+            return None, None, None
+        job_id = _safe_positive_int(task.get("job_id"))
+        if not job_id:
+            error = JobPlanError("Organizer task is not linked to a V1 import job")
+            if not reject:
+                return None, None, None
+            return None, None, self._reject_non_v1_task(
+                task,
+                None,
+                context=context,
+                error=error,
+            )
+        job = self._linked_job(task)
+        error: Exception | str
+        if not job:
+            error = JobPlanError(f"linked import job #{job_id} does not exist")
+        else:
+            try:
+                plan = self._validated_job_plan(job)
+                if not plan_requires_organizer(plan):
+                    raise JobPlanError("V1 execution_plan does not enable Organizer")
+                if not self._plan_path_text(plan, "organizer"):
+                    raise JobPlanError("V1 execution_plan is missing paths.organizer")
+                task_raw = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
+                task_ref = task_raw.get("execution_plan_ref") if isinstance(task_raw.get("execution_plan_ref"), dict) else {}
+                if str(task_ref.get("plan_hash") or "") != compute_plan_hash(plan):
+                    raise JobPlanError("Organizer task execution_plan_ref differs from linked job plan")
+                task_category = str(task.get("category") or "").strip()
+                plan_category = str(plan.get("category") or "").strip()
+                if not task_category or task_category != plan_category:
+                    raise JobPlanError("Organizer task category differs from linked V1 plan")
+            except (JobPlanError, TypeError, ValueError) as exc:
+                plan = None
+                error = exc
+            else:
+                return job, plan, None
+        if not reject:
+            return job, None, None
+        return job, None, self._reject_non_v1_task(task, job, context=context, error=error)
+
+    def _reject_non_v1_task(
+        self,
+        task: dict[str, Any],
+        job: dict[str, Any] | None,
+        *,
+        context: str,
+        error: Exception | str,
+    ) -> dict[str, Any]:
+        message = f"{context} requires V1 execution_plan; moved to manual review: {error}"
+        task_id = _safe_positive_int(task.get("id"))
+        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
+        marker = {
+            "state": "manual_review",
+            "reason": "unsupported_execution_plan",
+            "message": message,
+            "recorded_at": _utc_now_text(),
+        }
+        updated = False
+        if task_id and str(task.get("status") or "").strip().lower() not in ORGANIZER_CANCELLATION_TERMINAL_STATUSES:
+            try:
+                updated = self._update_organizer_task_from_snapshot(
+                    task,
+                    status="waiting_review",
+                    error_message=message,
+                    raw_data={**raw_data, "execution_plan_guard": marker},
+                    clear_scan_lease=True,
+                    bump_revision=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("mark non-v1 organizer task review failed task_id=%s", task_id, exc_info=True)
+        if isinstance(job, dict):
+            try:
+                reject_non_v1_job(self.db, job, context=context, error=error)
+            except Exception:  # noqa: BLE001
+                logger.debug("mark non-v1 linked job review failed job_id=%s", job.get("id"), exc_info=True)
+        return {
+            "success": False,
+            "skipped": True,
+            "manual_review": True,
+            "task_id": task_id,
+            "status": "waiting_review",
+            "message": message,
+            "status_updated": updated,
+        }
+
+    def _assert_task_v1_paths(self, task: dict[str, Any], plan: dict[str, Any]) -> None:
+        expected_scan = self._plan_path_text(plan, "organizer")
+        actual_scan = normalize_path(task.get("openlist_root_path") or "")
+        if not expected_scan or actual_scan.casefold() != expected_scan.casefold():
+            raise JobPlanError(
+                f"Organizer scan path does not match V1 execution_plan: task={actual_scan or '<empty>'}, plan={expected_scan or '<empty>'}"
+            )
+        ref = plan_path(plan, "organizer")
+        if not str(ref.get("namespace_id") or "").strip().lower().startswith("openlist:"):
+            raise JobPlanError("V1 paths.organizer must use an openlist namespace")
+
+    def _v1_target_root(self, plan: dict[str, Any]) -> str:
+        final_root = self._plan_path_text(plan, "destination_final")
+        if not final_root or final_root == "/":
+            raise JobPlanError("V1 execution_plan is missing a valid paths.destination_final")
+        return final_root
+
+    def _guard_enqueue_job(
+        self,
+        job: dict[str, Any] | None,
+        *,
+        context: str,
+        allowed_strategies: set[str] | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        """Validate automatic Organizer enqueue using only the frozen V1 plan."""
+
+        candidate = job if isinstance(job, dict) else {}
+        job_id = _safe_positive_int(candidate.get("id"))
+        getter = getattr(self.db, "get_job", None)
+        if job_id and callable(getter):
+            try:
+                candidate = getter(job_id) or candidate
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            plan = self._validated_job_plan(candidate)
+            if not plan_requires_organizer(plan):
+                raise JobPlanError("V1 execution_plan does not enable Organizer")
+            ref = plan_path(plan, "organizer")
+            if not str(ref.get("namespace_id") or "").strip() or not str(ref.get("path") or "").strip():
+                raise JobPlanError("V1 execution_plan is missing paths.organizer")
+            strategy = plan_strategy(plan)
+            if allowed_strategies and strategy not in allowed_strategies:
+                raise JobPlanError(f"Organizer enqueue does not support strategy {strategy!r}")
+        except (JobPlanError, TypeError, ValueError) as exc:
+            return candidate, None, reject_non_v1_job(self.db, candidate, context=context, error=exc)
+        return candidate, plan, None
+
+    def _task_waits_for_openlist_visibility(self, task: dict[str, Any]) -> bool:
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
+        return bool(plan and plan_requires_organizer(plan) and self._plan_path_text(plan, "organizer"))
+
+    def _task_has_v1_plan(self, task: dict[str, Any]) -> bool:
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
+        return bool(plan)
+
+    def _validated_task_v1_plan(self, task: dict[str, Any]) -> dict[str, Any]:
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
+        return plan or {}
+
+    def _validate_v1_task_boundaries(
         self,
         task: dict[str, Any],
         *,
         scan_root: str,
         target_category: dict[str, Any],
     ) -> None:
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        raw_plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        plan = self._validated_task_staging_plan(task)
-        if raw_plan.get("enabled") and not plan:
-            raise OpenListError("任务携带的 staging_plan 已启用但校验失败，已拒绝按普通目录任务降级扫描")
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
         if not plan:
-            return
-        job_root = normalize_path(plan.get("openlist_job_root") or "")
-        normalized_scan_root = normalize_path(scan_root)
-        if not job_root or not _path_is_same_or_child(normalized_scan_root, job_root):
+            raise OpenListError("Organizer task is not backed by a valid V1 execution_plan")
+        try:
+            self._assert_task_v1_paths(task, plan)
+            expected_scan = self._plan_path_text(plan, "organizer")
+            final_root = self._v1_target_root(plan)
+        except JobPlanError as exc:
+            raise OpenListError(str(exc)) from exc
+        actual_scan = normalize_path(scan_root)
+        if actual_scan.casefold() != expected_scan.casefold():
             raise OpenListError(
-                f"任务级暂存扫描目录越界：scan={normalized_scan_root}，job_root={job_root or '<empty>'}"
+                f"Organizer scan path does not match V1 execution_plan: scan={actual_scan}, plan={expected_scan}"
             )
-        final_category_root = normalize_path(plan.get("openlist_final_category_root") or "")
-        target_root = normalize_path(category_target_root(target_category))
-        resource_root = normalize_path(
-            target_category.get("resource_root_path")
-            or target_category.get("canonical_resource_root")
-            or target_root
-        )
-        for label, value in (("target_root", target_root), ("resource_root", resource_root)):
-            if not final_category_root or not _path_is_same_or_child(value, final_category_root):
-                raise OpenListError(
-                    f"任务级暂存最终目录越界：{label}={value}，final_root={final_category_root or '<empty>'}"
-                )
+        if not final_root or final_root == "/":
+            raise OpenListError("V1 execution_plan has no valid destination_final")
 
-    def _validate_staging_mapping_boundaries(self, task: dict[str, Any]) -> None:
-        """Revalidate persisted staging mappings immediately before apply.
+    def _validate_v1_mapping_boundaries(self, task: dict[str, Any]) -> None:
+        """Revalidate editable mappings against immutable V1 paths."""
 
-        Mapping paths are editable from the admin page after the scan plan is
-        generated.  The task-level scan/target-root checks therefore cannot be
-        the final trust boundary: every executable mapping must still stay
-        inside the immutable per-job staging root and final category root.
-        """
-
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        raw_plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        plan = self._validated_task_staging_plan(task)
-        if raw_plan.get("enabled") and not plan:
-            raise OpenListError("任务携带的 staging_plan 已启用但校验失败，已拒绝执行整理")
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
         if not plan:
-            return
-
-        job_root = normalize_path(plan.get("openlist_job_root") or "")
-        final_category_root = normalize_path(plan.get("openlist_final_category_root") or "")
+            raise OpenListError("Organizer task lacks a valid V1 execution_plan; apply rejected")
+        try:
+            self._assert_task_v1_paths(task, plan)
+            job_root = self._plan_path_text(plan, "organizer")
+            final_root = self._v1_target_root(plan)
+        except JobPlanError as exc:
+            raise OpenListError(str(exc)) from exc
         for mapping in task.get("mappings") or []:
             if not isinstance(mapping, dict):
                 continue
@@ -1212,37 +1922,28 @@ class OrganizerService:
                 continue
             source_path = normalize_path(mapping.get("source_path") or "")
             target_path = normalize_path(mapping.get("target_path") or "")
+            # Organizer mappings represent files.  The frozen organizer root
+            # itself is a directory and must never be accepted as an operation
+            # source; require a strict descendant just like destination_final.
             if not job_root or not _is_child_path(source_path, job_root):
                 raise OpenListError(
-                    "任务级暂存映射源路径越界："
-                    f"mapping_id={mapping.get('id') or '<unknown>'}，source={source_path}，"
-                    f"job_root={job_root or '<empty>'}"
+                    "Organizer mapping source path escaped frozen organizer root: "
+                    f"mapping_id={mapping.get('id') or '<unknown>'}, source={source_path}, organizer_root={job_root or '<empty>'}"
                 )
-            if not final_category_root or not _is_child_path(target_path, final_category_root):
+            if not final_root or not _is_child_path(target_path, final_root):
                 raise OpenListError(
-                    "任务级暂存映射目标路径越界："
-                    f"mapping_id={mapping.get('id') or '<unknown>'}，target={target_path}，"
-                    f"final_root={final_category_root or '<empty>'}"
+                    "Organizer mapping target path escaped frozen destination_final: "
+                    f"mapping_id={mapping.get('id') or '<unknown>'}, target={target_path}, destination_final={final_root or '<empty>'}"
                 )
 
-    @staticmethod
-    def _openlist_visibility_source_message(task: dict[str, Any]) -> str:
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        staging_plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        if staging_plan.get("enabled") and isinstance(raw_data.get("sixpan_openlist"), dict):
-            return "六盘离线任务已完成"
-        if raw_data.get("cloud139_openlist"):
-            return "139 已提交成功"
-        return "网盘任务已完成"
+    def _openlist_visibility_source_message(self, task: dict[str, Any]) -> str:
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
+        if plan:
+            return f"V1 {plan_strategy(plan)} import completed"
+        return "V1 import plan unavailable"
 
     def _task_retries_openlist_visibility(self, task: dict[str, Any]) -> bool:
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        trigger_type = str(task.get("trigger_type") or "").strip().lower()
-        return (
-            self._task_waits_for_openlist_visibility(task)
-            or trigger_type in {"rclone_category_done", "rclone_callback"}
-            or isinstance(raw_data.get("rclone"), dict)
-        )
+        return self._task_waits_for_openlist_visibility(task)
 
     @staticmethod
     def _retryable_openlist_visibility_error(exc: Exception) -> bool:
@@ -1476,6 +2177,9 @@ class OrganizerService:
         task = self.db.get_organizer_task(task_id, include_children=False)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
+        _job, _plan, rejection = self._task_v1_plan(task, context="Organizer worker")
+        if rejection:
+            return rejection
         status = str(task.get("status") or "").strip().lower()
         delay, deadline = self._persisted_worker_delay(task, status=status)
         if delay <= 0:
@@ -1579,9 +2283,41 @@ class OrganizerService:
         return result is not False
 
     def process_task(self, task_id: int, *, auto_apply: bool = True) -> dict[str, Any]:
+        """Scan one task using the OpenList connection frozen in its V1 plan."""
+
         task = self.db.get_organizer_task(task_id, include_children=False)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
+        _job, plan, rejection = self._task_v1_plan(task, context="Organizer scan")
+        if rejection:
+            return rejection
+        status = str(task.get("status") or "").strip().lower()
+        # Terminal/cancelled tasks do not perform OpenList I/O.  Preserve the
+        # existing cancellation-wins semantics instead of turning a harmless
+        # no-op into review merely because its historical connection vanished.
+        if (
+            self._task_abort_reason(task)
+            or status == "done"
+            or (status == "strm_pending" and not auto_apply)
+        ):
+            return self._process_task_v1(task_id, auto_apply=auto_apply)
+        try:
+            with self._task_openlist_scope(task, plan or {}, context="Organizer scan"):
+                return self._process_task_v1(task_id, auto_apply=auto_apply)
+        except FrozenOpenListResolutionError as exc:
+            return self._reject_frozen_openlist_task(
+                task,
+                context="Organizer scan",
+                error=exc,
+            )
+
+    def _process_task_v1(self, task_id: int, *, auto_apply: bool = True) -> dict[str, Any]:
+        task = self.db.get_organizer_task(task_id, include_children=False)
+        if not task:
+            return {"success": False, "message": "标准化任务不存在"}
+        _job, _plan, rejection = self._task_v1_plan(task, context="Organizer scan")
+        if rejection:
+            return rejection
         abort_reason = self._task_abort_reason(task)
         if abort_reason:
             if "关联入库任务已取消" in abort_reason:
@@ -1674,14 +2410,13 @@ class OrganizerService:
                 expected_revision=scan_revision,
                 scan_owner=getattr(self, "owner_id", "organizer") if scan_revision is not None else "",
             )
-            task = self._repair_task_title_from_linked_job(task)
             if scan_lease is not None:
                 scan_lease.ensure_owned()
             self._sync_linked_job(task, status=JOB_ORGANIZING, stage="organizing", message="Organizer 正在扫描 OpenList 目录并生成整理计划")
             category_key = str(task.get("category") or "movie")
             category = self.categories.get(category_key, {})
             root_path = normalize_path(task.get("openlist_root_path"))
-            self._validate_staging_task_boundaries(
+            self._validate_v1_task_boundaries(
                 task,
                 scan_root=root_path,
                 target_category=self._target_category_for_task(task, category),
@@ -1861,35 +2596,36 @@ class OrganizerService:
                 scan_lease.stop()
 
     def _scan_openlist_videos(self, task: dict[str, Any], root_path: str) -> list[Any]:
+        if not self._task_has_v1_plan(task):
+            raise OpenListError("Organizer scan requires a valid V1 execution_plan")
         filters = self._task_scan_filters(task)
         expected_names = [str(item or "").strip() for item in (filters.get("expected_names") or []) if str(item or "").strip()]
         expected_paths = [str(item or "").strip() for item in (filters.get("expected_paths") or []) if str(item or "").strip()]
         expected_count = _safe_non_negative_int(filters.get("expected_count"))
         max_depth = int(self.organizer_config.get("max_scan_depth") or 8)
         max_files = int(self.organizer_config.get("max_files_per_task") or 500)
-        if self._task_has_staging_plan(task):
-            # job-<id> 是本任务独占根目录。不能用 expected_names 的集合提前终止，
-            # 否则不同季目录中的同名文件会只扫描到第一份；也不能用通用 500 文件
-            # 上限截断大任务。若拿不到完整精确路径，就完整扫描整个 Job 根，再按
-            # expected_count 做可见性完整性校验。
-            normalized_root = normalize_path(root_path)
-            scoped_paths = _dedupe_texts(
-                normalize_path(item)
-                for item in expected_paths
-                if _path_is_same_or_child(normalize_path(item), normalized_root)
-            )
-            # 持久化 expected_count 可能把非 OpenList 命名空间路径（如 rclone 存储的
-            # webdav/...）一并计入导致虚高，从而误判"精确路径不齐"而清空清单。
-            # 对暂存任务以 root 下的精确路径数为准，缺失时才回退到持久化值。
-            if scoped_paths:
-                expected_count = len(scoped_paths)
-            if expected_count > 0 and len(scoped_paths) < expected_count:
-                scoped_paths = []
-            expected_paths = scoped_paths
-            if not expected_paths:
-                expected_names = []
-            max_depth = max(max_depth, 64)
-            max_files = 0
+        # job-<id> 是本任务独占根目录。不能用 expected_names 的集合提前终止，
+        # 否则不同季目录中的同名文件会只扫描到第一份；也不能用通用 500 文件
+        # 上限截断大任务。若拿不到完整精确路径，就完整扫描整个 Job 根，再按
+        # expected_count 做可见性完整性校验。
+        normalized_root = normalize_path(root_path)
+        scoped_paths = _dedupe_texts(
+            normalize_path(item)
+            for item in expected_paths
+            if _path_is_same_or_child(normalize_path(item), normalized_root)
+        )
+        # 持久化 expected_count 可能把非 OpenList 命名空间路径（如 rclone 存储的
+        # webdav/...）一并计入导致虚高，从而误判"精确路径不齐"而清空清单。
+        # 对暂存任务以 root 下的精确路径数为准，缺失时才回退到持久化值。
+        if scoped_paths:
+            expected_count = len(scoped_paths)
+        if expected_count > 0 and len(scoped_paths) < expected_count:
+            scoped_paths = []
+        expected_paths = scoped_paths
+        if not expected_paths:
+            expected_names = []
+        max_depth = max(max_depth, 64)
+        max_files = 0
         if self._is_automatic_category_root_scan(task, root_path):
             if not expected_names and not expected_paths:
                 raise OpenListError("本次资源直接落在分类根目录，但缺少本次文件清单；已拒绝递归扫描整个分类目录")
@@ -1906,8 +2642,8 @@ class OrganizerService:
         )
 
     def _scan_staging_companion_files(self, task: dict[str, Any], root_path: str) -> list[Any]:
-        if not self._task_has_staging_plan(task):
-            return []
+        if not self._task_has_v1_plan(task):
+            raise OpenListError("Organizer companion scan requires a valid V1 execution_plan")
         normalized_root = normalize_path(root_path)
         raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
         raw_transport_paths = (
@@ -1970,8 +2706,8 @@ class OrganizerService:
         return result
 
     def _scan_completeness_message(self, task: dict[str, Any], videos: list[Any], root_path: str) -> str:
-        if not self._task_has_staging_plan(task):
-            return ""
+        if not self._task_has_v1_plan(task):
+            return "Organizer task lacks a valid V1 execution_plan"
         filters = self._task_scan_filters(task)
         normalized_root = normalize_path(root_path)
         # 持久化 expected_count 可能把非 OpenList 命名空间路径（如 rclone 存储的
@@ -1995,61 +2731,19 @@ class OrganizerService:
             return ""
         return f"OpenList 任务目录文件尚未完整可见：已看到 {visible_count}/{expected_count} 个视频文件"
 
-    def _repair_task_title_from_linked_job(self, task: dict[str, Any]) -> dict[str, Any]:
-        """重试旧任务时，用关联入库任务恢复被路径分隔符误截断的标题。"""
-
-        try:
-            job_id = int(task.get("job_id") or 0)
-        except (TypeError, ValueError):
-            job_id = 0
-        getter = getattr(self.db, "get_job", None)
-        if not job_id or not callable(getter):
-            return task
-        try:
-            job = getter(job_id)
-            if not isinstance(job, dict):
-                return task
-            raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-            repaired = _title_from_update_payload(raw_data, job, normalize_path(task.get("openlist_root_path") or ""))
-            current = str(task.get("title") or "").strip()
-            if not repaired or repaired == current:
-                return task
-            evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
-            evidence = {
-                **evidence,
-                "title_repair": {
-                    "from": current,
-                    "to": repaired,
-                    "source": "linked_import_job",
-                },
-            }
-            if not self._update_organizer_task_from_snapshot(
-                task,
-                title=repaired,
-                source_keyword=repaired,
-                evidence=evidence,
-            ):
-                return task
-            return {**task, "title": repaired, "source_keyword": repaired, "evidence": evidence}
-        except Exception:  # noqa: BLE001
-            # 这是旧数据兼容修复，不应因读取或写回关联任务失败而阻断主扫描流程。
-            logger.warning(
-                "organizer_task_title_repair_failed task_id=%s job_id=%s",
-                task.get("id"),
-                job_id,
-                exc_info=True,
-            )
-            return task
-
     def _is_automatic_category_root_scan(self, task: dict[str, Any], root_path: str) -> bool:
-        if str(task.get("trigger_type") or "").strip() == "admin_manual":
-            return False
-        category = self.categories.get(str(task.get("category") or ""), {})
-        if not category:
-            return False
         normalized_root = normalize_path(root_path)
-        category_root = _source_category_root_for_path(normalized_root, category)
-        return normalize_path(category_root).casefold() == normalized_root.casefold()
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
+        if not plan:
+            # A missing plan must never make a broad scan look safe. The public
+            # scan entry point rejects it before I/O; this remains fail-closed
+            # for direct/unit callers as well.
+            return True
+        planned_root = self._plan_path_text(plan, "organizer")
+        if not planned_root or planned_root.casefold() != normalized_root.casefold():
+            return True
+        job_id = _safe_positive_int(task.get("job_id"))
+        return basename(planned_root).casefold() != f"job-{job_id}".casefold()
 
     def rebuild_task(self, task_id: int) -> dict[str, Any]:
         # “重建计划”仍会重新扫描并覆盖旧计划，但高置信、无冲突的结果应继续
@@ -2060,6 +2754,9 @@ class OrganizerService:
         task = self.db.get_organizer_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
+        _job, _plan, rejection = self._task_v1_plan(task, context="Organizer approve")
+        if rejection:
+            return rejection
         status = str(task.get("status") or "").strip().lower()
         if status in {"scanning", "executing"}:
             return {"success": False, "conflict": True, "message": f"任务正在{'扫描' if status == 'scanning' else '执行'}，不能修改或放行"}
@@ -2142,12 +2839,14 @@ class OrganizerService:
         mappings: list[dict[str, Any]],
     ) -> None:
         projected = {**task, "mappings": mappings}
-        self._validate_staging_mapping_boundaries(projected)
+        self._validate_v1_mapping_boundaries(projected)
         category = self.categories.get(str(task.get("category") or ""), {})
-        target_category = self._target_category_for_task(task, category)
-        final_root = normalize_path(category_target_root(target_category))
+        self._target_category_for_task(task, category)
         task_root = normalize_path(task.get("openlist_root_path") or "")
-        staging_root = task_root if self._task_has_staging_plan(task) else ""
+        _job, frozen_plan, _rejection = self._task_v1_plan(task, reject=False)
+        if not frozen_plan:
+            raise OpenListError("Organizer approval requires a valid V1 execution_plan")
+        final_root = normalize_path(self._v1_target_root(frozen_plan))
         owners: dict[str, int] = {}
         for mapping in mappings:
             if str(mapping.get("status") or "") not in {"ready", "skipped_existing"}:
@@ -2160,8 +2859,6 @@ class OrganizerService:
                 raise OpenListError(f"映射源路径不在任务扫描目录：{source}")
             if final_root != "/" and not _is_child_path(target, final_root):
                 raise OpenListError(f"映射目标路径不在最终分类目录：{target}")
-            if staging_root and _path_is_same_or_child(target, staging_root):
-                raise OpenListError(f"映射目标仍位于任务暂存目录：{target}")
             key = target.casefold()
             owners[key] = owners.get(key, 0) + 1
         duplicates = [path for path, count in owners.items() if count > 1]
@@ -2172,6 +2869,9 @@ class OrganizerService:
         task = self.db.get_organizer_task(task_id, include_children=False)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
+        _job, _plan, rejection = self._task_v1_plan(task, context="Organizer skip")
+        if rejection:
+            return rejection
         status = str(task.get("status") or "").strip().lower()
         if status == "executing":
             return {
@@ -2181,8 +2881,8 @@ class OrganizerService:
             }
         if status == "done":
             return {"success": False, "conflict": True, "message": "标准化任务已完成，不能跳过"}
-        staging_plan = self._validated_task_staging_plan(task)
-        if staging_plan:
+        execution_plan = self._validated_task_v1_plan(task)
+        if execution_plan:
             if status == "scanning":
                 return {
                     "success": False,
@@ -2196,7 +2896,14 @@ class OrganizerService:
                     "message": f"任务已处于 {status}，不能再执行直通入库",
                 }
             try:
-                return self._prepare_staging_passthrough(task, staging_plan)
+                with self._task_openlist_scope(task, execution_plan, context="Organizer skip"):
+                    return self._prepare_v1_passthrough(task, execution_plan)
+            except FrozenOpenListResolutionError as exc:
+                return self._reject_frozen_openlist_task(
+                    task,
+                    context="Organizer skip",
+                    error=exc,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("organizer_passthrough_prepare_failed task_id=%s", task_id)
                 return {
@@ -2234,6 +2941,10 @@ class OrganizerService:
         task = self.db.get_organizer_task(task_id, include_children=False)
         if not task:
             return {"success": False, "not_found": True, "message": "记录不存在"}
+        if _safe_positive_int(task.get("job_id")):
+            _job, _plan, rejection = self._task_v1_plan(task, context="Organizer delete")
+            if rejection:
+                return rejection
         status = str(task.get("status") or "").strip().lower()
         deletable_statuses = {"done", "cancelled"}
         if status not in deletable_statuses:
@@ -2257,10 +2968,10 @@ class OrganizerService:
             "message": "记录已删除",
         }
 
-    def _prepare_staging_passthrough(
+    def _prepare_v1_passthrough(
         self,
         task: dict[str, Any],
-        staging_plan: dict[str, Any],
+        execution_plan: dict[str, Any],
     ) -> dict[str, Any]:
         task_id = _safe_positive_int(task.get("id"))
         if not task_id:
@@ -2268,19 +2979,16 @@ class OrganizerService:
         category_key = str(task.get("category") or "").strip()
         category = self.categories.get(category_key, {})
         task_root = normalize_path(task.get("openlist_root_path") or "")
-        staging_root = normalize_path(staging_plan.get("openlist_job_root") or "")
-        final_root = normalize_path(staging_plan.get("openlist_final_category_root") or "")
+        staging_root = self._plan_path_text(execution_plan, "organizer")
+        final_root = self._v1_target_root(execution_plan)
         if not task_root or task_root == "/":
             raise OpenListError("暂存任务扫描目录为空")
         if not staging_root or staging_root == "/" or not _path_is_same_or_child(task_root, staging_root):
             raise OpenListError("暂存任务扫描目录不在固化的 job 目录内")
         if not final_root or final_root == "/":
             raise OpenListError("暂存任务缺少最终分类目录")
-        staging_category_root = normalize_path(staging_plan.get("openlist_staging_category_root") or "")
-        if staging_category_root and _path_is_same_or_child(final_root, staging_category_root):
-            raise OpenListError("最终分类目录仍位于暂存区，拒绝直通入库")
         target_category = self._target_category_for_task(task, category)
-        self._validate_staging_task_boundaries(
+        self._validate_v1_task_boundaries(
             task,
             scan_root=task_root,
             target_category=target_category,
@@ -2354,11 +3062,10 @@ class OrganizerService:
 
         passthrough_category = {
             **target_category,
-            "openlist_root_path": final_root,
             "source_category_root_path": staging_root,
+            V1_DESTINATION_FINAL_FIELD: final_root,
+            V1_DESTINATION_IS_RESOURCE_FIELD: False,
         }
-        passthrough_category.pop("resource_root_path", None)
-        passthrough_category.pop("canonical_resource_root", None)
         operations = self._operations_for_mappings(
             mappings,
             passthrough_category,
@@ -2370,7 +3077,7 @@ class OrganizerService:
             "enabled": True,
             "requested_at": now,
             "source_root": task_root,
-            "staging_job_root": staging_root,
+            "organizer_root": staging_root,
             "target_root": final_root,
             "file_count": len(files),
             "preserve_names": True,
@@ -2431,6 +3138,9 @@ class OrganizerService:
         task = self.db.get_organizer_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
+        _job, _plan, rejection = self._task_v1_plan(task, context="Organizer start apply")
+        if rejection:
+            return rejection
         status = str(task.get("status") or "")
         if status in {"cancelled", "skipped"}:
             return {"success": False, "message": f"标准化任务已{'取消' if status == 'cancelled' else '跳过'}，不再执行"}
@@ -2583,6 +3293,13 @@ class OrganizerService:
                 self._background_apply_tasks.discard(task_id)
 
     def update_mapping(self, mapping_id: int, payload: dict[str, Any], task_id: int | None = None) -> dict[str, Any]:
+        if not _safe_positive_int(task_id):
+            return {
+                "success": False,
+                "skipped": True,
+                "code": "V1_JOB_REQUIRED",
+                "message": "缺少 V1 Organizer 任务上下文，已拒绝修改映射",
+            }
         updates = {key: payload[key] for key in ("target_path", "target_name", "media_type", "title", "year", "season", "episode", "tmdb_id", "confidence", "status") if key in payload}
         if "reason" in payload:
             updates["reason"] = payload.get("reason")
@@ -2592,6 +3309,9 @@ class OrganizerService:
         if task_id:
             task_before = self.db.get_organizer_task(task_id)
             if task_before:
+                _job, _plan, rejection = self._task_v1_plan(task_before, context="Organizer mapping update")
+                if rejection:
+                    return rejection
                 task_status = str(task_before.get("status") or "").strip().lower()
                 if task_status in {"scanning", "executing", "done", "skipped", "cancelled"}:
                     return {
@@ -2700,6 +3420,9 @@ class OrganizerService:
         task = self.db.get_organizer_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
+        _job, _plan, rejection = self._task_v1_plan(task, context="Organizer batch mapping update")
+        if rejection:
+            return rejection
         task_status = str(task.get("status") or "").strip().lower()
         if task_status in {"scanning", "executing", "done", "skipped", "cancelled"}:
             return {
@@ -2857,11 +3580,53 @@ class OrganizerService:
             worker_context.active = False
 
     def apply_task(self, task_id: int, *, run_id: int | None = None) -> dict[str, Any]:
+        """Apply a task using only its frozen V1 OpenList connection."""
+
+        task = self.db.get_organizer_task(task_id)
+        if not task:
+            self._finish_organizer_run_failure(
+                _safe_positive_int(run_id),
+                task_id,
+                "标准化任务不存在",
+            )
+            return {"success": False, "message": "标准化任务不存在"}
+        _job, plan, rejection = self._task_v1_plan(task, context="Organizer apply")
+        if rejection:
+            return rejection
+        status = str(task.get("status") or "").strip().lower()
+        if self._task_abort_reason(task) or status in {"done", "cancelled", "skipped"}:
+            return self._apply_task_v1(task_id, run_id=run_id)
+        try:
+            with self._task_openlist_scope(task, plan or {}, context="Organizer apply"):
+                return self._apply_task_v1(task_id, run_id=run_id)
+        except FrozenOpenListResolutionError as exc:
+            result = self._reject_frozen_openlist_task(
+                task,
+                context="Organizer apply",
+                error=exc,
+            )
+            safe_run_id = _safe_positive_int(run_id)
+            if safe_run_id:
+                try:
+                    self._finish_organizer_run_failure(safe_run_id, task_id, result["message"])
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "mark frozen OpenList apply run review failed task_id=%s run_id=%s",
+                        task_id,
+                        safe_run_id,
+                        exc_info=True,
+                    )
+            return result
+
+    def _apply_task_v1(self, task_id: int, *, run_id: int | None = None) -> dict[str, Any]:
         run_id = _safe_positive_int(run_id)
         task = self.db.get_organizer_task(task_id)
         if not task:
             self._finish_organizer_run_failure(run_id, task_id, "标准化任务不存在")
             return {"success": False, "message": "标准化任务不存在"}
+        _job, _plan, rejection = self._task_v1_plan(task, context="Organizer apply")
+        if rejection:
+            return rejection
         if not run_id:
             run_id, active_run = self._claim_organizer_run(task_id)
             if not run_id:
@@ -2910,7 +3675,7 @@ class OrganizerService:
         task_status = str(task.get("status") or "").strip().lower()
         if task_status in {"executing", "manual_confirmed"}:
             try:
-                self._validate_staging_mapping_boundaries(task)
+                self._validate_v1_mapping_boundaries(task)
             except Exception as exc:  # noqa: BLE001
                 message = str(exc)
                 self._update_organizer_run(
@@ -3053,7 +3818,7 @@ class OrganizerService:
         try:
             self._ensure_task_active(task_id, allowed_statuses={"executing"})
             lease.ensure_owned()
-            self._validate_staging_mapping_boundaries(task)
+            self._validate_v1_mapping_boundaries(task)
             lock_keys = self._lock_keys(task)
             acquired = self._acquire_organizer_locks(task, run_id, lock_keys, lease=lease)
             lease.ensure_owned()
@@ -3529,16 +4294,36 @@ class OrganizerService:
             offset += len(page)
         if not matched_run:
             return {"success": False, "message": "运行记录不存在"}
+        task_id = _safe_positive_int(matched_run.get("task_id"))
+        task = self.db.get_organizer_task(task_id) if task_id else None
+        if not task:
+            return {"success": False, "message": "运行记录关联的 Organizer 任务不存在"}
+        _job, _plan, rejection = self._task_v1_plan(
+            task,
+            context="Organizer rollback",
+        )
+        if rejection:
+            return rejection
         undo_items = matched_run.get("undo_data") or []
+        if not undo_items:
+            return {"success": True, "done": 0, "errors": []}
         done = 0
         errors = []
-        for op in undo_items:
-            try:
-                self._execute_inverse(op)
-                done += 1
-            except Exception as exc:  # noqa: BLE001
-                errors.append(str(exc))
-                break
+        try:
+            with self._task_openlist_scope(task, _plan or {}, context="Organizer rollback"):
+                for op in undo_items:
+                    try:
+                        self._execute_inverse(op)
+                        done += 1
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(str(exc))
+                        break
+        except FrozenOpenListResolutionError as exc:
+            return self._reject_frozen_openlist_task(
+                task,
+                context="Organizer rollback",
+                error=exc,
+            )
         return {"success": not errors, "done": done, "errors": errors}
 
     def _build_plan(
@@ -3551,7 +4336,8 @@ class OrganizerService:
         companion_files: list[Any] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         target_category = self._target_category_for_task(task, category)
-        staging_task = self._task_has_staging_plan(task)
+        if not self._task_has_v1_plan(task):
+            raise OpenListError("Organizer plan generation requires a valid V1 execution_plan")
         root_name = basename(task.get("openlist_root_path") or "")
         parent_name = basename(dirname(task.get("openlist_root_path") or ""))
         names = [item.name for item in videos]
@@ -3730,15 +4516,8 @@ class OrganizerService:
                 reason.append("多版本文件追加版本后缀")
                 target_index[target] = target_index.get(target, 0) + 1
             if self.openlist.exists(target) and normalize_path(item.path) != normalize_path(target):
-                if self._update_target_already_exists_ok(task, season, episode) and not staging_task:
-                    status = "skipped_existing"
-                    reason.append("目标路径已存在，定时追更单集视为已在标准目录，不覆盖也不要求人工确认")
-                else:
-                    status = "conflict"
-                    if staging_task:
-                        reason.append("任务级暂存源文件仍存在且目标路径已存在，拒绝自动删除或覆盖")
-                    else:
-                        reason.append("目标路径已存在，不覆盖")
+                status = "conflict"
+                reason.append("任务级暂存源文件仍存在且目标路径已存在，拒绝自动删除或覆盖")
             files.append(
                 {
                     "path": item.path,
@@ -3771,7 +4550,7 @@ class OrganizerService:
                         "tmdb": tmdb_item,
                         "ai": ai_suggestion,
                         "season_hint": season_hint,
-                        "staging_file": staging_task,
+                        "staging_file": True,
                     },
                 }
             )
@@ -4006,10 +4785,9 @@ class OrganizerService:
     def _cleanup_source_empty_dirs_after_apply(self, task: dict[str, Any]) -> dict[str, Any]:
         category = self.categories.get(str(task.get("category") or ""), {})
         target_category = self._target_category_for_task(task, category)
-        category_root = normalize_path(
-            target_category.get("source_category_root_path")
-            or category_target_root(category)
-        )
+        category_root = normalize_path(target_category.get("source_category_root_path") or "")
+        if category_root == "/":
+            raise OpenListError("V1 execution_plan has no valid Organizer source root")
         candidates: list[str] = []
         task_root = normalize_path(task.get("openlist_root_path") or "")
         if self._safe_cleanup_dir(task_root, category_root):
@@ -4582,10 +5360,15 @@ class OrganizerService:
         if passthrough.get("enabled") and passthrough.get("skip_openlist_strm_refresh"):
             logger.info("organizer_passthrough_openlist_refresh_skipped task_id=%s", task_id)
             return {}
-        staging_required = self._task_has_staging_plan(task)
+        v1_plan_task = self._task_has_v1_plan(task)
+        if not v1_plan_task:
+            return {
+                "enabled": False,
+                "skipped": True,
+                "manual_review": True,
+                "message": "缺少 V1 execution_plan，已拒绝触发 STRM 刷新",
+            }
         configured_refresh = bool(self.organizer_config.get("strm_refresh_after_apply"))
-        if not configured_refresh and not staging_required:
-            return {}
         endpoint = OPENLIST_STRM_SCAN_ENDPOINT
         category_key = str(task.get("category") or "").strip()
         names = self._final_resource_names(task)
@@ -4621,7 +5404,7 @@ class OrganizerService:
             "refresh_paths": refresh_paths,
             "count": len(result_items),
             "failed": len(failed),
-            "forced_by_staging": bool(staging_required and not configured_refresh),
+            "forced_by_v1_plan": bool(v1_plan_task and not configured_refresh),
             "items": result_items,
             "message": f"OpenList 文件夹刷新已触发 {len(result_items)} 个目录" if not failed else f"OpenList 文件夹刷新 {len(failed)}/{len(result_items)} 个目录失败",
         }
@@ -4638,7 +5421,7 @@ class OrganizerService:
             return {"enabled": False, "skipped": True, "message": "\u65e7 STRM \u76ee\u5f55\u6e05\u7406\u672a\u542f\u7528"}
         old_name = self._old_strm_resource_name(task)
         if not old_name:
-            old_name = self._staging_job_strm_resource_name(task)
+            old_name = self._job_scoped_strm_resource_name(task)
         normalized_category = str(category_key or "").strip().lower()
         if not old_name:
             return {
@@ -4706,19 +5489,18 @@ class OrganizerService:
                 candidates.append(candidate)
         return candidates[0] if len(candidates) == 1 else ""
 
-    def _staging_job_strm_resource_name(self, task: dict[str, Any]) -> str:
+    def _job_scoped_strm_resource_name(self, task: dict[str, Any]) -> str:
         """Return a system-owned job directory only for a verified direct-file staging task."""
 
         root = normalize_path(task.get("openlist_root_path") or "")
         root_name = basename(root)
         if not re.fullmatch(r"job-\d+", root_name, flags=re.IGNORECASE):
             return ""
-        if not self._task_has_staging_plan(task):
+        if not self._task_has_v1_plan(task):
             return ""
 
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        planned_root = normalize_path(plan.get("openlist_job_root") or "")
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
+        planned_root = self._plan_path_text(plan or {}, "organizer")
         if not planned_root or planned_root.casefold() != root.casefold():
             return ""
 
@@ -4941,13 +5723,10 @@ class OrganizerService:
         return join_path(effective_prefix, resource_name) if effective_prefix else ""
 
     def _strm_refresh_prefix_for_task(self, task: dict[str, Any], category_key: str) -> str:
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        if plan.get("enabled"):
-            persisted = str(plan.get("openlist_refresh_prefix") or "").strip()
-            if persisted:
-                return normalize_path(persisted)
-        return self._strm_refresh_prefix(str(category_key or "").strip().lower())
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
+        if not plan:
+            return ""
+        return self._plan_path_text(plan, "destination_final")
 
     def _strm_refresh_prefix(self, normalized_category: str) -> str:
         prefix = str(self.organizer_config.get(f"strm_refresh_prefix_{normalized_category}") or "").strip()
@@ -4958,33 +5737,11 @@ class OrganizerService:
         return _dedupe_repeated_tail_path(normalize_path(prefix)) if prefix else ""
 
     def _filter_videos_for_task(self, task: dict[str, Any], videos: list[Any]) -> list[Any]:
-        """按任务侧提供的文件证据收窄扫描结果。
+        """Return videos from the already V1-scoped OpenList scan."""
 
-        6盘离线完成时只能稳定知道分类根目录，例如 /清云/电影；如果直接扫描整
-        个分类根目录，可能误把历史资源一起整理。调用方可在 raw_data/evidence
-        里写入 scan_filters.expected_names / expected_paths，本方法只保留本次任务
-        相关的视频文件。没有过滤条件时保持旧行为。
-        """
-
-        if self._task_has_staging_plan(task):
-            return videos
-        filters = self._task_scan_filters(task)
-        expected_names = {_normalize_match_text(item) for item in filters.get("expected_names") or [] if _normalize_match_text(item)}
-        expected_paths = {_normalize_match_text(item) for item in filters.get("expected_paths") or [] if _normalize_match_text(item)}
-        if not expected_names and not expected_paths:
-            return videos
-
-        matched = []
-        for item in videos:
-            name = _normalize_match_text(getattr(item, "name", ""))
-            path = _normalize_match_text(getattr(item, "path", ""))
-            if name and name in expected_names:
-                matched.append(item)
-                continue
-            if path and any(path.endswith(expected) or expected.endswith(path) or expected in path for expected in expected_paths):
-                matched.append(item)
-                continue
-        return matched
+        if not self._task_has_v1_plan(task):
+            raise OpenListError("Organizer video filtering requires a valid V1 execution_plan")
+        return videos
 
     @staticmethod
     def _task_scan_filters(task: dict[str, Any]) -> dict[str, Any]:
@@ -4995,57 +5752,33 @@ class OrganizerService:
                 return filters
         return {}
 
-    @staticmethod
-    def _task_update_context(task: dict[str, Any]) -> dict[str, Any]:
-        for container_key in ("raw_data", "evidence"):
-            container = task.get(container_key) if isinstance(task.get(container_key), dict) else {}
-            for key in ("update_context", "organizer_context"):
-                context = container.get(key) if isinstance(container.get(key), dict) else {}
-                if context:
-                    return context
-        return {}
-
-    def _update_target_already_exists_ok(self, task: dict[str, Any], season: int | None, episode: int | None) -> bool:
-        context = self._task_update_context(task)
-        if not context or not episode:
-            return False
-        target_episode = _safe_positive_int(context.get("target_episode"))
-        target_episodes = [
-            _safe_positive_int(item)
-            for item in (context.get("target_episodes") or [])
-        ]
-        target_episodes = [item for item in target_episodes if item]
-        if target_episode and episode == target_episode:
-            return True
-        if target_episodes and episode in target_episodes:
-            return True
-        return not target_episode and not target_episodes and bool(context.get("subscription_id"))
-
-    @staticmethod
-    def _target_category_for_task(task: dict[str, Any], category: dict[str, Any]) -> dict[str, Any]:
-        target_root = ""
-        resource_root = ""
-        target_root_is_resource = False
-        for container_key in ("raw_data", "evidence"):
-            container = task.get(container_key) if isinstance(task.get(container_key), dict) else {}
-            target_root = str(container.get("target_root_path") or "").strip()
-            resource_root = str(container.get("canonical_resource_root") or container.get("resource_root_path") or "").strip()
-            target_root_is_resource = _flag_enabled(container.get("target_root_is_resource"))
-            if target_root:
-                break
+    def _target_category_for_task(self, task: dict[str, Any], category: dict[str, Any]) -> dict[str, Any]:
+        _job, frozen_plan, _rejection = self._task_v1_plan(task, reject=False)
+        if not frozen_plan:
+            raise OpenListError("Organizer target path requires a frozen V1 execution_plan")
+        organizer_root = self._plan_path_text(frozen_plan, "organizer")
+        final_root = self._plan_path_text(frozen_plan, "destination_final")
+        if not organizer_root or organizer_root == "/":
+            raise OpenListError("V1 execution_plan has no valid paths.organizer")
+        if not final_root or final_root == "/":
+            raise OpenListError("V1 execution_plan has no valid paths.destination_final")
         scoped = dict(category)
-        scoped["source_category_root_path"] = _source_category_root_for_path(
-            task.get("openlist_root_path"),
-            category,
-        )
-        if not target_root:
-            return scoped
-        target_root = _resource_root_from_task_context(target_root)
-        resource_root = _resource_root_from_task_context(resource_root)
-        scoped["openlist_root_path"] = target_root
-        if resource_root or target_root_is_resource:
-            scoped["resource_root_path"] = resource_root or target_root
-            scoped["canonical_resource_root"] = resource_root or target_root
+        for key in (
+            "openlist_root_path",
+            "cloud139_fnos_target_path",
+            "mobile_openlist_root_path",
+            "mobile_target_path",
+            "sixpan_fnos_target_path",
+            "resource_root_path",
+            "canonical_resource_root",
+            "target_root_path",
+        ):
+            scoped.pop(key, None)
+        scoped["source_category_root_path"] = organizer_root
+        scoped[V1_DESTINATION_FINAL_FIELD] = final_root
+        # Preserve the current V1 contract: destination_final is the immutable
+        # root into which this task writes its standardized files.
+        scoped[V1_DESTINATION_IS_RESOURCE_FIELD] = True
         return scoped
 
     def _match_tmdb(
@@ -5085,6 +5818,12 @@ class OrganizerService:
         return best[1]
 
     def _configured_category_root_for_path(self, path: str) -> str:
+        """Read legacy category paths for diagnostics only.
+
+        Execution planning no longer calls this helper; V1 paths are supplied
+        by ``_target_category_for_task``.
+        """
+
         normalized = normalize_path(path)
         explicit_candidates: list[str] = []
         inferred_candidates: list[str] = []
@@ -5098,7 +5837,12 @@ class OrganizerService:
             ]
             explicit = [value for value in roots if str(value or "").strip()]
             if not explicit:
-                explicit = [category_target_root(item)]
+                try:
+                    explicit = [
+                        category_target_root(item, allow_legacy_diagnostic=True)
+                    ]
+                except ValueError:
+                    explicit = []
             for value in explicit:
                 root = normalize_path(value)
                 if root == "/" or not _path_is_same_or_child(normalized, root):
@@ -5115,13 +5859,11 @@ class OrganizerService:
         target_dir = dirname(target_path)
         if resource_root and resource_root != "/" and _path_is_same_or_child(target_dir, resource_root):
             return dirname(resource_root)
-        configured_root = self._configured_category_root_for_path(target_dir)
-        if configured_root:
-            return configured_root
         if category_root != "/" and _path_is_same_or_child(target_dir, category_root):
             return category_root
-        resource_dir = dirname(target_dir) if _is_explicit_season_name(basename(target_dir)) else target_dir
-        return dirname(resource_dir)
+        raise OpenListError(
+            f"Organizer target path is outside frozen V1 destination_final: {target_path}"
+        )
 
     def _operations_for_mappings(self, mappings: list[dict[str, Any]], category: dict[str, Any], *, include_auto_delete: bool = True) -> list[dict[str, Any]]:
         operations: list[dict[str, Any]] = []
@@ -5129,7 +5871,11 @@ class OrganizerService:
         cleanup_dirs: list[str] = []
         category_root = normalize_path(category_target_root(category))
         source_category_root = normalize_path(category.get("source_category_root_path") or category_root)
-        resource_root = normalize_path(category.get("resource_root_path") or category.get("canonical_resource_root") or "")
+        resource_root = (
+            category_root
+            if bool(category.get(V1_DESTINATION_IS_RESOURCE_FIELD, True))
+            else ""
+        )
         for mapping in mappings:
             status = str(mapping.get("status") or "")
             if status == "delete_ad":
@@ -6860,6 +7606,8 @@ class OrganizerService:
         return parent
 
     def _category_from_label_or_path(self, label: str, target_path: str) -> str:
+        """Best-effort legacy category classification for read-only diagnostics."""
+
         wanted = str(label or "").strip()
         for key, item in self.categories.items():
             if wanted and wanted in {str(item.get("label") or ""), str(item.get("fnos_lib") or "")}:
@@ -6937,10 +7685,6 @@ def _strm_cleanup_message(openlist_cleanup: dict[str, Any], local_cleanup: dict[
         if message:
             parts.append(message)
     return "\uff1b".join(parts) if parts else "\u65e7 STRM \u76ee\u5f55\u6e05\u7406\u5b8c\u6210"
-
-
-def _normalize_match_text(value: Any) -> str:
-    return str(value or "").replace("\\", "/").strip().strip("/").casefold()
 
 
 def _confidence_percent(value: Any) -> float:
@@ -7305,18 +8049,6 @@ def _is_explicit_season_name(value: Any) -> bool:
     )
 
 
-def _resource_root_from_task_context(value: Any) -> str:
-    if not str(value or "").strip():
-        return ""
-    root = normalize_path(value)
-    while root and root != "/" and _is_explicit_season_name(basename(root)):
-        parent = dirname(root)
-        if not parent or parent == root:
-            break
-        root = normalize_path(parent)
-    return root
-
-
 def _clean_title_hint(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
@@ -7593,30 +8325,6 @@ def _path_is_same_or_child(path: str, parent: str) -> bool:
     return normalized_folded == root_folded or normalized_folded.startswith(f"{root_folded}/")
 
 
-def _staging_plan_identity(plan: dict[str, Any]) -> tuple[Any, ...]:
-    path_fields = (
-        "provider_target_path",
-        "quark_source_category_root",
-        "quark_job_root",
-        "storage_final_category_root",
-        "storage_staging_category_root",
-        "storage_job_root",
-        "openlist_final_category_root",
-        "openlist_staging_category_root",
-        "openlist_job_root",
-        "openlist_refresh_prefix",
-    )
-    return (
-        _safe_non_negative_int(plan.get("version")),
-        _safe_non_negative_int(plan.get("job_id")),
-        str(plan.get("route") or "").strip().casefold(),
-        str(plan.get("category") or "").strip().casefold(),
-        str(plan.get("job_dir_name") or "").strip().casefold(),
-        str(plan.get("storage_backend") or "").strip().casefold(),
-        *(normalize_path(plan.get(field) or "").casefold() for field in path_fields),
-    )
-
-
 def _relative_virtual_parts(path: str, parent: str) -> list[str]:
     normalized_path = normalize_path(path)
     normalized_parent = normalize_path(parent)
@@ -7760,7 +8468,12 @@ def _source_category_root_for_path(path: Any, category: dict[str, Any]) -> str:
     for index, part in enumerate(parts):
         if part.casefold() in anchors:
             return normalize_path("/" + "/".join(parts[: index + 1]))
-    return normalize_path(category_target_root(category))
+    try:
+        return normalize_path(
+            category_target_root(category, allow_legacy_diagnostic=True)
+        )
+    except ValueError:
+        return "/"
 
 
 def _flag_enabled(value: Any) -> bool:

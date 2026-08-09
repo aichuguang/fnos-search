@@ -32,14 +32,12 @@ class JobAdminCommandService:
         self._deps = dependencies
 
     def retry(self, job_id: int, *, reason: str | None = None) -> dict[str, Any]:
-        if self._deps.worker_dispatcher:
-            queued = self._deps.worker_dispatcher.import_retry(
-                job_id, reason=reason or f"admin_retry:{job_id}"
-            )
-            if queued:
-                return queued
+        # Retry is a short durable-state command; execute it synchronously so
+        # cancelled/manual-review tasks cannot be reported as successfully
+        # queued before the execution repository rejects them.
         result = self._deps.imports.retry_job(job_id)
-        self._deps.auto_start_rclone(result, reason or f"admin_retry:{job_id}")
+        if bool(result.get("success", True)):
+            self._deps.auto_start_rclone(result, reason or f"admin_retry:{job_id}")
         return {"success": bool(result.get("success", True)), **result}
 
     def delete(self, job_id: int) -> tuple[dict[str, Any], int]:
@@ -69,17 +67,13 @@ class JobAdminCommandService:
             if job_id is None:
                 continue
             try:
-                if self._deps.worker_dispatcher:
-                    queued = self._deps.worker_dispatcher.import_retry(
-                        job_id, reason=f"admin_batch_retry:{job_id}"
-                    )
-                    if queued:
-                        success_count += 1
-                        items.append({"job_id": job_id, **queued})
-                        continue
                 result = self._deps.imports.retry_job(job_id)
-                rclone_start = self._deps.auto_start_rclone(result, f"admin_batch_retry:{job_id}")
                 success = bool(result.get("success", True))
+                rclone_start = (
+                    self._deps.auto_start_rclone(result, f"admin_batch_retry:{job_id}")
+                    if success
+                    else None
+                )
                 success_count += int(success)
                 items.append({
                     "job_id": job_id,

@@ -1,6 +1,36 @@
 from __future__ import annotations
 
+"""Canonical storage-target path helpers.
+
+Storage destinations and OpenList mounts are V1 database resources.  This
+module intentionally does not translate the pre-V1 ``cmcc_upload``,
+``cloud139`` or category ``mobile_*`` fields into a synthetic destination.
+Callers that still provide those fields receive a deterministic validation
+error instead of silently selecting the historical mobile target.
+"""
+
 from typing import Any
+
+
+_LEGACY_SIXPAN_PATH_FIELDS = frozenset(
+    {"fnos_mount_name", "openlist_mount_name", "mount_name", "mount_path"}
+)
+_LEGACY_CATEGORY_PATH_FIELDS = frozenset(
+    {
+        "mobile_target_path",
+        "cloud139_target_path",
+        "cloud139_fnos_target_path",
+        "cloud139_folder_id",
+        "cmcc_parent_file_id",
+        "cmcc_parent_path",
+        "sixpan_fnos_target_path",
+        "sixpan_fnos_dir_list",
+    }
+)
+
+
+class LegacyStoragePathError(ValueError):
+    """Raised when a removed pre-V1 path field is supplied."""
 
 
 def normalize_storage_path(value: Any) -> str:
@@ -10,82 +40,90 @@ def normalize_storage_path(value: Any) -> str:
     return text.strip("/")
 
 
+def _reject_legacy_category_fields(category: Any) -> dict[str, Any]:
+    value = category if isinstance(category, dict) else {}
+    invalid = sorted(_LEGACY_CATEGORY_PATH_FIELDS.intersection(value))
+    if invalid:
+        raise LegacyStoragePathError(
+            "配置包含已删除的存储路径字段：" + ", ".join(invalid)
+        )
+    return value
+
+
 def normalize_sixpan_path_sources(
     config: dict[str, Any],
     *,
     materialize_category_paths: bool,
 ) -> None:
-    """Keep one SixPan mount source and derive per-category OpenList paths."""
+    """Validate the canonical SixPan runtime section without deriving paths.
+
+    ``materialize_category_paths`` remains in the signature for callers that
+    have not yet been migrated, but it is deliberately ignored.  V1 target
+    locators are the only source of destination paths.  Any removed global or
+    category alias is rejected so malformed persisted/config-file data cannot
+    be silently revived.
+    """
+
+    del materialize_category_paths
+    if not isinstance(config, dict):
+        raise LegacyStoragePathError("配置根必须是对象")
 
     sixpan = config.get("sixpan")
-    if not isinstance(sixpan, dict):
-        sixpan = {}
-        config["sixpan"] = sixpan
-    mount_name = normalize_storage_path(
-        sixpan.get("fnos_mount_name")
-        or sixpan.get("openlist_mount_name")
-        or sixpan.get("mount_name")
-        or sixpan.get("mount_path")
-    )
-    if mount_name:
-        sixpan["fnos_mount_name"] = mount_name
-    for legacy_key in ("openlist_mount_name", "mount_name", "mount_path"):
-        sixpan.pop(legacy_key, None)
+    if isinstance(sixpan, dict):
+        invalid = sorted(_LEGACY_SIXPAN_PATH_FIELDS.intersection(sixpan))
+        if invalid:
+            raise LegacyStoragePathError(
+                "六盘全局挂载路径已移除，请在存储目标中配置 locator：" + ", ".join(invalid)
+            )
 
     categories = config.get("categories")
-    if not isinstance(categories, dict):
-        return
-    for category in categories.values():
-        if not isinstance(category, dict):
-            continue
-        if materialize_category_paths:
-            category_dir = normalize_storage_path(
-                category.get("sixpan_save_path") or category.get("label")
-            )
-            derived = "/".join(part for part in (mount_name, category_dir) if part)
-            if derived:
-                category["sixpan_fnos_target_path"] = f"/{derived}"
-            else:
-                category.pop("sixpan_fnos_target_path", None)
-        else:
-            category.pop("sixpan_fnos_target_path", None)
+    if isinstance(categories, dict):
+        for category_key, category in categories.items():
+            if not isinstance(category, dict):
+                continue
+            invalid = sorted(_LEGACY_CATEGORY_PATH_FIELDS.intersection(category))
+            if invalid:
+                raise LegacyStoragePathError(
+                    f"分类 {category_key} 包含已删除的存储路径字段：" + ", ".join(invalid)
+                )
+
+
+def _canonical_category_root(category: Any, *, organizer: bool = False) -> str:
+    value = _reject_legacy_category_fields(category)
+    if organizer:
+        return normalize_storage_path(
+            value.get("organizer_root")
+            or value.get("openlist_root")
+            or value.get("final_root")
+        )
+    return normalize_storage_path(
+        value.get("final_root")
+        or value.get("provider_path")
+        or value.get("native_path")
+    )
 
 
 def cmcc_upload_root(category: dict[str, Any], cloud139_config: dict[str, Any] | None = None) -> str:
-    """Return the real CMCC cloud directory used by API uploads.
+    """Return a V1 target category root.
 
-    CMCC API paths and OpenList mount paths are different namespaces.  An
-    explicit ``cmcc_parent_path`` remains a supported override; otherwise API
-    uploads share the same official directory as 139 direct saves.
+    The second argument is retained only to avoid an import-time API break for
+    code being migrated; its contents are never read.  Paths must come from a
+    storage-target category locator, not from a global cloud139 section.
     """
 
-    official = normalize_storage_path(category.get("cloud139_target_path"))
-    official_root = normalize_storage_path((cloud139_config or {}).get("target_root_path"))
-    official_folded = official.casefold()
-    root_folded = official_root.casefold()
-    if official_root and official and official_folded != root_folded and not official_folded.startswith(f"{root_folded}/"):
-        return f"{official_root}/{official}"
-    # A full category path saved by the settings page is authoritative.  The
-    # legacy CMCC override is still useful when the category only contains its
-    # default leaf (for example just "电影").
-    if official and "/" in official:
-        return official
-    explicit = normalize_storage_path(category.get("cmcc_parent_path"))
-    if explicit:
-        return explicit
-    if official:
-        return official
-    if official_root:
-        label = normalize_storage_path(category.get("label"))
-        return f"{official_root}/{label}" if label else official_root
-    return normalize_storage_path(category.get("mobile_target_path") or category.get("label"))
+    del cloud139_config
+    return _canonical_category_root(category)
 
 
 def upload_backend(config: dict[str, Any], cmcc_upload_config: dict[str, Any] | None = None) -> str:
-    cmcc = cmcc_upload_config or {}
-    enabled = str(cmcc.get("enabled", True)).strip().lower()
-    fallback = "webdav" if enabled in {"0", "false", "no", "off"} else "cmcc_api"
-    return str(config.get("upload_backend") or cmcc.get("backend") or fallback).strip().lower()
+    """Return the explicitly selected storage driver.
+
+    ``cmcc_upload_config`` is intentionally ignored; credentials and target
+    identity are resolved from V1 account/target bindings.
+    """
+
+    del cmcc_upload_config
+    return str((config or {}).get("upload_backend") or "").strip().lower()
 
 
 def rclone_upload_root(
@@ -94,9 +132,10 @@ def rclone_upload_root(
     backend: str,
     cloud139_config: dict[str, Any] | None = None,
 ) -> str:
+    del cloud139_config
     if str(backend or "").strip().lower() == "cmcc_api":
-        return cmcc_upload_root(category, cloud139_config)
-    return normalize_storage_path(category.get("mobile_target_path") or category.get("label"))
+        return cmcc_upload_root(category)
+    return _canonical_category_root(category)
 
 
 def openlist_root_for_upload(
@@ -105,33 +144,8 @@ def openlist_root_for_upload(
     backend: str,
     cloud139_config: dict[str, Any] | None = None,
 ) -> str:
-    if str(backend or "").strip().lower() != "cmcc_api":
-        return normalize_storage_path(
-            category.get("openlist_root_path")
-            or category.get("mobile_openlist_root_path")
-            or category.get("mobile_target_path")
-        )
-
-    configured = normalize_storage_path(
-        category.get("cloud139_fnos_target_path")
-        or category.get("mobile_openlist_root_path")
-        or category.get("openlist_root_path")
-    )
-    if configured:
-        return configured
-
-    cloud139 = cloud139_config or {}
-    mount_name = normalize_storage_path(cloud139.get("fnos_mount_name") or cloud139.get("mount_name"))
-    if not mount_name:
-        return ""
-    official = cmcc_upload_root(category, cloud139)
-    official_root = normalize_storage_path(cloud139.get("target_root_path"))
-    suffix = official
-    official_folded = official.casefold()
-    root_folded = official_root.casefold()
-    if official_root and (official_folded == root_folded or official_folded.startswith(f"{root_folded}/")):
-        suffix = official[len(official_root) :].strip("/")
-    return "/".join(part for part in (mount_name, suffix) if part)
+    del backend, cloud139_config
+    return _canonical_category_root(category, organizer=True)
 
 
 def map_upload_path_to_openlist(
@@ -141,13 +155,14 @@ def map_upload_path_to_openlist(
     backend: str,
     cloud139_config: dict[str, Any] | None = None,
 ) -> str:
-    """Map an actual upload path to the path exposed by OpenList."""
+    """Map an upload path using V1 category roots only."""
 
+    del backend, cloud139_config
     value = normalize_storage_path(path)
     if not value:
         return ""
-    source_root = rclone_upload_root(category, backend=backend, cloud139_config=cloud139_config)
-    visible_root = openlist_root_for_upload(category, backend=backend, cloud139_config=cloud139_config)
+    source_root = _canonical_category_root(category)
+    visible_root = _canonical_category_root(category, organizer=True)
     if not source_root or not visible_root:
         return f"/{value}"
     value_folded = value.casefold()
@@ -158,3 +173,15 @@ def map_upload_path_to_openlist(
         suffix = value[len(source_root) + 1 :]
         return f"/{visible_root}/{suffix}"
     return f"/{value}"
+
+
+__all__ = [
+    "LegacyStoragePathError",
+    "cmcc_upload_root",
+    "map_upload_path_to_openlist",
+    "normalize_sixpan_path_sources",
+    "normalize_storage_path",
+    "openlist_root_for_upload",
+    "rclone_upload_root",
+    "upload_backend",
+]

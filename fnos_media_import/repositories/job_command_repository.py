@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import uuid
 import sqlite3
 from contextlib import AbstractContextManager
@@ -13,9 +14,39 @@ ConnectionFactory = Callable[[], AbstractContextManager[sqlite3.Connection]]
 TerminalStatusChecker = Callable[..., bool]
 StatusTransitionEmitter = Callable[[sqlite3.Connection, dict[str, Any], dict[str, Any]], None]
 
+_V1_SENSITIVE_KEYS = frozenset(
+    {
+        "url", "source_url", "share_url", "shareurl", "magnet", "magnet_uri",
+        "password", "pwd", "token", "access_token", "refresh_token", "cookie",
+        "authorization", "credentials", "credentials_ciphertext", "secret",
+    }
+)
+
 
 def _utc_now() -> str:
     return utc_now_iso()
+
+
+def _v1_source_reference(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith("source-record:"):
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()[:24]
+    return f"source-ref:{digest}"
+
+
+def _redact_v1_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_v1_payload(candidate)
+            for key, candidate in value.items()
+            if str(key).strip().lower() not in _V1_SENSITIVE_KEYS
+        }
+    if isinstance(value, list):
+        return [_redact_v1_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_v1_payload(item) for item in value]
+    return value
 
 
 class JobCommandRepository:
@@ -30,37 +61,56 @@ class JobCommandRepository:
         self._status_transition_emitter = emitter
 
     def create(self, data: dict[str, Any]) -> tuple[int, bool]:
+        with self._connection_factory() as connection:
+            return self.create_with_connection(connection, data)
+
+    def create_with_connection(
+        self, connection: sqlite3.Connection, data: dict[str, Any]
+    ) -> tuple[int, bool]:
         now = _utc_now()
         raw_data = data.get("raw_data")
-        raw_text = json.dumps(raw_data, ensure_ascii=False) if raw_data is not None else None
         idempotency_key = str(data.get("idempotency_key") or f"legacy:{uuid.uuid4().hex}")
         destination_id = str(data.get("destination_id") or "").strip() or None
         plan_version = self._safe_plan_version(data.get("plan_version"))
-        with self._connection_factory() as connection:
-            idempotent = connection.execute(
-                "SELECT id FROM import_jobs WHERE idempotency_key = ? LIMIT 1", (idempotency_key,)
-            ).fetchone()
-            if idempotent:
-                return int(idempotent["id"]), False
+        source_url = str(data.get("source_url") or "")
+        password = str(data.get("password") or "")
+        if plan_version == 1:
+            # Repository-level defence in depth: callers must not be able to
+            # bypass the service and persist a share URL/password in the job
+            # row. The encrypted source revision is the only credential store.
+            source_url = _v1_source_reference(source_url)
+            password = ""
+            raw_data = _redact_v1_payload(raw_data)
+        raw_text = json.dumps(raw_data, ensure_ascii=False) if raw_data is not None else None
+        idempotent = connection.execute(
+            "SELECT id FROM import_jobs WHERE idempotency_key = ? LIMIT 1", (idempotency_key,)
+        ).fetchone()
+        if idempotent:
+            return int(idempotent["id"]), False
+        # V1 identity is the complete server-generated key (source revision,
+        # selection hash, category, target/binding and account revisions). A
+        # broad URL/category/destination lookup would merge valid jobs that
+        # differ only by selection or frozen credentials.
+        if plan_version != 1:
             existing = connection.execute(
-                """
-                SELECT id, status, error_message
-                FROM import_jobs
-                WHERE source_url = ? AND category = ?
-                  AND (destination_id = ? OR (destination_id IS NULL AND ? IS NULL))
-                  AND status NOT IN ('cancelled', 'failed', 'unsupported', 'skipped', 'rejected')
-                  AND COALESCE(status, '') NOT LIKE '%取消%'
-                  AND COALESCE(status, '') NOT LIKE '%拒绝%'
-                  AND COALESCE(status, '') NOT LIKE '%未通过%'
-                  AND COALESCE(status, '') NOT LIKE '%失败%'
-                  AND COALESCE(status, '') NOT LIKE '%暂不支持%'
-                ORDER BY id DESC LIMIT 1
-                """,
-                (data["source_url"], data["category"], destination_id, destination_id),
+                    """
+                    SELECT id, status, error_message
+                    FROM import_jobs
+                    WHERE source_url = ? AND category = ?
+                      AND (destination_id = ? OR (destination_id IS NULL AND ? IS NULL))
+                      AND status NOT IN ('cancelled', 'failed', 'unsupported', 'skipped', 'rejected')
+                      AND COALESCE(status, '') NOT LIKE '%取消%'
+                      AND COALESCE(status, '') NOT LIKE '%拒绝%'
+                      AND COALESCE(status, '') NOT LIKE '%未通过%'
+                      AND COALESCE(status, '') NOT LIKE '%失败%'
+                      AND COALESCE(status, '') NOT LIKE '%暂不支持%'
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (source_url, data["category"], destination_id, destination_id),
             ).fetchone()
             if existing and not self._terminal_status_checker(existing["status"], existing["error_message"]):
                 return int(existing["id"]), False
-            cursor = connection.execute(
+        cursor = connection.execute(
                 """
                 INSERT INTO import_jobs
                 (title, category, category_label, source_type, source_url, password, target_route,
@@ -70,14 +120,14 @@ class JobCommandRepository:
                 """,
                 (
                     data["title"], data["category"], data["category_label"], data["source_type"],
-                    data["source_url"], data.get("password") or "", data["target_route"],
+                    source_url, password, data["target_route"],
                     data.get("target_path"), data["status"], data.get("external_task_id"),
                     data.get("error_message"), raw_text, now, now, idempotency_key,
                     self._safe_revision(data.get("config_revision")), str(data.get("executor_id") or ""),
                     destination_id, plan_version,
                 ),
-            )
-            return int(cursor.lastrowid), True
+        )
+        return int(cursor.lastrowid), True
 
     @staticmethod
     def _safe_plan_version(value: Any) -> int | None:

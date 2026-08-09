@@ -1,412 +1,1269 @@
-"""V1.0 统一账号体系契约测试（unittest，不使用 pytest）。
-
-覆盖：凭证加密往返与错误密钥失败、创建+修订（旧修订可读、新修订隔离）、
-激活互斥与乐观并发冲突、当前账号禁用保护、删除引用保护、API 永不泄露凭证、
-未检测/禁用账号不可激活。
-"""
-
 from __future__ import annotations
 
-import tempfile
+import json
+import shutil
+import threading
 import unittest
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from fnos_media_import.accounts import (
-    AccountDisabledError,
-    AccountInUseError,
-    AccountNotTestedError,
-    ActiveAccountDisableError,
+from flask import Flask
+
+from fnos_media_import.accounts.blueprint import accounts_blueprint_for_service
+from fnos_media_import.accounts.auth_sessions import (
+    AuthStep,
+    ManagedAccountAuthHandler,
+    ProviderAuthSessionService,
+    QuarkQrAuthHandler,
+    SixpanDeviceCodeAuthHandler,
+    TianyiPasswordAuthHandler,
+)
+from fnos_media_import.accounts.crypto import (
+    PURPOSE_APP_SESSION,
+    PURPOSE_AUTH_SESSION,
+    PURPOSE_PROVIDER_ACCOUNT,
+    PURPOSE_SOURCE_RECORD,
     DecryptionError,
     MasterKeyMissingError,
-    ProviderAccountService,
-    SelectionChangedError,
-    accounts_blueprint_for_service,
+    UnknownKeyIdError,
     decrypt,
+    derive_key,
     encrypt,
     master_key_from_env,
 )
+from fnos_media_import.accounts.service import InvalidConfigError, ProviderAccountService
+from fnos_media_import.accounts.repository import AccountConflictError
 from fnos_media_import.database import Database
 from fnos_media_import.domain.models import AccountTestResult
 
-TEST_KEY_HEX = "a" * 64  # 32 字节 AES-256 主密钥
-OTHER_KEY_HEX = "b" * 64
+
+KEY = bytes.fromhex("aa" * 32)
+OTHER_KEY = bytes.fromhex("bb" * 32)
+WORK_TEST_ROOT = Path.cwd() / "codex_tmp" / "accounts-v1-tests"
 
 
-def _master_key() -> bytes:
-    return bytes.fromhex(TEST_KEY_HEX)
-
-
-def _tester(*, ok: bool = True, hint: str = "masked-user") -> Any:
-    def tester(credentials: dict[str, Any], config: dict[str, Any]) -> AccountTestResult:
-        return AccountTestResult(ok=ok, identity_hint=hint, message="通过" if ok else "网络失败")
-
-    return tester
-
-
-class AccountsTestCaseBase(unittest.TestCase):
+class AccountsV1Tests(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.db_path = Path(self._tmp.name) / "accounts.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
-        self.service = ProviderAccountService(self.database, _master_key)
+        WORK_TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        self.db_path = WORK_TEST_ROOT / f"accounts-{uuid.uuid4().hex}.db"
+        self.db = Database(self.db_path)
+        self.db.init_schema()
+        self.service = ProviderAccountService(self.db, lambda: KEY)
 
     def tearDown(self) -> None:
-        self._tmp.cleanup()
+        try:
+            self.db.close_all_connections()
+        except AttributeError:
+            pass
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(f"{self.db_path}{suffix}").unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            if WORK_TEST_ROOT.exists() and not any(WORK_TEST_ROOT.iterdir()):
+                shutil.rmtree(WORK_TEST_ROOT)
+        except OSError:
+            pass
 
-    def _create(self, provider_kind: str = "quark", name: str = "家庭账号", **kw: Any) -> Any:
-        credentials = kw.pop("credentials", {"cookie": "cookie-value-1"})
-        config = kw.pop("config", {})
-        account = self.service.create_account(
-            provider_kind=provider_kind,
+    def _quark(self, name: str = "夸克主账号"):
+        return self.service.create_account(
+            provider_kind="quark",
             name=name,
-            config=config,
-            credentials=credentials,
-            **kw,
+            config={"device_id": "device-a"},
+            credentials={"cookie": "secret-cookie"},
         )
-        return account
 
-    def _create_tested(self, provider_kind: str = "quark", name: str = "家庭账号", **kw: Any) -> Any:
-        account = self._create(provider_kind=provider_kind, name=name, **kw)
-        self.service.test_account(account.account_id, tester=_tester(ok=True))
-        return account
-
-
-class CryptoTests(unittest.TestCase):
-    def test_round_trip_and_wrong_key_fails(self) -> None:
-        ciphertext, key_id = encrypt(_master_key(), '{"cookie": "secret-1"}')
-        self.assertEqual(key_id, "v1")
-        self.assertEqual(
-            decrypt(_master_key(), key_id, ciphertext).decode("utf-8"),
-            '{"cookie": "secret-1"}',
-        )
+    def test_crypto_round_trip_and_wrong_key_fails(self) -> None:
+        ciphertext, key_id = encrypt(KEY, "secret")
+        self.assertEqual(key_id, "v2:provider-account")
+        self.assertEqual(decrypt(KEY, key_id, ciphertext), b"secret")
         with self.assertRaises(DecryptionError):
-            decrypt(bytes.fromhex(OTHER_KEY_HEX), key_id, ciphertext)
+            decrypt(OTHER_KEY, key_id, ciphertext)
 
-    def test_binary_plaintext_round_trip(self) -> None:
-        ciphertext, key_id = encrypt(_master_key(), b"\x00\x01raw")
-        self.assertEqual(decrypt(_master_key(), key_id, ciphertext), b"\x00\x01raw")
-
-    def test_unknown_key_id_rejected(self) -> None:
-        ciphertext, _key_id = encrypt(_master_key(), b"data")
-        with self.assertRaises(Exception):
-            decrypt(_master_key(), "v9", ciphertext)
-
-    def test_missing_master_key_raises_clear_error(self) -> None:
+    def test_master_key_missing_fails_closed(self) -> None:
         with self.assertRaises(MasterKeyMissingError):
             master_key_from_env({})
-        key = master_key_from_env({"FNOS_ACCOUNT_MASTER_KEY": TEST_KEY_HEX})
-        self.assertEqual(len(key), 32)
 
-
-class AccountLifecycleTests(AccountsTestCaseBase):
-    def test_create_and_revise_keeps_old_revision_readable(self) -> None:
-        account = self._create(credentials={"cookie": "cookie-v1"})
-        self.assertEqual(account.current_revision, 1)
-        self.assertEqual(
-            self.service.resolve_credentials(account.account_id, 1), {"cookie": "cookie-v1"}
+    def test_root_key_derives_isolated_purpose_keys(self) -> None:
+        purposes = (
+            PURPOSE_APP_SESSION,
+            PURPOSE_PROVIDER_ACCOUNT,
+            PURPOSE_AUTH_SESSION,
+            PURPOSE_SOURCE_RECORD,
         )
+        derived = {derive_key(KEY, purpose) for purpose in purposes}
+        self.assertEqual(len(derived), len(purposes))
+        ciphertext, key_id = encrypt(KEY, "secret", purpose=PURPOSE_AUTH_SESSION)
+        with self.assertRaisesRegex(DecryptionError, "用途不匹配"):
+            decrypt(KEY, key_id, ciphertext, purpose=PURPOSE_PROVIDER_ACCOUNT)
 
-        updated = self.service.revise_credentials(
-            account.account_id, config={}, credentials={"cookie": "cookie-v2"}
-        )
-        self.assertEqual(updated.current_revision, 2)
-        # 旧修订保持不变，新修订完全隔离。
-        self.assertEqual(
-            self.service.resolve_credentials(account.account_id, 1), {"cookie": "cookie-v1"}
-        )
-        self.assertEqual(
-            self.service.resolve_credentials(account.account_id, 2), {"cookie": "cookie-v2"}
-        )
-        # 凭证更新后必须重新检测才能激活。
-        self.assertNotEqual(
-            self.service.get_account(account.account_id).last_test_status, "ok"
-        )
-
-    def test_revise_unknown_revision_raises(self) -> None:
-        account = self._create()
-        with self.assertRaises(Exception):
-            self.service.resolve_credentials(account.account_id, 99)
-
-    def test_activation_mutually_exclusive_and_optimistic_conflict(self) -> None:
-        a = self._create_tested(provider_kind="quark", name="A")
-        b = self._create_tested(provider_kind="quark", name="B")
-
-        first = self.service.activate_account("default", a.account_id, None)
-        self.assertEqual(first.selection_revision, 1)
-        self.assertEqual(self.service.get_active_account("quark").account_id, a.account_id)
-
-        # 过期 selection_revision 激活 B 必须冲突。
-        with self.assertRaises(SelectionChangedError):
-            self.service.activate_account("default", b.account_id, 0)
-        # 已有选择却未携带 expected（无法校验）也必须冲突。
-        with self.assertRaises(SelectionChangedError):
-            self.service.activate_account("default", b.account_id, None)
-        # 用最新 revision 激活 B 成功，同一 Provider 只有一个激活账号。
-        second = self.service.activate_account("default", b.account_id, 1)
-        self.assertEqual(second.selection_revision, 2)
-        self.assertEqual(second.account_id, b.account_id)
-        self.assertEqual(self.service.get_active_account("quark").account_id, b.account_id)
-
-        # 不同 Provider 可以同时各自激活。
-        c = self._create_tested(provider_kind="mobile", name="M")
-        self.service.activate_account("default", c.account_id, None)
-        self.assertEqual(self.service.get_active_account("mobile").account_id, c.account_id)
-        self.assertEqual(self.service.get_active_account("quark").account_id, b.account_id)
-
-    def test_untested_or_failed_cannot_activate(self) -> None:
-        draft = self._create(provider_kind="quark", name="草稿")
-        with self.assertRaises(AccountNotTestedError):
-            self.service.activate_account("default", draft.account_id, None)
-
-        self.service.test_account(draft.account_id, tester=_tester(ok=False))
-        with self.assertRaises(AccountNotTestedError):
-            self.service.activate_account("default", draft.account_id, None)
-
-    def test_disabled_cannot_activate(self) -> None:
-        account = self._create_tested(provider_kind="sixpan", name="A")
-        self.service.disable_account(account.account_id)
-        with self.assertRaises(AccountDisabledError):
-            self.service.activate_account("default", account.account_id, None)
-
-    def test_disable_current_blocked_until_switch(self) -> None:
-        a = self._create_tested(provider_kind="tianyi", name="A")
-        self.service.activate_account("default", a.account_id, None)
-        with self.assertRaises(ActiveAccountDisableError):
-            self.service.disable_account(a.account_id)
-
-        b = self._create_tested(provider_kind="tianyi", name="B")
-        self.service.activate_account("default", b.account_id, 1)
-        self.service.disable_account(a.account_id)
-        self.assertFalse(self.service.get_account(a.account_id).enabled)
-
-    def test_delete_active_selection_blocked(self) -> None:
-        account = self._create_tested(provider_kind="quark", name="A")
-        self.service.activate_account("default", account.account_id, None)
-        with self.assertRaises(AccountInUseError):
-            self.service.delete_account(account.account_id)
-
-    def test_delete_blocked_by_non_terminal_job_then_ok(self) -> None:
-        account = self._create_tested(provider_kind="mobile", name="A")
-        plan = {
-            "version": 4,
-            "job_id": 1,
-            "source": {"account_id": account.account_id, "account_revision": 1},
-            "destination": {},
-        }
-        job_id, created = self.database.create_job(
-            {
-                "title": "Referenced",
-                "category": "movie",
-                "category_label": "电影",
-                "source_type": "mobile",
-                "source_url": "https://example.com/referenced-job",
-                "target_route": "mobile_direct",
-                "target_path": "/电影/x",
-                "status": "waiting_transfer",
-                "plan_version": 4,
-                "raw_data": {"execution_plan": plan},
-                "idempotency_key": "account-ref-job-1",
-            }
-        )
-        self.assertTrue(created)
-        with self.assertRaises(AccountInUseError):
-            self.service.delete_account(account.account_id)
-
-        # 任务进入终态后不再阻挡删除。
-        self.database.update_job_if_status(job_id, {"waiting_transfer"}, status="done")
-        self.service.delete_account(account.account_id)
-        self.assertIsNone(self.service.get_account(account.account_id))
-
-    def test_delete_unreferenced_account(self) -> None:
-        account = self._create(provider_kind="mobile", name="临时")
-        self.service.delete_account(account.account_id)
-        self.assertIsNone(self.service.get_account(account.account_id))
-
-    def test_account_id_and_provider_kind_immutable(self) -> None:
-        account = self._create_tested(provider_kind="quark", name="A")
-        # service 层没有任何改 account_id / provider_kind 的方法，二次修订仍保留原值。
-        updated = self.service.revise_credentials(
-            account.account_id, config={}, credentials={"cookie": "v2"}
-        )
-        self.assertEqual(updated.account_id, account.account_id)
-        self.assertEqual(updated.provider_kind, "quark")
-
-    def test_master_key_missing_blocks_creation(self) -> None:
-        service = ProviderAccountService(self.database, lambda: master_key_from_env({}))
+    def test_legacy_root_key_name_is_rejected(self) -> None:
         with self.assertRaises(MasterKeyMissingError):
-            service.create_account(
-                provider_kind="quark", name="x", config={}, credentials={"cookie": "c"}
+            master_key_from_env({"FNOS_ACCOUNT_MASTER_KEY": KEY.hex()})
+        self.assertEqual(
+            master_key_from_env(
+                {"FNOS_ROOT_KEY": OTHER_KEY.hex(), "FNOS_ACCOUNT_MASTER_KEY": KEY.hex()}
+            ),
+            OTHER_KEY,
+        )
+
+    def test_legacy_ciphertext_key_ids_are_rejected(self) -> None:
+        with self.assertRaises(UnknownKeyIdError):
+            decrypt(KEY, "v1", b"ignored")
+        with self.assertRaises(UnknownKeyIdError):
+            decrypt(KEY, "ol:v1", b"ignored")
+
+    def test_account_revision_is_immutable_and_secret_is_not_serialized(self) -> None:
+        account = self._quark()
+        updated = self.service.revise_credentials(
+            account.account_id,
+            config={"device_id": "device-b"},
+            credentials={},
+        )
+        old = self.service.resolve_account_context(account.account_id, 1)
+        current = self.service.resolve_account_context(account.account_id, updated.current_revision)
+        self.assertEqual(old["config"]["device_id"], "device-a")
+        self.assertEqual(current["config"]["device_id"], "device-b")
+        self.assertEqual(current["credentials"]["cookie"], "secret-cookie")
+        payload = json.dumps(self.service.serialize_account(updated), ensure_ascii=False)
+        self.assertNotIn("secret-cookie", payload)
+        self.assertNotIn("ciphertext", payload)
+
+    def test_account_test_requires_real_tester(self) -> None:
+        account = self._quark()
+        with self.assertRaises(InvalidConfigError):
+            self.service.test_account(account.account_id)
+        result = self.service.test_account(
+            account.account_id,
+            tester=lambda *_args: AccountTestResult(True, "user***1", "检测通过"),
+        )
+        self.assertTrue(result.ok)
+
+    def test_account_test_can_probe_without_persisting_health(self) -> None:
+        account = self._quark()
+        before = self.service.get_account(account.account_id)
+
+        result = self.service.test_account(
+            account.account_id,
+            tester=lambda *_args: AccountTestResult(True, "user***1", "ok"),
+            persist_result=False,
+        )
+
+        after = self.service.get_account(account.account_id)
+        self.assertTrue(result.ok)
+        self.assertEqual(after.last_test_status, before.last_test_status)
+        self.assertEqual(after.last_test_message, before.last_test_message)
+        self.assertEqual(after.last_tested_at, before.last_tested_at)
+        self.assertEqual(after.identity_hint, before.identity_hint)
+
+    def test_tianyi_account_test_receives_account_scoped_cache_namespace(self) -> None:
+        account = self.service.create_account(
+            provider_kind="tianyi",
+            name="Cloud189",
+            config={"username": "same-user"},
+            credentials={"password": "same-password"},
+        )
+        seen: list[str] = []
+
+        self.service.test_account(
+            account.account_id,
+            tester=lambda _kind, _credentials, config: (
+                seen.append(str(config.get("_cache_namespace") or ""))
+                or AccountTestResult(True, "user***1", "ok")
+            ),
+            persist_result=False,
+        )
+
+        self.assertEqual(seen, [f"account:{account.account_id}"])
+
+    def test_account_test_discards_result_when_credentials_change_mid_probe(self) -> None:
+        account = self._quark()
+
+        def tester(*_args):
+            self.service.revise_credentials(
+                account.account_id,
+                config={},
+                credentials={"cookie": "new-cookie"},
+            )
+            return AccountTestResult(True, "user-1", "旧凭证检测通过")
+
+        with self.assertRaises(AccountConflictError):
+            self.service.test_account(account.account_id, tester=tester)
+        current = self.service.get_account(account.account_id)
+        self.assertEqual(current.current_revision, 2)
+        self.assertEqual(current.last_test_status, "untested")
+        self.assertEqual(
+            self.service.resolve_credentials(account.account_id, 2)["cookie"],
+            "new-cookie",
+        )
+
+    def test_activation_freezes_account_revision(self) -> None:
+        first = self._quark("A")
+        second = self._quark("B")
+        for account in (first, second):
+            self.service.test_account(
+                account.account_id,
+                tester=lambda *_args: AccountTestResult(True, "user", "ok"),
+            )
+        selected_a = self.service.activate_account("default", first.account_id, None)
+        selected_b = self.service.activate_account(
+            "default", second.account_id, selected_a.selection_revision
+        )
+        self.assertEqual(selected_b.account_id, second.account_id)
+        self.assertTrue(self.service.has_revision(first.account_id, selected_a.account_revision))
+
+    def test_provider_token_refresh_advances_active_selection(self) -> None:
+        account = self._quark()
+        self.service.test_account(
+            account.account_id,
+            tester=lambda *_args: AccountTestResult(True, "user", "ok"),
+        )
+        selected = self.service.activate_account("default", account.account_id, None)
+        updated = self.service.refresh_runtime_credentials(
+            account.account_id,
+            {"cookie": "refreshed-cookie"},
+        )
+        current = self.service.get_active_account("quark")
+        self.assertGreater(updated.current_revision, selected.account_revision)
+        self.assertEqual(current.account_revision, updated.current_revision)
+        self.assertEqual(
+            self.service.resolve_credentials(account.account_id, updated.current_revision)["cookie"],
+            "refreshed-cookie",
+        )
+
+        unchanged = self.service.refresh_runtime_credentials(
+            account.account_id,
+            {"cookie": "refreshed-cookie"},
+        )
+        self.assertEqual(unchanged.current_revision, updated.current_revision)
+
+    def test_stale_runtime_refresh_cannot_overwrite_newer_credentials(self) -> None:
+        account = self._quark()
+        old_revision = account.current_revision
+        current = self.service.revise_credentials(
+            account.account_id,
+            config={},
+            credentials={"cookie": "administrator-cookie"},
+        )
+
+        with self.assertRaises(AccountConflictError):
+            self.service.refresh_runtime_credentials(
+                account.account_id,
+                {"cookie": "stale-worker-cookie"},
+                expected_revision=old_revision,
             )
 
-
-class AccountApiTests(AccountsTestCaseBase):
-    def _app(self, *, deny_admin: bool = False) -> Any:
-        from flask import Flask
-
-        app = Flask(__name__)
-
-        def protected(handler: Any) -> Any:
-            if deny_admin:
-
-                def denied(*_args: Any, **_kwargs: Any) -> Any:
-                    from flask import jsonify
-
-                    return jsonify({"success": False}), 401
-
-                return denied
-
-            return handler
-
-        app.register_blueprint(accounts_blueprint_for_service(self.service, protected))
-        return app
-
-    def test_credentials_never_leak_in_api(self) -> None:
-        app = self._app()
-        client = app.test_client()
-        self.service.create_account(
-            provider_kind="quark",
-            name="家庭账号",
-            config={"remark": "some-note"},
-            credentials={"cookie": "super-secret-cookie-value"},
+        self.assertEqual(
+            self.service.resolve_credentials(account.account_id, current.current_revision)["cookie"],
+            "administrator-cookie",
         )
 
-        raw = client.get("/api/admin/provider-accounts").get_data(as_text=True)
-        self.assertNotIn("super-secret-cookie-value", raw)
-        self.assertNotIn("cookie", raw)
-
-        account = self.service.list_accounts("quark")[0]
-        detail = client.get(f"/api/admin/provider-accounts/{account.account_id}")
-        self.assertEqual(detail.status_code, 200)
-        body = detail.get_json()
-        self.assertTrue(body["success"])
-        self.assertNotIn("credentials", body["account"])
-        self.assertNotIn("ciphertext", body["account"])
-        self.assertTrue(body["account"]["configured"])
+    def test_one_runtime_can_advance_its_expected_revision_repeatedly(self) -> None:
+        account = self._quark()
+        first = self.service.refresh_runtime_credentials(
+            account.account_id,
+            {"cookie": "runtime-cookie-1"},
+            expected_revision=account.current_revision,
+        )
+        second = self.service.refresh_runtime_credentials(
+            account.account_id,
+            {"cookie": "runtime-cookie-2"},
+            expected_revision=first.current_revision,
+        )
+        self.assertEqual(second.current_revision, first.current_revision + 1)
         self.assertEqual(
-            set(body["account"].keys()),
-            {
-                "account_id",
-                "provider_kind",
-                "name",
-                "enabled",
-                "current_revision",
-                "identity_hint",
-                "configured",
-                "last_test_status",
-                "last_test_message",
-                "last_tested_at",
-                "created_at",
-                "updated_at",
+            self.service.resolve_credentials(account.account_id, second.current_revision)["cookie"],
+            "runtime-cookie-2",
+        )
+
+    def test_manifest_driven_api_and_auth(self) -> None:
+        app = Flask(__name__)
+        app.register_blueprint(
+            accounts_blueprint_for_service(self.service, lambda view: view)
+        )
+        client = app.test_client()
+        providers = client.get("/api/admin/providers").get_json()["providers"]
+        kinds = {item["provider_kind"] for item in providers}
+        self.assertEqual(kinds, {"mobile", "quark", "tianyi", "sixpan"})
+        quark = next(item for item in providers if item["provider_kind"] == "quark")
+        self.assertEqual(quark["account_schema"]["fields"][0]["name"], "cookie")
+        self.assertEqual(quark["native_locator_schema"]["fields"][0]["name"], "path")
+        self.assertEqual([item["kind"] for item in quark["auth_methods"]], ["qrcode"])
+        tianyi = next(item for item in providers if item["provider_kind"] == "tianyi")
+        self.assertEqual([item["kind"] for item in tianyi["auth_methods"]], ["password"])
+        self.assertEqual(
+            [item["name"] for item in tianyi["auth_methods"][0]["input_schema"]["fields"]],
+            ["username", "password"],
+        )
+        sixpan = next(item for item in providers if item["provider_kind"] == "sixpan")
+        sixpan_fields = {item["name"] for item in sixpan["account_schema"]["fields"]}
+        self.assertIn("oauth_client_id", sixpan_fields)
+        self.assertNotIn("access_token", sixpan_fields)
+        self.assertNotIn("refresh_token", sixpan_fields)
+        self.assertNotIn("fnos_mount_name", sixpan_fields)
+        self.assertIsNone(sixpan["runtime_schema"])
+        auth_fields = {
+            item["name"]
+            for item in sixpan["auth_methods"][0]["input_schema"]["fields"]
+        }
+        self.assertEqual(auth_fields, {"host", "client_id", "client_secret", "oauth_client_id"})
+        self.assertIn("access_token", sixpan["secret_fields"])
+        self.assertIn("refresh_token", sixpan["secret_fields"])
+
+        mobile = next(item for item in providers if item["provider_kind"] == "mobile")
+        self.assertIsNone(mobile["runtime_schema"])
+        mobile_fields = {item["name"] for item in mobile["account_schema"]["fields"]}
+        self.assertEqual(mobile_fields, {"phone", "host", "authorization"})
+
+        response = client.post(
+            "/api/admin/provider-accounts",
+            json={
+                "provider_kind": "quark",
+                "name": "API 账号",
+                "credentials": {"cookie": "api-secret"},
             },
         )
-        detail_text = detail.get_data(as_text=True)
-        self.assertNotIn("super-secret-cookie-value", detail_text)
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("api-secret", response.get_data(as_text=True))
 
-    def test_catalog_endpoint(self) -> None:
-        app = self._app()
-        payload = app.test_client().get("/api/admin/providers/catalog").get_json()
-        self.assertTrue(payload["success"])
-        kinds = {item["provider_kind"] for item in payload["providers"]}
-        self.assertEqual(kinds, {"mobile", "quark", "tianyi", "sixpan"})
-        quark = next(item for item in payload["providers"] if item["provider_kind"] == "quark")
-        self.assertTrue(quark["capabilities"]["supports_native_save"])
-        self.assertFalse(quark["capabilities"]["supports_native_offline"])
-        self.assertIn("cookie", [f["name"] for f in quark["schema"]["fields"]])
-
-    def test_activate_conflict_via_api_returns_selection_changed(self) -> None:
-        app = self._app()
-        client = app.test_client()
-        a = self._create_tested(provider_kind="quark", name="A")
-        b = self._create_tested(provider_kind="quark", name="B")
-        # a 激活 revision=1，再次激活 a（携带当前值）revision=2，使旧值 1 变成过期。
-        client.post(f"/api/admin/provider-accounts/{a.account_id}/activate", json={"scope": "default"})
-        client.post(
-            f"/api/admin/provider-accounts/{a.account_id}/activate",
-            json={"scope": "default", "expected_selection_revision": 1},
+        protected = Flask(__name__ + "_protected")
+        protected.register_blueprint(
+            accounts_blueprint_for_service(
+                self.service, lambda _view: (lambda **_kwargs: ({"success": False}, 401))
+            )
         )
-        conflict = client.post(
-            f"/api/admin/provider-accounts/{b.account_id}/activate",
-            json={"scope": "default", "expected_selection_revision": 1},
+        self.assertEqual(
+            protected.test_client().get("/api/admin/providers").status_code,
+            401,
         )
-        self.assertEqual(conflict.status_code, 409)
-        self.assertEqual(conflict.get_json()["code"], "SELECTION_CHANGED")
 
-        ok = client.post(
-            f"/api/admin/provider-accounts/{b.account_id}/activate",
-            json={"scope": "default", "expected_selection_revision": 2},
-        )
-        self.assertEqual(ok.status_code, 200)
-        self.assertEqual(ok.get_json()["selection"]["selection_revision"], 3)
-
-    def test_disable_current_via_api_blocked(self) -> None:
-        app = self._app()
+    def test_auth_managed_account_update_is_name_only_and_atomic(self) -> None:
+        account = self._quark()
+        app = Flask(__name__ + "_rename")
+        app.register_blueprint(accounts_blueprint_for_service(self.service, lambda view: view))
         client = app.test_client()
-        account = self._create_tested(provider_kind="tianyi", name="A")
-        client.post(f"/api/admin/provider-accounts/{account.account_id}/activate", json={})
-        response = client.post(f"/api/admin/provider-accounts/{account.account_id}/disable")
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.get_json()["code"], "ACCOUNT_ACTIVE")
 
-    def test_patch_rejects_immutable_fields(self) -> None:
-        app = self._app()
-        client = app.test_client()
-        account = self._create_tested(provider_kind="quark", name="A")
-        response = client.patch(
+        renamed = client.patch(
             f"/api/admin/provider-accounts/{account.account_id}",
-            json={"account_id": "hacked", "name": "改名"},
+            json={"name": "家庭账号"},
+        )
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(self.service.get_account(account.account_id).name, "家庭账号")
+        self.assertEqual(self.service.get_account(account.account_id).current_revision, 1)
+
+        rejected = client.patch(
+            f"/api/admin/provider-accounts/{account.account_id}",
+            json={"name": "不应生效", "config": {"device_id": "forged"}},
+        )
+        self.assertEqual(rejected.status_code, 400)
+        current = self.service.get_account(account.account_id)
+        self.assertEqual(current.name, "家庭账号")
+        self.assertEqual(current.current_revision, 1)
+        self.assertEqual(
+            self.service.resolve_credentials(account.account_id, 1)["cookie"],
+            "secret-cookie",
+        )
+
+    def test_account_name_validation_is_enforced_by_service(self) -> None:
+        account = self._quark()
+        with self.assertRaisesRegex(InvalidConfigError, "不能为空"):
+            self.service.update_account_name(account.account_id, "   ")
+        with self.assertRaisesRegex(InvalidConfigError, "80"):
+            self.service.update_account_name(account.account_id, "a" * 81)
+
+    def test_managed_login_session_creates_tests_and_activates_account(self) -> None:
+        accounts = ProviderAccountService(
+            self.db,
+            lambda: KEY,
+            tester=lambda *_args: AccountTestResult(True, "138****0000", "检测通过"),
+        )
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {
+                ("mobile", "managed_account"): ManagedAccountAuthHandler(
+                    "mobile",
+                    lambda: {
+                        "name": "移动云主账号",
+                        "config": {"phone": "13800000000"},
+                        "credentials": {"authorization": "Basic hidden-secret"},
+                    },
+                )
+            },
+        )
+        app = Flask(__name__ + "_auth")
+        app.register_blueprint(accounts_blueprint_for_service(accounts, lambda view: view, sessions))
+        response = app.test_client().post(
+            "/api/admin/provider-auth-sessions",
+            json={"provider_kind": "mobile", "auth_method": "managed_account"},
+        )
+        self.assertEqual(response.status_code, 200)
+        text = response.get_data(as_text=True)
+        self.assertNotIn("hidden-secret", text)
+        session = response.get_json()["session"]
+        self.assertEqual(session["status"], "completed")
+        selection = accounts.get_active_account("mobile")
+        self.assertEqual(selection.account_id, session["account_id"])
+        relogin = app.test_client().post(
+            "/api/admin/provider-auth-sessions",
+            json={
+                "provider_kind": "mobile",
+                "auth_method": "managed_account",
+                "payload": {"account_id": session["account_id"], "name": "移动云主账号"},
+            },
+        ).get_json()["session"]
+        self.assertEqual(relogin["account_id"], session["account_id"])
+        self.assertEqual(len(accounts.list_accounts("mobile")), 1)
+        self.assertEqual(accounts.get_account(session["account_id"]).current_revision, 2)
+
+    def test_failed_relogin_keeps_previous_revision_health_and_selection(self) -> None:
+        def tester(_kind, credentials, _config):
+            ok = credentials.get("authorization") == "Basic good"
+            return AccountTestResult(ok, "138****0000", "检测通过" if ok else "凭证失效")
+
+        accounts = ProviderAccountService(self.db, lambda: KEY, tester=tester)
+        context = {
+            "name": "移动云主账号",
+            "config": {"phone": "13800000000"},
+            "credentials": {"authorization": "Basic good"},
+        }
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {("mobile", "managed_account"): ManagedAccountAuthHandler("mobile", lambda: context)},
+        )
+        first = sessions.start("mobile", "managed_account")
+        account_id = first["account_id"]
+        selection = accounts.get_active_account("mobile")
+        context.update(
+            {
+                "name": "不应保存的新名称",
+                "credentials": {"authorization": "Basic bad"},
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "凭证失效"):
+            sessions.start(
+                "mobile",
+                "managed_account",
+                {"account_id": account_id, "name": context["name"]},
+            )
+
+        account = accounts.get_account(account_id)
+        current = accounts.get_active_account("mobile")
+        self.assertEqual(account.current_revision, 1)
+        self.assertEqual(account.last_test_status, "ok")
+        self.assertEqual(account.name, "移动云主账号")
+        self.assertEqual(current.account_revision, selection.account_revision)
+        self.assertEqual(
+            accounts.resolve_credentials(account_id, 1)["authorization"],
+            "Basic good",
+        )
+
+    def test_quark_qrcode_session_extracts_and_verifies_cookie(self) -> None:
+        import requests
+
+        class Response:
+            status_code = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def json(self):
+                return self.payload
+
+        class Session:
+            def __init__(self):
+                self.cookies = requests.cookies.RequestsCookieJar()
+                self.headers = {}
+
+            def get(self, url, **kwargs):
+                del kwargs
+                if "getTokenForQrcodeLogin" in url:
+                    return Response({"status": 2000000, "data": {"members": {"token": "qr-token"}}})
+                if "getServiceTicketByQrcodeToken" in url:
+                    self.cookies.set("__pus", "cookie-secret", domain="pan.quark.cn")
+                    return Response({"status": 2000000, "data": {"members": {"service_ticket": "ticket"}}})
+                if "drive-pc.quark.cn/1/clouddrive/file/sort" in url:
+                    self.cookies.set("__puus", "refresh-secret", domain=".quark.cn")
+                    return Response({"status": 200})
+                # account/info is a cookie exchange endpoint. A successful
+                # response does not consistently include a JSON status field.
+                return Response({"data": {"uid": "user-1"}})
+
+        session = Session()
+        accounts = ProviderAccountService(
+            self.db,
+            lambda: KEY,
+            tester=lambda kind, credentials, config: AccountTestResult(
+                kind == "quark" and "__pus=cookie-secret" in credentials.get("cookie", ""),
+                "user-1",
+                "ok",
+            ),
+        )
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {("quark", "qrcode"): QuarkQrAuthHandler(
+                lambda kind, credentials, config: AccountTestResult(
+                    kind == "quark" and "__pus=cookie-secret" in credentials.get("cookie", ""),
+                    "user-1",
+                    "ok",
+                ),
+                session_factory=lambda: session,
+            )},
+        )
+        waiting = sessions.start("quark", "qrcode", {"name": "夸克扫码账号"})
+        self.assertEqual(waiting["status"], "waiting")
+        self.assertTrue(waiting["public"]["qr_image"].startswith("data:image/svg+xml;base64,"))
+        self.assertNotIn("qr-token", waiting["message"])
+        completed = sessions.poll(waiting["session_id"])
+        self.assertEqual(completed["status"], "completed")
+        account_id = completed["account_id"]
+        cookie = accounts.resolve_credentials(account_id, 1)["cookie"]
+        self.assertIn("__pus=cookie-secret", cookie)
+        self.assertIn("__puus=refresh-secret", cookie)
+        self.assertEqual(accounts.get_active_account("quark").account_id, account_id)
+
+    def test_auth_session_validation_error_is_not_reported_as_conflict(self) -> None:
+        accounts = ProviderAccountService(self.db, lambda: KEY)
+        sessions = ProviderAuthSessionService(self.db, lambda: KEY, accounts, {})
+        app = Flask(__name__ + "_auth_error")
+        app.register_blueprint(accounts_blueprint_for_service(accounts, lambda view: view, sessions))
+        response = app.test_client().post(
+            "/api/admin/provider-auth-sessions",
+            json={"provider_kind": "tianyi", "auth_method": "missing"},
         )
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["code"], "IMMUTABLE_FIELD")
-        self.assertEqual(self.service.get_account(account.account_id).name, "A")
+        self.assertEqual(response.get_json()["code"], "AUTH_METHOD_UNAVAILABLE")
 
-    def test_patch_updates_name_and_credentials(self) -> None:
-        app = self._app()
+    def test_auth_session_request_validation_returns_structured_400(self) -> None:
+        accounts = ProviderAccountService(self.db, lambda: KEY)
+        sessions = ProviderAuthSessionService(self.db, lambda: KEY, accounts, {})
+        app = Flask(__name__ + "_auth_request_validation")
+        app.register_blueprint(accounts_blueprint_for_service(accounts, lambda view: view, sessions))
         client = app.test_client()
-        account = self._create(provider_kind="quark", name="原名")
-        response = client.patch(
-            f"/api/admin/provider-accounts/{account.account_id}",
-            json={"name": "新名", "credentials": {"cookie": "new-cookie"}},
+
+        malformed = client.post(
+            "/api/admin/provider-auth-sessions",
+            data="{",
+            content_type="application/json",
         )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["account"]["name"], "新名")
+        self.assertEqual(malformed.status_code, 400)
+        self.assertEqual(malformed.get_json()["code"], "INVALID_JSON")
+        self.assertEqual(malformed.get_json()["stage"], "request")
+
+        missing = client.post("/api/admin/provider-auth-sessions", json={})
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.get_json()["code"], "AUTH_INPUT_REQUIRED")
         self.assertEqual(
-            self.service.resolve_credentials(account.account_id, 2), {"cookie": "new-cookie"}
-        )
-        self.assertEqual(
-            self.service.resolve_credentials(account.account_id, 1), {"cookie": "cookie-value-1"}
+            set(missing.get_json()["field_errors"]),
+            {"provider_kind", "auth_method"},
         )
 
-    def test_test_endpoint_returns_result_without_secret(self) -> None:
-        app = self._app()
-        client = app.test_client()
-        account = self._create(provider_kind="quark", name="A", credentials={"cookie": "hush-hush"})
-        response = client.post(f"/api/admin/provider-accounts/{account.account_id}/test")
-        self.assertEqual(response.status_code, 200)
-        body = response.get_data(as_text=True)
-        self.assertNotIn("hush-hush", body)
-        result = response.get_json()["result"]
-        self.assertTrue(result["ok"])
+        invalid_payload = client.post(
+            "/api/admin/provider-auth-sessions",
+            json={
+                "provider_kind": "tianyi",
+                "auth_method": "password",
+                "payload": [],
+            },
+        )
+        self.assertEqual(invalid_payload.status_code, 400)
+        self.assertEqual(invalid_payload.get_json()["code"], "AUTH_INPUT_INVALID")
+        self.assertEqual(invalid_payload.get_json()["field_errors"], {"payload": "必须是 JSON 对象"})
 
-    def test_admin_required_applies_to_all_account_routes(self) -> None:
-        app = self._app(deny_admin=True)
+    def test_tianyi_password_session_handles_captcha_and_encrypts_tokens(self) -> None:
+        factory_configs: list[dict[str, object]] = []
+
+        class FakeTianyiImporter:
+            def begin_password_login(self, username, password):
+                self.assertions = (username, password)
+                return {
+                    "status": "captcha_required",
+                    "captcha_image": "data:image/png;base64,Y2FwdGNoYQ==",
+                    "login_state": {"rsa_password": "private-encrypted-password"},
+                }
+
+            def complete_password_login(self, login_state, validate_code):
+                if login_state.get("rsa_password") != "private-encrypted-password" or validate_code != "A1B2":
+                    raise ValueError("验证码错误")
+                return {
+                    "status": "completed",
+                    "identity_hint": "189****0000",
+                    "credentials": {
+                        "session_key": "session-secret",
+                        "session_secret": "session-signing-secret",
+                        "access_token": "access-secret",
+                        "refresh_token": "refresh-secret",
+                        "access_token_expires_at": 4102444800,
+                    },
+                }
+
+        accounts = ProviderAccountService(
+            self.db,
+            lambda: KEY,
+            tester=lambda kind, credentials, config: AccountTestResult(
+                kind == "tianyi"
+                and config.get("username") == "18900000000"
+                and credentials.get("access_token") == "access-secret",
+                "189****0000",
+                "检测通过",
+            ),
+        )
+        def factory(config):
+            factory_configs.append(dict(config or {}))
+            return FakeTianyiImporter()
+
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {("tianyi", "password"): TianyiPasswordAuthHandler(factory)},
+        )
+        waiting = sessions.start(
+            "tianyi",
+            "password",
+            {"name": "天翼云主账号", "username": "18900000000", "password": "login-secret"},
+        )
+        self.assertEqual(waiting["status"], "waiting")
+        self.assertEqual(waiting["public"]["challenge"], "captcha")
+        public_json = json.dumps(waiting, ensure_ascii=False)
+        self.assertNotIn("login-secret", public_json)
+        self.assertNotIn("private-encrypted-password", public_json)
+        self.assertEqual(factory_configs[0]["username"], "18900000000")
+        self.assertEqual(factory_configs[0]["password"], "login-secret")
+
+        completed = sessions.poll(waiting["session_id"], {"validate_code": "A1B2"})
+        self.assertEqual(completed["status"], "completed")
+        account_id = completed["account_id"]
+        credentials = accounts.resolve_credentials(account_id, 1)
+        self.assertEqual(credentials["password"], "login-secret")
+        self.assertEqual(credentials["session_key"], "session-secret")
+        self.assertEqual(credentials["session_secret"], "session-signing-secret")
+        self.assertEqual(credentials["refresh_token"], "refresh-secret")
+        self.assertEqual(accounts.get_active_account("tianyi").account_id, account_id)
+        self.assertEqual(factory_configs[1]["username"], "18900000000")
+        self.assertEqual(factory_configs[1]["password"], "login-secret")
+
+    def test_tianyi_captcha_refresh_and_error_retry_remain_waiting(self) -> None:
+        class FakeTianyiImporter:
+            def begin_password_login(self, _username, _password):
+                return {
+                    "status": "captcha_required",
+                    "captcha_image": "data:image/png;base64,aW1hZ2UtMQ==",
+                    "login_state": {"challenge": "one"},
+                }
+
+            def refresh_password_captcha(self, login_state):
+                self.assert_state = dict(login_state)
+                return {
+                    "status": "captcha_required",
+                    "captcha_image": "data:image/png;base64,aW1hZ2UtMg==",
+                    "login_state": {"challenge": "two"},
+                }
+
+            def complete_password_login(self, login_state, validate_code):
+                if validate_code == "BAD":
+                    return {
+                        "status": "captcha_required",
+                        "captcha_image": "data:image/png;base64,aW1hZ2UtMw==",
+                        "login_state": {"challenge": "three"},
+                        "message": "验证码错误，请重试",
+                        "error": "验证码错误",
+                    }
+                self.assert_state = dict(login_state)
+                return {
+                    "status": "completed",
+                    "identity_hint": "189****0000",
+                    "credentials": {
+                        "session_key": "session-1",
+                        "session_secret": "secret-1",
+                    },
+                }
+
+        accounts = ProviderAccountService(
+            self.db,
+            lambda: KEY,
+            tester=lambda kind, credentials, _config: AccountTestResult(
+                kind == "tianyi"
+                and credentials.get("session_key") == "session-1"
+                and credentials.get("session_secret") == "secret-1",
+                "189****0000",
+                "检测通过",
+            ),
+        )
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {
+                ("tianyi", "password"): TianyiPasswordAuthHandler(
+                    lambda _config: FakeTianyiImporter()
+                )
+            },
+        )
+        waiting = sessions.start(
+            "tianyi",
+            "password",
+            {"username": "18900000000", "password": "login-secret"},
+        )
+
+        unchanged = sessions.poll(waiting["session_id"], {})
+        self.assertEqual(unchanged["status"], "waiting")
+        self.assertEqual(
+            unchanged["public"]["captcha_image"],
+            "data:image/png;base64,aW1hZ2UtMQ==",
+        )
+
+        refreshed = sessions.poll(waiting["session_id"], {"refresh_captcha": True})
+        self.assertEqual(refreshed["status"], "waiting")
+        self.assertEqual(
+            refreshed["public"]["captcha_image"],
+            "data:image/png;base64,aW1hZ2UtMg==",
+        )
+
+        rejected = sessions.poll(waiting["session_id"], {"validate_code": "BAD"})
+        self.assertEqual(rejected["status"], "waiting")
+        self.assertEqual(
+            rejected["public"]["captcha_image"],
+            "data:image/png;base64,aW1hZ2UtMw==",
+        )
+        self.assertEqual(rejected["public"]["error"], "验证码错误")
+
+        completed = sessions.poll(waiting["session_id"], {"validate_code": "GOOD"})
+        self.assertEqual(completed["status"], "completed")
+
+    def test_sixpan_device_code_session_encrypts_tokens_and_activates_account(self) -> None:
+        class FakeSixpanImporter:
+            def start_device_authorization(self, **_kwargs):
+                return {
+                    "device_code": "private-device-code",
+                    "user_code": "ABCD-1234",
+                    "verification_uri": "https://auth.example.test/device",
+                    "interval": 2,
+                    "expires_in": 900,
+                }
+
+            def check_device_authorization(self, **_kwargs):
+                return {"access_token": "access-secret", "refresh_token": "refresh-secret"}
+
+            @staticmethod
+            def extract_tokens(result):
+                return {
+                    key: result[key]
+                    for key in ("access_token", "refresh_token")
+                    if result.get(key)
+                }
+
+        accounts = ProviderAccountService(
+            self.db,
+            lambda: KEY,
+            tester=lambda kind, credentials, config: AccountTestResult(
+                kind == "sixpan"
+                and credentials.get("access_token") == "access-secret"
+                and config.get("client_id") == "client-id",
+                "sixpan-user",
+                "检测通过",
+            ),
+        )
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {
+                ("sixpan", "device_code"): SixpanDeviceCodeAuthHandler(
+                    lambda: {
+                        "host": "api.example.test",
+                        "client_id": "client-id",
+                        "client_secret": "client-secret",
+                        "oauth_client_id": "oauth-client-id",
+                    },
+                    lambda _config: FakeSixpanImporter(),
+                )
+            },
+        )
+        waiting = sessions.start("sixpan", "device_code", {"name": "六盘主账号"})
+        self.assertEqual(waiting["status"], "waiting")
+        self.assertTrue(waiting["expires_at"])
+        waiting_json = json.dumps(waiting, ensure_ascii=False)
+        self.assertNotIn("private-device-code", waiting_json)
+        self.assertNotIn("client-secret", waiting_json)
+
+        completed = sessions.poll(waiting["session_id"])
+        self.assertEqual(completed["status"], "completed")
+        account_id = completed["account_id"]
+        selection = accounts.get_active_account("sixpan")
+        credentials = accounts.resolve_credentials(account_id, selection.account_revision)
+        self.assertEqual(credentials["access_token"], "access-secret")
+        self.assertEqual(credentials["refresh_token"], "refresh-secret")
+        self.assertEqual(credentials["client_secret"], "client-secret")
+        context = accounts.resolve_account_context(account_id, selection.account_revision)
+        self.assertEqual(context["config"]["oauth_client_id"], "oauth-client-id")
+
+    def test_sixpan_device_code_expiry_and_denial_are_terminal(self) -> None:
+        class FakeSixpanImporter:
+            def __init__(self, status):
+                self.status = status
+
+            def start_device_authorization(self, **_kwargs):
+                return {
+                    "device_code": "private-device-code",
+                    "verification_uri": "https://auth.example.test/device",
+                    "expires_in": 600,
+                }
+
+            def check_device_authorization(self, **_kwargs):
+                return {"status": self.status, "message": "用户拒绝了授权"}
+
+            @staticmethod
+            def extract_tokens(_result):
+                return {}
+
+        config = {
+            "client_id": "client-id",
+            "client_secret": "client-secret",
+        }
+        denied_handler = SixpanDeviceCodeAuthHandler(
+            lambda: config,
+            lambda _config: FakeSixpanImporter("AUTHORIZATION_DENIED"),
+        )
+        waiting = denied_handler.start({})
+        denied = denied_handler.poll(waiting.private_state, {})
+        self.assertEqual(denied.status, "failed")
+        self.assertIn("用户拒绝", denied.message)
+
+        expired_state = dict(waiting.private_state)
+        expired_state["expires_at"] = "2000-01-01T00:00:00Z"
+        expired = denied_handler.poll(expired_state, {})
+        self.assertEqual(expired.status, "failed")
+        self.assertIn("已过期", expired.message)
+
+    def test_sixpan_device_code_start_provider_error_is_structured(self) -> None:
+        class ProviderError(RuntimeError):
+            status_code = 502
+
+        class FailingSixpanImporter:
+            def start_device_authorization(self, **_kwargs):
+                raise ProviderError(
+                    "upstream failed accessToken=private-token at https://api.example.test/device"
+                )
+
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            self.service,
+            {
+                ("sixpan", "device_code"): SixpanDeviceCodeAuthHandler(
+                    lambda: {},
+                    lambda _config: FailingSixpanImporter(),
+                )
+            },
+        )
+        app = Flask(__name__ + "_sixpan_start_error")
+        app.register_blueprint(accounts_blueprint_for_service(self.service, lambda view: view, sessions))
+
+        response = app.test_client().post(
+            "/api/admin/provider-auth-sessions",
+            json={
+                "provider_kind": "sixpan",
+                "auth_method": "device_code",
+                "payload": {"client_id": "client-id", "client_secret": "client-secret"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertEqual(payload["code"], "SIXPAN_DEVICE_CODE_START_FAILED")
+        self.assertEqual(payload["stage"], "device_code_start")
+        self.assertEqual(payload["http_status"], 502)
+        self.assertEqual(payload["provider_kind"], "sixpan")
+        self.assertEqual(payload["auth_method"], "device_code")
+        self.assertNotIn("private-token", response.get_data(as_text=True))
+        self.assertNotIn("https://api.example.test", response.get_data(as_text=True))
+
+    def test_sixpan_device_code_poll_provider_error_is_structured(self) -> None:
+        class ProviderError(RuntimeError):
+            status_code = 503
+
+        class FailingSixpanImporter:
+            def start_device_authorization(self, **_kwargs):
+                return {
+                    "device_code": "private-device-code",
+                    "user_code": "ABCD-1234",
+                    "verification_uri": "https://auth.example.test/device",
+                    "expires_in": 600,
+                }
+
+            def check_device_authorization(self, **_kwargs):
+                raise ProviderError("sixpan poll unavailable refreshToken=private-refresh")
+
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            self.service,
+            {
+                ("sixpan", "device_code"): SixpanDeviceCodeAuthHandler(
+                    lambda: {},
+                    lambda _config: FailingSixpanImporter(),
+                )
+            },
+        )
+        app = Flask(__name__ + "_sixpan_poll_error")
+        app.register_blueprint(accounts_blueprint_for_service(self.service, lambda view: view, sessions))
         client = app.test_client()
-        self.assertEqual(client.get("/api/admin/providers/catalog").status_code, 401)
-        self.assertEqual(client.get("/api/admin/provider-accounts").status_code, 401)
-        self.assertEqual(client.post("/api/admin/provider-accounts", json={}).status_code, 401)
-        self.assertEqual(client.get("/api/admin/provider-accounts/acc_1").status_code, 401)
-        self.assertEqual(client.patch("/api/admin/provider-accounts/acc_1", json={}).status_code, 401)
-        self.assertEqual(
-            client.post("/api/admin/provider-accounts/acc_1/test").status_code, 401
+        started = client.post(
+            "/api/admin/provider-auth-sessions",
+            json={
+                "provider_kind": "sixpan",
+                "auth_method": "device_code",
+                "payload": {"client_id": "client-id", "client_secret": "client-secret"},
+            },
+        ).get_json()["session"]
+
+        response = client.post(
+            f"/api/admin/provider-auth-sessions/{started['session_id']}/verify",
+            json={},
         )
-        self.assertEqual(
-            client.post("/api/admin/provider-accounts/acc_1/activate", json={}).status_code, 401
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertEqual(payload["code"], "SIXPAN_DEVICE_CODE_POLL_FAILED")
+        self.assertEqual(payload["stage"], "device_code_poll")
+        self.assertEqual(payload["http_status"], 503)
+        self.assertNotIn("private-refresh", response.get_data(as_text=True))
+
+    def test_sixpan_device_code_uses_encrypted_session_config_not_global_credentials(self) -> None:
+        configs: list[dict[str, Any]] = []
+
+        class FakeSixpanImporter:
+            def __init__(self, config):
+                configs.append(dict(config))
+
+            def start_device_authorization(self, **_kwargs):
+                return {
+                    "device_code": "private-device-code",
+                    "user_code": "ABCD-1234",
+                    "verification_uri": "https://auth.example.test/device",
+                    "expires_in": 900,
+                }
+
+            def check_device_authorization(self, **_kwargs):
+                return {"access_token": "access-secret", "refresh_token": "refresh-secret"}
+
+            @staticmethod
+            def extract_tokens(result):
+                return {
+                    key: result[key]
+                    for key in ("access_token", "refresh_token")
+                    if result.get(key)
+                }
+
+        accounts = ProviderAccountService(
+            self.db,
+            lambda: KEY,
+            tester=lambda kind, credentials, config: AccountTestResult(
+                kind == "sixpan"
+                and config.get("client_id") == "client-id"
+                and credentials.get("client_secret") == "client-secret",
+                "sixpan-user",
+                "检测通过",
+            ),
         )
-        self.assertEqual(
-            client.post("/api/admin/provider-accounts/acc_1/disable").status_code, 401
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {
+                ("sixpan", "device_code"): SixpanDeviceCodeAuthHandler(
+                    lambda: {},
+                    FakeSixpanImporter,
+                )
+            },
         )
-        self.assertEqual(client.delete("/api/admin/provider-accounts/acc_1").status_code, 401)
+        waiting = sessions.start(
+            "sixpan",
+            "device_code",
+            {
+                "name": "六盘主账号",
+                "host": "api.example.test",
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "oauth_client_id": "oauth-client-id",
+            },
+        )
+        completed = sessions.poll(waiting["session_id"])
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(configs[0]["client_secret"], "client-secret")
+        self.assertEqual(configs[1]["client_secret"], "client-secret")
+        public_json = json.dumps(completed, ensure_ascii=False)
+        self.assertNotIn("client-secret", public_json)
+        self.assertNotIn("access-secret", public_json)
+
+    def test_expired_auth_session_is_terminalized_when_restored(self) -> None:
+        class PendingSixpanImporter:
+            def start_device_authorization(self, **_kwargs):
+                return {
+                    "device_code": "private-device-code",
+                    "verification_uri": "https://auth.example.test/device",
+                    "expires_in": 600,
+                }
+
+            def check_device_authorization(self, **_kwargs):
+                raise AssertionError("expired session must not poll Provider")
+
+            @staticmethod
+            def extract_tokens(_result):
+                return {}
+
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            self.service,
+            {
+                ("sixpan", "device_code"): SixpanDeviceCodeAuthHandler(
+                    lambda: {"client_id": "client-id", "client_secret": "client-secret"},
+                    lambda _config: PendingSixpanImporter(),
+                )
+            },
+        )
+        waiting = sessions.start("sixpan", "device_code")
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE provider_auth_sessions SET expires_at=? WHERE session_id=?",
+                ("2000-01-01T00:00:00Z", waiting["session_id"]),
+            )
+
+        restored = sessions.get(waiting["session_id"])
+        self.assertEqual(restored["status"], "failed")
+        self.assertIn("已过期", restored["message"])
+
+    def test_concurrent_poll_claim_creates_only_one_account(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        class BlockingHandler:
+            def start(self, _payload: dict[str, Any]) -> AuthStep:
+                return AuthStep(status="waiting", message="等待授权", private_state={"code": "one-time"})
+
+            def poll(self, _state: dict[str, Any], _payload: dict[str, Any]) -> AuthStep:
+                nonlocal calls
+                with calls_lock:
+                    calls += 1
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("poll release timed out")
+                return AuthStep(
+                    status="completed",
+                    message="授权完成",
+                    account_data={
+                        "name": "并发授权账号",
+                        "config": {"device_id": "device-concurrent"},
+                        "credentials": {"cookie": "concurrent-secret"},
+                    },
+                )
+
+            def cancel(self, _state: dict[str, Any]) -> None:
+                return None
+
+        accounts = ProviderAccountService(
+            self.db,
+            lambda: KEY,
+            tester=lambda *_args: AccountTestResult(True, "user", "ok"),
+        )
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {("quark", "test_concurrent"): BlockingHandler()},
+        )
+        waiting = sessions.start("quark", "test_concurrent")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            owner = executor.submit(sessions.poll, waiting["session_id"])
+            self.assertTrue(entered.wait(timeout=5))
+            observer = executor.submit(sessions.poll, waiting["session_id"])
+            observed = observer.result(timeout=5)
+            self.assertEqual(observed["status"], "waiting")
+            release.set()
+            completed = owner.result(timeout=5)
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(calls, 1)
+        with self.db.connect() as connection:
+            account_count = connection.execute(
+                "SELECT COUNT(*) FROM provider_accounts WHERE provider_kind='quark'"
+            ).fetchone()[0]
+            session_row = connection.execute(
+                "SELECT status, row_version FROM provider_auth_sessions WHERE session_id=?",
+                (waiting["session_id"],),
+            ).fetchone()
+        self.assertEqual(account_count, 1)
+        self.assertEqual(session_row["status"], "completed")
+        self.assertGreaterEqual(int(session_row["row_version"]), 3)
+
+    def test_stale_poll_fails_closed_without_redeeming_one_time_code_again(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        class OneTimeHandler:
+            def start(self, _payload: dict[str, Any]) -> AuthStep:
+                return AuthStep(status="waiting", message="等待授权", private_state={"code": "device"})
+
+            def poll(self, _state: dict[str, Any], _payload: dict[str, Any]) -> AuthStep:
+                nonlocal calls
+                with calls_lock:
+                    calls += 1
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("stale poll release timed out")
+                return AuthStep(
+                    status="completed",
+                    message="一次性凭证已兑换",
+                    account_data={
+                        "name": "不应落库的陈旧授权账号",
+                        "config": {"device_id": "device-stale"},
+                        "credentials": {"cookie": "stale-secret"},
+                    },
+                )
+
+            def cancel(self, _state: dict[str, Any]) -> None:
+                return None
+
+        accounts = ProviderAccountService(
+            self.db,
+            lambda: KEY,
+            tester=lambda *_args: AccountTestResult(True, "user", "ok"),
+        )
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {("quark", "test_one_time"): OneTimeHandler()},
+        )
+        waiting = sessions.start("quark", "test_one_time")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            stale_owner = executor.submit(sessions.poll, waiting["session_id"])
+            self.assertTrue(entered.wait(timeout=5))
+            with self.db.connect() as connection:
+                connection.execute(
+                    "UPDATE provider_auth_sessions SET updated_at=? WHERE session_id=?",
+                    ("2000-01-01T00:00:00Z", waiting["session_id"]),
+                )
+            recovered = sessions.poll(waiting["session_id"])
+            self.assertEqual(recovered["status"], "failed")
+            self.assertIn("避免重复兑换", recovered["message"])
+            release.set()
+            stale_result = stale_owner.result(timeout=5)
+
+        self.assertEqual(stale_result["status"], "failed")
+        self.assertEqual(sessions.get(waiting["session_id"])["status"], "failed")
+        self.assertEqual(calls, 1)
+        with self.db.connect() as connection:
+            account_count = connection.execute(
+                "SELECT COUNT(*) FROM provider_accounts WHERE provider_kind='quark'"
+            ).fetchone()[0]
+        self.assertEqual(account_count, 0)
+
+    def test_stale_account_persistence_recovers_without_repoll_or_duplicate_account(self) -> None:
+        persist_entered = threading.Event()
+        release_first_persist = threading.Event()
+        provider_calls = 0
+        test_calls = 0
+        calls_lock = threading.Lock()
+
+        class CompletedHandler:
+            def start(self, _payload: dict[str, Any]) -> AuthStep:
+                return AuthStep(status="waiting", message="等待授权", private_state={"code": "device"})
+
+            def poll(self, _state: dict[str, Any], _payload: dict[str, Any]) -> AuthStep:
+                nonlocal provider_calls
+                with calls_lock:
+                    provider_calls += 1
+                return AuthStep(
+                    status="completed",
+                    message="授权完成",
+                    account_data={
+                        "name": "持久化恢复账号",
+                        "config": {"device_id": "device-persist"},
+                        "credentials": {"cookie": "persist-secret"},
+                    },
+                )
+
+            def cancel(self, _state: dict[str, Any]) -> None:
+                return None
+
+        def tester(*_args: Any) -> AccountTestResult:
+            nonlocal test_calls
+            with calls_lock:
+                test_calls += 1
+                call_number = test_calls
+            if call_number == 1:
+                persist_entered.set()
+                if not release_first_persist.wait(timeout=5):
+                    raise AssertionError("first persistence probe release timed out")
+            return AccountTestResult(True, "user", "ok")
+
+        accounts = ProviderAccountService(self.db, lambda: KEY, tester=tester)
+        sessions = ProviderAuthSessionService(
+            self.db,
+            lambda: KEY,
+            accounts,
+            {("quark", "test_persist_recovery"): CompletedHandler()},
+        )
+        waiting = sessions.start("quark", "test_persist_recovery")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first_owner = executor.submit(sessions.poll, waiting["session_id"])
+            self.assertTrue(persist_entered.wait(timeout=5))
+            with self.db.connect() as connection:
+                internal = connection.execute(
+                    "SELECT status FROM provider_auth_sessions WHERE session_id=?",
+                    (waiting["session_id"],),
+                ).fetchone()
+                self.assertEqual(internal["status"], "persisting_active")
+                connection.execute(
+                    "UPDATE provider_auth_sessions SET updated_at=? WHERE session_id=?",
+                    ("2000-01-01T00:00:00Z", waiting["session_id"]),
+                )
+
+            recovered = sessions.poll(waiting["session_id"])
+            self.assertEqual(recovered["status"], "completed")
+            recovered_account_id = recovered["account_id"]
+            release_first_persist.set()
+            first_result = first_owner.result(timeout=5)
+
+        self.assertEqual(first_result["status"], "completed")
+        self.assertEqual(first_result["account_id"], recovered_account_id)
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(test_calls, 2)
+        repeated = sessions.poll(waiting["session_id"])
+        self.assertEqual(repeated["account_id"], recovered_account_id)
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(test_calls, 2)
+        with self.db.connect() as connection:
+            account_count = connection.execute(
+                "SELECT COUNT(*) FROM provider_accounts WHERE provider_kind='quark'"
+            ).fetchone()[0]
+            session_row = connection.execute(
+                "SELECT status, account_id FROM provider_auth_sessions WHERE session_id=?",
+                (waiting["session_id"],),
+            ).fetchone()
+        self.assertEqual(account_count, 1)
+        self.assertEqual(session_row["status"], "completed")
+        self.assertEqual(session_row["account_id"], recovered_account_id)
 
 
 if __name__ == "__main__":

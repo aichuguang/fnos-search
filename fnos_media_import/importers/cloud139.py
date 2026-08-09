@@ -23,21 +23,16 @@ class Cloud139Importer:
         self.config = config if isinstance(config, dict) else {}
         self.cmcc_config = cmcc_config if isinstance(cmcc_config, dict) else {}
         self.timeout = int(self.config.get("timeout", self.cmcc_config.get("timeout", 30)) or 30)
-        self.target_root_path = _normalize_cloud_path(
-            self.config.get("target_root_path")
-            or self.config.get("cloud_root_path")
-            or self.config.get("save_root_path")
-            or self.config.get("root_path")
-            or ""
-        )
-        self.fnos_mount_name = str(self.config.get("fnos_mount_name") or self.config.get("mount_name") or "").strip()
+        # Destination roots/mount identities are frozen in the V1 storage
+        # target binding.  They are deliberately not read from importer
+        # configuration (which may only contain provider account settings).
+        self.target_root_path = ""
+        self.fnos_mount_name = ""
         self.check_before_save = _as_bool(self.config.get("check_before_save"), True)
         self.refresh_after_submit = _as_bool(self.config.get("refresh_after_submit"), True)
         self.refresh_delay_seconds = max(0, int(self.config.get("refresh_delay_seconds", 90) or 0))
         self.mark_done_after_submit = _as_bool(self.config.get("mark_done_after_submit"), True)
         self.create_folder_if_missing = _as_bool(self.config.get("create_folder_if_missing"), True)
-        self.default_target_path = _normalize_cloud_path(self.config.get("target_path") or self.config.get("target_folder") or "")
-        self.category_target_paths = _dict_of_str(self.config.get("category_target_paths"))
         self._cmcc_client: CmccClient | None = None
 
     @property
@@ -46,12 +41,7 @@ class Cloud139Importer:
             return False
         if str(self.cmcc_config.get("access_token") or self.cmcc_config.get("authorization") or "").strip():
             return True
-        return bool(
-            os.getenv("CMCC_ACCESS_TOKEN")
-            or os.getenv("CMCC_AUTHORIZATION")
-            or os.getenv("CMCC_BASIC_AUTH")
-            or os.getenv("CM_CLOUD_ACCESS_TOKEN")
-        )
+        return False
 
     @property
     def native_configured(self) -> bool:
@@ -95,6 +85,10 @@ class Cloud139Importer:
         try:
             client = self._cmcc()
             details["phone_configured"] = bool(client.phone)
+            # Building the client only validates local configuration.  Use a
+            # minimal read-only request so an expired or malformed Basic token
+            # cannot be accepted as a healthy Provider account.
+            client.list_dir("/", page_size=1, max_pages=1)
         except Exception as exc:  # noqa: BLE001
             return AdapterCheckResult(False, "probe_failed", f"139 官方直转认证检测失败：{exc}", details)
         return AdapterCheckResult(True, "ready", "139 官方直转认证检测通过", details)
@@ -271,18 +265,17 @@ class Cloud139Importer:
         category_key: str = "",
         category: dict[str, Any] | None = None,
     ) -> str:
-        category = category or {}
-        category_path = _normalize_cloud_path(
-            category.get("cloud139_target_path")
-            or self.category_target_paths.get(category_key)
-        )
-        if category_path:
-            return self._with_target_root(category_path)
-        category_sub_path = _normalize_cloud_path(category.get("cloud139_target_sub_path"))
-        if category_sub_path:
-            return self._with_target_root(category_sub_path)
-        fallback_path = _normalize_cloud_path(save_path or self.default_target_path or category.get("label") or category_key)
-        return fallback_path
+        del category_key
+        category = category if isinstance(category, dict) else {}
+        # V1 callers pass the immutable native locator value as ``save_path``.
+        # Do not derive a destination from removed category/global path keys;
+        # an empty value is an explicit configuration error.
+        explicit = _normalize_cloud_path(save_path)
+        if not explicit:
+            locator = category.get("native_locator")
+            if isinstance(locator, dict):
+                explicit = _normalize_cloud_path(locator.get("value"))
+        return self._with_target_root(explicit) if explicit else ""
 
     def _cmcc(self) -> CmccClient:
         if self._cmcc_client is None:
@@ -324,9 +317,7 @@ class Cloud139Importer:
         }
 
     def _resolve_target_parent_id(self, target_path: str, *, category_key: str = "", category: dict[str, Any]) -> str:
-        explicit_id = str(category.get("cloud139_folder_id") or category.get("cloud139_target_folder_id") or category.get("cmcc_parent_file_id") or "").strip()
-        if explicit_id and _same_cloud_path(target_path, self.target_path_for_category(category_key=category_key, category=category)):
-            return "/" if _is_root_folder_id(explicit_id) else explicit_id
+        del category_key
         if not self.create_folder_if_missing:
             raise RuntimeError(f"目标目录不存在或未允许自动创建：{target_path}")
         return self._cmcc().ensure_path(target_path)

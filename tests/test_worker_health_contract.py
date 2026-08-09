@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from fnos_media_import.process_role import legacy_deployment_layout, resolve_process_role
+from fnos_media_import.process_role import resolve_process_role
 from fnos_media_import.services.rclone_service import RcloneService
 from fnos_media_import.services.readiness_service import ReadinessService
 from fnos_media_import.services.security_status_service import SecurityStatusService
@@ -15,24 +15,21 @@ from fnos_media_import.services.update_scheduler import UpdateScheduler
 from fnos_media_import.services.worker_watchdog import WorkerWatchdog
 
 
-class ProcessRoleCompatibilityTests(unittest.TestCase):
-    def test_production_without_explicit_role_degrades_to_web(self) -> None:
+class ProcessRoleConfigurationTests(unittest.TestCase):
+    def test_role_is_required_in_every_environment(self) -> None:
         with patch.dict(os.environ, {"APP_ENV": "production"}, clear=True):
-            self.assertTrue(legacy_deployment_layout())
-            self.assertEqual(resolve_process_role(), "web")
-
-    def test_development_without_explicit_role_keeps_all_in_one_runtime(self) -> None:
+            with self.assertRaisesRegex(ValueError, "FNOS_PROCESS_ROLE is required"):
+                resolve_process_role()
         with patch.dict(os.environ, {"APP_ENV": "development"}, clear=True):
-            self.assertFalse(legacy_deployment_layout())
-            self.assertEqual(resolve_process_role(), "all")
+            with self.assertRaisesRegex(ValueError, "FNOS_PROCESS_ROLE is required"):
+                resolve_process_role()
 
-    def test_explicit_production_role_disables_legacy_degradation(self) -> None:
+    def test_explicit_roles_are_resolved_without_environment_fallback(self) -> None:
         with patch.dict(
             os.environ,
             {"APP_ENV": "production", "FNOS_PROCESS_ROLE": "all"},
             clear=True,
         ):
-            self.assertFalse(legacy_deployment_layout())
             self.assertEqual(resolve_process_role(), "all")
 
 
@@ -42,8 +39,12 @@ class ReadinessServiceTests(unittest.TestCase):
         arguments = {
             "process_role": "web",
             "database_probe": lambda: {"ok": True},
-            "deployment_degraded": lambda: False,
             "docker_socket_mounted": lambda: False,
+            "root_key_probe": lambda: b"root-key",
+            "active_provider_accounts_probe": lambda: 1,
+            "openlist_required": lambda: False,
+            "valid_openlist_mounts_probe": lambda: 0,
+            "enabled_storage_targets_probe": lambda: 1,
             "remote_worker_status": lambda: {
                 "success": True,
                 "healthy": True,
@@ -73,17 +74,19 @@ class ReadinessServiceTests(unittest.TestCase):
         self.assertFalse(status["ok"])
         self.assertEqual(status["checks"]["worker"]["status"], "worker_unavailable")
 
-    def test_legacy_compose_is_degraded_without_contacting_worker(self) -> None:
+    def test_web_always_checks_the_explicitly_configured_worker(self) -> None:
         calls: list[str] = []
         status = self._service(
-            deployment_degraded=lambda: True,
-            remote_worker_status=lambda: calls.append("called") or {},
+            remote_worker_status=lambda: calls.append("called") or {
+                "success": True,
+                "healthy": True,
+                "status": "ready",
+            },
         ).status()
 
-        self.assertFalse(status["ok"])
-        self.assertEqual(status["checks"]["deployment_layout"]["status"], "legacy_compose")
-        self.assertEqual(status["checks"]["worker"]["status"], "upgrade_required")
-        self.assertEqual(calls, [])
+        self.assertTrue(status["ok"])
+        self.assertNotIn("deployment_layout", status["checks"])
+        self.assertEqual(calls, ["called"])
 
     def test_docker_socket_and_database_failure_are_reported_separately(self) -> None:
         def fail_database():
@@ -114,28 +117,69 @@ class ReadinessServiceTests(unittest.TestCase):
         self.assertFalse(status["ok"])
         self.assertEqual(status["checks"]["worker_runtime"]["status"], "unhealthy")
 
+    def test_root_key_failure_is_reported_without_echoing_secret_or_exception(self) -> None:
+        status = self._service(
+            root_key_probe=lambda: (_ for _ in ()).throw(RuntimeError("root-secret-value")),
+        ).status()
 
-class SecurityStatusCompatibilityTests(unittest.TestCase):
-    def test_socket_and_legacy_layout_are_both_critical(self) -> None:
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["checks"]["root_key"]["status"], "invalid")
+        self.assertNotIn("root-secret-value", str(status))
+
+    def test_missing_active_provider_account_blocks_readiness(self) -> None:
+        status = self._service(active_provider_accounts_probe=lambda: 0).status()
+
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["checks"]["provider_accounts"]["active_count"], 0)
+        self.assertEqual(status["checks"]["provider_accounts"]["status"], "unconfigured")
+
+    def test_openlist_is_not_checked_when_organizer_and_cross_disk_are_disabled(self) -> None:
+        calls: list[str] = []
+        status = self._service(
+            openlist_required=lambda: False,
+            valid_openlist_mounts_probe=lambda: calls.append("called") or 0,
+        ).status()
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["checks"]["openlist"]["status"], "not_required")
+        self.assertEqual(calls, [])
+
+    def test_required_openlist_without_valid_mount_blocks_readiness(self) -> None:
+        status = self._service(
+            openlist_required=lambda: True,
+            valid_openlist_mounts_probe=lambda: 0,
+        ).status()
+
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["checks"]["openlist"]["status"], "unconfigured")
+
+    def test_storage_target_absence_is_business_unconfigured_not_process_failure(self) -> None:
+        status = self._service(enabled_storage_targets_probe=lambda: 0).status()
+
+        self.assertTrue(status["ok"])
+        self.assertFalse(status["checks"]["storage_targets"]["configured"])
+        self.assertFalse(status["checks"]["storage_targets"]["required"])
+        self.assertEqual(status["checks"]["storage_targets"]["status"], "unconfigured")
+
+
+class SecurityStatusTests(unittest.TestCase):
+    def test_socket_is_critical_without_legacy_layout_flag(self) -> None:
         service = SecurityStatusService(
             raw_config=lambda: {
                 "admin": {"username": "owner", "password": "strong-password"},
-                "app": {"secret_key": "stable-secret"},
             },
             settings=lambda: {},
             strict_enabled=lambda _raw: True,
-            default_secret=lambda _value: False,
             docker_socket_mounted=lambda: True,
-            deployment_degraded=lambda: True,
             admin_profile_key="admin.profile",
         )
 
         result = service.build()
 
         self.assertEqual(result["status"], "critical")
-        self.assertEqual(result["critical_count"], 2)
+        self.assertEqual(result["critical_count"], 1)
         self.assertTrue(result["flags"]["docker_socket_mounted"])
-        self.assertTrue(result["flags"]["deployment_degraded"])
+        self.assertNotIn("deployment_degraded", result["flags"])
 
 
 class WorkerWatchdogTests(unittest.TestCase):

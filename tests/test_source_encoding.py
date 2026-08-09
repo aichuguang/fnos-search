@@ -7,7 +7,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_SUFFIXES = {".py", ".js", ".css", ".html", ".json", ".md", ".yaml", ".yml", ".toml", ".sh"}
 EXCLUDED_DIRS = {".git", ".claude", ".codex", ".venv", "node_modules", "data", "logs", "codex_tmp"}
+EXCLUDED_PREFIXES = ("_audit_", "_codex_", "_tmp_", ".test-tmp")
 MOJIBAKE_MARKERS = ("\ufffd", "\u951f\u65a4\u62f7", "\u9983", "\u9286")
+
+
+def _is_excluded(path: Path) -> bool:
+    parts = path.relative_to(ROOT).parts
+    return any(
+        part in EXCLUDED_DIRS or part.startswith(EXCLUDED_PREFIXES)
+        for part in parts
+    )
 
 
 class SourceEncodingTests(unittest.TestCase):
@@ -16,7 +25,7 @@ class SourceEncodingTests(unittest.TestCase):
         for path in ROOT.rglob("*"):
             if not path.is_file() or path.suffix.lower() not in SOURCE_SUFFIXES:
                 continue
-            if any(part in EXCLUDED_DIRS for part in path.relative_to(ROOT).parts):
+            if _is_excluded(path):
                 continue
             raw = path.read_bytes()
             if raw.startswith(b"\xef\xbb\xbf"):

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from ..constants import COMPLETION_STAGE_REVIEW, COMPLETION_STAGE_WAITING_ORGANIZER, EVENT_INFO, EVENT_WARN, JOB_REVIEW, JOB_WAITING_ORGANIZER
+from ..constants import COMPLETION_STAGE_REVIEW, COMPLETION_STAGE_WAITING_ORGANIZER, EVENT_ERROR, EVENT_INFO, EVENT_WARN, JOB_REVIEW, JOB_WAITING_ORGANIZER
+from ..planning.job_plan import plan_strategy, validated_v1_execution_plan_from_job
 
 
 class RcloneReadyItemsCompletionService:
@@ -30,8 +31,36 @@ class RcloneReadyItemsCompletionService:
         trigger: str,
         success_message: str,
     ) -> dict[str, Any]:
-        refresh = self._refresh(category_key, category, events, trigger)
-        trigger_text = "分类完成后" if trigger == "rclone_category_done" else "run 结束后"
+        # Only completed V1 rclone_copy jobs may enter the media-refresh and
+        # completion path. Legacy staging/v3 jobs are moved to review and are
+        # never allowed to become done through this service.
+        valid_items: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]] = []
+        rejected: list[int] = []
+        valid_events: list[dict[str, Any]] = []
+        for job, job_events, verdict in items:
+            try:
+                plan = validated_v1_execution_plan_from_job(job)
+                if plan_strategy(plan) != "rclone_copy":
+                    raise ValueError("completion requires a V1 rclone_copy plan")
+            except Exception as exc:  # noqa: BLE001
+                job_id = _safe_job_id(job)
+                if job_id:
+                    rejected.append(job_id)
+                    _mark_job_review(self.database, job, f"rclone completion rejected: {exc}")
+                continue
+            valid_items.append((job, job_events, verdict))
+            valid_events.extend(item for item in job_events if isinstance(item, dict))
+        if rejected and not valid_items:
+            return {
+                "success": False,
+                "manual_review": True,
+                "status": "manual_review",
+                "review_job_ids": rejected,
+                "completed_items": [],
+                "message": "legacy or unsupported rclone jobs were moved to manual review",
+            }
+        refresh = self._refresh(category_key, category, valid_events, trigger)
+        trigger_text = "category completion" if trigger == "rclone_category_done" else "run completion"
         action = "已移交 OpenList 标准化" if refresh.get("deferred_to_organizer") else "刷新媒体库"
         self.database.add_rclone_event(
             run_id,
@@ -40,7 +69,7 @@ class RcloneReadyItemsCompletionService:
             refresh,
         )
         completed = []
-        for job, job_events, verdict in items:
+        for job, job_events, verdict in valid_items:
             item = self._finish_job(
                 run_id, category_key, category, job, job_events, verdict, refresh, trigger
             )
@@ -66,16 +95,14 @@ class RcloneReadyItemsCompletionService:
         return self.refresh_media(category_key, category, events, trigger=trigger)
 
     def _official_save_path(self, job: dict[str, Any]) -> str:
-        """暂存任务的最终落盘路径取移动云侧（storage_job_root），而不是夸克临时根。"""
-        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        execution = raw_data.get("execution_plan") if isinstance(raw_data.get("execution_plan"), dict) else {}
-        if execution:
-            paths = execution.get("paths") if isinstance(execution.get("paths"), dict) else {}
-            staging = paths.get("staging") if isinstance(paths.get("staging"), dict) else {}
-            final = paths.get("final") if isinstance(paths.get("final"), dict) else {}
-            return str(staging.get("path") or final.get("path") or "").strip()
-        plan = raw_data.get("staging_plan") if isinstance(raw_data.get("staging_plan"), dict) else {}
-        return str(plan.get("storage_job_root") or plan.get("openlist_job_root") or "").strip()
+        """Return the frozen V1 destination path; never consult legacy fields."""
+        try:
+            plan = validated_v1_execution_plan_from_job(job)
+        except Exception:  # noqa: BLE001
+            return ""
+        paths = plan.get("paths") if isinstance(plan.get("paths"), dict) else {}
+        final = paths.get("destination_final") if isinstance(paths.get("destination_final"), dict) else {}
+        return str(final.get("path") or "").strip()
 
     def _finish_job(
         self,
@@ -149,6 +176,36 @@ class RcloneReadyItemsCompletionService:
             "file_count": len(events),
             "verdict": verdict,
         }
+
+
+def _safe_job_id(job: dict[str, Any] | None) -> int:
+    try:
+        return int((job or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mark_job_review(database: Any, job: dict[str, Any], message: str) -> None:
+    job_id = _safe_job_id(job)
+    if job_id <= 0 or database is None:
+        return
+    updater = getattr(database, "update_job_if_status", None)
+    expected = str(job.get("status") or "").strip()
+    updates = {"status": JOB_REVIEW, "error_message": message}
+    if callable(updater) and expected:
+        try:
+            updater(job_id, {expected}, **updates)
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        try:
+            database.update_job(job_id, **updates)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        database.add_event(job_id, EVENT_ERROR, message, {"stage": "review", "v1_only_guard": True})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _dedupe(values: Any) -> list[str]:

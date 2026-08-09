@@ -15,6 +15,13 @@ from fnos_media_import.organizer.openlist_client import (
     OpenListTransientError,
 )
 from fnos_media_import.organizer.service import OrganizerService, _clean_title_hint, _title_from_update_payload
+from tests._organizer_v1_fixtures import (
+    attach_organizer_v1_task,
+    bind_organizer_v1_execution_repository,
+    bind_task_openlist_resolver,
+    organizer_v1_job,
+    organizer_v1_plan,
+)
 
 
 class _JsonResponse:
@@ -377,103 +384,74 @@ class OrganizerTransientScanTests(unittest.TestCase):
     def test_update_progress_title_keeps_title_before_year(self) -> None:
         self.assertEqual(_clean_title_hint("百花杀（2026）更新至第31集 4K"), "百花杀")
 
-    def test_retry_repairs_old_metadata_only_task_title_from_linked_job(self) -> None:
-        class FakeDatabase:
-            def __init__(self) -> None:
-                self.updates: list[dict] = []
-
-            def get_job(self, _job_id: int) -> dict:
-                return {"id": 9, "title": "藏海传 4K 国语/粤语 6音轨"}
-
-            def update_organizer_task(self, _task_id: int, **updates) -> None:
-                self.updates.append(updates)
-
-        service = OrganizerService.__new__(OrganizerService)
-        service.db = FakeDatabase()
-        task = {
-            "id": 17,
-            "job_id": 9,
-            "title": "6音轨",
-            "source_keyword": "6音轨",
-            "openlist_root_path": "/移动云/电视剧",
-            "raw_data": {},
-            "evidence": {},
-        }
-
-        repaired = service._repair_task_title_from_linked_job(task)
-
-        self.assertEqual(repaired["title"], "藏海传")
-        self.assertEqual(repaired["source_keyword"], "藏海传")
-        self.assertEqual(service.db.updates[0]["title"], "藏海传")
-
-    def test_title_repair_database_failure_does_not_block_retry_scan(self) -> None:
-        task = {
-            "id": 17,
-            "job_id": 9,
-            "title": "6音轨",
-            "source_keyword": "6音轨",
-            "openlist_root_path": "/移动云/电视剧",
-            "raw_data": {},
-        }
-
-        for database in (
-            SimpleNamespace(get_job=Mock(side_effect=RuntimeError("read failed"))),
-            SimpleNamespace(
-                get_job=Mock(return_value={"id": 9, "title": "藏海传 4K 国语/粤语 6音轨"}),
-                update_organizer_task=Mock(side_effect=RuntimeError("write failed")),
-            ),
-        ):
-            with self.subTest(database=database):
-                service = OrganizerService.__new__(OrganizerService)
-                service.db = database
-
-                with self.assertLogs("fnos_media_import.organizer.service", level="WARNING"):
-                    self.assertIs(service._repair_task_title_from_linked_job(task), task)
-
     def test_automatic_category_root_scan_without_file_evidence_is_rejected(self) -> None:
+        root = "/mobile/tv"
+        plan = organizer_v1_plan(
+            41,
+            category="tv",
+            organizer_root=root,
+            destination_final="/library/tv",
+        )
+        job = organizer_v1_job(plan)
+        task = attach_organizer_v1_task(
+            {
+                "id": 41,
+                "trigger_type": "rclone_category_done",
+                "raw_data": {},
+            },
+            plan,
+        )
         service = OrganizerService.__new__(OrganizerService)
-        service.categories = {"tv": {"label": "电视剧", "openlist_root_path": "/移动云/电视剧"}}
+        service.db = SimpleNamespace(get_job=lambda _job_id: job)
+        service.categories = {"tv": {"label": "TV", "openlist_root_path": root}}
         service.organizer_config = {"max_scan_depth": 8, "max_files_per_task": 500}
         service.openlist = SimpleNamespace(scan_videos=Mock())
-        task = {
-            "category": "tv",
-            "trigger_type": "rclone_category_done",
-            "openlist_root_path": "/移动云/电视剧",
-            "raw_data": {},
-        }
+        bind_organizer_v1_execution_repository(service, plan)
 
-        with self.assertRaises(OpenListError) as raised:
-            service._scan_openlist_videos(task, "/移动云/电视剧")
+        with self.assertRaises(OpenListError):
+            service._scan_openlist_videos(task, root)
 
-        self.assertIn("拒绝递归扫描整个分类目录", str(raised.exception))
         service.openlist.scan_videos.assert_not_called()
 
     def test_automatic_category_root_scan_uses_exact_paths_and_zero_depth(self) -> None:
+        root = "/mobile/tv"
+        expected_path = f"{root}/resource/episode.mkv"
+        plan = organizer_v1_plan(
+            42,
+            category="tv",
+            organizer_root=root,
+            destination_final="/library/tv",
+        )
+        job = organizer_v1_job(plan)
+        task = attach_organizer_v1_task(
+            {
+                "id": 42,
+                "trigger_type": "rclone_category_done",
+                "raw_data": {
+                    "scan_filters": {
+                        "expected_names": ["episode.mkv"],
+                        "expected_paths": [expected_path],
+                    }
+                },
+            },
+            plan,
+        )
         service = OrganizerService.__new__(OrganizerService)
-        service.categories = {"tv": {"label": "电视剧", "openlist_root_path": "/移动云/电视剧"}}
+        service.db = SimpleNamespace(get_job=lambda _job_id: job)
+        service.categories = {"tv": {"label": "TV", "openlist_root_path": root}}
         service.organizer_config = {"max_scan_depth": 8, "max_files_per_task": 500}
         service.openlist = SimpleNamespace(scan_videos=Mock(return_value=[]))
-        task = {
-            "category": "tv",
-            "trigger_type": "rclone_category_done",
-            "openlist_root_path": "/移动云/电视剧",
-            "raw_data": {
-                "scan_filters": {
-                    "expected_names": ["藏海传.S01E01.mkv"],
-                    "expected_paths": ["/移动云/电视剧/6音轨/藏海传.S01E01.mkv"],
-                }
-            },
-        }
+        bind_organizer_v1_execution_repository(service, plan)
 
-        service._scan_openlist_videos(task, "/移动云/电视剧")
+        service._scan_openlist_videos(task, root)
 
         service.openlist.scan_videos.assert_called_once_with(
-            "/移动云/电视剧",
+            root,
             max_depth=0,
-            max_files=500,
+            max_files=0,
             refresh=True,
-            expected_names=["藏海传.S01E01.mkv"],
-            expected_paths=["/移动云/电视剧/6音轨/藏海传.S01E01.mkv"],
+            expected_names=["episode.mkv"],
+            expected_paths=[expected_path],
         )
 
     def test_stale_timer_does_not_rerun_an_already_failed_task(self) -> None:
@@ -488,22 +466,33 @@ class OrganizerTransientScanTests(unittest.TestCase):
         service.process_task.assert_not_called()
 
     def test_background_task_waits_instead_of_failing_on_connection_reset(self) -> None:
-        task = {
-            "id": 17,
-            "job_id": None,
-            "trigger_type": "rclone_callback",
-            "category": "tv",
-            "openlist_root_path": "/mobile/tv",
-            "status": "stabilizing",
-            "raw_data": {
-                "rclone": {},
-                "scan_filters": {"expected_names": ["target.mkv"]},
+        root = "/mobile/tv/job-17"
+        plan = organizer_v1_plan(
+            17,
+            category="tv",
+            organizer_root=root,
+            destination_final="/library/tv",
+        )
+        job = organizer_v1_job(plan)
+        task = attach_organizer_v1_task(
+            {
+                "id": 17,
+                "trigger_type": "rclone_callback",
+                "status": "stabilizing",
+                "revision": 1,
+                "raw_data": {
+                    "scan_filters": {"expected_names": ["target.mkv"]},
+                },
             },
-        }
+            plan,
+        )
 
         class FakeDatabase:
             def __init__(self) -> None:
                 self.updates: list[tuple[int, dict]] = []
+
+            def get_job(self, _job_id: int) -> dict:
+                return job
 
             def get_organizer_task(self, _task_id: int, *, include_children: bool = False) -> dict:
                 return dict(task)
@@ -511,15 +500,19 @@ class OrganizerTransientScanTests(unittest.TestCase):
             def update_organizer_task(self, task_id: int, **updates) -> None:
                 self.updates.append((task_id, updates))
 
+        client = SimpleNamespace(
+            configured=True,
+            scan_videos=Mock(side_effect=OpenListTransientError("connection reset")),
+        )
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
-        service.categories = {"tv": {"label": "TV", "openlist_root_path": "/mobile/tv"}}
+        service.categories = {"tv": {"label": "TV"}}
         service.organizer_config = {"openlist_visible_retry_delays_seconds": [1, 2, 3]}
-        service.openlist = SimpleNamespace(
-            scan_videos=Mock(side_effect=OpenListTransientError("OpenList 请求失败；连接被对端重置"))
-        )
+        service.openlist = client
         service._sync_linked_job = Mock()
         service._schedule_task_after = Mock()
+        bind_organizer_v1_execution_repository(service, plan)
+        bind_task_openlist_resolver(service, client, plan)
 
         result = service.process_task(17)
 
@@ -533,17 +526,31 @@ class OrganizerTransientScanTests(unittest.TestCase):
         service._schedule_task_after.assert_called_once_with(17, 1)
 
     def test_suspended_process_does_not_leave_false_waiting_openlist_state(self) -> None:
-        task = {
-            "id": 18,
-            "trigger_type": "rclone_callback",
-            "category": "tv",
-            "openlist_root_path": "/mobile/tv",
-            "raw_data": {"rclone": {}},
-        }
+        root = "/mobile/tv/job-18"
+        plan = organizer_v1_plan(
+            18,
+            category="tv",
+            organizer_root=root,
+            destination_final="/library/tv",
+        )
+        job = organizer_v1_job(plan)
+        task = attach_organizer_v1_task(
+            {
+                "id": 18,
+                "trigger_type": "rclone_callback",
+                "status": "scanning",
+                "revision": 1,
+                "raw_data": {},
+            },
+            plan,
+        )
 
         class FakeDatabase:
             def __init__(self) -> None:
                 self.updates: list[tuple[int, dict]] = []
+
+            def get_job(self, _job_id: int) -> dict:
+                return job
 
             def update_organizer_task(self, task_id: int, **updates) -> None:
                 self.updates.append((task_id, updates))
@@ -554,11 +561,12 @@ class OrganizerTransientScanTests(unittest.TestCase):
         service._background_suspended = True
         service._timers = {}
         service._sync_linked_job = Mock()
+        bind_organizer_v1_execution_repository(service, plan)
 
         result = service._schedule_openlist_visibility_retry(
             task,
-            root_path="/mobile/tv",
-            error=OpenListTransientError("OpenList 服务繁忙"),
+            root_path=root,
+            error=OpenListTransientError("service busy"),
         )
 
         self.assertFalse(result["success"])

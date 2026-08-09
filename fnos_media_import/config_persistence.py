@@ -8,15 +8,10 @@ from urllib.parse import urlparse
 from .config import AppConfig, _deep_merge, _ensure_storage_config
 from .constants import (
     CATEGORY_ANIME,
-    CATEGORY_LABELS,
     CATEGORY_MOVIE,
     CATEGORY_OTHER,
     CATEGORY_TV,
     CATEGORY_VARIETY,
-    ROUTE_CLOUD139_DIRECT,
-    ROUTE_CLOUD189_DIRECT,
-    ROUTE_QUARK_TO_MOBILE,
-    ROUTE_SIXPAN_OFFLINE,
 )
 from .storage_paths import normalize_sixpan_path_sources
 
@@ -24,23 +19,43 @@ from .storage_paths import normalize_sixpan_path_sources
 ADVANCED_CONFIG_KEY = "advanced_config"
 ADVANCED_CONFIG_EXPORT_FORMAT = "fnos-media-import/advanced-config"
 ADVANCED_CONFIG_EXPORT_VERSION = 1
+_ADVANCED_DOCUMENT_METADATA_FIELDS = frozenset(
+    {"format", "version", "stored", "effective", "exported_at", "source"}
+)
 
 CATEGORY_KEYS = [CATEGORY_MOVIE, CATEGORY_TV, CATEGORY_ANIME, CATEGORY_VARIETY, CATEGORY_OTHER]
-CATEGORY_KEYS_SET = frozenset(CATEGORY_KEYS)
-ROUTE_DEFAULTS = {
-    "quark": ROUTE_QUARK_TO_MOBILE,
-    "uc": ROUTE_QUARK_TO_MOBILE,
-    "cloud139": ROUTE_CLOUD139_DIRECT,
-    "cloud189": ROUTE_CLOUD189_DIRECT,
-    "magnet": ROUTE_SIXPAN_OFFLINE,
-    "torrent": ROUTE_SIXPAN_OFFLINE,
-}
 
+# Fields from pre-V1 configuration documents.  New imports still fail with an
+# actionable path.  Existing database values are filtered once during startup
+# so an upgrade cannot be blocked by options that no longer have a V1 owner.
+DEPRECATED_ADVANCED_FIELDS: dict[str, frozenset[str]] = {
+    "quark": frozenset({"auto_save_url", "token", "check_before_save", "run_immediately"}),
+    "cloud189": frozenset({"auto_save_url", "endpoint", "token", "timeout", "refresh_after_submit"}),
+    "cmcc_upload": frozenset({
+        "enabled", "backend", "mode", "rename_mode", "host", "auth_mode",
+        "access_token", "authorization", "phone", "put_timeout",
+    }),
+    "cloud139": frozenset({
+        "target_root_path", "cloud_root_path", "save_root_path", "root_path",
+        "fnos_mount_name", "mount_name", "timeout", "check_before_save",
+        "create_folder_if_missing", "refresh_after_submit", "refresh_delay_seconds",
+        "mark_done_after_submit", "token", "endpoint", "auto_save_url",
+    }),
+    "openlist": frozenset({"base_url", "token"}),
+    "sixpan": frozenset({
+        "api_url", "endpoint", "host", "fnos_mount_name", "openlist_mount_name",
+        "mount_name", "mount_path", "client_id", "client_secret", "oauth_client_id",
+        "access_token", "refresh_token", "token",
+    }),
+    "categories": frozenset({
+        "mobile_target_path", "cloud139_target_path", "cloud139_fnos_target_path",
+        "cloud139_folder_id", "cmcc_parent_file_id", "cmcc_parent_path",
+        "sixpan_fnos_target_path", "sixpan_mount_path", "sixpan_fnos_dir_list",
+        "openlist_root_path", "quark_save_path", "sixpan_save_path",
+    }),
+}
 ADVANCED_CONFIG_SECTIONS = (
     "pansou",
-    "quark",
-    "cloud139",
-    "cmcc_upload",
     "openlist",
     "tmdb",
     "ai",
@@ -51,7 +66,6 @@ ADVANCED_CONFIG_SECTIONS = (
     "organizer",
     "sixpan",
     "fnos",
-    "routes",
     "categories",
     "rclone",
     "storage",
@@ -86,24 +100,6 @@ def _allowed_secret_paths() -> set[str]:
     }
 
 
-def _storage_secret_paths(config: dict[str, Any]) -> set[str]:
-    """返回配置中实际出现的 storage.targets.<id>.<secret> 路径。"""
-
-    paths: set[str] = set()
-    storage = config.get("storage")
-    if not isinstance(storage, dict):
-        return paths
-    targets = storage.get("targets")
-    if not isinstance(targets, dict):
-        return paths
-    for destination_id, target in targets.items():
-        if not isinstance(target, dict):
-            continue
-        for field in STORAGE_TARGET_SECRET_FIELDS:
-            if field in target:
-                paths.add(f"storage.targets.{destination_id}.{field}")
-    return paths
-
 SECTION_SCHEMA: dict[str, dict[str, str]] = {
     "pansou": {
         "base_url": "str",
@@ -124,30 +120,6 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "async_poll_max_rounds": "int",
         "async_poll_stable_rounds": "int",
         "timeout": "int",
-    },
-    "quark": {
-        "auto_save_url": "str",
-        "token": "secret",
-        "check_before_save": "bool",
-        "run_immediately": "bool",
-    },
-    "cloud139": {
-        "check_before_save": "bool",
-        "create_folder_if_missing": "bool",
-        "refresh_after_submit": "bool",
-        "refresh_delay_seconds": "int",
-        "mark_done_after_submit": "bool",
-    },
-    "cmcc_upload": {
-        "enabled": "bool",
-        "backend": "str",
-        "mode": "str",
-        "rename_mode": "str",
-        "host": "str",
-        "auth_mode": "str",
-        "access_token": "secret",
-        "phone": "str",
-        "put_timeout": "int",
     },
     "update_scheduler": {
         "enabled": "bool",
@@ -185,8 +157,6 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "youku_url": "str",
     },
     "openlist": {
-        "base_url": "str",
-        "token": "secret",
         "timeout": "int",
         "batch_timeout": "int",
         "list_refresh_default": "bool",
@@ -258,15 +228,6 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "local_strm_root": "str",
     },
     "sixpan": {
-        "host": "str",
-        "fnos_mount_name": "str",
-        "openlist_mount_name": "str",
-        "mount_name": "str",
-        "mount_path": "str",
-        "client_id": "str",
-        "client_secret": "secret",
-        "access_token": "secret",
-        "refresh_token": "secret",
         "timeout": "int",
         "verify_tls": "bool",
         "parse_before_add": "bool",
@@ -283,6 +244,8 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "success_statuses": "list",
         "failed_statuses": "list",
         "running_statuses": "list",
+        "callbacks": "list",
+        "refresh_after_submit": "bool",
     },
     "fnos": {
         "server_url": "str",
@@ -304,62 +267,13 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
 }
 
 CATEGORY_SCHEMA = {
-    "label": "str",
-    "quark_save_path": "str",
-    "sixpan_save_path": "str",
-    "sixpan_fnos_target_path": "str",
-    "sixpan_mount_path": "str",
-    "sixpan_fnos_dir_list": "list",
-    "mobile_target_path": "str",
-    "cloud139_target_path": "str",
-    "cloud139_fnos_target_path": "str",
-    "cloud139_folder_id": "str",
-    "cmcc_parent_file_id": "str",
-    "cmcc_parent_path": "str",
-    "openlist_root_path": "str",
-    "strm_fnos_dir_list": "list",
     "fnos_lib": "str",
     "fnos_dir_list": "list",
 }
 
-CATEGORY_KEYS_SET = frozenset(CATEGORY_KEYS)
-
-# storage 段是动态 destination ID 的注册表，不能塞进扁平 SECTION_SCHEMA。
-STORAGE_TOP_FIELDS = frozenset({"enabled", "plan_version", "default_target", "targets"})
-STORAGE_TARGET_FIELDS = frozenset({
-    "name",
-    "driver",
-    "enabled",
-    "guest_selectable",
-    "namespace_id",
-    "native_ingress",
-    "host",
-    "auth_mode",
-    "access_token",
-    "phone",
-    "upload_mode",
-    "rename_mode",
-    "base_path",
-    "openlist_mount",
-    "remote",
-    "config_path",
-    "root",
-    "organizer_namespace_id",
-    "organizer_root",
-    "categories",
-})
-STORAGE_TARGET_SECRET_FIELDS = frozenset({
-    "access_token",
-    "phone",
-    "token",
-    "password",
-    "secret",
-    "client_secret",
-    "api_key",
-})
-STORAGE_CATEGORY_FIELDS = frozenset({"final_root", "organizer_namespace_id", "organizer_root"})
-DESTINATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-STORAGE_NATIVE_INGRESSES = frozenset({"cloud139_direct"})
+# V1 targets and assignments are database resources.  The advanced storage
+# section retains only process-level switches needed during startup.
+STORAGE_TOP_FIELDS = frozenset({"enabled", "plan_version"})
 
 
 
@@ -374,19 +288,6 @@ def apply_persisted_config(app_config: AppConfig, settings: dict[str, Any]) -> A
     if not persisted:
         return app_config
     merged = _deep_merge(copy.deepcopy(app_config.raw), persisted)
-    _ensure_derived_config(merged)
-    persisted_storage = persisted.get("storage") if isinstance(persisted.get("storage"), dict) else {}
-    persisted_targets = (
-        persisted_storage.get("targets")
-        if isinstance(persisted_storage.get("targets"), dict)
-        else {}
-    )
-    if not isinstance(persisted_targets.get("mobile_main"), dict) and any(
-        section in persisted for section in ("cmcc_upload", "cloud139", "categories")
-    ):
-        merged_storage = merged.get("storage") if isinstance(merged.get("storage"), dict) else {}
-        merged_targets = merged_storage.get("targets") if isinstance(merged_storage.get("targets"), dict) else {}
-        merged_targets.pop("mobile_main", None)
     _ensure_storage_config(merged)
     return AppConfig(raw=merged, base_dir=app_config.base_dir)
 
@@ -395,41 +296,147 @@ def persisted_config_from_settings(settings: dict[str, Any]) -> dict[str, Any]:
     raw = settings.get(ADVANCED_CONFIG_KEY)
     if not isinstance(raw, dict):
         return {}
-    return sanitize_advanced_config(raw, current={}, preserve_secret_placeholders=False)
+    # The database stores the canonical V1 *stored section map*, not an
+    # exported document envelope.  Refuse an accidentally persisted export
+    # (or any pre-V1 wrapper) instead of silently filtering it to an empty
+    # configuration and losing credentials at runtime.
+    if _ADVANCED_DOCUMENT_METADATA_FIELDS.intersection(raw):
+        raise ValueError(
+            "数据库高级配置不是 V1 存储覆盖项；请清空该项并通过版本化配置文件重新录入"
+        )
+    migrated, _removed_paths = migrate_stored_advanced_config(raw)
+    return sanitize_advanced_config(
+        migrated,
+        current={},
+        preserve_secret_placeholders=False,
+    )
+
+
+def migrate_stored_advanced_config(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Filter a pre-V1 database override to the canonical V1 schema.
+
+    This compatibility path is deliberately limited to values already stored
+    in the application database.  Versioned import payloads continue to use
+    strict validation and therefore cannot silently reintroduce removed keys.
+    Returned diagnostics contain paths only and never configuration values.
+    """
+
+    if not isinstance(raw, dict):
+        return {}, []
+    if _ADVANCED_DOCUMENT_METADATA_FIELDS.intersection(raw):
+        raise ValueError(
+            "数据库高级配置不是 V1 存储覆盖项；请清空该项并通过版本化配置文件重新录入"
+        )
+    cleaned = _filter_known_advanced_config(raw)
+    return cleaned, _removed_config_paths(raw, cleaned)
+
+
+def migrate_persisted_advanced_config_setting(
+    database: Any,
+) -> tuple[dict[str, Any], list[str]]:
+    """CAS-persist the stored V1 compatibility cleanup during startup."""
+
+    settings = database.get_app_settings()
+    for _attempt in range(3):
+        raw = settings.get(ADVANCED_CONFIG_KEY)
+        if not isinstance(raw, dict):
+            return settings, []
+        cleaned, removed_paths = migrate_stored_advanced_config(raw)
+        if not removed_paths:
+            return settings, []
+        if database.compare_and_set_app_setting(
+            ADVANCED_CONFIG_KEY,
+            raw,
+            cleaned,
+        ):
+            migrated_settings = copy.deepcopy(settings)
+            migrated_settings[ADVANCED_CONFIG_KEY] = cleaned
+            return migrated_settings, removed_paths
+        settings = database.get_app_settings()
+    return settings, []
+
+
+def _removed_config_paths(
+    original: dict[str, Any],
+    cleaned: dict[str, Any],
+    prefix: str = "",
+) -> list[str]:
+    removed: list[str] = []
+    for key, value in original.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if key not in cleaned:
+            removed.append(path)
+            continue
+        cleaned_value = cleaned.get(key)
+        if isinstance(value, dict) and isinstance(cleaned_value, dict):
+            removed.extend(_removed_config_paths(value, cleaned_value, path))
+    return removed
 
 
 def normalize_advanced_config_payload(payload: dict[str, Any], current_stored: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("高级配置格式不正确")
+    migrated_current, _removed_current_paths = migrate_stored_advanced_config(
+        current_stored or {}
+    )
     requested_mode = str(payload.get("mode") or "").strip().lower()
-    config_payload = payload.get("config", payload)
+    # Imports and updates use one versioned document shape.  Bare section
+    # dictionaries were accepted by the pre-V1 UI and are intentionally
+    # rejected rather than guessed as a merge patch.  Reject an ambiguous
+    # payload that mixes the wrapper and document fields; otherwise a caller
+    # could accidentally update a different section than the one it showed.
+    has_document_fields = bool({"format", "version"}.intersection(payload))
+    has_wrapper = "config" in payload
+    if has_document_fields and has_wrapper:
+        raise ValueError("高级配置请求不能同时包含顶层版本字段和 config 包装层")
+    if has_wrapper:
+        unknown_wrapper_fields = sorted(
+            set(payload) - {"config", "mode", "scope", "clear_secrets", "source"}
+        )
+        if unknown_wrapper_fields:
+            preview = "、".join(unknown_wrapper_fields[:8])
+            suffix = " 等" if len(unknown_wrapper_fields) > 8 else ""
+            raise ValueError(f"高级配置请求包含不支持的字段：{preview}{suffix}")
+    config_payload = payload if has_document_fields else payload.get("config")
     if not isinstance(config_payload, dict):
         raise ValueError("高级配置内容必须是对象")
+    if "format" not in config_payload or "version" not in config_payload:
+        raise ValueError(
+            "高级配置必须是带 format 和 version 的版本化配置文件；请先导出当前配置"
+        )
+    export_format = str(config_payload.get("format") or "").strip()
+    if export_format != ADVANCED_CONFIG_EXPORT_FORMAT:
+        raise ValueError("配置文件格式标识不受支持")
+    unknown_document_fields = sorted(set(config_payload) - _ADVANCED_DOCUMENT_METADATA_FIELDS)
+    if unknown_document_fields:
+        preview = "、".join(unknown_document_fields[:8])
+        suffix = " 等" if len(unknown_document_fields) > 8 else ""
+        raise ValueError(f"配置文件包含不支持的 envelope 字段：{preview}{suffix}")
+    if isinstance(config_payload.get("version"), bool):
+        raise ValueError("配置文件版本不正确")
+    try:
+        export_version = int(config_payload.get("version"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("配置文件版本不正确") from exc
+    if export_version != ADVANCED_CONFIG_EXPORT_VERSION:
+        raise ValueError(
+            f"配置文件版本 {export_version} 不受支持，当前仅支持版本 {ADVANCED_CONFIG_EXPORT_VERSION}"
+        )
+    import_scope = str(payload.get("scope") or "stored").strip().lower()
+    if import_scope not in {"stored", "effective"}:
+        raise ValueError("配置导入范围只能是 stored 或 effective")
+    for scope_name in ("stored", "effective"):
+        if scope_name in config_payload and not isinstance(config_payload[scope_name], dict):
+            raise ValueError(f"配置文件中的 {scope_name} 必须是对象")
+    config_payload = config_payload.get(import_scope)
+    if not isinstance(config_payload, dict):
+        raise ValueError(f"配置文件缺少可导入的 {import_scope} 配置")
 
-    is_export_document = "format" in config_payload or "version" in config_payload
-    if is_export_document:
-        export_format = str(config_payload.get("format") or "").strip()
-        if export_format != ADVANCED_CONFIG_EXPORT_FORMAT:
-            raise ValueError("配置文件格式标识不受支持")
-        try:
-            export_version = int(config_payload.get("version"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("配置文件版本不正确") from exc
-        if export_version != ADVANCED_CONFIG_EXPORT_VERSION:
-            raise ValueError(
-                f"配置文件版本 {export_version} 不受支持，当前仅支持版本 {ADVANCED_CONFIG_EXPORT_VERSION}"
-            )
-        import_scope = str(payload.get("scope") or "stored").strip().lower()
-        if import_scope not in {"stored", "effective"}:
-            raise ValueError("配置导入范围只能是 stored 或 effective")
-        config_payload = config_payload.get(import_scope)
-        if not isinstance(config_payload, dict):
-            raise ValueError(f"配置文件缺少可导入的 {import_scope} 配置")
-
-    mode = requested_mode or ("replace" if is_export_document else "merge")
+    mode = requested_mode or "replace"
     if mode not in {"merge", "replace"}:
         raise ValueError("配置保存模式只能是 merge 或 replace")
 
+    _reject_deprecated_advanced_paths(config_payload)
     unknown_paths = _unknown_advanced_config_paths(config_payload)
     if unknown_paths:
         preview = "、".join(unknown_paths[:8])
@@ -447,11 +454,7 @@ def normalize_advanced_config_payload(payload: dict[str, Any], current_stored: d
         clear_secrets = []
     if not isinstance(clear_secrets, list) or any(not isinstance(path, str) for path in clear_secrets):
         raise ValueError("待清除的密钥字段格式不正确")
-    allowed_clear = (
-        _allowed_secret_paths()
-        | _storage_secret_paths(config_payload)
-        | _storage_secret_paths(current_stored or {})
-    )
+    allowed_clear = _allowed_secret_paths()
     invalid_clear_paths = sorted(set(clear_secrets) - allowed_clear)
     if invalid_clear_paths:
         preview = "、".join(invalid_clear_paths[:8])
@@ -459,22 +462,10 @@ def normalize_advanced_config_payload(payload: dict[str, Any], current_stored: d
 
     normalized = sanitize_advanced_config(
         config_payload,
-        current=(current_stored or {}) if mode == "merge" else {},
+        current=migrated_current if mode == "merge" else {},
         preserve_secret_placeholders=mode == "merge",
     )
     for path in clear_secrets:
-        if path.startswith("storage.targets."):
-            parts = path.split(".")
-            if len(parts) == 4:
-                storage_cfg = normalized.get("storage")
-                target_cfg = (
-                    storage_cfg.get("targets", {}).get(parts[2])
-                    if isinstance(storage_cfg, dict)
-                    else None
-                )
-                if isinstance(target_cfg, dict):
-                    target_cfg.pop(parts[3], None)
-            continue
         section, field = path.split(".", 1)
         section_config = normalized.get(section)
         if isinstance(section_config, dict):
@@ -489,18 +480,82 @@ def advanced_config_payload_mode(payload: dict[str, Any]) -> str:
     """Return the effective persistence mode without exposing configuration values."""
 
     if not isinstance(payload, dict):
-        return "merge"
+        return "invalid"
     requested = str(payload.get("mode") or "").strip().lower()
     if requested in {"merge", "replace"}:
         return requested
-    config_payload = payload.get("config")
-    if isinstance(config_payload, dict) and ("format" in config_payload or "version" in config_payload):
+    config_payload = payload if {"format", "version"}.intersection(payload) else payload.get("config")
+    if isinstance(config_payload, dict) and {
+        "format", "version"
+    }.issubset(config_payload):
         return "replace"
-    return "merge"
+    return "invalid"
+
+
+def _reject_deprecated_advanced_paths(config: dict[str, Any]) -> None:
+    """Raise for removed pre-V1 fields instead of silently filtering them."""
+
+    if not isinstance(config, dict):
+        return
+    invalid: list[str] = []
+    for section, fields in DEPRECATED_ADVANCED_FIELDS.items():
+        value = config.get(section)
+        if not isinstance(value, dict):
+            if value is not None and section not in SECTION_SCHEMA:
+                invalid.append(section)
+            continue
+        # A removed section (quark/cloud189/cmcc_upload/cloud139) is invalid
+        # even when an unknown field is supplied; report the concrete fields
+        # where possible for a useful migration error.
+        if section not in SECTION_SCHEMA and section not in {"categories"}:
+            invalid.extend(f"{section}.{field}" for field in value if field in fields)
+            if not any(field in fields for field in value):
+                invalid.append(section)
+            continue
+        if section == "categories":
+            for category_key, category in value.items():
+                if not isinstance(category, dict):
+                    continue
+                invalid.extend(
+                    f"categories.{category_key}.{field}"
+                    for field in category
+                    if field in fields
+                )
+            continue
+        invalid.extend(f"{section}.{field}" for field in value if field in fields)
+
+    storage = config.get("storage")
+    if isinstance(storage, dict):
+        # Targets, default selection and their locators are V1 database
+        # resources.  Reject the entire pre-V1 declarative registry rather
+        # than accepting a subset and accidentally creating a second source
+        # of truth.
+        for field in ("targets", "default_target"):
+            if field in storage:
+                invalid.append(f"storage.{field}")
+    if "routes" in config:
+        invalid.append("routes")
+    if invalid:
+        preview = "、".join(sorted(set(invalid))[:8])
+        suffix = " 等" if len(set(invalid)) > 8 else ""
+        raise ValueError(f"配置包含已删除的旧版字段：{preview}{suffix}")
+
+
+def _reject_unknown_advanced_paths(config: dict[str, Any]) -> None:
+    """Reject unknown fields in a newly submitted V1 configuration document."""
+
+    if not isinstance(config, dict):
+        return
+    unknown_paths = _unknown_advanced_config_paths(config)
+    if not unknown_paths:
+        return
+    preview = "、".join(unknown_paths[:8])
+    suffix = " 等" if len(unknown_paths) > 8 else ""
+    raise ValueError(f"配置包含不支持的字段：{preview}{suffix}")
 
 
 def _unknown_advanced_config_paths(config: dict[str, Any]) -> list[str]:
-    allowed_sections = set(SECTION_SCHEMA) | {"routes", "categories", "storage"}
+    allowed_sections = set(SECTION_SCHEMA) | {"categories", "storage"}
     unknown: list[str] = []
     for section in config:
         if section not in allowed_sections:
@@ -513,23 +568,6 @@ def _unknown_advanced_config_paths(config: dict[str, Any]) -> list[str]:
                 unknown.append(section)
             continue
         unknown.extend(f"{section}.{field}" for field in section_payload if field not in schema)
-
-    routes = config.get("routes")
-    if isinstance(routes, dict):
-        for source_type, item in routes.items():
-            if source_type not in ROUTE_DEFAULTS:
-                unknown.append(f"routes.{source_type}")
-                continue
-            if not isinstance(item, dict):
-                unknown.append(f"routes.{source_type}")
-                continue
-            unknown.extend(
-                f"routes.{source_type}.{field}"
-                for field in item
-                if field not in {"enabled", "route"}
-            )
-    elif routes is not None:
-        unknown.append("routes")
 
     categories = config.get("categories")
     if isinstance(categories, dict):
@@ -553,7 +591,11 @@ def _unknown_advanced_config_paths(config: dict[str, Any]) -> list[str]:
 
 
 def _validate_storage_config_paths(config: dict[str, Any]) -> list[str]:
-    """严格校验动态 storage.targets。<destination_id> 是动态 key，字段逐层白名单。"""
+    """Validate only process-level storage switches.
+
+    Provider targets, locators and assignments are database V1 resources; an
+    advanced-config document may not carry a declarative ``targets`` map.
+    """
 
     unknown: list[str] = []
     storage = config.get("storage")
@@ -571,74 +613,8 @@ def _validate_storage_config_paths(config: dict[str, Any]) -> list[str]:
         except (TypeError, ValueError):
             unknown.append("storage.plan_version")
         else:
-            if parsed_plan_version != 3:
+            if parsed_plan_version != 1:
                 unknown.append("storage.plan_version")
-    targets = storage.get("targets")
-    if targets is None:
-        return sorted(set(unknown))
-    if not isinstance(targets, dict):
-        return sorted(set(unknown) | {"storage.targets"})
-
-    from .storage.registry import registered_driver_kinds
-
-    known_drivers = set(registered_driver_kinds())
-    for destination_id, target in targets.items():
-        if not DESTINATION_ID_RE.match(str(destination_id)):
-            unknown.append(f"storage.targets.{destination_id}")
-            continue
-        if not isinstance(target, dict):
-            unknown.append(f"storage.targets.{destination_id}")
-            continue
-        if not str(target.get("driver") or "").strip():
-            unknown.append(f"storage.targets.{destination_id}.driver")
-        for field in target:
-            if field not in STORAGE_TARGET_FIELDS:
-                unknown.append(f"storage.targets.{destination_id}.{field}")
-        driver = str(target.get("driver") or "").strip().lower()
-        if driver and driver not in known_drivers:
-            unknown.append(f"storage.targets.{destination_id}.driver")
-        native_ingress = str(target.get("native_ingress") or "").strip().lower()
-        if native_ingress and (
-            native_ingress not in STORAGE_NATIVE_INGRESSES or driver != "cmcc_api"
-        ):
-            unknown.append(f"storage.targets.{destination_id}.native_ingress")
-        if driver == "rclone":
-            remote = str(target.get("remote") or "").strip()
-            root = str(target.get("root") or "").strip().replace("\\", "/")
-            if bool(remote) == bool(root):
-                unknown.append(f"storage.targets.{destination_id}.remote")
-                unknown.append(f"storage.targets.{destination_id}.root")
-            if remote and root:
-                unknown.append(f"storage.targets.{destination_id}.remote")
-                unknown.append(f"storage.targets.{destination_id}.root")
-            if remote and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
-                unknown.append(f"storage.targets.{destination_id}.remote")
-            if root and not (
-                root == "/storage-targets" or root.startswith("/storage-targets/")
-            ):
-                unknown.append(f"storage.targets.{destination_id}.root")
-        categories = target.get("categories")
-        if categories is None:
-            continue
-        if not isinstance(categories, dict):
-            unknown.append(f"storage.targets.{destination_id}.categories")
-            continue
-        for category_key, category_cfg in categories.items():
-            if category_key not in CATEGORY_KEYS_SET:
-                unknown.append(f"storage.targets.{destination_id}.categories.{category_key}")
-                continue
-            if not isinstance(category_cfg, dict):
-                unknown.append(f"storage.targets.{destination_id}.categories.{category_key}")
-                continue
-            for field in category_cfg:
-                if field not in STORAGE_CATEGORY_FIELDS:
-                    unknown.append(f"storage.targets.{destination_id}.categories.{category_key}.{field}")
-            final_root = str(category_cfg.get("final_root") or "").strip().replace("\\", "/")
-            if final_root and any(part in {"", ".", ".."} for part in final_root.strip("/").split("/")):
-                unknown.append(f"storage.targets.{destination_id}.categories.{category_key}.final_root")
-    default_target = str(storage.get("default_target") or "").strip()
-    if default_target and isinstance(targets, dict) and targets and default_target not in targets:
-        unknown.append("storage.default_target")
     return sorted(set(unknown))
 
 
@@ -653,16 +629,6 @@ def _masked_secret_paths(config: dict[str, Any]) -> list[str]:
                 continue
             if str(section_payload.get(field) or "").strip() in MASKED_SECRET_PLACEHOLDERS:
                 masked.append(f"{section}.{field}")
-    storage = config.get("storage")
-    if isinstance(storage, dict):
-        targets = storage.get("targets")
-        if isinstance(targets, dict):
-            for destination_id, target in targets.items():
-                if not isinstance(target, dict):
-                    continue
-                for field in STORAGE_TARGET_SECRET_FIELDS:
-                    if field in target and str(target.get(field) or "").strip() in MASKED_SECRET_PLACEHOLDERS:
-                        masked.append(f"storage.targets.{destination_id}.{field}")
     return masked
 
 
@@ -724,22 +690,15 @@ def advanced_config_subset(config: dict[str, Any]) -> dict[str, Any]:
     result = _filter_known_advanced_config(config)
     for section in ADVANCED_CONFIG_SECTIONS:
         result.setdefault(section, {})
-    result.setdefault("routes", {})
-    for key, route in ROUTE_DEFAULTS.items():
-        result["routes"].setdefault(key, {"enabled": False, "route": route})
-    result.setdefault("categories", {})
-    for key in CATEGORY_KEYS:
-        category = result["categories"].setdefault(key, {})
-        category.setdefault("label", CATEGORY_LABELS.get(key, key))
     return result
-
-
 def sanitize_advanced_config(
     payload: dict[str, Any],
     *,
     current: dict[str, Any] | None = None,
     preserve_secret_placeholders: bool = False,
 ) -> dict[str, Any]:
+    _reject_deprecated_advanced_paths(payload)
+    _reject_deprecated_advanced_paths(current or {})
     result = _filter_known_advanced_config(current or {})
 
     for section, schema in SECTION_SCHEMA.items():
@@ -756,28 +715,6 @@ def sanitize_advanced_config(
             converted, should_set = _convert_value(section_payload.get(field), field_type, preserve_secret_placeholders)
             if should_set:
                 section_result[field] = converted
-
-    routes_payload = payload.get("routes")
-    if isinstance(routes_payload, dict):
-        route_result = result.setdefault("routes", {})
-        if not isinstance(route_result, dict):
-            route_result = {}
-            result["routes"] = route_result
-        for source_type, default_route in ROUTE_DEFAULTS.items():
-            item_payload = routes_payload.get(source_type)
-            if not isinstance(item_payload, dict):
-                continue
-            item_result = route_result.setdefault(source_type, {})
-            if not isinstance(item_result, dict):
-                item_result = {}
-                route_result[source_type] = item_result
-            if "enabled" in item_payload:
-                item_result["enabled"] = _to_bool(item_payload.get("enabled"), False)
-            if "route" in item_payload:
-                route_value = str(item_payload.get("route") or default_route).strip() or default_route
-                item_result["route"] = route_value
-            else:
-                item_result.setdefault("route", default_route)
 
     categories_payload = payload.get("categories")
     if isinstance(categories_payload, dict):
@@ -799,14 +736,12 @@ def sanitize_advanced_config(
                 converted, should_set = _convert_value(category_payload.get(field), field_type, preserve_secret_placeholders)
                 if should_set:
                     category_result[field] = converted
-            category_result.setdefault("label", CATEGORY_LABELS.get(category_key, category_key))
 
     storage_payload = payload.get("storage")
     if isinstance(storage_payload, dict):
         current_storage = result.get("storage") if isinstance(result.get("storage"), dict) else {}
         result["storage"] = _sanitize_storage_config(
             storage_payload,
-            preserve_secret_placeholders,
             current=current_storage,
         )
 
@@ -817,67 +752,16 @@ def sanitize_advanced_config(
 
 def _sanitize_storage_config(
     storage_payload: dict[str, Any],
-    preserve_secret_placeholders: bool,
     *,
     current: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """按 storage 动态 schema 清洗目标注册表。未知字段被过滤（未知字段在保存前已被校验拒绝）。"""
+    """清洗仅用于启动的 storage 开关；目标注册表由 V1 数据库维护。"""
 
     storage_result: dict[str, Any] = copy.deepcopy(current) if isinstance(current, dict) else {}
     if "enabled" in storage_payload:
         storage_result["enabled"] = _to_bool(storage_payload.get("enabled"), True)
     if "plan_version" in storage_payload:
-        storage_result["plan_version"] = _to_int(storage_payload.get("plan_version"), 3)
-    if "default_target" in storage_payload:
-        storage_result["default_target"] = str(storage_payload.get("default_target") or "").strip()
-    targets_payload = storage_payload.get("targets")
-    if isinstance(targets_payload, dict):
-        existing_targets = storage_result.get("targets")
-        targets_result: dict[str, Any] = (
-            copy.deepcopy(existing_targets) if isinstance(existing_targets, dict) else {}
-        )
-        for destination_id, target_payload in targets_payload.items():
-            if not isinstance(target_payload, dict) or not DESTINATION_ID_RE.match(str(destination_id)):
-                continue
-            existing_target = targets_result.get(destination_id)
-            target_result: dict[str, Any] = (
-                copy.deepcopy(existing_target) if isinstance(existing_target, dict) else {}
-            )
-            for field in STORAGE_TARGET_FIELDS:
-                if field not in target_payload or field == "categories":
-                    continue
-                if field in {"enabled", "guest_selectable"}:
-                    target_result[field] = _to_bool(target_payload.get(field), False)
-                elif field in STORAGE_TARGET_SECRET_FIELDS:
-                    text = str(target_payload.get(field) or "").strip()
-                    if preserve_secret_placeholders and text in SECRET_PLACEHOLDERS:
-                        continue
-                    target_result[field] = text
-                else:
-                    target_result[field] = str(target_payload.get(field) or "").strip()
-            categories_payload = target_payload.get("categories")
-            if isinstance(categories_payload, dict):
-                existing_categories = target_result.get("categories")
-                categories_result: dict[str, Any] = (
-                    copy.deepcopy(existing_categories) if isinstance(existing_categories, dict) else {}
-                )
-                for category_key, category_cfg in categories_payload.items():
-                    if category_key not in CATEGORY_KEYS_SET or not isinstance(category_cfg, dict):
-                        continue
-                    previous_category = categories_result.get(category_key)
-                    cleaned_category = (
-                        copy.deepcopy(previous_category) if isinstance(previous_category, dict) else {}
-                    )
-                    for field in STORAGE_CATEGORY_FIELDS:
-                        if field in category_cfg:
-                            cleaned_category[field] = str(category_cfg.get(field) or "").strip()
-                    if cleaned_category:
-                        categories_result[category_key] = cleaned_category
-                if categories_result:
-                    target_result["categories"] = categories_result
-            if target_result:
-                targets_result[destination_id] = target_result
-        storage_result["targets"] = targets_result
+        storage_result["plan_version"] = _to_int(storage_payload.get("plan_version"), 1)
     return storage_result
 
 
@@ -896,20 +780,6 @@ def _filter_known_advanced_config(config: dict[str, Any]) -> dict[str, Any]:
         if filtered:
             result[section] = filtered
 
-    routes = config.get("routes")
-    if isinstance(routes, dict):
-        route_result: dict[str, Any] = {}
-        for source_type, default_route in ROUTE_DEFAULTS.items():
-            item = routes.get(source_type)
-            if not isinstance(item, dict):
-                continue
-            route_result[source_type] = {
-                "enabled": _to_bool(item.get("enabled"), False),
-                "route": str(item.get("route") or default_route).strip() or default_route,
-            }
-        if route_result:
-            result["routes"] = route_result
-
     categories = config.get("categories")
     if isinstance(categories, dict):
         categories_result: dict[str, Any] = {}
@@ -925,42 +795,15 @@ def _filter_known_advanced_config(config: dict[str, Any]) -> dict[str, Any]:
 
     storage = config.get("storage")
     if isinstance(storage, dict):
-        storage_result: dict[str, Any] = {}
-        for top_field in STORAGE_TOP_FIELDS:
-            if top_field in storage:
-                storage_result[top_field] = copy.deepcopy(storage[top_field])
-        targets = storage.get("targets")
-        if isinstance(targets, dict):
-            targets_result: dict[str, Any] = {}
-            for destination_id, target in targets.items():
-                if not isinstance(target, dict):
-                    continue
-                filtered_target = {
-                    field: copy.deepcopy(target[field])
-                    for field in STORAGE_TARGET_FIELDS
-                    if field in target
-                }
-                categories_cfg = target.get("categories")
-                if isinstance(categories_cfg, dict):
-                    filtered_target["categories"] = {
-                        key: {
-                            field: copy.deepcopy(cfg[field])
-                            for field in STORAGE_CATEGORY_FIELDS
-                            if field in cfg
-                        }
-                        for key, cfg in categories_cfg.items()
-                        if isinstance(cfg, dict) and key in CATEGORY_KEYS_SET
-                    }
-                if filtered_target:
-                    targets_result[destination_id] = filtered_target
-            if targets_result:
-                storage_result["targets"] = targets_result
+        storage_result = {
+            field: copy.deepcopy(storage[field])
+            for field in STORAGE_TOP_FIELDS
+            if field in storage
+        }
         if storage_result:
             result["storage"] = storage_result
 
     return result
-
-
 def redact_advanced_config(config: dict[str, Any]) -> dict[str, Any]:
     def redact(value: Any, key: str = "") -> Any:
         if isinstance(value, dict):
@@ -1045,21 +888,6 @@ def _prune_empty_sections(config: dict[str, Any]) -> dict[str, Any]:
             cleaned = _prune_empty_sections(value)
             if cleaned:
                 result[key] = cleaned
-        elif value not in (None, "", []):
+        elif value is not None:
             result[key] = value
     return result
-
-
-def _ensure_derived_config(config: dict[str, Any]) -> None:
-    sixpan = config.get("sixpan")
-    if isinstance(sixpan, dict):
-        if sixpan.get("api_url") and not sixpan.get("endpoint"):
-            sixpan["endpoint"] = sixpan.get("api_url")
-    normalize_sixpan_path_sources(config, materialize_category_paths=True)
-
-    routes = config.setdefault("routes", {})
-    if isinstance(routes, dict):
-        for key, route in ROUTE_DEFAULTS.items():
-            item = routes.setdefault(key, {})
-            if isinstance(item, dict):
-                item.setdefault("route", route)

@@ -20,18 +20,12 @@ def get_openapi_spec() -> dict[str, Any]:
         "servers": [{"url": "/", "description": "当前服务"}],
         "tags": [
             {"name": "Health", "description": "健康检查"},
-            {"name": "Config", "description": "前端公开配置"},
+            {"name": "Config", "description": "服务文档与配置元数据"},
             {"name": "Public", "description": "访客公开接口，只返回裁剪字段"},
             {"name": "AdminAuth", "description": "管理员登录与会话"},
             {"name": "Admin", "description": "管理员接口，需要登录会话"},
-            {"name": "Search", "description": "资源搜索与链接识别"},
-            {"name": "Import", "description": "入库任务"},
-            {"name": "Jobs", "description": "任务中心"},
             {"name": "Rclone", "description": "rclone 搬运编排"},
             {"name": "Organizer", "description": "OpenList 标准化整理与 STRM 融合"},
-            {"name": "Quark", "description": "Quark 分享检测"},
-            {"name": "Cloud139", "description": "139 移动云官方直转与分享检测"},
-            {"name": "Media", "description": "飞牛媒体库刷新"},
             {"name": "Callback", "description": "外部/脚本回调"},
         ],
         "paths": {
@@ -68,13 +62,6 @@ def get_openapi_spec() -> dict[str, Any]:
                         "200": {"description": "依赖状态", "content": _json_schema({"type": "object"})},
                         "401": {"description": "管理员未登录", "content": _json_ref("ErrorResponse")},
                     },
-                }
-            },
-            "/api/config/public": {
-                "get": {
-                    "tags": ["Config"],
-                    "summary": "获取前端公开配置",
-                    "responses": {"200": {"description": "公开配置", "content": _json_schema({"type": "object"})}},
                 }
             },
             "/api/public/config": {
@@ -356,175 +343,6 @@ def get_openapi_spec() -> dict[str, Any]:
                 "管理员仅重试已完成六盘任务的飞牛媒体库刷新",
                 parameters=[_path("job_id", "integer", "入库任务 ID")],
             ),
-            "/api/admin/sixpan/oauth/device-code": _admin_post("管理员创建六盘 device_code 授权入口"),
-            "/api/admin/sixpan/oauth/device-code/check": _admin_post("管理员检查六盘 device_code 授权状态并保存 token"),
-            "/api/search": {
-                "post": {
-                    "tags": ["Search"],
-                    "summary": "搜索影视资源",
-                    "requestBody": _body_ref("SearchRequest"),
-                    "responses": {"200": {"description": "搜索结果", "content": _json_ref("SearchResponse")}},
-                }
-            },
-            "/api/detect": {
-                "post": {
-                    "tags": ["Search"],
-                    "summary": "识别资源链接类型和入库线路",
-                    "requestBody": _body_ref("DetectRequest"),
-                    "responses": {"200": {"description": "识别结果", "content": _json_ref("DetectResponse")}},
-                }
-            },
-            "/api/import": {
-                "post": {
-                    "tags": ["Import"],
-                    "summary": "创建入库任务",
-                    "requestBody": _body_ref("ImportRequest"),
-                    "responses": {"200": {"description": "入库结果", "content": _json_ref("JobMutationResponse")}},
-                }
-            },
-            "/api/jobs": {
-                "get": {
-                    "tags": ["Jobs"],
-                    "summary": "查询任务列表",
-                    "parameters": [
-                        _query("limit", "integer", "返回数量，默认 100，范围 1-500"),
-                        _query("status", "string", "按任务状态过滤"),
-                        _query("category", "string", "按分类过滤"),
-                        _query("source_type", "string", "按来源类型过滤"),
-                        _query("keyword", "string", "关键词搜索"),
-                    ],
-                    "responses": {"200": {"description": "任务列表", "content": _json_ref("JobListResponse")}},
-                }
-            },
-            "/api/jobs/{job_id}": {
-                "get": {
-                    "tags": ["Jobs"],
-                    "summary": "查询任务详情和事件",
-                    "parameters": [_path("job_id", "integer", "任务 ID")],
-                    "responses": {
-                        "200": {"description": "任务详情", "content": _json_schema({"type": "object"})},
-                        "404": {"description": "任务不存在", "content": _json_ref("ErrorResponse")},
-                    },
-                }
-            },
-            "/api/jobs/{job_id}/retry": {
-                "post": {
-                    "tags": ["Jobs"],
-                    "summary": "重试任务",
-                    "parameters": [_path("job_id", "integer", "任务 ID")],
-                    "responses": {"200": {"description": "重试结果", "content": _json_ref("JobMutationResponse")}},
-                }
-            },
-            "/api/media/refresh": {
-                "post": {
-                    "tags": ["Media"],
-                    "summary": "触发飞牛媒体库刷新",
-                    "requestBody": _body_ref("MediaRefreshRequest"),
-                    "responses": {"200": {"description": "刷新结果", "content": _json_schema({"type": "object"})}},
-                }
-            },
-            "/api/rclone/status": {
-                "get": {
-                    "tags": ["Rclone"],
-                    "summary": "查询 rclone 搬运状态",
-                    "responses": {"200": {"description": "rclone 状态", "content": _json_ref("RcloneStatusResponse")}},
-                }
-            },
-            "/api/rclone/start": {
-                "post": {
-                    "tags": ["Rclone"],
-                    "summary": "启动 rclone 搬运",
-                    "requestBody": _body_ref("RcloneStartRequest"),
-                    "responses": {"200": {"description": "启动结果", "content": _json_schema({"type": "object"})}},
-                }
-            },
-            "/api/rclone/stop": {
-                "post": {
-                    "tags": ["Rclone"],
-                    "summary": "停止 rclone 搬运",
-                    "responses": {"200": {"description": "停止结果", "content": _json_schema({"type": "object"})}},
-                }
-            },
-            "/api/rclone/logs": {
-                "get": {
-                    "tags": ["Rclone"],
-                    "summary": "查询 rclone 搬运日志",
-                    "parameters": [_query("limit", "integer", "日志行数，默认 200，范围 1-1000")],
-                    "responses": {"200": {"description": "日志列表", "content": _json_ref("StringListResponse")}},
-                }
-            },
-            "/api/rclone/runs": {
-                "get": {
-                    "tags": ["Rclone"],
-                    "summary": "查询 rclone 运行记录",
-                    "parameters": [_query("limit", "integer", "返回数量，默认 50，范围 1-200")],
-                    "responses": {"200": {"description": "运行记录", "content": _json_schema({"type": "object"})}},
-                }
-            },
-            "/api/rclone/events": {
-                "get": {
-                    "tags": ["Rclone"],
-                    "summary": "查询 rclone 事件",
-                    "parameters": [
-                        _query("run_id", "integer", "运行 ID，可选"),
-                        _query("limit", "integer", "返回数量，默认 200，范围 1-1000"),
-                    ],
-                    "responses": {"200": {"description": "事件列表", "content": _json_schema({"type": "object"})}},
-                }
-            },
-            "/api/rclone/files": {
-                "get": {
-                    "tags": ["Rclone"],
-                    "summary": "查询 rclone 文件级搬运记录",
-                    "parameters": [
-                        _query("run_id", "integer", "运行 ID，可选"),
-                        _query("job_id", "integer", "任务 ID，可选"),
-                        _query("status", "string", "搬运状态，可选"),
-                        _query("category", "string", "分类过滤，可选"),
-                        _query("limit", "integer", "返回数量，默认 200，范围 1-1000"),
-                    ],
-                    "responses": {"200": {"description": "文件级搬运记录", "content": _json_schema({"type": "object"})}},
-                }
-            },
-            "/api/rclone/check": {
-                "get": {
-                    "tags": ["Rclone"],
-                    "summary": "检查 rclone 编排环境",
-                    "responses": {"200": {"description": "环境检查结果", "content": _json_ref("RcloneCheckResponse")}},
-                }
-            },
-            "/api/quark/check": {
-                "post": {
-                    "tags": ["Quark"],
-                    "summary": "检测 Quark 分享有效性",
-                    "requestBody": _body_ref("QuarkCheckRequest"),
-                    "responses": {"200": {"description": "检测结果", "content": _json_schema({"type": "object"})}},
-                }
-            },
-            "/api/quark/file-list": {
-                "post": {
-                    "tags": ["Quark"],
-                    "summary": "查询 Quark 分享文件列表",
-                    "requestBody": _body_ref("QuarkFileListRequest"),
-                    "responses": {"200": {"description": "文件列表", "content": _json_schema({"type": "object"})}},
-                }
-            },
-            "/api/cloud139/check": {
-                "post": {
-                    "tags": ["Cloud139"],
-                    "summary": "检测 139 移动云分享有效性",
-                    "requestBody": _body_ref("Cloud139CheckRequest"),
-                    "responses": {"200": {"description": "检测结果", "content": _json_schema({"type": "object"})}},
-                }
-            },
-            "/api/cloud139/file-list": {
-                "post": {
-                    "tags": ["Cloud139"],
-                    "summary": "查询 139 移动云分享文件列表",
-                    "requestBody": _body_ref("Cloud139FileListRequest"),
-                    "responses": {"200": {"description": "文件列表", "content": _json_schema({"type": "object"})}},
-                }
-            },
             "/api/callback/rclone": {
                 "post": {
                     "tags": ["Callback"],
@@ -563,13 +381,6 @@ def get_openapi_spec() -> dict[str, Any]:
                         "token": {"type": "string", "description": "临时 PanSou Token"},
                     },
                     required=["keyword"],
-                ),
-                "SearchResponse": _object(
-                    {
-                        "success": {"type": "boolean"},
-                        "items": {"type": "array", "items": {"type": "object"}},
-                        "raw": {"type": "object"},
-                    }
                 ),
                 "PublicSearchResponse": _object(
                     {
@@ -610,17 +421,6 @@ def get_openapi_spec() -> dict[str, Any]:
                     {"url": {"type": "string"}, "password": {"type": "string"}},
                     required=["url"],
                 ),
-                "DetectResponse": _object({"success": {"type": "boolean"}, "link": {"type": "object"}}),
-                "ImportRequest": _object(
-                    {
-                        "title": {"type": "string"},
-                        "url": {"type": "string"},
-                        "source_url": {"type": "string"},
-                        "password": {"type": "string"},
-                        "category": {"type": "string", "enum": ["movie", "tv", "anime", "variety", "other"]},
-                    },
-                    required=["url"],
-                ),
                 "PublicSubmitRequest": _object(
                     {
                         "public_id": {"type": "string", "description": "公开搜索返回的资源 ID，例如 RS-123"},
@@ -650,15 +450,6 @@ def get_openapi_spec() -> dict[str, Any]:
                     },
                     required=["username", "password"],
                 ),
-                "JobMutationResponse": _object(
-                    {
-                        "success": {"type": "boolean"},
-                        "created": {"type": "boolean"},
-                        "message": {"type": "string"},
-                        "job": {"type": "object"},
-                        "status_label": {"type": "string"},
-                    }
-                ),
                 "BatchRetryRequest": _object(
                     {
                         "job_ids": {
@@ -669,7 +460,6 @@ def get_openapi_spec() -> dict[str, Any]:
                     },
                     required=["job_ids"],
                 ),
-                "JobListResponse": _object({"success": {"type": "boolean"}, "items": {"type": "array", "items": {"type": "object"}}}),
                 "CancelRequest": _object(
                     {
                         "reason": {"type": "string", "description": "取消或拒绝原因"},
@@ -800,31 +590,6 @@ def get_openapi_spec() -> dict[str, Any]:
                     },
                     "anyOf": [{"required": ["title"]}, {"required": ["season"]}],
                 },
-                "RcloneStatusResponse": _object({"success": {"type": "boolean"}, "status": {"type": "object"}}),
-                "StringListResponse": _object({"success": {"type": "boolean"}, "items": {"type": "array", "items": {"type": "string"}}}),
-                "RcloneCheckResponse": _object(
-                    {
-                        "success": {"type": "boolean"},
-                        "message": {"type": "string"},
-                        "items": {"type": "array", "items": {"type": "object"}},
-                    }
-                ),
-                "QuarkCheckRequest": _object(
-                    {"url": {"type": "string"}, "shareurl": {"type": "string"}, "title": {"type": "string"}, "taskname": {"type": "string"}},
-                    required=["url"],
-                ),
-                "QuarkFileListRequest": _object(
-                    {"pwd_id": {"type": "string"}, "fid": {"type": "string"}, "stoken": {"type": "string"}},
-                    required=["pwd_id"],
-                ),
-                "Cloud139CheckRequest": _object(
-                    {"url": {"type": "string"}, "shareurl": {"type": "string"}, "title": {"type": "string"}, "taskname": {"type": "string"}, "password": {"type": "string"}, "pwd": {"type": "string"}},
-                    required=["url"],
-                ),
-                "Cloud139FileListRequest": _object(
-                    {"url": {"type": "string"}, "shareurl": {"type": "string"}, "fid": {"type": "string"}, "folder_id": {"type": "string"}, "catalog_id": {"type": "string"}, "password": {"type": "string"}, "pwd": {"type": "string"}},
-                    required=["url", "fid"],
-                ),
                 "RcloneCallbackRequest": _object(
                     {
                         "run_id": {"type": "integer"},

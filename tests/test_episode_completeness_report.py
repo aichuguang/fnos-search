@@ -4,8 +4,19 @@ import unittest
 from types import SimpleNamespace
 
 from fnos_media_import.organizer.openlist_client import OpenListItem
-from fnos_media_import.organizer.parser import parse_file_name, standard_target_path
+from fnos_media_import.organizer.parser import (
+    V1_DESTINATION_FINAL_FIELD,
+    V1_DESTINATION_IS_RESOURCE_FIELD,
+    parse_file_name,
+    standard_target_path,
+)
 from fnos_media_import.organizer.service import OrganizerService, _episode_completeness_report
+from tests._organizer_v1_fixtures import (
+    attach_organizer_v1_task,
+    bind_organizer_v1_execution_repository,
+    organizer_v1_job,
+    organizer_v1_plan,
+)
 
 
 def _mapping(
@@ -109,33 +120,54 @@ class EpisodeCompletenessReportTests(unittest.TestCase):
 
         target = standard_target_path(
             category_key="tv",
-            category={"openlist_root_path": "/电视剧"},
+            category={
+                V1_DESTINATION_FINAL_FIELD: "/library/tv",
+                V1_DESTINATION_IS_RESOURCE_FIELD: False,
+            },
             title="Show",
             year="2025",
             season=0,
             episode=1,
             ext=".mkv",
         )
-        self.assertEqual(target, "/电视剧/Show (2025)/Season 00/Show (2025) - S00E01.mkv")
+        self.assertEqual(
+            target,
+            "/library/tv/Show (2025)/Season 00/Show (2025) - S00E01.mkv",
+        )
 
     def test_mapping_update_preserves_s00_and_refreshes_completeness_evidence(self) -> None:
+        final_root = "/library/tv/Show (2025)"
+        plan = organizer_v1_plan(
+            3,
+            category="tv",
+            organizer_root="/staging/Show",
+            destination_final=final_root,
+        )
+        job = organizer_v1_job(plan)
         mapping = {
             **_mapping("Show.S01E01.mkv", season=1, episode=1),
             "id": 7,
             "media_type": "tv",
             "title": "Show",
             "year": "2025",
-            "target_path": "/电视剧/Show (2025)/Season 01/Show (2025) - S01E01.mkv",
+            "source_path": "/staging/Show/Show.S01E01.mkv",
+            "target_path": f"{final_root}/Season 01/Show (2025) - S01E01.mkv",
         }
-        task = {
-            "id": 3,
-            "category": "tv",
-            "openlist_root_path": "/staging/Show",
-            "evidence": {},
-            "mappings": [mapping],
-        }
+        task = attach_organizer_v1_task(
+            {
+                "id": 3,
+                "status": "waiting_review",
+                "revision": 1,
+                "evidence": {},
+                "mappings": [mapping],
+            },
+            plan,
+        )
 
         class FakeDatabase:
+            def get_job(self, _job_id: int) -> dict:
+                return job
+
             def update_organizer_mapping(self, _mapping_id: int, **updates) -> None:
                 mapping.update(updates)
 
@@ -150,7 +182,8 @@ class EpisodeCompletenessReportTests(unittest.TestCase):
 
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
-        service.categories = {"tv": {"label": "电视剧", "openlist_root_path": "/电视剧"}}
+        service.categories = {"tv": {"label": "TV"}}
+        bind_organizer_v1_execution_repository(service, plan)
 
         result = service.update_mapping(
             7,
@@ -166,6 +199,7 @@ class EpisodeCompletenessReportTests(unittest.TestCase):
             task_id=3,
         )
 
+        self.assertTrue(result["success"])
         self.assertIn("Season 00", result["target_path"])
         self.assertIn("S00E01", result["target_path"])
         report = task["evidence"]["episode_completeness"]
@@ -173,32 +207,52 @@ class EpisodeCompletenessReportTests(unittest.TestCase):
         self.assertEqual(report["special_episodes"], [1])
 
     def test_build_plan_persists_report_in_summary_evidence(self) -> None:
+        plan = organizer_v1_plan(
+            1,
+            category="variety",
+            organizer_root="/staging/Example Show",
+            destination_final="/library/variety",
+        )
+        job = organizer_v1_job(plan)
+        task = attach_organizer_v1_task(
+            {
+                "id": 1,
+                "title": "Example Show",
+                "source_keyword": "Example Show",
+                "raw_data": {},
+            },
+            plan,
+        )
         service = OrganizerService.__new__(OrganizerService)
         service.organizer_config = {"auto_apply_confidence": 85}
         service.openlist = SimpleNamespace(exists=lambda _path: False)
         service.tmdb = SimpleNamespace(configured=False, search=lambda *_args, **_kwargs: [])
         service.ai = SimpleNamespace(configured=False)
         service.db = SimpleNamespace(
+            get_job=lambda _job_id: job,
             add_organizer_tmdb_match=lambda *_args, **_kwargs: None,
             add_organizer_ai_suggestion=lambda *_args, **_kwargs: None,
         )
-        task = {
-            "id": 1,
-            "category": "variety",
-            "title": "Example Show",
-            "source_keyword": "Example Show",
-            "openlist_root_path": "/staging/Example Show",
-            "raw_data": {},
-        }
+        bind_organizer_v1_execution_repository(service, plan)
         videos = [
-            OpenListItem(name="Example.Show.S01E01.mkv", path="/staging/Example Show/Example.Show.S01E01.mkv", is_dir=False, size=1000),
-            OpenListItem(name="Example.Show.S01E03.mkv", path="/staging/Example Show/Example.Show.S01E03.mkv", is_dir=False, size=1000),
+            OpenListItem(
+                name="Example.Show.S01E01.mkv",
+                path="/staging/Example Show/Example.Show.S01E01.mkv",
+                is_dir=False,
+                size=1000,
+            ),
+            OpenListItem(
+                name="Example.Show.S01E03.mkv",
+                path="/staging/Example Show/Example.Show.S01E03.mkv",
+                is_dir=False,
+                size=1000,
+            ),
         ]
 
         _files, _mappings, _operations, summary = service._build_plan(
             task,
             "variety",
-            {"label": "综艺", "openlist_root_path": "/综艺"},
+            {"label": "Variety"},
             videos,
         )
 

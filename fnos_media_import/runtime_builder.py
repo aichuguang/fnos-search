@@ -6,9 +6,9 @@ import threading
 from typing import Any, Callable
 
 from .importers.cloud139 import Cloud139Importer
-from .importers.generic import GenericWebhookImporter
-from .importers.quark import QuarkImporter
+from .importers.quark import ActiveQuarkImporter, QuarkImporter
 from .importers.sixpan import SixPanOfflineImporter
+from .importers.tianyi import TianyiImporter
 from .media.fnos import FnosMediaRefresher
 from .organizer.service import OrganizerService
 from .providers.btbtla import BtbtlaClient
@@ -58,13 +58,26 @@ class RuntimeBuild:
         return errors
 
 
-def organizer_defer_media_refresh(config: Any) -> bool:
+def organizer_defer_media_refresh(
+    config: Any,
+    openlist_config_provider: Callable[[], dict[str, Any]] | None = None,
+) -> bool:
     organizer = config.raw.get("organizer", {}) if isinstance(config.raw.get("organizer"), dict) else {}
-    openlist = config.raw.get("openlist", {}) if isinstance(config.raw.get("openlist"), dict) else {}
-    return bool(organizer.get("enabled", False) and str(openlist.get("base_url") or "").strip())
+    # V1 planning validates the concrete OpenList mount/connection before a
+    # transfer can start.  Runtime refresh deferral therefore follows the
+    # Organizer feature flag, not a removed process-wide OpenList URL.  The
+    # optional provider is retained only for API compatibility.
+    _ = openlist_config_provider
+    return bool(
+        organizer.get("enabled", False)
+        and organizer.get("staging_enabled", True)
+    )
 
 
-def rclone_runtime_config(config: Any) -> dict[str, Any]:
+def rclone_runtime_config(
+    config: Any,
+    openlist_config_provider: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     runtime = dict(config.raw.get("rclone", {}) or {})
     for legacy_key in ("execution_mode", "container_name", "exec_user"):
         runtime.pop(legacy_key, None)
@@ -74,7 +87,7 @@ def rclone_runtime_config(config: Any) -> dict[str, Any]:
     runtime["cache_dir"] = str(
         os.getenv("RCLONE_CACHE_DIR") or runtime.get("cache_dir") or "/cache"
     ).strip()
-    defer_refresh = organizer_defer_media_refresh(config)
+    defer_refresh = organizer_defer_media_refresh(config, openlist_config_provider)
     runtime["defer_media_refresh_to_organizer"] = defer_refresh
     if defer_refresh:
         # 新流程由 OpenList 生成并同步 STRM，飞牛监听本地目录变化即可。
@@ -87,8 +100,8 @@ def rclone_runtime_config(config: Any) -> dict[str, Any]:
     )
     runtime["staging_enabled"] = staging_enabled
     if staging_enabled:
-        # 任务级暂存只能由带固化 staging_plan 的 Job 触发。即使旧数据库
-        # 还保留了分类级定时分钟，也应在运行时关闭，避免周期性空跑和告警。
+        # V1 任务级搬运只能由固化 execution_plan 触发。即使旧数据库还保留
+        # 了分类级定时分钟，也应在运行时关闭，避免周期性空跑和告警。
         runtime["auto_interval_minutes"] = 0
     runtime["staging_dir_name"] = str(organizer.get("staging_dir_name") or "_入库暂存").strip()
     return runtime
@@ -100,25 +113,125 @@ class RuntimeBuilder:
         database: Any,
         token_update_callback: Callable[[dict[str, Any]], bool],
         owner_id: str = "",
+        quark_resolver: Callable[[], Any] | None = None,
+        openlist_config_provider: Callable[[], dict[str, Any]] | None = None,
+        organizer_openlist_client_resolver: Callable[[dict[str, Any], dict[str, Any]], Any]
+        | None = None,
     ) -> None:
         self._database = database
         self._token_update_callback = token_update_callback
         self._owner_id = str(owner_id or "").strip()
+        self._quark_resolver = quark_resolver if callable(quark_resolver) else None
+        self._openlist_config_provider = (
+            openlist_config_provider if callable(openlist_config_provider) else None
+        )
+        self._organizer_openlist_client_resolver = (
+            organizer_openlist_client_resolver
+            if callable(organizer_openlist_client_resolver)
+            else None
+        )
+
+    def set_quark_resolver(self, resolver: Callable[[], Any] | None) -> None:
+        """Bind the account-aware Quark resolver for every future runtime build.
+
+        ``RuntimeBuilder`` is also used by the hot-reload path.  A resolver set
+        only on the first ``ActiveQuarkImporter`` instance would be lost when a
+        new runtime is built, causing the wrapper to silently fall back to the
+        legacy global ``quark`` configuration.  Keeping the callback on the
+        builder makes initial and replacement builds use the same account
+        selection logic.
+        """
+
+        self._quark_resolver = resolver if callable(resolver) else None
+
+    def set_openlist_config_provider(
+        self, provider: Callable[[], dict[str, Any]] | None
+    ) -> None:
+        self._openlist_config_provider = provider if callable(provider) else None
+
+    def set_organizer_openlist_client_resolver(
+        self,
+        resolver: Callable[[dict[str, Any], dict[str, Any]], Any] | None,
+    ) -> None:
+        """Bind the task-scoped frozen OpenList resolver for future builds."""
+
+        self._organizer_openlist_client_resolver = resolver if callable(resolver) else None
+
+    def _openlist_config(self) -> dict[str, Any]:
+        if not callable(self._openlist_config_provider):
+            return {}
+        try:
+            value = self._openlist_config_provider()
+        except Exception:  # noqa: BLE001
+            return {}
+        return dict(value or {}) if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _runtime_config(config: Any, openlist: dict[str, Any]) -> Any:
+        """Return a config view containing only non-identity OpenList tuning."""
+
+        raw = dict(getattr(config, "raw", {}) or {})
+        allowed_openlist_keys = {
+            "timeout",
+            "batch_timeout",
+            "verify_tls",
+            "list_refresh_default",
+            "use_env_proxy",
+            "request_retries",
+            "retry_backoff_seconds",
+        }
+        configured = raw.get("openlist") if isinstance(raw.get("openlist"), dict) else {}
+        supplied = openlist if isinstance(openlist, dict) else {}
+        raw["openlist"] = {
+            key: value
+            for source in (configured, supplied)
+            for key, value in source.items()
+            if key in allowed_openlist_keys
+        }
+        config_type = type(config)
+        try:
+            return config_type(raw=raw, base_dir=getattr(config, "base_dir", None))
+        except TypeError:
+            return config_type(raw)
+
+    def _build_quark_importer(self, config: Any) -> ActiveQuarkImporter:
+        # Quark credentials are resolved exclusively from the active Provider
+        # account.  The fallback is intentionally empty and can never use a
+        # removed global auto-save URL/token section.
+        importer = ActiveQuarkImporter(QuarkImporter({}))
+        if self._quark_resolver is not None:
+            importer.set_resolver(self._quark_resolver)
+        return importer
 
     def build(self, config: Any, *, recover_background: bool = True) -> RuntimeBuild:
-        pansou = PanSouClient(config.raw["pansou"], config.raw.get("routes", {}))
-        btbtla = BtbtlaClient(config.raw.get("btbtla", {}), config.raw.get("routes", {}))
-        quark = QuarkImporter(config.raw["quark"])
-        cloud139_config = dict(config.raw.get("cloud139", {}) or {})
-        if organizer_defer_media_refresh(config):
-            cloud139_config["refresh_after_submit"] = False
-        cloud139 = Cloud139Importer(cloud139_config, cmcc_config=config.raw.get("cmcc_upload", {}))
+        runtime_config = self._runtime_config(config, self._openlist_config())
+        # Search source enablement and destination routing are V1 database
+        # concerns.  The search adapters keep a route argument for their
+        # low-level API shape, but must never receive the removed global
+        # ``config.routes`` section.
+        pansou = PanSouClient(runtime_config.raw["pansou"], {})
+        btbtla = BtbtlaClient(runtime_config.raw.get("btbtla", {}), {})
+        quark = self._build_quark_importer(runtime_config)
+        # 139 credentials/target paths are resolved from Provider account and
+        # storage-target bindings.  Keep an empty shell for legacy service
+        # interfaces until their callers are fully migrated; it is always
+        # reported as unconfigured rather than reading global fields.
+        cloud139 = Cloud139Importer({}, cmcc_config={})
         generic = {
-            "cloud189": GenericWebhookImporter("天翼云", config.raw.get("cloud189", {})),
-            "sixpan": SixPanOfflineImporter(config.raw.get("sixpan", {}), token_update_callback=self._token_update_callback),
+            # Cloud189 is the historical source name for Tianyi.  Do not
+            # construct a generic Webhook from global endpoint/token values;
+            # the active Tianyi Provider account is supplied by V1 planning.
+            "cloud189": TianyiImporter({}),
+            # ``sixpan`` contains only non-secret polling/parse defaults in
+            # V1.  Client identity and tokens are resolved from the active
+            # Provider account by the V1 execution adapter.
+            "sixpan": SixPanOfflineImporter(
+                runtime_config.raw.get("sixpan", {}),
+                token_update_callback=self._token_update_callback,
+            ),
         }
-        fnos = FnosMediaRefresher(config.raw["fnos"])
-        search_config = config.raw.get("search", {})
+        fnos = FnosMediaRefresher(runtime_config.raw["fnos"])
+        search_config = runtime_config.raw.get("search", {})
         providers = search_config.get("providers", {}) if isinstance(search_config.get("providers"), dict) else {}
         pansou_config = providers.get("pansou", {}) if isinstance(providers.get("pansou"), dict) else {}
         btbtla_config = providers.get("btbtla", {}) if isinstance(providers.get("btbtla"), dict) else {}
@@ -130,17 +243,28 @@ class RuntimeBuilder:
             aliases=search_config.get("aliases", {}),
         )
         search = SearchService(self._database, aggregator)
-        importer = ImportService(self._database, config, quark, fnos, cloud139_importer=cloud139, generic_importers=generic)
+        importer = ImportService(
+            self._database,
+            runtime_config,
+            quark,
+            fnos,
+            cloud139_importer=cloud139,
+            generic_importers=generic,
+        )
         organizer = OrganizerService(
             self._database,
-            config.raw,
-            config.categories,
+            runtime_config.raw,
+            runtime_config.categories,
             fnos,
             recover_on_startup=recover_background,
             owner_id=self._owner_id,
         )
+        if self._organizer_openlist_client_resolver is not None:
+            organizer.set_openlist_client_resolver(
+                self._organizer_openlist_client_resolver
+            )
         if not recover_background:
-            # Web-only 进程仍可持久化 Organizer task，但不能在本进程启动
+            # Web 进程仍可持久化 Organizer task，但不能在本进程启动
             # Timer 扫描；worker/all 进程会通过启动恢复或热重载激活它。
             organizer.suspend_background()
         return RuntimeBuild(pansou, btbtla, quark, cloud139, generic, fnos, search, importer, organizer)

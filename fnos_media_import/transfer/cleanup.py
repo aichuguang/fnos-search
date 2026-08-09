@@ -130,16 +130,18 @@ class CompositeFilesystemOps(FilesystemOps):
         return "local" if namespace_id.startswith("local:") else "openlist"
 
     def resolve_real(self, descriptor: dict[str, str]) -> str:
-        if self._kind(descriptor) == "local" and self.local_ops is not None:
+        if self._kind(descriptor) in {"local", "relay"} and self.local_ops is not None:
             return self.local_ops.resolve_real(descriptor)
         return str(descriptor.get("path") or "")
 
     def delete_tree(self, descriptor: dict[str, str]) -> dict[str, Any]:
         kind = self._kind(descriptor)
-        if kind == "local":
+        if kind in {"local", "relay"}:
             if self.local_ops is None:
                 return {"ok": False, "retryable": True, "message": "本地删除适配器未配置"}
             return self.local_ops.delete_tree(descriptor)
+        if kind == "native":
+            return {"ok": False, "refused": True, "message": "native target is not a cleanup landing"}
         if self.openlist_ops is None:
             return {"ok": False, "retryable": True, "message": "OpenList 删除适配器未配置，跳过远端清理"}
         return self.openlist_ops.delete_tree(descriptor)
@@ -167,7 +169,7 @@ def _job_scope_check(descriptor: dict[str, str], job_id: int, filesystem: Filesy
             refused=True,
             message=f"非任务级目录 {parts[-1]}，拒绝递归删除（只允许 {expected}）",
         )
-    if kind == "local" and local_roots:
+    if kind in {"local", "relay"} and local_roots:
         real = os.path.normpath(os.path.realpath(str(filesystem.resolve_real(descriptor))))
         for root in local_roots:
             root_real = os.path.normpath(os.path.realpath(root))
@@ -211,7 +213,21 @@ class TransferCleanupService:
         app_acked: bool = False,
     ) -> CleanupResult:
         if not isinstance(plan, TransferPlan):
-            plan = TransferPlan.from_dict(plan)
+            try:
+                plan = TransferPlan.from_dict(plan)
+            except Exception as exc:  # noqa: BLE001
+                # Cleanup is a safety boundary, not a reason to crash the
+                # worker.  A malformed/legacy descriptor must be represented
+                # as a durable refusal so the caller can keep the source and
+                # surface manual review; it must never be interpreted as a
+                # wildcard root.
+                return CleanupResult(
+                    ok=False,
+                    warning=False,
+                    retryable=False,
+                    reason=f"清理计划无效，拒绝删除：{exc}",
+                    items=[],
+                )
         if not target_verified or not app_acked:
             return CleanupResult(
                 ok=True,

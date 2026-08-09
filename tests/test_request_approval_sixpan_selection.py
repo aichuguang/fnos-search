@@ -141,6 +141,8 @@ class RequestApprovalSixPanSelectionTests(unittest.TestCase):
         )
         self.assertNotIn("target_path", payload["sixpan_selection"])
         self.assertNotIn("vendor_payload", payload["sixpan_selection"])
+        for field in ("destination_id", "idempotency_key", "executor_id", "config_revision"):
+            self.assertNotIn(field, payload)
 
     def test_approval_falls_back_to_nested_ignore_files(self) -> None:
         captured: dict = {}

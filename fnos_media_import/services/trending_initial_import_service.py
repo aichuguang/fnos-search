@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 import secrets
 from collections.abc import Callable, Mapping
@@ -123,7 +121,7 @@ class TrendingInitialImportService:
         submit_payload = self._import_payload(
             candidate=candidate, resource=resource, category=category, request_payload=payload
         )
-        existing = self._existing_import_result(candidate, submit_payload["idempotency_key"])
+        existing = self._existing_import_result(candidate, submit_payload)
         if existing is not None:
             return existing
         claimed = self.repository.claim_trending_candidate_for_initial_import(
@@ -135,7 +133,11 @@ class TrendingInitialImportService:
                 raise TrendingInitialImportError("\u70ed\u699c\u5019\u9009\u4e0d\u5b58\u5728", 404)
             raise TrendingInitialImportError(self._not_importable_message(latest), 409)
         try:
-            result = self.import_service().create_import_job(submit_payload)
+            imports = self.import_service()
+            creator = getattr(imports, "create_internal_import_job", None)
+            if not callable(creator):
+                creator = imports.create_import_job
+            result = creator(submit_payload)
             job = result.get("job") if isinstance(result, dict) else None
             if not isinstance(job, dict) or not job.get("id"):
                 raise RuntimeError("\u5165\u5e93\u670d\u52a1\u672a\u8fd4\u56de\u4efb\u52a1")
@@ -172,7 +174,7 @@ class TrendingInitialImportService:
             raise
 
     def _existing_import_result(
-        self, candidate: Mapping[str, Any], expected_idempotency_key: str
+        self, candidate: Mapping[str, Any], expected_request: Mapping[str, Any]
     ) -> dict[str, Any] | None:
         status = str(candidate.get("status") or "")
         job_id = candidate.get("initial_import_job_id")
@@ -183,7 +185,17 @@ class TrendingInitialImportService:
             return None
         raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), Mapping) else {}
         request = raw_data.get("request") if isinstance(raw_data.get("request"), Mapping) else raw_data
-        if str(request.get("idempotency_key") or "") != str(expected_idempotency_key or ""):
+        expected_resource_id = str(expected_request.get("resource_id") or "").strip()
+        expected_public_id = str(expected_request.get("public_id") or "").strip()
+        same_resource = bool(
+            expected_resource_id
+            and str(request.get("resource_id") or "").strip() == expected_resource_id
+        )
+        if expected_public_id:
+            same_resource = same_resource and (
+                str(request.get("public_id") or "").strip() == expected_public_id
+            )
+        if not same_resource:
             raise TrendingInitialImportError("\u8be5\u70ed\u699c\u5019\u9009\u5df2\u7ed1\u5b9a\u5176\u4ed6\u5165\u5e93\u8d44\u6e90", 409)
         current_status = self._candidate_status_for_job(job)
         if current_status != status:
@@ -303,33 +315,18 @@ class TrendingInitialImportService:
         resource_id = int(resource["id"])
         title = str(candidate.get("title") or resource.get("title") or "").strip()
         selections = self._selection_payload(request_payload)
-        requested_destination = str(request_payload.get("destination_id") or "").strip()
-        destination_id = requested_destination
-        if callable(self.resolve_destination):
-            destination_id = str(self.resolve_destination(requested_destination or None) or "").strip()
-            if requested_destination and not destination_id:
-                raise TrendingInitialImportError(
-                    f"\u5b58\u50a8\u76ee\u6807\u4e0d\u5b58\u5728\u3001\u5df2\u7981\u7528\u6216\u5f53\u524d\u4e0d\u53ef\u7528\uff1a{requested_destination}"
-                )
-        selection_text = json.dumps(selections, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(
-            f"{url}\n{category}\n{destination_id}\n{selection_text}".encode("utf-8")
-        ).hexdigest()[:24]
         result: dict[str, Any] = {
             "title": title,
             "url": url,
             "password": str(resource.get("password") or raw.get("password") or ""),
             "category": category,
-            "idempotency_key": f"trending:{int(candidate['id'])}:resource:{resource_id}:{digest}",
-            "config_revision": int(self.runtime_revision() or 1),
-            "executor_id": str(self.executor_id() or "web"),
+            "resource_id": resource_id,
             "trending_candidate_id": int(candidate["id"]),
             "trending_resource_id": resource_id,
             **selections,
         }
-        if destination_id:
-            result["destination_id"] = destination_id
         if public_id:
+            result["public_id"] = public_id
             result["trending_public_id"] = public_id
         return result
 

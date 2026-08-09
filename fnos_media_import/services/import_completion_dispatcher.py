@@ -3,18 +3,23 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from ..constants import (
+    EVENT_INFO,
+    EVENT_WARN,
     JOB_DONE,
     JOB_SUBMITTED,
     JOB_WAITING_OPENLIST,
     JOB_WAITING_ORGANIZER,
     JOB_WAITING_TRANSFER,
 )
-from .import_staging_service import rclone_copy_run_from_job, rclone_staging_run_from_job
-from .import_planner import execution_plan_from_job
+from ..planning.job_plan import plan_strategy, validated_v1_execution_plan_from_job
+from .execution_plan_guard import (
+    plan_requires_organizer,
+    v1_plan_or_review,
+)
 
 
 class ImportCompletionDispatcher:
-    """Dispatches completed import jobs to rclone staging or Organizer."""
+    """Dispatch completion only through the canonical durable V1 queue."""
 
     def __init__(
         self,
@@ -23,11 +28,15 @@ class ImportCompletionDispatcher:
         rclone_service: Any,
         category: Callable[[str], dict[str, Any]],
         enqueue_organizer: Callable[[dict[str, Any], str], dict[str, Any] | None],
+        enqueue_transfer: Callable[[int], Any] | None = None,
+        execution_repository: Any = None,
     ) -> None:
         self.database = database
         self.rclone_service = rclone_service
         self.category = category
         self.enqueue_organizer = enqueue_organizer
+        self.enqueue_transfer = enqueue_transfer
+        self.execution_repository = execution_repository
 
     def dispatch(self, result: dict[str, Any], reason: str) -> dict[str, Any] | None:
         if not isinstance(result, dict) or not result.get("success", True):
@@ -35,106 +44,157 @@ class ImportCompletionDispatcher:
         job = result.get("job") if isinstance(result.get("job"), dict) else {}
         if not job:
             return None
+        plan, rejection = v1_plan_or_review(
+            self.database,
+            job,
+            context="入库完成分发时",
+            execution_repository=self.execution_repository,
+        )
+        if rejection:
+            result["execution_rejection"] = rejection
+            return rejection
+
         status = str(job.get("status") or "").strip()
-        if self.uses_rclone_staging(job) and status in {JOB_WAITING_TRANSFER, JOB_WAITING_OPENLIST}:
-            return self._start_and_record(result, job, reason)
+        if status in {JOB_WAITING_TRANSFER, JOB_WAITING_OPENLIST}:
+            if callable(self.enqueue_transfer):
+                return self._enqueue_transfer_and_record(result, job, reason)
+            return self._queue_unavailable(job, reason, plan_strategy(plan))
+
         raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
         cloud139_saved = (
             status == JOB_SUBMITTED
             and str(job.get("source_type") or "").strip().lower() == "cloud139"
             and isinstance(raw_data.get("save"), dict)
         )
-        if status in {JOB_DONE, JOB_WAITING_OPENLIST, JOB_WAITING_ORGANIZER} or cloud139_saved:
+        if (
+            plan_requires_organizer(plan)
+            and (status in {JOB_DONE, JOB_WAITING_OPENLIST, JOB_WAITING_ORGANIZER} or cloud139_saved)
+        ):
             return self.enqueue_organizer(result, reason)
-        if status != JOB_WAITING_TRANSFER:
-            return None
-        return self._start_and_record(result, job, reason)
+        return None
 
-    def start_rclone_for_job(self, job: dict[str, Any], reason: str) -> dict[str, Any] | None:
+    def start_rclone_for_job(
+        self,
+        job: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any] | None:
         if not job:
             return None
         job_id = _job_id(job)
-        category_key = str(job.get("category") or "").strip()
-        try:
-            copy_run = rclone_copy_run_from_job(job)
-            staging_run = rclone_staging_run_from_job(job)
-        except ValueError as exc:
-            result = {"success": False, "message": f"拒绝启动 rclone：{exc}"}
-            if job_id:
-                self.database.add_event(job_id, "error", result["message"], {"reason": reason})
-            return result
-        run = copy_run or staging_run
-        execution = execution_plan_from_job(job)
-        if execution and not run:
-            strategy = str((execution.get("transfer") or {}).get("strategy") or "").strip().lower()
+        plan, rejection = v1_plan_or_review(
+            self.database,
+            job,
+            context="启动 rclone 时",
+            execution_repository=self.execution_repository,
+        )
+        if rejection:
+            return rejection
+        strategy = plan_strategy(plan)
+        if strategy != "rclone_copy":
             result = {
                 "success": False,
                 "skipped": True,
-                "message": f"v3 任务策略 {strategy or 'missing'} 不应启动 rclone Worker",
+                "message": f"V1 任务策略 {strategy or 'missing'} 不应由 rclone 完成分发入口启动",
             }
             if job_id:
-                self.database.add_event(job_id, "warn", result["message"], {"reason": reason})
+                self.database.add_event(job_id, EVENT_WARN, result["message"], {"reason": reason})
             return result
-        if run:
-            # The category key is a stable worker alias. Runtime labels and
-            # library names may be edited after this job has been created.
-            category_filter = run["category"]
-            result = self.rclone_service.start(
-                reason=reason,
-                category_filter=category_filter,
-                staging_run=run,
-            )
-        else:
-            category = self.category(category_key)
-            category_filter = str(
-                category.get("fnos_lib")
-                or job.get("category_label")
-                or category.get("label")
-                or category_key
-            ).strip()
-            result = self.rclone_service.start(reason=reason, category_filter=category_filter)
+
+        if callable(self.enqueue_transfer):
+            return self._enqueue_transfer_and_record({}, job, reason)
+        return self._queue_unavailable(job, reason, strategy)
+
+    def uses_rclone_staging(self, job: dict[str, Any]) -> bool:
+        """Return whether a *validated* V1 plan owns rclone staging.
+
+        This helper is used by completion/recovery code as a dispatch hint.  A
+        permissive envelope reader here would let a malformed or partially
+        migrated job re-enter the rclone path before the durable transfer
+        worker has a chance to reject it.  Treat every validation failure as
+        ``False``; callers that need the actionable rejection reason use
+        :meth:`start_rclone_for_job`, which records manual review.
+        """
+        try:
+            if self.execution_repository is not None:
+                from .execution_plan_guard import require_v1_execution_plan
+
+                plan = require_v1_execution_plan(
+                    job,
+                    execution_repository=self.execution_repository,
+                )
+            else:
+                plan = validated_v1_execution_plan_from_job(job)
+        except Exception:  # noqa: BLE001 - status/query helper must fail closed
+            return False
+        return plan_strategy(plan) == "rclone_copy"
+
+    def _queue_unavailable(
+        self,
+        job: dict[str, Any],
+        reason: str,
+        strategy: str,
+    ) -> dict[str, Any]:
+        job_id = _job_id(job)
+        message = "V1 持久化传输队列未配置，任务未启动并需要人工检查"
+        rejection = {
+            "success": False,
+            "rejected": True,
+            "manual_review": True,
+            "job_id": job_id,
+            "message": message,
+        }
         if job_id:
-            event_data = {"reason": reason, "category_filter": category_filter, "rclone": result}
-            if run:
-                event_data["staging_run"] = run
             self.database.add_event(
                 job_id,
-                "info" if result.get("success") else "warn",
-                result.get("message") or "已通知 rclone 搬运队列",
-                event_data,
+                EVENT_WARN,
+                message,
+                {"reason": reason, "strategy": strategy},
             )
-        return result
+        return rejection
 
-    @staticmethod
-    def uses_rclone_staging(job: dict[str, Any]) -> bool:
-        execution = execution_plan_from_job(job)
-        if execution:
-            transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
-            return str(transfer.get("strategy") or "").strip().lower() in {
-                "rclone_copy",
-                "relay_upload",
-            }
-        source_type = str((job or {}).get("source_type") or "").strip().lower()
-        target_route = str((job or {}).get("target_route") or "").strip().lower()
-        return source_type in {"quark", "uc"} or target_route == "quark_to_mobile"
-
-    def _start_and_record(
+    def _enqueue_transfer_and_record(
         self,
         result: dict[str, Any],
         job: dict[str, Any],
         reason: str,
-    ) -> dict[str, Any] | None:
-        start_result = self.start_rclone_for_job(job, reason)
-        result["rclone_start"] = start_result
+    ) -> dict[str, Any]:
+        """Queue the canonical V1 transfer exactly once.
+
+        ``WorkerTaskDispatcher.import_transfer_execute`` is idempotent by
+        job id.  Treat a callback returning ``None`` as an unavailable queue,
+        rather than claiming that the transfer was queued successfully.
+        External callers may return either the normal worker result mapping or
+        a simple truthy value, so normalize both forms here.
+        """
+
         job_id = _job_id(job)
-        if job_id and isinstance(start_result, dict):
-            if start_result.get("queued"):
-                level, message = "info", "rclone 正在搬运，当前任务已加入后续自动搬运队列"
-            elif start_result.get("success"):
-                level, message = "info", "已通知 rclone 开始搬运当前分类"
-            else:
-                level, message = "warn", start_result.get("message") or "rclone 自动搬运启动失败"
-            self.database.add_event(job_id, level, message, start_result)
+        try:
+            queued = self.enqueue_transfer(job_id) if callable(self.enqueue_transfer) else None
+        except Exception as exc:  # noqa: BLE001 - persist a bounded failure
+            queued = {"success": False, "message": str(exc)}
+        if isinstance(queued, dict):
+            start_result = dict(queued)
+        else:
+            start_result = {
+                "success": queued is not None and queued is not False,
+                "queued": queued is not None and queued is not False,
+                "worker": queued,
+            }
+        start_result.setdefault("job_id", job_id)
+        start_result.setdefault(
+            "message",
+            "V1 持久化传输任务已入队"
+            if start_result.get("success")
+            else "V1 transfer queue is unavailable",
+        )
+        result["transfer_queue"] = start_result
+        if job_id:
+            self.database.add_event(
+                job_id,
+                EVENT_INFO if start_result.get("success") else EVENT_WARN,
+                start_result["message"],
+                {"reason": reason, "transfer": start_result},
+            )
         return start_result
 
 

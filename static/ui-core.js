@@ -1,5 +1,6 @@
 (function () {
     const DEFAULT_FOCUSABLE = "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex='-1'])";
+    let adminCsrfToken = "";
 
     function escapeHtml(value) {
         return String(value ?? "")
@@ -27,9 +28,25 @@
             allowFailure = false,
             headers = {},
             onUnauthorized = null,
+            credentials = "same-origin",
             ...fetchOptions
         } = options;
-        const response = await fetch(path, { headers, ...fetchOptions });
+        const body = fetchOptions.body;
+        const isFormData = typeof FormData !== "undefined" && body instanceof FormData;
+        const requestHeaders = { ...headers };
+        const hasContentType = Object.keys(requestHeaders).some(
+            (key) => key.toLowerCase() === "content-type",
+        );
+        // Keep JSON request headers in one place. FormData must remain untouched
+        // so the browser can generate its multipart boundary automatically.
+        if (!isFormData && body != null && !hasContentType) {
+            requestHeaders["Content-Type"] = "application/json";
+        }
+        const response = await fetch(path, {
+            credentials,
+            headers: requestHeaders,
+            ...fetchOptions,
+        });
         const data = await response.json().catch(() => ({}));
         if (response.status === 401 && typeof onUnauthorized === "function") onUnauthorized(response, data);
         if (!response.ok || (!allowFailure && data.success === false)) {
@@ -39,6 +56,28 @@
             throw error;
         }
         return data;
+    }
+
+    async function requestAdminJson(path, options = {}) {
+        const method = String(options.method || "GET").toUpperCase();
+        const headers = { ...(options.headers || {}) };
+        if (!adminCsrfToken && !["GET", "HEAD", "OPTIONS"].includes(method)) {
+            const sessionResponse = await fetch("/api/admin/session", { credentials: "same-origin" });
+            const sessionData = await sessionResponse.json().catch(() => ({}));
+            adminCsrfToken = String(sessionData.csrf_token || "");
+        }
+        if (adminCsrfToken && !Object.keys(headers).some((key) => key.toLowerCase() === "x-csrf-token")) {
+            headers["X-CSRF-Token"] = adminCsrfToken;
+        }
+        return requestJson(path, {
+            ...options,
+            credentials: "same-origin",
+            headers,
+            onUnauthorized: (response, data) => {
+                adminCsrfToken = "";
+                options.onUnauthorized?.(response, data);
+            },
+        });
     }
 
     function rememberAndFocus(container, preferred = null) {
@@ -111,6 +150,7 @@
         escapeHtml,
         showToast,
         requestJson,
+        requestAdminJson,
         rememberAndFocus,
         restoreFocus,
         trapFocus,

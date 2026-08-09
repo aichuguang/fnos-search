@@ -56,73 +56,6 @@ class RcloneRecoveryPaginationTests(unittest.TestCase):
         self.assertEqual(self.database.run_offsets, [0, 500])
 
 
-class RcloneOrphanEventPaginationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        self.db_path = root / f"rclone-orphan-pagination-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
-        self.job_id, created = self.database.create_job(
-            {
-                "title": "Old match",
-                "category": "tv",
-                "category_label": "电视剧",
-                "source_type": "quark",
-                "source_url": "https://pan.quark.cn/s/old-match",
-                "target_route": "quark_to_mobile",
-                "target_path": "/移动云/电视剧/Old match",
-                "status": "waiting_transfer",
-                "idempotency_key": f"orphan-pagination:{uuid.uuid4().hex}",
-            }
-        )
-        self.assertTrue(created)
-        self.service = RcloneWaitingJobRecoveryService(
-            database=self.database,
-            state_lock=threading.Lock(),
-            is_running=lambda: False,
-            file_identity=lambda _event: "",
-            is_pollution_file=lambda _name: False,
-            finalize_run=lambda _run_id, _exit_code: None,
-        )
-
-    def tearDown(self) -> None:
-        for suffix in ("", "-wal", "-shm"):
-            candidate = Path(f"{self.db_path}{suffix}")
-            if candidate.exists():
-                candidate.unlink()
-
-    def test_old_match_is_relinked_after_more_than_one_page_of_new_orphans(self) -> None:
-        old_event_id = self.database.add_rclone_file_event(
-            status="done",
-            level="info",
-            category="电视剧",
-            filename="Old.Match.S01E01.mkv",
-            source_path="quark/Old Match/Old.Match.S01E01.mkv",
-            target_path="webdav/电视剧/Old Match/Old.Match.S01E01.mkv",
-        )
-        with self.database.connect() as connection:
-            connection.executemany(
-                """
-                INSERT INTO rclone_file_events
-                (run_id, job_id, status, level, category, filename, source_path,
-                 target_path, message, raw_data, created_at)
-                VALUES (NULL, NULL, 'done', 'info', '电影', ?, '', '', '', NULL, ?)
-                """,
-                [
-                    (f"unmatched-{index:03d}.mkv", "2026-07-31T00:00:00Z")
-                    for index in range(501)
-                ],
-            )
-
-        relinked = self.service._relink_unmatched_events(limit=1)
-
-        self.assertEqual(relinked, [old_event_id])
-        self.assertEqual(
-            self.database.get_rclone_file_event(old_event_id)["job_id"],
-            self.job_id,
-        )
-
-
 class _LeaseDatabase:
     def __init__(self) -> None:
         self.release_count = 0
@@ -311,22 +244,26 @@ class PublicAdapterCapabilityTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(item["route_enabled"])
+        self.assertFalse(item["route_enabled"])
         self.assertFalse(item["configured"])
         self.assertFalse(item["enabled"])
         self.assertFalse(item["capabilities"]["submit"])
 
     def test_configured_cloud189_webhook_exposes_submit_capability(self) -> None:
+        class ConfiguredCloud189:
+            @staticmethod
+            def describe() -> dict:
+                return {
+                    "adapter_type": "cloud189_provider",
+                    "configured": True,
+                    "capabilities": {"submit": True},
+                    "message": "天翼云 Provider 账号已配置",
+                }
+
         item = self._cloud189(
             _public_adapter_capabilities(
-                {
-                    "routes": {"cloud189": {"enabled": True}},
-                    "cloud189": {"endpoint": "https://example.invalid/import"},
-                    "cloud139": {},
-                    "cmcc_upload": {},
-                    "sixpan": {},
-                    "quark": {},
-                }
+                {},
+                generic_importers={"cloud189": ConfiguredCloud189()},
             )
         )
 

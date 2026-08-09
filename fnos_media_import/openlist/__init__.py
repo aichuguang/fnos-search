@@ -31,7 +31,7 @@ class OpenListValidationError(OpenListError):
 
 
 class OpenListMasterKeyError(OpenListError):
-    """缺少或无法解析 FNOS_ACCOUNT_MASTER_KEY。"""
+    """缺少或无法解析 FNOS_ROOT_KEY。"""
 
 
 class OpenListCredentialError(OpenListError):

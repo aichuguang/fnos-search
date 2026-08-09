@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fnos_media_import.services.callback_service import CallbackDependencies, RcloneCallbackService
+from tests._rclone_v1_fixtures import rclone_v1_job
 
 
 def _safe_int(value, default, minimum, maximum) -> int:
@@ -23,12 +24,7 @@ def _safe_int(value, default, minimum, maximum) -> int:
 
 class _CallbackDatabase:
     def __init__(self, job_status: str) -> None:
-        self.job = {
-            "id": 42,
-            "status": job_status,
-            "category": "tv",
-            "raw_data": {},
-        }
+        self.job = rclone_v1_job(job_id=42, status=job_status)
         self.updates: list[dict] = []
         self.job_events: list[tuple] = []
         self.file_events: list[dict] = []
@@ -85,8 +81,8 @@ class CallbackTerminalAckTests(unittest.TestCase):
                 "status": "done",
                 "category": "tv",
                 "filename": "E01.mkv",
-                "source_path": "/source/E01.mkv",
-                "target_path": "/target/E01.mkv",
+                "source_path": "/quark/tv/job-42/E01.mkv",
+                "target_path": "/openlist/staging/tv/job-42/E01.mkv",
                 "message": "completion raced with cancellation",
             }
         )
@@ -108,8 +104,8 @@ class CallbackTerminalAckTests(unittest.TestCase):
                 "status": "done",
                 "category": "tv",
                 "filename": "E01.mkv",
-                "source_path": "/source/E01.mkv",
-                "target_path": "/target/E01.mkv",
+                "source_path": "/quark/tv/job-42/E01.mkv",
+                "target_path": "/openlist/staging/tv/job-42/E01.mkv",
                 "message": "late completion after cancellation",
             }
         )
@@ -185,8 +181,8 @@ class CallbackTerminalAckTests(unittest.TestCase):
                             "status": callback_status,
                             "category": "tv",
                             "filename": "E01.mkv",
-                            "source_path": "/source/E01.mkv",
-                            "target_path": "/target/E01.mkv",
+                            "source_path": "/quark/tv/job-42/E01.mkv",
+                            "target_path": "/openlist/staging/tv/job-42/E01.mkv",
                             "message": "late callback",
                         }
                     )
@@ -218,8 +214,8 @@ class CallbackTerminalAckTests(unittest.TestCase):
                 "status": "done",
                 "category": "tv",
                 "filename": "E01.mkv",
-                "source_path": "/source/E01.mkv",
-                "target_path": "/target/E01.mkv",
+                "source_path": "/quark/tv/job-42/E01.mkv",
+                "target_path": "/openlist/staging/tv/job-42/E01.mkv",
             }
         )
 

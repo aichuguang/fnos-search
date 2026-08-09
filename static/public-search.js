@@ -23,6 +23,7 @@
             handleQuarkFolderOpen,
             handleQuarkSelectionChange,
             handleCloud139SelectionChange,
+            handleTianyiSelectionChange,
             submitPublicResource,
             renderPublicResourceDetail,
             isPublicSubmitConfirmOpen,
@@ -236,6 +237,19 @@
                 item?.provider,
             ].filter(Boolean).join(" ").toLowerCase();
             return raw.includes("cloud139") || raw.includes("139") || raw.includes("mobile") || raw.includes("移动") || raw.includes("cloud139_direct");
+        }
+
+        function isTianyiCandidate(item) {
+            const raw = [
+                item?.source_type,
+                item?.source_hint,
+                item?.source,
+                item?.route,
+                item?.source_url,
+                item?.source_url_masked,
+                item?.provider,
+            ].filter(Boolean).join(" ").toLowerCase();
+            return raw.includes("cloud189") || raw.includes("189") || raw.includes("tianyi") || raw.includes("天翼") || raw.includes("cloud189_direct");
         }
 
         function sortPublicResources(items) {
@@ -636,6 +650,10 @@
                     event.stopPropagation();
                     handleCloud139SelectionChange(input);
                 },
+                onTianyiSelection: (input, event) => {
+                    event.stopPropagation();
+                    handleTianyiSelectionChange(input);
+                },
             });
             root.querySelectorAll("[data-quark-action]").forEach((button) => {
                 button.addEventListener("click", (event) => {
@@ -659,6 +677,20 @@
                 });
             });
             root.querySelectorAll("[data-cloud139-open]").forEach((row) => {
+                row.addEventListener("click", (event) => {
+                    if (event.target.closest("input, label")) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    toggleResourceFolder(row.dataset.filePublicId, row.dataset.fileFid);
+                });
+                row.addEventListener("keydown", (event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    toggleResourceFolder(row.dataset.filePublicId, row.dataset.fileFid);
+                });
+            });
+            root.querySelectorAll("[data-tianyi-open]").forEach((row) => {
                 row.addEventListener("click", (event) => {
                     if (event.target.closest("input, label")) return;
                     event.preventDefault();
@@ -762,6 +794,7 @@
             isBtbtlaCandidate,
             isQuarkCandidate,
             isCloud139Candidate,
+            isTianyiCandidate,
             sortPublicResources,
             inferQuality,
             categoryConfidenceText,

@@ -4,6 +4,8 @@ import posixpath
 import re
 from typing import Any
 
+from ..planning.job_plan import plan_strategy, validated_v1_execution_plan_from_job
+
 
 class RcloneJobFeasibilityEvaluator:
     """Determines whether rclone evidence is sufficient to complete an import job."""
@@ -22,7 +24,44 @@ class RcloneJobFeasibilityEvaluator:
 
     @classmethod
     def evaluate(cls, job: dict[str, Any], events: list[dict[str, Any]], exit_code: int) -> dict[str, Any]:
-        manifest_required = cls.requires_staging_manifest(job)
+        """Evaluate only a validated V1 ``rclone_copy`` execution plan.
+
+        Legacy ``staging_plan``/v3/raw-data evidence is intentionally not an
+        execution source.  Returning ``manual_review`` instead of raising keeps
+        recovery workers alive while preventing an old task from being marked
+        done or handed to Organizer.
+        """
+        try:
+            plan = validated_v1_execution_plan_from_job(job)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ready": False,
+                "status": "manual_review",
+                "manual_review": True,
+                "error_code": "UNSUPPORTED_PLAN_VERSION",
+                "message": f"rclone feasibility requires a valid V1 execution_plan: {exc}",
+                "expected_file_count": 0,
+                "completed_file_count": 0,
+                "manifest_required": False,
+                "missing_manifest_file_count": 0,
+                "missing_manifest_files": [],
+                "failed_file_count": 0,
+            }
+        if plan_strategy(plan) != "rclone_copy":
+            return {
+                "ready": False,
+                "status": "manual_review",
+                "manual_review": True,
+                "error_code": "INVALID_PLAN",
+                "message": "rclone feasibility only accepts V1 rclone_copy plans",
+                "expected_file_count": 0,
+                "completed_file_count": 0,
+                "manifest_required": False,
+                "missing_manifest_file_count": 0,
+                "missing_manifest_files": [],
+                "failed_file_count": 0,
+            }
+        manifest_required = True
         manifest_paths = cls.staging_manifest_paths(job) if manifest_required else []
         manifest_path_set = set(manifest_paths)
         statuses = [str(event.get("status") or "").strip().lower() for event in events]
@@ -46,7 +85,7 @@ class RcloneJobFeasibilityEvaluator:
             "expected_file_count": expected,
             "completed_file_count": completed_count,
             "expected_file_count_source": (
-                "staging_manifest" if manifest_paths else "unknown" if manifest_required else "legacy_raw_data"
+                "staging_manifest" if manifest_paths else "v1_verification"
             ),
             "manifest_required": manifest_required,
             "missing_manifest_file_count": len(missing_manifest_files),
@@ -63,6 +102,7 @@ class RcloneJobFeasibilityEvaluator:
                 completed_count > 0
                 and not failed_files
                 and expected > 0
+                and bool(manifest_paths)
                 and completed_count >= expected
                 and (not manifest_required or not missing_manifest_files)
             ):
@@ -102,6 +142,14 @@ class RcloneJobFeasibilityEvaluator:
                 "ready": False,
                 "status": "transferring",
                 "message": "任务级 rclone 未持久化可信文件清单，已阻止提前移交 Organizer",
+                **common,
+                "failed_file_count": 0,
+            }
+        if manifest_required and not manifest_paths:
+            return {
+                "ready": False,
+                "status": "transferring",
+                "message": "rclone task manifest is required before completion can be acknowledged",
                 **common,
                 "failed_file_count": 0,
             }
@@ -160,49 +208,28 @@ class RcloneJobFeasibilityEvaluator:
 
     @classmethod
     def expected_file_count(cls, job: dict[str, Any]) -> int:
-        if cls.requires_staging_manifest(job):
-            return len(cls.staging_manifest_paths(job))
-        raw = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        candidates = [
-            cls.find_first_value(raw, {"expected_file_count", "file_count", "file_num", "fileCount"}),
-            cls.find_first_value(
-                raw.get("check") if isinstance(raw.get("check"), dict) else {},
-                {"file_count", "file_num", "fileCount"},
-            ),
-        ]
-        for value in candidates:
-            try:
-                number = int(str(value).strip())
-            except (TypeError, ValueError):
-                continue
-            if number > 0:
-                return number
-        return 0
+        """Read expected count only from the frozen V1 verification block."""
+        try:
+            plan = validated_v1_execution_plan_from_job(job)
+        except Exception:  # noqa: BLE001
+            return 0
+        verification = plan.get("verification") if isinstance(plan.get("verification"), dict) else {}
+        try:
+            value = int(verification.get("expected_file_count") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+        return len(cls.staging_manifest_paths(job)) if cls.requires_staging_manifest(job) else 0
 
     @classmethod
     def requires_staging_manifest(cls, job: dict[str, Any]) -> bool:
-        raw = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-        execution = raw.get("execution_plan") if isinstance(raw.get("execution_plan"), dict) else {}
-        transfer = execution.get("transfer") if isinstance(execution.get("transfer"), dict) else {}
+        """Whether a validated V1 copy run needs its persisted source manifest."""
         try:
-            execution_version = int(execution.get("version") or 0)
-            job_plan_version = int(job.get("plan_version") or 0)
-        except (TypeError, ValueError):
-            execution_version = 0
-            job_plan_version = 0
-        if (
-            job_plan_version >= 3
-            and execution_version == job_plan_version
-            and str(transfer.get("strategy") or "").strip() in {"rclone_copy", "relay_upload"}
-        ):
-            return True
-        plan = raw.get("staging_plan") if isinstance(raw.get("staging_plan"), dict) else {}
-        try:
-            version = int(plan.get("version") or 0)
-        except (TypeError, ValueError):
-            version = 0
-        route = str(plan.get("route") or job.get("target_route") or "").strip().lower()
-        return bool(plan.get("enabled") and version >= 2 and route == "quark_to_mobile")
+            plan = validated_v1_execution_plan_from_job(job)
+        except Exception:  # noqa: BLE001
+            return False
+        return plan_strategy(plan) == "rclone_copy"
 
     @classmethod
     def staging_manifest_paths(cls, job: dict[str, Any]) -> list[str]:

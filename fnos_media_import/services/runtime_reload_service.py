@@ -61,6 +61,7 @@ class RuntimeReloadService:
         rollback_logger: Callable[[], None],
         advanced_config_key: str,
         organizer_dispatcher: Any | None = None,
+        openlist_config_provider: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.load_config = load_config
         self.builder = builder
@@ -76,6 +77,9 @@ class RuntimeReloadService:
         self.config_int = config_int
         self.rollback_logger = rollback_logger
         self.advanced_config_key = advanced_config_key
+        self.openlist_config_provider = (
+            openlist_config_provider if callable(openlist_config_provider) else None
+        )
         # Kept as an optional constructor argument for compatibility with
         # existing composition tests. Dispatcher publication belongs to the
         # app closure, after its config/service references have been updated.
@@ -159,12 +163,15 @@ class RuntimeReloadService:
             run_at=str(hot_discovery.get("run_at") or "08:30"),
         )
         self.rclone_service.apply_runtime_config(
-            rclone_runtime_config(config),
+            rclone_runtime_config(config, self.openlist_config_provider),
             config.raw["fnos"],
             config.categories,
-            config.raw.get("cmcc_upload", {}),
-            config.raw.get("cloud139", {}),
-            config.raw.get("storage", {}),
+            # Provider credentials, destinations and mount identities are
+            # resolved from V1 account/target bindings.  Never feed removed
+            # global sections back into the rclone service during reload.
+            {},
+            {},
+            {},
         )
 
 
@@ -180,11 +187,6 @@ def _preserve_runtime_secrets(current_config: Any, reloaded_config: Any) -> None
     """Keep process-scoped secrets that are resolved after the base config loads."""
     current_raw = current_config.raw if isinstance(getattr(current_config, "raw", None), dict) else {}
     reloaded_raw = reloaded_config.raw if isinstance(getattr(reloaded_config, "raw", None), dict) else {}
-
-    current_app = current_raw.get("app") if isinstance(current_raw.get("app"), dict) else {}
-    secret_key = str(current_app.get("secret_key") or "").strip()
-    if secret_key:
-        reloaded_raw.setdefault("app", {})["secret_key"] = secret_key
 
     current_security = current_raw.get("security") if isinstance(current_raw.get("security"), dict) else {}
     ip_hash_salt = str(current_security.get("ip_hash_salt") or "").strip()

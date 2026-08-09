@@ -92,6 +92,7 @@
         }));
         root.querySelectorAll("[data-quark-select]").forEach((input) => input.addEventListener("change", (event) => handlers.onQuarkSelection?.(input, event)));
         root.querySelectorAll("[data-cloud139-select]").forEach((input) => input.addEventListener("change", (event) => handlers.onCloud139Selection?.(input, event)));
+        root.querySelectorAll("[data-tianyi-select]").forEach((input) => input.addEventListener("change", (event) => handlers.onTianyiSelection?.(input, event)));
     }
 
     function detailValue(response = {}) {
@@ -114,6 +115,7 @@
         const type = String(value || "").toLowerCase();
         if (type.includes("quark") || type.includes("uc") || type.includes("夸克")) return "quark";
         if (type.includes("139") || type.includes("mobile") || type.includes("移动")) return "cloud139";
+        if (type.includes("189") || type.includes("tianyi") || type.includes("天翼")) return "tianyi";
         if (type.includes("magnet") || type.includes("torrent") || type.includes("sixpan") || type.includes("bt")) return "sixpan";
         return "generic";
     }
@@ -165,6 +167,11 @@
             const selectedFolders = chosen.filter((item) => item.is_dir || item.directory || item.type === "dir" || item.type === 1);
             const selectedFiles = chosen.filter((item) => !selectedFolders.includes(item));
             return chosen.length ? { cloud139_selection: { mode: "items", selected_files: selectedFiles, selected_folders: selectedFolders } } : {};
+        }
+        if (kind === "tianyi") {
+            const selectedFolders = chosen.filter((item) => item.is_dir || item.directory || item.type === "dir" || item.type === 1);
+            const selectedFiles = chosen.filter((item) => !selectedFolders.includes(item));
+            return chosen.length ? { tianyi_selection: { mode: "items", selected_files: selectedFiles, selected_folders: selectedFolders } } : {};
         }
         if (kind === "sixpan") {
             if (!chosen.length) return {};

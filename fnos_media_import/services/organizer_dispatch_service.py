@@ -269,7 +269,17 @@ class OrganizerDispatchService:
     def _unavailable_reason(self) -> str:
         if not self.organizer.enabled:
             return "Organizer 未启用，已提交资源但不能确认完整整理入库"
-        if not self.organizer.openlist.configured:
+        status_reader = getattr(self.organizer, "status", None)
+        if callable(status_reader):
+            openlist_ready = bool((status_reader() or {}).get("openlist_configured"))
+        else:
+            # Lightweight protocol fakes may expose only ``openlist``.  The
+            # production OrganizerService always takes the resolver-backed
+            # status branch above.
+            openlist_ready = bool(
+                getattr(getattr(self.organizer, "openlist", None), "configured", False)
+            )
+        if not openlist_ready:
             return "OpenList 未配置，已提交资源但不能确认标准目录"
         return ""
 
