@@ -10,7 +10,12 @@ Docker Compose 首次启动会自动创建空文件：
 rclone/config/rclone.conf
 ```
 
-使用夸克到移动云等 rclone 搬运线路前，优先在管理后台“系统设置 → 飞牛与 rclone”中配置并检测连接。页面会通过 Worker 自动写入 `[MP]`，密码不回显，连接失败时会恢复原配置。
+启用跨 Provider 来源落地、受控本地下载或通用 OpenList 目标前，优先在管理后台“系统设置 → 飞牛与 rclone”中配置并检测连接。页面会通过 Worker 自动写入 `[MP]`，密码不回显，连接失败时会恢复原配置。
+
+移动云和天翼作为跨 Provider 目标时，rclone **只负责把来源下载到**
+`/data/relay/job-<id>`。最终文件写入分别由移动云原生 API uploader 和
+189CloudPC 原生 API uploader 完成；OpenList/WebDAV 仅承担来源读取、目标可见性与
+Organizer 的 MOVE/DELETE，不是这两个目标的上传数据面。
 
 如果是源码调试或页面无法使用，也可以复制示例后手工编辑：
 
@@ -30,58 +35,36 @@ cp rclone/config/rclone.conf.example rclone/config/rclone.conf
 RCLONE_REMOTE_NAME=你的remote名
 ```
 
-## 推荐：通过 OpenList WebDAV 统一访问
+## 通过 OpenList WebDAV 读取来源
 
-如果 OpenList 已经挂载了夸克和移动云，可以把 `MP` 配成 OpenList 的 WebDAV 根目录。
+如果 OpenList 已经挂载 Provider，可以把 `MP` 配成 OpenList 的 WebDAV 根目录。
 
-这样脚本会访问：
-
-```text
-MP:离线下载/电影
-MP:移动云盘A/电影
-```
-
-实际对应 OpenList 中的目录。
-
-## 目录映射必须一致
-
-默认情况下，本系统认为：
+Worker 会按冻结执行计划访问任务级来源 landing，例如：
 
 ```text
-Quark 自动转存目录 = MP:离线下载/电影
-rclone 搬运目标目录 = MP:移动云盘A/电影
-飞牛媒体库扫描目录 = MP:移动云盘A/电影 对应的真实目录
+MP:夸克账号/任务落地/job-123
 ```
 
-其他分类默认如下：
+跨 Provider 写入移动云或天翼时，rclone 的目标是受控本地目录：
 
 ```text
-MP:离线下载/电视剧  -> MP:移动云盘A/电视剧
-MP:离线下载/动漫    -> MP:移动云盘A/动漫
-MP:离线下载/综艺    -> MP:移动云盘A/综艺
-MP:离线下载/其他    -> MP:移动云盘A/其他
+/data/relay/job-123
 ```
 
-如果 OpenList 里的实际目录不同，优先在管理后台“分类路径”中配置。旧版环境变量仍然兼容：
+随后 Python Provider uploader 使用计划冻结的目标账号 ID、revision 和原生目录 ID 直连云盘 API 上传。
 
-```env
-RCLONE_SRC_MOVIE_DIR=夸克/离线下载/电影
-RCLONE_DST_MOVIE_DIR=移动云/影视/电影
-RCLONE_SRC_TV_DIR=夸克/离线下载/电视剧
-RCLONE_DST_TV_DIR=移动云/影视/电视剧
-RCLONE_SRC_ANIME_DIR=夸克/离线下载/动漫
-RCLONE_DST_ANIME_DIR=移动云/影视/动漫
-RCLONE_SRC_VARIETY_DIR=夸克/离线下载/综艺
-RCLONE_DST_VARIETY_DIR=移动云/影视/综艺
-RCLONE_SRC_OTHER_DIR=夸克/离线下载/其他
-RCLONE_DST_OTHER_DIR=移动云/影视/其他
-```
+## 目录与能力边界
 
-自检：
+- 来源、目标、账号修订和任务目录全部来自 V1 冻结执行计划，不再读取旧版分类目录环境变量。
+- `RCLONE_SRC_*_DIR`、`RCLONE_DST_*_DIR` 等旧配置不会参与新任务规划。
+- 普通 `rclone_copy` 只能写入计划允许的通用 OpenList 目标或 `/storage-targets` 受控本地目标。
+- `relay_upload_provider` 只能下载到 `/data/relay/job-<id>`；移动云和天翼的最终写入必须走各自原生 API。
+- 移动云和天翼保存位置必须同时通过 `upload_verified` 与 `organizer_mutation_verified`，WebDAV writable 不能代替原生上传证明。
+
+只读自检示例：
 
 ```bash
 docker exec fnos-rclone-worker rclone lsf "MP:你的源目录" --max-depth 1 --config /config/rclone/rclone.conf --cache-dir /cache
-docker exec fnos-rclone-worker rclone lsf "MP:你的目标目录" --max-depth 1 --config /config/rclone/rclone.conf --cache-dir /cache
 ```
 
 ## 密码处理

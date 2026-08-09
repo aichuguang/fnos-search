@@ -1,9 +1,9 @@
 # V1.0 多链路改造验证记录
 
-更新时间：2026-08-09  
-工作区：`C:\WorkSpace\fnos-search`  
-分支：`faat_0806_入库流程改造`  
-HEAD：`c454fa3`
+更新时间：2026-08-09
+工作区：`C:\WorkSpace\fnos-search`
+分支：`faat_0806_入库流程改造`
+验证代码提交：`2500a34`
 
 ## 1. 本轮目标
 
@@ -117,7 +117,7 @@ OK
 - 移动、夸克、天翼同源直转；
 - 六盘磁链离线；
 - OpenList/rclone 跨盘复制；
-- 跨盘到移动 relay；
+- 跨 Provider 到移动云/天翼的原生 API relay；
 - Organizer 开启/关闭矩阵；
 - Worker 重启、长任务续租和真实 Provider receipt reconcile。
 
@@ -198,3 +198,91 @@ OK
 - `tests.test_source_encoding`。
 
 未执行真实外部天翼账号或真实转存任务。部署后仍需使用非生产账号验证一次搜索结果预览、子目录展开、勾选提交，以及一次手动天翼链接提交。
+
+## 10. 天翼保存目录 WebDAV PUT 405 原生链路降级（2026-08-09）
+
+现场现象：当前 OpenList 实例的 `189CloudPC`（天翼云盘客户端）挂载能够认证、列举和创建目录，但 WebDAV `PUT` 文件上传返回 HTTP 405。官方源码确认 `189CloudPC` 实现了 `Put`，并支持 `stream`、`rapid`、`old` 三种上传方式；同时 OpenList WebDAV 层会把 `fs.PutDirectly` 返回的任意非 NotFound 错误统一映射为 HTTP 405。因此，405 不是“WebDAV 或天翼驱动不支持上传”的能力结论，而是当前实例底层上传失败后的笼统状态码，真实错误仍需查看 OpenList 容器同一时刻的 `PUT /dav/...` 日志。
+
+本轮最终产品策略：天翼同源入库继续使用 Provider `native_save`；跨 Provider 入库则使用 `relay_upload_provider`，先把来源落到本地临时目录，再通过冻结账号修订对应的 189CloudPC 原生 API 上传到天翼。OpenList 在这条链路中负责目录可见性和 Organizer 的读取、MOVE、DELETE，不负责上传文件字节。因此，WebDAV `PUT` 405 不再阻断天翼作为跨盘目标，但也不代表当前 OpenList WebDAV 上传故障已经修复。
+
+本轮完成：
+
+- `TIANYI_MANIFEST` 与 `TianyiProviderAdapter` 已声明并装配 relay 能力，冻结账号修订后可构造天翼上传器和原生目录浏览器；
+- 管理端保存位置支持直接浏览天翼原生目录并保存真实 `folder_id`，同时保留用于回显的目录名称；
+- 新增 189CloudPC 原生递归上传：分片哈希、上传初始化、预签名分片 PUT、秒传提交、子目录创建、进度回调、durable manifest 幂等和重启 fence；
+- 上传完成后按 durable manifest 中的文件 ID、相对路径和大小精确校验，不能仅凭目录总数或模糊名称判定成功；
+- 保存位置创建时必须完成“天翼原生上传并列举确认”以及“OpenList 读取、MOVE、DELETE”两份证明，证明指纹绑定 Provider、账号修订、原生目录、OpenList 连接修订和 WebDAV 根目录；缺少任一证明均失败关闭；
+- mount 探测仍真实执行 WebDAV `PUT`。PUT 405 时天翼 mount 持久化为 `readable=true / writable=false`，但已通过上述两份原生证明后仍可作为 Provider relay 目标；
+- Planner 对天翼同源选择 `native_save`，对夸克/移动等跨源选择 `relay_upload_provider / provider_relay`，并冻结目标账号修订、mount 修订、原生 `folder_id` 与本地 relay 临时目录；
+- Planner、PlanValidator 与 Storage Setup 均拒绝将“WebDAV 可写”冒充移动云或天翼原生上传证明；两个 Provider 都必须具备显式双证明；
+- 管理端展示“原生上传已验证”“OpenList 整理已验证”“WebDAV 只读”等独立能力状态，路由说明明确跨盘数据由目标云盘原生 API 上传；
+- 非 relay Provider 遇到相同 PUT 405 仍按 `OPENLIST_PROBE_FAILED` 失败关闭并补偿删除半成品 mount。
+
+定向验证：
+
+- 天翼上传协议与递归 relay：`tests.test_tianyi_upload_v1` 10 项通过；
+- 天翼同源、夸克到天翼 relay、Planner/Validator 双证明：`tests.test_multilink_v1_integration` 6 项通过；
+- Storage Setup、PUT 405、原生目录、双证明和预检：`tests.test_storage_setup_v1` 29 项通过；
+- 传输分派、Provider 契约、V1 退役、管理端 UI/缓存与源码编码等定向组合：合计 80 项通过；
+- `node --check static/admin-storage-v1.js`、`python -m compileall -q fnos_media_import`、相关文件 `ruff check`、`tests.test_source_encoding` 和全工作树 `git diff --check` 通过。
+
+未访问真实天翼账号，也未执行真实外部上传。部署后仍需使用非生产账号完成一次小文件原生上传探测、一次跨 Provider relay、一次 Organizer 整理，并结合 OpenList 与本服务日志确认完整链路。
+
+## 11. V1 旧代码全量硬切换最终门禁（2026-08-09）
+
+### 11.1 固定架构结论
+
+- 移动云与天翼都是冻结账号修订驱动的 Provider 原生 API 直传目标；rclone 只负责把来源下载到受控 `/data/relay/job-<id>`。
+- Mobile 使用 `CmccMobileUploader`，Tianyi 使用 `TianyiCloudUploader`；两者都由 `ProviderRelayExecutor` 执行并在 ACK 后清理。
+- Shell 中已删除的只是脚本内嵌 Provider 上传后端，不影响 Python Provider API relay。
+- Mobile/Tianyi 保存位置都必须具备 `native_locator.upload_verified` 与 `native_locator.organizer_mutation_verified`；WebDAV writable 不得冒充任一证明。
+
+### 11.2 本轮收尾修复
+
+- rclone callback 强制要求冻结 `job-N` 目录，测试补充空值与非法目录拒绝；完成 ACK 必须明确 `delete_source_allowed=true`。
+- rclone Worker 头部文案改为“script-embedded provider upload backends retired”，避免误读为 Provider relay 被退役。
+- 删除无调用的 `evaluate_bt_content_risk` 兼容 façade 与 `TransferVerifier.__call__` 裸调用兼容。
+- 更新设计、存储、部署和回滚文档，统一使用 `relay_upload_provider`，并明确 Mobile/Tianyi 双 Provider API relay。
+
+### 11.3 最终测试结果
+
+使用测试进程内的 Windows tempfile ACL 继承方案执行：
+
+```text
+Ran 983 tests in 171.812s
+
+OK
+```
+
+安装 pytest 后全量执行：
+
+```text
+992 passed, 174 subtests passed in 179.60s
+```
+
+定向复核：
+
+- rclone callback、dispatch、Worker 隔离、冻结描述符与 Storage V1 退役：`57` 项通过；
+- Mobile/Tianyi 双原生证明、Provider、Planner、Validator 与 dispatch：`71` 项通过；
+- retired façade、Transfer 与 native protocol：`84` 项通过。
+
+静态门禁：
+
+- `python -m compileall -q fnos_media_import tests scripts`：通过；
+- `python -m ruff check fnos_media_import tests`：通过；
+- `tests.test_source_encoding`：通过；
+- Git Bash `bash -n scripts/fnos_rclone_worker.sh`：通过；
+- 所有最终修改 JavaScript 的 `node --check`：通过；
+- 工作树与文档暂存区 `git diff --check` / `git diff --cached --check`：通过。
+
+### 11.4 未执行项
+
+当前环境未访问真实 Provider 账号、未绕过验证码，也未执行真实外部上传。以下仍属于发布维护窗口门槛，不能记为已通过：
+
+- Quark、Tianyi、Mobile、SixPan 非生产账号只读探测；
+- 四 Provider 对应传输流程；
+- 跨 Provider 到 Mobile 的移动云 API relay；
+- 跨 Provider 到 Tianyi 的 189CloudPC API relay；
+- OpenList、Organizer、取消、重试和 Worker 重启恢复。
+
+执行步骤与回滚要求见 `docs/v1-hard-cutover-deploy.md`。

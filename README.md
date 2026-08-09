@@ -140,7 +140,9 @@ docker compose logs -f fnos-media-import
 
 ### 配置 rclone
 
-只有使用夸克到移动云等 rclone 搬运线路时，才需要完成这一步。
+只有启用跨 Provider 来源落地、受控本地下载或通用 OpenList 目标时，才需要完成这一步。
+移动云和天翼作为目标时，rclone 只把来源下载到本地 relay，最终写入分别由移动云 API 和
+189CloudPC API 完成，不通过 rclone/WebDAV 上传文件字节。
 
 登录管理后台，进入“系统设置 → 飞牛与 rclone”，填写以下内容：
 
@@ -221,7 +223,7 @@ cp .env.example .env
 | `RCLONE_CONFIG_HOST_PATH` | `./rclone/config` | 强烈建议确认 | `rclone.conf` 持久化目录，保存 OpenList WebDAV Remote 配置。 |
 | `RCLONE_CACHE_HOST_PATH` | `./rclone/cache` | 按需 | rclone 缓存目录，可清理，但运行中不要删除。 |
 | `RCLONE_TEMP_HOST_PATH` | `./rclone/temp` | 建议配置 | 搬运完整媒体文件的临时目录，应放在空间充足的磁盘。 |
-| `FNOS_RELAY_HOST_PATH` | `./rclone/relay` | 建议配置 | 跨盘到移动云时的共享中继目录，Web 与 Worker 都挂载到 `/data/relay`。应放在空间充足的磁盘。 |
+| `FNOS_RELAY_HOST_PATH` | `./rclone/relay` | 建议配置 | 跨 Provider 写入移动云或天翼时的共享中继目录，Web 与 Worker 都挂载到 `/data/relay`。rclone 只负责下载，随后由目标 Provider 原生 API uploader 上传；应放在空间充足的磁盘。 |
 | `RCLONE_LOCAL_STORAGE_HOST_PATH` | `./rclone/local-storage` | 按需 | 本地存储目标的宿主机挂载目录，挂载到 Worker 的 `/storage-targets`。仅当使用本地文件夹目标时配置，必须指向预先挂载的独立目录，不能复用 `APP_DATA_HOST_PATH`。 |
 | `FNOS_ROOT_KEY` | 无 | 必填 | 唯一的 32 字节根密钥，填写 64 位 hex。程序通过 HKDF-SHA256 为 Flask 会话、账号、OpenList、授权会话、来源快照和通知派生隔离子密钥。可用 `openssl rand -hex 32` 生成。 |
 | `RCLONE_WORKER_CONTROL_TOKEN` | 空，自动生成 | 新部署不要填写 | Web 与独立 rclone Worker 之间的内部 Bearer Token。留空时生成并保存到 `APP_DATA_HOST_PATH/.secrets/rclone_worker_control_token`，重新编排会继续使用原值。 |
@@ -253,27 +255,49 @@ TMDB、通知和分类目录也全部在管理后台配置，不放进 `.env`。
 
 ### 更新版本
 
-拉取新镜像不会覆盖宿主机上的 `app.db`。但从旧版单容器/辅助 rclone 容器架构升级时，
-**必须同时替换 `docker-compose.yml`，不能只拉取新镜像**。完整顺序如下：
+完整维护窗口、冒烟与回滚清单见 [V1 v29 硬切换发布与回滚手册](docs/v1-hard-cutover-deploy.md)。
 
-1. 备份当前 `APP_DATA_HOST_PATH`。
-2. 从当前发布版本下载新的 `docker-compose.yml`，覆盖面板或项目中的旧编排内容。
-3. 确认新旧编排使用相同的 `APP_DATA_HOST_PATH`。
-4. 执行：
+拉取新镜像不会覆盖宿主机上的 `app.db`。但从旧版单容器/辅助 rclone 容器架构升级时，
+**必须同时替换 `docker-compose.yml`，不能只拉取新镜像**。该版本包含数据库 v29 破坏性硬切换，
+必须使用维护窗口，禁止新旧容器并存。完整顺序如下：
+
+1. 备份当前 `APP_DATA_HOST_PATH`、`FNOS_ROOT_KEY`、配置目录和 rclone 配置。
+2. 停止 Web、Worker、Scheduler 及旧版辅助容器，确认没有进程继续连接 `app.db`。
+3. 下载新的 `docker-compose.yml`，确认仍使用原 `APP_DATA_HOST_PATH`，然后拉取新镜像。
+4. 在不启动服务的情况下运行硬切换预演，审核保留/删除数量、关联清理数量和 ID 集合哈希：
 
 ```bash
+docker compose down
 docker compose pull
+docker compose run --rm --no-deps fnos-media-import \
+  python -m fnos_media_import.v1_cutover \
+  --database /app/data/app.db --dry-run
+```
+
+5. 确认预演结果后执行 `--apply`。命令会获取独占锁、生成迁移前数据库备份、升级到 v29 并执行外键检查：
+
+```bash
+docker compose run --rm --no-deps fnos-media-import \
+  python -m fnos_media_import.v1_cutover \
+  --database /app/data/app.db --apply
+```
+
+6. 只有迁移成功后才启动全部新版本进程并执行健康检查：
+
+```bash
 docker compose up -d --remove-orphans
 docker compose ps
 curl -fsS "http://127.0.0.1:${APP_PORT:-5251}/readyz"
 ```
 
+7. 使用非生产目录验证任务创建、四 Provider 只读探测、移动云/天翼原生 API relay、OpenList、Organizer、取消与恢复后，再解除维护模式。
+
 `--remove-orphans` 只有在新编排已经生效后，才能识别并删除旧版辅助容器。若仍使用旧编排，
 新镜像不会再兼容旧角色变量，也不会以 Web-only 模式降级；旧编排缺少显式
 `FNOS_PROCESS_ROLE` 时容器会直接启动失败，因此必须先替换编排再更新镜像。
 
-数据库会在原文件上自动升级。发生数据库迁移时，程序会在
-`APP_DATA_HOST_PATH/backups` 中自动创建迁移前备份。
+迁移框架仍保留数据库升级能力，但现有部署不得依赖应用启动时自动完成 v29；发布流程必须先离线运行上述
+硬切换 CLI。CLI 会在 `APP_DATA_HOST_PATH/backups` 中创建迁移前备份并在 JSON 摘要中返回路径。
 
 `FNOS_ROOT_KEY` 不写入数据库，必须与数据备份分开保存；修改或丢失后，新版敏感数据将无法解密，
 现有浏览器登录会话也会全部失效。应用签名密钥由根密钥按 `app-session` 用途稳定派生，不写入
@@ -385,7 +409,8 @@ Docker 重启策略恢复。短暂重启期间，Web 查询会自动进行有限
 APP_VERSION=1.2.0
 ```
 
-回滚旧镜像时，需要同时恢复升级前的 `data` 备份，不能只修改镜像标签。
+回滚旧镜像时，必须先停止全部新版本进程，再恢复 v29 前的 `data` 备份并启动旧镜像；不能只修改镜像标签，
+旧镜像也不能直接读取 v29 数据库。
 
 ### 当前兼容范围
 

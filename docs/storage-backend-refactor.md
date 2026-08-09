@@ -55,15 +55,16 @@ OpenList 地址和凭证、保存目录、remote、mount 均不得放入环境�
 | --- | --- |
 | 同 Provider 原生转存 | `native_save` |
 | 磁链进入六盘 | `native_offline` |
-| 可读来源进入非移动目标 | `rclone_copy` |
-| 非移动来源进入移动云 | `relay_upload_mobile` |
+| 可读来源进入普通 OpenList/本地目标 | `rclone_copy` |
+| 跨 Provider 来源进入移动云或天翼 | `relay_upload_provider` |
 
 约束：
 
 - 同源必须使用 Provider 原生能力，禁止静默降级为跨盘复制；
 - 磁链只允许六盘原生离线；
 - `rclone_copy` 必须冻结 `source_landing`、`destination_staging` 和 `destination_final`；
-- `relay_upload_mobile` 必须冻结 `source_landing`、`local_temp` 和 `destination_final`；
+- `relay_upload_provider` 必须冻结 `source_landing`、`local_temp`、目标 Provider、目标账号修订和 `destination_final`；
+- 移动云与天翼 relay 都由目标 Provider 原生 API uploader 执行，WebDAV writable 不能替代 `upload_verified` 与 `organizer_mutation_verified` 双证明；
 - 路径、能力或修订缺失时任务进入审核/拒绝，不从当前配置猜测。
 
 ## 5. 执行计划
@@ -89,8 +90,8 @@ OpenList 地址和凭证、保存目录、remote、mount 均不得放入环境�
 保存同一份 V1 快照供只读状态展示。执行器必须使用数据库计划真源并重新校验 hash、版本、任务 ID、
 策略、执行器和必需路径。
 
-缺少有效 V1 计划的历史任务不得启动 rclone、Organizer、回调确认、六盘轮询或自动重试；系统应将其
-转入 `review_required` / `rejected`，由管理员基于新版配置重新提交。
+缺少有效 V1 计划的历史任务不得启动 rclone、Organizer、回调确认、六盘轮询或自动重试；v29 硬切换
+会直接删除这些任务及其执行关联。访客请求、追更候选和热榜候选按迁移规则解除任务绑定并记录明确状态。
 
 ## 6. OpenList 与本地路径
 
@@ -98,7 +99,7 @@ OpenList 地址和凭证、保存目录、remote、mount 均不得放入环境�
 - target 必须绑定明确的 connection/mount/revision 和 storage identity；
 - Provider 原生路径、OpenList 虚拟路径、rclone remote path、本地 relay path 不得混用；
 - 本地目标仅允许位于 `/storage-targets` 的受控挂载；
-- 移动云中继仅允许位于 `/data/relay/job-<id>` 的任务目录；
+- 移动云/天翼 Provider relay 仅允许位于 `/data/relay/job-<id>` 的任务目录；
 - 写入前必须执行规范化、realpath containment 和符号链接/重解析点防护。
 
 ## 7. 一次性硬切换
@@ -114,7 +115,9 @@ OpenList 地址和凭证、保存目录、remote、mount 均不得放入环境�
 
 数据库 migration 文件继续保留，以保证结构升级历史可追踪；保留 migration 不代表保留旧运行时行为。
 
-升级前必须备份 `data/`。已有部署应把原账号主密钥的值原样改名为 `FNOS_ROOT_KEY`；若数据库中仍是
+升级前必须停止 Web、Worker、Scheduler，并先运行 `python -m fnos_media_import.v1_cutover --database <app.db> --dry-run`；
+审核删除摘要后再使用 `--apply` 获取独占锁、生成备份、执行 v29 和外键检查。已有部署应把原账号主密钥的值
+原样改名为 `FNOS_ROOT_KEY`；若数据库中仍是
 不受支持的旧密文格式，必须在后台重新登录账号、重新保存 OpenList 和通知凭据。
 
 ## 8. 最低验收
@@ -124,6 +127,6 @@ OpenList 地址和凭证、保存目录、remote、mount 均不得放入环境�
 - 访客无法覆盖 assignment；
 - 新任务只生成 V1 计划，计划 hash 可重复验证；
 - 历史无效计划不会触发任何外部副作用；
-- 四种策略均覆盖主流程、幂等重试、取消和失败转审核；
+- `native_save`、`native_offline`、`rclone_copy`、`relay_upload_provider` 四种策略均覆盖主流程、幂等重试、取消和失败转审核；
 - Web/Worker 共用数据库与 relay，但仅 Worker 直接执行 rclone；
 - `/readyz` 区分进程健康与业务尚未配置，不因没有保存位置阻止 Web 启动。
