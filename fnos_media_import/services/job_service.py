@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from ..database import Database
+from ..repositories.repository_set import JobRepositories
 
 
 PHASE_LABELS = {
@@ -23,47 +23,42 @@ DONE_STATUSES = {"done", "success", "completed", "skipped", "skipped_existing"}
 
 
 class JobService:
-    def __init__(self, db: Database):
+    def __init__(self, db: JobRepositories):
         self.db = db
 
     def list_jobs(self, limit: int = 100, status: str | None = None) -> list[dict[str, Any]]:
-        return self.db.list_jobs(limit=limit, status=status)
+        return self.db.job_queries.list(limit=limit, status=status)
 
     def get_job_with_events(self, job_id: int) -> dict[str, Any] | None:
-        job = self.db.get_job(job_id)
+        job = self.db.job_queries.get(job_id)
         if not job:
             return None
 
-        events = self.db.list_events(job_id)
-        guest_requests = self.db.list_guest_requests_by_job(job_id)
+        events = self.db.job_queries.list_events(job_id)
+        guest_requests = self.db.guest_request_queries.list_by_job(job_id)
         request_ids = [int(item["id"]) for item in guest_requests if item.get("id")]
-        guest_events_by_request = self.db.list_guest_request_events_for_requests(request_ids)
+        guest_events_by_request = self.db.guest_request_queries.list_events_for_requests(request_ids)
         for guest_request in guest_requests:
             request_id = int(guest_request.get("id") or 0)
             guest_request["events"] = guest_events_by_request.get(request_id, [])
 
-        rclone_file_events = self.db.list_all_rclone_file_events(job_id=job_id)
-        organizer_task_rows = self.db.list_organizer_tasks_by_job(job_id, limit=100)
+        rclone_file_events = self.db.rclone.list_all_rclone_file_events(job_id=job_id)
+        organizer_task_rows = self.db.organizer.list_organizer_tasks_by_job(job_id, limit=100)
         organizer_tasks: list[dict[str, Any]] = []
         organizer_operations: list[dict[str, Any]] = []
         for task_row in organizer_task_rows:
             task_id = int(task_row.get("id") or 0)
-            detail = self.db.get_organizer_task(task_id) if task_id else None
+            detail = self.db.organizer.get_organizer_task(task_id) if task_id else None
             task = detail or task_row
             organizer_tasks.append(task)
             organizer_operations.extend(task.get("operations") or [])
 
         organizer_task_ids = [int(item["id"]) for item in organizer_tasks if item.get("id")]
-        organizer_runs = self.db.list_organizer_runs_by_task_ids(organizer_task_ids)
-        worker_repository = getattr(self.db, "worker_tasks", None)
-        worker_tasks = (
-            worker_repository.list_related(
-                job_id=job_id,
-                guest_request_ids=request_ids,
-                organizer_task_ids=organizer_task_ids,
-            )
-            if worker_repository and hasattr(worker_repository, "list_related")
-            else []
+        organizer_runs = self.db.organizer.list_organizer_runs_by_task_ids(organizer_task_ids)
+        worker_tasks = self.db.worker_tasks.list_related(
+            job_id=job_id,
+            guest_request_ids=request_ids,
+            organizer_task_ids=organizer_task_ids,
         )
         latest_organizer_task = organizer_tasks[0] if organizer_tasks else None
         organizer_mappings = (latest_organizer_task or {}).get("mappings") or []

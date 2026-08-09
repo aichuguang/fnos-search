@@ -85,10 +85,12 @@ class PublicBtResolveService:
             "url": resolved["magnet"],
             "source_url": resolved["magnet"],
             "source_type": "magnet",
+            "provider_kind": "sixpan",
+            "source_form": "magnet",
+            "search_source_id": "sixpan_magnet",
             "source": "btbtla",
             "source_hint": "btbtla",
             "supported": bool(resolved.get("supported")),
-            "route": resolved.get("route") or "sixpan_offline",
             "reason": "BTBTLA 下载资源已解析为磁链",
             "size_text": raw.get("size_text") or "",
             "raw_data": {

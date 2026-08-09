@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import requests
 
-from fnos_media_import.app import _cloud139_scan_filters_from_job
+from fnos_media_import.path_planning import _cloud139_scan_filters_from_job
 from fnos_media_import.organizer.openlist_client import (
     OpenListClient,
     OpenListEndpointUnsupported,
@@ -24,7 +26,7 @@ from tests._organizer_v1_fixtures import (
 )
 
 
-class _JsonResponse:
+class _JsonResponse(RepositoryFakeMixin):
     def __init__(
         self,
         payload: dict | None,
@@ -402,7 +404,9 @@ class OrganizerTransientScanTests(unittest.TestCase):
             plan,
         )
         service = OrganizerService.__new__(OrganizerService)
-        service.db = SimpleNamespace(get_job=lambda _job_id: job)
+        service.db = SimpleNamespace(
+            job_queries=SimpleNamespace(get=lambda _job_id: job)
+        )
         service.categories = {"tv": {"label": "TV", "openlist_root_path": root}}
         service.organizer_config = {"max_scan_depth": 8, "max_files_per_task": 500}
         service.openlist = SimpleNamespace(scan_videos=Mock())
@@ -437,7 +441,9 @@ class OrganizerTransientScanTests(unittest.TestCase):
             plan,
         )
         service = OrganizerService.__new__(OrganizerService)
-        service.db = SimpleNamespace(get_job=lambda _job_id: job)
+        service.db = SimpleNamespace(
+            job_queries=SimpleNamespace(get=lambda _job_id: job)
+        )
         service.categories = {"tv": {"label": "TV", "openlist_root_path": root}}
         service.organizer_config = {"max_scan_depth": 8, "max_files_per_task": 500}
         service.openlist = SimpleNamespace(scan_videos=Mock(return_value=[]))
@@ -457,7 +463,12 @@ class OrganizerTransientScanTests(unittest.TestCase):
     def test_stale_timer_does_not_rerun_an_already_failed_task(self) -> None:
         service = OrganizerService.__new__(OrganizerService)
         service.db = SimpleNamespace(
-            get_organizer_task=lambda _task_id, include_children=False: {"id": 17, "status": "failed"}
+            organizer=SimpleNamespace(
+                get_organizer_task=lambda _task_id, include_children=False: {
+                    "id": 17,
+                    "status": "failed",
+                }
+            )
         )
         service.process_task = Mock()
 
@@ -487,7 +498,7 @@ class OrganizerTransientScanTests(unittest.TestCase):
             plan,
         )
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.updates: list[tuple[int, dict]] = []
 
@@ -497,8 +508,29 @@ class OrganizerTransientScanTests(unittest.TestCase):
             def get_organizer_task(self, _task_id: int, *, include_children: bool = False) -> dict:
                 return dict(task)
 
+            def claim_organizer_task_for_scan(self, _task_id: int, *, owner_id: str, **_kwargs) -> bool:
+                task["status"] = "scanning"
+                task["revision"] = int(task.get("revision") or 1) + 1
+                task["scan_owner"] = owner_id
+                return True
+
+            @staticmethod
+            def renew_organizer_scan(*_args, **_kwargs) -> bool:
+                return True
+
+            @staticmethod
+            def owns_organizer_scan(*_args, **_kwargs) -> bool:
+                return True
+
             def update_organizer_task(self, task_id: int, **updates) -> None:
                 self.updates.append((task_id, updates))
+                task.update(
+                    {
+                        key: value
+                        for key, value in updates.items()
+                        if key not in {"expected_statuses", "expected_revision", "clear_scan_lease"}
+                    }
+                )
 
         client = SimpleNamespace(
             configured=True,
@@ -545,7 +577,7 @@ class OrganizerTransientScanTests(unittest.TestCase):
             plan,
         )
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.updates: list[tuple[int, dict]] = []
 

@@ -7,17 +7,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import posixpath
 import re
 import secrets
 import logging
+import time
 from dataclasses import asdict
 from typing import Any
 
 from ..config import CATEGORY_KEYS
 from ..constants import CATEGORY_LABELS
 from ..domain.models import LocalLocator, NativeLocator, OpenListLocator, RcloneLocator, TargetCategory
+from ..time_utils import utc_now_iso
 
 
 logger = logging.getLogger("fnos_media_import.storage_setup")
@@ -80,12 +83,177 @@ class StorageSetupService:
         mount_service: Any,
         target_service: Any,
         assignment_service: Any,
+        connection_factory: Any,
     ) -> None:
         self.accounts = accounts_service
         self.connections = connection_service
         self.mounts = mount_service
         self.targets = target_service
         self.assignments = assignment_service
+        self.connection_factory = connection_factory
+        self.provider_uploader_resolver: Any = None
+        self.provider_folder_resolver: Any = None
+
+    def set_provider_uploader_resolver(self, resolver: Any) -> None:
+        """Inject the account-revision-scoped native uploader factory."""
+
+        self.provider_uploader_resolver = resolver
+
+    def set_provider_folder_resolver(self, resolver: Any) -> None:
+        """Inject an account-revision-scoped native folder browser."""
+
+        self.provider_folder_resolver = resolver
+
+    def _provider_catalog_item(self, provider_kind: str) -> dict[str, Any]:
+        normalized = _text(provider_kind).lower()
+        return next(
+            (
+                dict(item)
+                for item in self.accounts.catalog()
+                if _text(item.get("provider_kind")).lower() == normalized
+            ),
+            {},
+        )
+
+    def _supports_relay_upload(self, provider_kind: str) -> bool:
+        provider = self._provider_catalog_item(provider_kind)
+        return bool((provider.get("capabilities") or {}).get("supports_relay_upload"))
+
+    def _mount_native_proofs(
+        self,
+        provider_kind: str,
+        mount: dict[str, Any] | None,
+    ) -> tuple[bool, bool]:
+        """Return frozen native-upload and Organizer mutation proof state.
+
+        Every relay-upload Provider, including Mobile and Tianyi, writes the
+        destination through its native API.  Therefore both native upload and
+        Organizer mutation must be explicitly proven for the frozen account,
+        connection and mount revision.  WebDAV writability is never a native
+        upload proof.
+        """
+
+        value = dict(mount or {})
+        native_locator = dict(value.get("native_locator") or {})
+        relay_upload_capable = self._supports_relay_upload(provider_kind)
+        upload_verified = bool(native_locator.get("upload_verified"))
+        organizer_verified = bool(
+            native_locator.get("organizer_mutation_verified")
+            or (not relay_upload_capable and value.get("writable"))
+        )
+        return upload_verified, organizer_verified
+
+    def _provider_uploader(
+        self,
+        provider_kind: str,
+        account_id: str,
+        revision: int,
+    ) -> Any:
+        if not callable(self.provider_uploader_resolver):
+            raise StorageSetupError(
+                "Provider 原生上传运行时尚未装配",
+                code="PROVIDER_UPLOAD_UNAVAILABLE",
+                status=503,
+            )
+        try:
+            uploader = self.provider_uploader_resolver(
+                _text(provider_kind),
+                _text(account_id),
+                int(revision or 0),
+            )
+        except StorageSetupError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalize composition failures
+            raise StorageSetupError(
+                "Provider \u539f\u751f\u4e0a\u4f20\u5668\u521d\u59cb\u5316\u5931\u8d25",
+                code="PROVIDER_UPLOAD_UNAVAILABLE",
+                status=503,
+                retryable=True,
+            ) from exc
+        if uploader is None:
+            raise StorageSetupError(
+                "所选 Provider 未提供原生上传器",
+                code="PROVIDER_UPLOAD_UNAVAILABLE",
+                status=503,
+            )
+        return uploader
+
+    def list_account_folders(
+        self,
+        account_id: str,
+        parent_id: str = "",
+    ) -> dict[str, Any]:
+        account = self.accounts.get_account(_text(account_id))
+        if account is None or not account.enabled:
+            raise StorageSetupError(
+                "云盘账号不存在或已停用",
+                code="ACCOUNT_NOT_FOUND",
+                status=404,
+            )
+        revision = int(getattr(account, "current_revision", 0) or 0)
+        if not callable(self.provider_folder_resolver):
+            raise StorageSetupError(
+                "Provider \u539f\u751f\u76ee\u5f55\u6d4f\u89c8\u8fd0\u884c\u65f6\u5c1a\u672a\u88c5\u914d",
+                code="PROVIDER_FOLDER_BROWSER_UNAVAILABLE",
+                status=503,
+            )
+        try:
+            browser = self.provider_folder_resolver(
+                account.provider_kind,
+                account.account_id,
+                revision,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize composition failures
+            raise StorageSetupError(
+                "Provider \u539f\u751f\u76ee\u5f55\u6d4f\u89c8\u5668\u521d\u59cb\u5316\u5931\u8d25",
+                code="PROVIDER_FOLDER_BROWSER_UNAVAILABLE",
+                status=503,
+                retryable=True,
+            ) from exc
+        list_folders = getattr(browser, "list_folders", None)
+        if not callable(list_folders):
+            raise StorageSetupError(
+                "所选 Provider 不支持原生目录浏览",
+                code="PROVIDER_FOLDER_BROWSER_UNAVAILABLE",
+                status=422,
+            )
+        selected_parent = _text(parent_id) or "-11"
+        try:
+            items = list_folders(selected_parent)
+        except StorageSetupError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalize Provider failures
+            provider_code = _text(getattr(exc, "code", ""))
+            try:
+                provider_status = int(getattr(exc, "http_status", 0) or 0)
+            except (TypeError, ValueError):
+                provider_status = 0
+            auth_failed = provider_code in {
+                "AUTH_EXPIRED",
+                "InvalidAccessToken",
+                "InvalidSessionKey",
+                "SESSION_CREDENTIALS_MISSING",
+                "SESSION_IP_MISMATCH",
+                "UserInvalidOpenToken",
+            } or provider_status in {401, 403}
+            raise StorageSetupError(
+                (
+                    "\u4e91\u76d8\u8ba4\u8bc1\u5df2\u5931\u6548\uff0c\u8bf7\u5148\u91cd\u65b0\u767b\u5f55\u8d26\u53f7"
+                    if auth_failed
+                    else f"\u539f\u751f\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25\uff1a{exc}"
+                ),
+                code=("PROVIDER_AUTH_EXPIRED" if auth_failed else "PROVIDER_FOLDER_LIST_FAILED"),
+                status=(401 if auth_failed else 503),
+                retryable=not auth_failed,
+            ) from exc
+        return {
+            "success": True,
+            "account_id": account.account_id,
+            "provider_kind": account.provider_kind,
+            "account_revision": revision,
+            "parent_id": selected_parent,
+            "items": [dict(item) for item in items if isinstance(item, dict)],
+        }
 
     # ------------------------------------------------------------------ read
 
@@ -177,11 +345,228 @@ class StorageSetupService:
             return bool(source_caps.get("supports_native_save"))
         if not source_caps.get("supports_source_materialization"):
             return False
-        if target_kind == "mobile":
-            return bool(target_caps.get("supports_relay_upload"))
-        if target.get("kind") in {"local", "generic"}:
+        if target_caps.get("supports_relay_upload"):
+            return bool(
+                target.get("native_upload_verified")
+                and target.get("organizer_mutation_verified")
+            )
+        if target.get("kind") == "local":
             return True
-        return bool(target_caps.get("supports_rclone_dest"))
+        # Cross-provider copies into OpenList ultimately upload files through
+        # WebDAV/rclone. A mount whose current PUT probe fails (OpenList can
+        # collapse an underlying driver upload error into HTTP 405) must never
+        # be offered for that route, even when native same-provider save is
+        # still usable.
+        webdav_writable = bool(target.get("webdav_writable", True))
+        if target.get("kind") == "generic":
+            return webdav_writable
+        return bool(target_caps.get("supports_rclone_dest")) and webdav_writable
+
+    def _webdav_file_write_required(self, provider_kind: str) -> bool:
+        policy = getattr(self.mounts, "requires_webdav_file_write_for_provider", None)
+        if callable(policy):
+            return bool(policy(provider_kind))
+        return True
+
+    def _native_locator_with_probe(
+        self,
+        *,
+        provider_kind: str,
+        account: Any,
+        locator_kind: str,
+        locator_value: str,
+        display_name: str,
+        connection_id: str,
+        webdav_root: str,
+        previous: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        native_locator: dict[str, Any] = {
+            "kind": _text(locator_kind),
+            "value": _text(locator_value),
+        }
+        previous = dict(previous or {})
+        if display_name:
+            native_locator["display_name"] = _text(display_name)
+        elif (
+            _text(previous.get("kind")) == native_locator["kind"]
+            and _text(previous.get("value")) == native_locator["value"]
+            and _text(previous.get("display_name"))
+        ):
+            native_locator["display_name"] = _text(previous.get("display_name"))
+
+        if not self._supports_relay_upload(provider_kind):
+            return native_locator
+        if account is None:
+            raise StorageSetupError(
+                "Provider 原生上传探测缺少账号",
+                code="PROVIDER_UPLOAD_UNAVAILABLE",
+                status=503,
+            )
+        connection = self.connections.get_connection(connection_id) or {}
+        fingerprint_source = {
+            "provider_kind": _text(provider_kind).lower(),
+            "account_id": _text(account.account_id),
+            "account_revision": int(account.current_revision or 0),
+            "locator_kind": native_locator["kind"],
+            "locator_value": native_locator["value"],
+            "connection_id": _text(connection_id),
+            "connection_revision": int(connection.get("revision") or 0),
+            "webdav_root": posixpath.normpath(
+                "/" + _text(webdav_root).replace("\\", "/").strip("/")
+            ),
+        }
+        probe_fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_source,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            _text(previous.get("probe_fingerprint")) == probe_fingerprint
+            and previous.get("upload_verified")
+            and previous.get("organizer_mutation_verified")
+        ):
+            native_locator.update(
+                {
+                    "upload_verified": True,
+                    "upload_tested_at": _text(previous.get("upload_tested_at")),
+                    "organizer_mutation_verified": True,
+                    "organizer_tested_at": _text(previous.get("organizer_tested_at")),
+                    "probe_message": _text(previous.get("probe_message")),
+                    "probe_fingerprint": probe_fingerprint,
+                }
+            )
+            return {key: value for key, value in native_locator.items() if value not in (None, "")}
+
+        uploader = self._provider_uploader(
+            provider_kind,
+            account.account_id,
+            int(account.current_revision or 0),
+        )
+        probe = getattr(uploader, "probe_target", None)
+        if not callable(probe):
+            raise StorageSetupError(
+                "所选 Provider 未实现原生上传探测",
+                code="PROVIDER_UPLOAD_PROBE_UNAVAILABLE",
+                status=503,
+            )
+        observer = self._openlist_mutation_observer(connection_id, webdav_root)
+        result = probe(
+            target_locator={
+                "kind": native_locator["kind"],
+                "value": native_locator["value"],
+            },
+            observer=observer,
+        )
+        result = dict(result or {}) if isinstance(result, dict) else {}
+        if (
+            not result.get("ok")
+            or not result.get("upload_verified")
+            or not result.get("organizer_mutation_verified")
+        ):
+            raise StorageSetupError(
+                _text(result.get("message")) or "Provider 原生上传与整理链路检测未通过",
+                code=_text(result.get("code")) or "PROVIDER_UPLOAD_PROBE_FAILED",
+                status=503,
+                retryable=True,
+                field_errors={"native_root": "原生上传或 OpenList 整理检测未通过"},
+            )
+        tested_at = utc_now_iso()
+        native_locator.update(
+            {
+                "upload_verified": True,
+                "upload_tested_at": tested_at,
+                "organizer_mutation_verified": True,
+                "organizer_tested_at": tested_at,
+                "probe_message": _text(result.get("message")),
+                "probe_fingerprint": probe_fingerprint,
+            }
+        )
+        return native_locator
+
+    def _openlist_mutation_observer(
+        self,
+        connection_id: str,
+        webdav_root: str,
+    ) -> Any:
+        connection = self.connections.get_connection(connection_id)
+        revision = int((connection or {}).get("revision") or 0)
+        if connection is None or revision <= 0:
+            raise StorageSetupError(
+                "OpenList 连接不存在或缺少 revision",
+                code="OPENLIST_NOT_FOUND",
+                status=404,
+            )
+        credentials = self.connections.resolve_credentials(connection_id, revision)
+        client = self.mounts.webdav_factory(credentials)
+        root = posixpath.normpath("/" + _text(webdav_root).strip("/"))
+
+        def observe(info: dict[str, Any]) -> dict[str, Any]:
+            file_name = posixpath.basename(_text(info.get("file_name")))
+            if not file_name:
+                return {
+                    "organizer_mutation_verified": False,
+                    "deleted": False,
+                    "message": "Provider upload probe returned no file name",
+                }
+            source = posixpath.join(root, file_name)
+            moved = posixpath.join(root, f"{file_name}.moved")
+            content = bytes(info.get("content") or b"")
+            expected_size = int(info.get("file_size") or len(content))
+
+            def visible(path: str, expected: bool) -> bool:
+                for _attempt in range(12):
+                    try:
+                        exists = bool(client.exists(path))
+                    except Exception:  # noqa: BLE001 - retry eventual visibility
+                        exists = not expected
+                    if exists is expected:
+                        return True
+                    time.sleep(0.5)
+                return False
+
+            deleted = False
+            try:
+                if not visible(source, True):
+                    raise RuntimeError("OpenList did not expose the native probe file")
+                if int(client.file_size(source) or 0) != expected_size:
+                    raise RuntimeError("OpenList probe file size does not match")
+                if content and bytes(client.read_bytes(source)) != content:
+                    raise RuntimeError("OpenList probe file content does not match")
+                client.move(source, moved)
+                if not visible(moved, True) or not visible(source, False):
+                    raise RuntimeError("OpenList MOVE result could not be verified")
+                if int(client.file_size(moved) or 0) != expected_size:
+                    raise RuntimeError("OpenList moved probe file size does not match")
+                client.delete(moved)
+                deleted = visible(moved, False)
+                if not deleted:
+                    raise RuntimeError("OpenList DELETE result could not be verified")
+                return {
+                    "organizer_mutation_verified": True,
+                    "deleted": True,
+                    "message": "OpenList read, MOVE and DELETE checks passed",
+                }
+            except Exception as exc:  # noqa: BLE001 - return structured probe failure
+                for candidate in (source, moved):
+                    try:
+                        if client.exists(candidate):
+                            client.delete(candidate)
+                    except Exception:  # noqa: BLE001 - Provider cleanup is the fallback
+                        pass
+                try:
+                    deleted = not client.exists(source) and not client.exists(moved)
+                except Exception:  # noqa: BLE001
+                    deleted = False
+                return {
+                    "organizer_mutation_verified": False,
+                    "deleted": deleted,
+                    "message": f"OpenList organizer mutation probe failed: {exc}",
+                }
+
+        return observe
 
     def _location_view(
         self,
@@ -209,12 +594,23 @@ class StorageSetupService:
         check = self.targets.test_target(target.destination_id)
         remote_ready = True
         connection_ready = True
+        webdav_write_required = self._webdav_file_write_required(target.provider_kind)
+        provider = self._provider_catalog_item(target.provider_kind)
+        relay_upload_capable = bool(
+            (provider.get("capabilities") or {}).get("supports_relay_upload")
+        )
+        native_locator = dict((mount or {}).get("native_locator") or {})
+        native_upload_verified, organizer_mutation_verified = (
+            self._mount_native_proofs(target.provider_kind, mount)
+        )
         if mount is not None:
             remote_ready = bool(
                 mount.get("enabled")
                 and mount.get("readable")
-                and mount.get("writable")
+                and (mount.get("writable") or not webdav_write_required)
                 and mount.get("identity_status") in {"verified", "declared"}
+                and (not relay_upload_capable or native_upload_verified)
+                and (not relay_upload_capable or organizer_mutation_verified)
             )
             connection = next(
                 (
@@ -250,22 +646,66 @@ class StorageSetupService:
                 and mount.get("identity_status") not in {"verified", "declared"}
             ),
             "webdav_root": mount.get("webdav_root") if mount else None,
+            "webdav_readable": bool((mount or {}).get("readable")),
+            "webdav_writable": bool((mount or {}).get("writable")),
+            "webdav_file_write_required": webdav_write_required,
+            "native_upload_capable": relay_upload_capable,
+            "native_upload_verified": native_upload_verified,
+            "native_upload_tested_at": native_locator.get("upload_tested_at"),
+            "organizer_mutation_verified": organizer_mutation_verified,
+            "organizer_tested_at": native_locator.get("organizer_tested_at"),
+            "native_only": bool(
+                mount is not None
+                and mount.get("readable")
+                and not mount.get("writable")
+                and not webdav_write_required
+            ),
             "native_root": ((mount or {}).get("native_locator") or {}).get("value") or "",
+            "native_root_name": ((mount or {}).get("native_locator") or {}).get("display_name") or "",
             "resolved_category_paths": resolved_category_paths,
             "enabled": target.enabled,
             "ready": bool(target.enabled and check.get("ok") and remote_ready),
-            "status_message": (
-                "可以接收入库任务"
-                if target.enabled and check.get("ok") and remote_ready
-                else (
-                    "需要管理员确认存储身份"
-                    if mount is not None and mount.get("identity_status") not in {"verified", "declared"}
-                    else "OpenList 连接已变化，请重新检测目录"
-                    if mount is not None and not connection_ready
-                    else "需要检查目录或连接"
-                )
+            "status_message": self._location_status_message(
+                target_enabled=bool(target.enabled),
+                target_valid=bool(check.get("ok")),
+                remote_ready=remote_ready,
+                mount=mount,
+                connection_ready=connection_ready,
+                relay_upload_capable=relay_upload_capable,
+                native_upload_verified=native_upload_verified,
+                organizer_mutation_verified=organizer_mutation_verified,
+                webdav_write_required=webdav_write_required,
             ),
         }
+
+    @staticmethod
+    def _location_status_message(
+        *,
+        target_enabled: bool,
+        target_valid: bool,
+        remote_ready: bool,
+        mount: dict[str, Any] | None,
+        connection_ready: bool,
+        relay_upload_capable: bool,
+        native_upload_verified: bool,
+        organizer_mutation_verified: bool,
+        webdav_write_required: bool,
+    ) -> str:
+        if target_enabled and target_valid and remote_ready:
+            if relay_upload_capable:
+                return "Provider \u539f\u751f\u76f4\u4f20\u4e0e OpenList \u6574\u7406\u94fe\u8def\u53ef\u7528"
+            if mount is not None and not mount.get("writable") and not webdav_write_required:
+                return "\u53ef\u4ee5\u63a5\u6536\u540c\u6e90\u539f\u751f\u8f6c\u5b58\uff1b\u8de8\u76d8 rclone \u5199\u5165\u4e0d\u53ef\u7528"
+            return "\u53ef\u4ee5\u63a5\u6536\u5165\u5e93\u4efb\u52a1"
+        if mount is not None and mount.get("identity_status") not in {"verified", "declared"}:
+            return "\u9700\u8981\u7ba1\u7406\u5458\u786e\u8ba4\u5b58\u50a8\u8eab\u4efd"
+        if mount is not None and not connection_ready:
+            return "OpenList \u8fde\u63a5\u5df2\u53d8\u5316\uff0c\u8bf7\u91cd\u65b0\u68c0\u6d4b\u76ee\u5f55"
+        if relay_upload_capable and not native_upload_verified:
+            return "Provider \u539f\u751f\u4e0a\u4f20\u5c1a\u672a\u901a\u8fc7\u63a2\u6d4b"
+        if relay_upload_capable and not organizer_mutation_verified:
+            return "OpenList \u8bfb\u53d6\u3001MOVE \u6216 DELETE \u6574\u7406\u94fe\u8def\u5c1a\u672a\u901a\u8fc7\u63a2\u6d4b"
+        return "\u9700\u8981\u68c0\u67e5\u76ee\u5f55\u6216\u8fde\u63a5"
 
     def _route_view(self, matrix: dict[str, Any], locations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         location_by_id = {item["destination_id"]: item for item in locations}
@@ -308,8 +748,8 @@ class StorageSetupService:
             return "六盘离线后直接入库"
         if source.get("provider_kind") == target.get("provider_kind"):
             return "同源直转，不经过本地"
-        if target.get("provider_kind") == "mobile":
-            return "来源落地后下载到本地，再由移动云 API 上传"
+        if target.get("native_upload_capable"):
+            return "来源落地后下载到本地，再由目标云盘原生 API 上传"
         if target.get("kind") == "local":
             return "来源落地后通过 rclone 下载到本地"
         return "来源落地后通过 rclone 搬运到目标网盘"
@@ -508,6 +948,7 @@ class StorageSetupService:
                     status=409,
                 )
         account_id = _text(payload.get("account_id")) or None
+        account: Any = None
         if existing and kind == "provider" and not account_id:
             try:
                 account_id = self.targets.resolve_binding(
@@ -547,6 +988,7 @@ class StorageSetupService:
         connection_id = _text(payload.get("connection_id"))
         webdav_root = _text(payload.get("webdav_root"))
         native_root = _text(payload.get("native_root"))
+        native_root_name = _text(payload.get("native_root_name"))
         explicit_confirm = _bool(payload.get("confirm_identity"), False)
         mount: dict[str, Any] | None = None
         old_mount: dict[str, Any] | None = None
@@ -594,20 +1036,77 @@ class StorageSetupService:
                     field_errors={"connection_id": "请新建保存位置"},
                 )
             locator_kind = self._locator_kind(provider_kind) if kind == "provider" else "provider_path"
+            previous_native_locator = dict((old_mount or {}).get("native_locator") or {})
+            storage_identity_id = (
+                f"provider:{provider_kind}:account:{account_id}"
+                if kind == "provider"
+                else f"generic:{destination_id}"
+            )
+            provisional_native_locator: dict[str, Any] = {}
+            if kind == "provider" and native_root:
+                provisional_native_locator = {
+                    "kind": locator_kind,
+                    "value": native_root,
+                }
+                resolved_display_name = native_root_name or (
+                    _text(previous_native_locator.get("display_name"))
+                    if _text(previous_native_locator.get("kind")) == locator_kind
+                    and _text(previous_native_locator.get("value")) == native_root
+                    else ""
+                )
+                if resolved_display_name:
+                    provisional_native_locator["display_name"] = resolved_display_name
+            previous_identity_locator = {
+                key: previous_native_locator.get(key)
+                for key in ("kind", "value", "display_name")
+                if previous_native_locator.get(key) not in (None, "")
+            }
+            identity_inputs_changed = not old_mount or any(
+                _text(old_mount.get(key)) != _text(value)
+                for key, value in {
+                    "name": name,
+                    "webdav_root": webdav_root,
+                    "provider_kind": provider_kind if kind == "provider" else None,
+                    "account_id": account_id,
+                    "storage_identity_id": storage_identity_id,
+                    "identity_root": webdav_root,
+                }.items()
+            ) or previous_identity_locator != provisional_native_locator
+            identity_status = str((old_mount or {}).get("identity_status") or "unverified")
+            if (
+                identity_inputs_changed
+                or identity_status not in {"verified", "declared"}
+            ) and not explicit_confirm:
+                raise StorageSetupError(
+                    "\u8bf7\u786e\u8ba4 OpenList \u76ee\u5f55\u786e\u5b9e\u5bf9\u5e94\u6240\u9009\u4e91\u76d8/\u5b58\u50a8\u8eab\u4efd",
+                    code="IDENTITY_CONFIRMATION_REQUIRED",
+                    status=422,
+                    field_errors={"confirm_identity": "\u5fc5\u987b\u52fe\u9009\u786e\u8ba4"},
+                )
+            native_locator_payload = (
+                self._native_locator_with_probe(
+                    provider_kind=provider_kind,
+                    account=account,
+                    locator_kind=locator_kind,
+                    locator_value=native_root,
+                    display_name=native_root_name,
+                    connection_id=connection_id,
+                    webdav_root=webdav_root,
+                    previous=previous_native_locator,
+                )
+                if kind == "provider" and native_root
+                else {}
+            )
             mount_payload = {
                 "connection_id": connection_id,
                 "name": name,
                 "provider_kind": provider_kind if kind == "provider" else None,
                 "account_id": account_id,
                 "webdav_root": webdav_root,
-                "storage_identity_id": (
-                    f"provider:{provider_kind}:account:{account_id}"
-                    if kind == "provider"
-                    else f"generic:{destination_id}"
-                ),
+                "storage_identity_id": storage_identity_id,
                 "identity_root": webdav_root,
                 "probe_root": (old_mount or {}).get("probe_root") or "/_fnos_probe",
-                "native_locator": {"kind": locator_kind, "value": native_root} if native_root else {},
+                "native_locator": native_locator_payload,
             }
             if old_mount:
                 # Protect the aggregate edit from a concurrent mount change;
@@ -617,14 +1116,6 @@ class StorageSetupService:
                 _text(old_mount.get(key)) != _text(mount_payload.get(key))
                 for key in ("name", "webdav_root", "provider_kind", "account_id", "storage_identity_id", "identity_root")
             ) or dict(old_mount.get("native_locator") or {}) != dict(mount_payload.get("native_locator") or {})
-            identity_status = str((old_mount or {}).get("identity_status") or "unverified")
-            if (mount_changed or identity_status not in {"verified", "declared"}) and not explicit_confirm:
-                raise StorageSetupError(
-                    "请确认 OpenList 目录确实对应所选云盘/存储身份",
-                    code="IDENTITY_CONFIRMATION_REQUIRED",
-                    status=422,
-                    field_errors={"confirm_identity": "必须勾选确认"},
-                )
             if mount_changed:
                 try:
                     if mount_id:
@@ -641,6 +1132,9 @@ class StorageSetupService:
                             (connection_snapshot or {}).get("revision") or 0
                         )
                         or None,
+                        require_webdav_file_write=self._webdav_file_write_required(
+                            provider_kind
+                        ),
                     )
                     # probe_mount advances the mount revision even when a
                     # required check fails; carry that revision into the
@@ -650,6 +1144,19 @@ class StorageSetupService:
                         mount = {**mount, "revision": probe["revision"]}
                     if probe.get("connection_revision"):
                         mount = {**mount, "connection_revision": probe["connection_revision"]}
+                    if (
+                        probe.get("ok")
+                        and not probe.get("writable")
+                        and not probe.get("webdav_file_write_required", True)
+                    ):
+                        logger.info(
+                            "event=storage_mount_native_only mount_id=%s provider=%s "
+                            "webdav_readable=%s webdav_writable=%s",
+                            mount.get("mount_id"),
+                            provider_kind,
+                            bool(probe.get("readable")),
+                            bool(probe.get("writable")),
+                        )
                     if not probe.get("ok"):
                         logger.warning(
                             "event=storage_mount_probe_checks_failed mount_id=%s checks=%s",
@@ -742,7 +1249,11 @@ class StorageSetupService:
             "success": True,
             "destination_id": target.destination_id,
             "identity_status": (mount or {}).get("identity_status") if mount else None,
-            "message": "保存位置已创建并通过读写检测",
+            "message": (
+                "\u4fdd\u5b58\u4f4d\u7f6e\u5df2\u521b\u5efa\uff0cProvider \u539f\u751f\u76f4\u4f20\u4e0e OpenList \u6574\u7406\u94fe\u8def\u5df2\u9a8c\u8bc1"
+                if self._supports_relay_upload(provider_kind)
+                else "保存位置已创建并通过读写检测"
+            ),
         }
 
     def _restore_mount(
@@ -865,16 +1376,7 @@ class StorageSetupService:
         if target is None:
             raise StorageSetupError("保存位置不存在")
         mount_id = self._target_mount_id(target)
-        database = getattr(self.targets, "database", None)
-        mount_database = getattr(self.mounts, "database", None)
-        if database is None or mount_database is None or database is not mount_database:
-            raise StorageSetupError(
-                "保存位置删除未装配为同一数据库事务",
-                code="STORAGE_SETUP_UNAVAILABLE",
-                status=503,
-            )
-
-        with database.connect() as conn:
+        with self.connection_factory() as conn:
             conn.execute("BEGIN IMMEDIATE")
             target_row = conn.execute(
                 "SELECT destination_id FROM storage_targets WHERE destination_id=?",
@@ -1063,6 +1565,16 @@ class StorageSetupService:
                         "generic" if target.target_kind == "openlist_generic" else "provider"
                     ),
                 }
+                target_mount_id = self._target_mount_id(target)
+                target_mount = self.mounts.get_mount(target_mount_id) if target_mount_id else None
+                target_view["webdav_writable"] = bool((target_mount or {}).get("writable"))
+                (
+                    target_view["native_upload_verified"],
+                    target_view["organizer_mutation_verified"],
+                ) = self._mount_native_proofs(
+                    target.provider_kind,
+                    target_mount,
+                )
                 if not self._route_supported(
                     source_id,
                     sources[source_id],
@@ -1205,16 +1717,36 @@ class StorageSetupService:
                     expected_connection_revision=int((connection or {}).get("revision") or 0)
                     or None,
                     persist_result=False,
+                    require_webdav_file_write=self._webdav_file_write_required(
+                        _text(mount.get("provider_kind"))
+                    ),
                 )
                 identity_ok = mount.get("identity_status") in {"verified", "declared"}
+                provider_kind = _text(mount.get("provider_kind"))
+                relay_upload_capable = self._supports_relay_upload(provider_kind)
+                native_upload_ok, organizer_mutation_ok = self._mount_native_proofs(
+                    provider_kind,
+                    mount,
+                )
+                mount_ok = bool(result.get("ok")) and identity_ok
+                if relay_upload_capable:
+                    mount_ok = bool(
+                        mount_ok
+                        and native_upload_ok
+                        and organizer_mutation_ok
+                    )
+                if not identity_ok:
+                    mount_message = "\u76ee\u5f55\u68c0\u6d4b\u901a\u8fc7\uff0c\u4f46\u5c1a\u672a\u786e\u8ba4\u5b58\u50a8\u8eab\u4efd"
+                elif relay_upload_capable and not native_upload_ok:
+                    mount_message = "Provider \u539f\u751f\u4e0a\u4f20\u63a2\u6d4b\u8bc1\u660e\u7f3a\u5931\uff0c\u8bf7\u91cd\u65b0\u4fdd\u5b58\u5e76\u68c0\u6d4b\u8be5\u4f4d\u7f6e"
+                elif relay_upload_capable and not organizer_mutation_ok:
+                    mount_message = "OpenList \u8bfb\u53d6\u3001MOVE \u6216 DELETE \u6574\u7406\u63a2\u6d4b\u8bc1\u660e\u7f3a\u5931"
+                else:
+                    mount_message = _text(result.get("message"))
                 checks.append({
-                    "name": f"目录 {mount['name']}",
-                    "ok": bool(result.get("ok")) and identity_ok,
-                    "message": (
-                        result.get("message")
-                        if identity_ok
-                        else "目录读写检测通过，但尚未确认存储身份"
-                    ),
+                    "name": f"\u76ee\u5f55 {mount['name']}",
+                    "ok": mount_ok,
+                    "message": mount_message,
                 })
             except Exception as exc:
                 checks.append({"name": f"目录 {mount['name']}", "ok": False, "message": str(exc)})

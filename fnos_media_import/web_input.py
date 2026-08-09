@@ -564,7 +564,7 @@ def _task_log_summaries(
             ij.title,
             ij.category,
             ij.category_label,
-            ij.source_type,
+            ij.source_provider_kind,
             ij.status,
             ij.error_message,
             ij.created_at,

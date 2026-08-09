@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import base64
 import hashlib
 import json
@@ -14,7 +16,7 @@ from fnos_media_import.repositories.job_command_repository import JobCommandRepo
 from fnos_media_import.services.source_record_service import SourceRecordService
 
 
-class _MemoryDatabase:
+class _MemoryDatabase(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
@@ -228,8 +230,9 @@ class JobIdempotencyTests(unittest.TestCase):
             CREATE TABLE import_jobs (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               title TEXT NOT NULL, category TEXT NOT NULL, category_label TEXT NOT NULL,
-              source_type TEXT NOT NULL, source_url TEXT NOT NULL, password TEXT,
-              target_route TEXT NOT NULL, target_path TEXT, status TEXT NOT NULL,
+              source_provider_kind TEXT NOT NULL, source_form TEXT NOT NULL,
+              source_url TEXT NOT NULL, password TEXT,
+              target_path TEXT, status TEXT NOT NULL,
               external_task_id TEXT, error_message TEXT, raw_data TEXT,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
               idempotency_key TEXT NOT NULL UNIQUE, config_revision INTEGER NOT NULL,
@@ -243,8 +246,8 @@ class JobIdempotencyTests(unittest.TestCase):
     def _job(key: str) -> dict:
         return {
             "title": "x", "category": "movie", "category_label": "电影",
-            "source_type": "quark", "source_url": "source-record:abc@1",
-            "target_route": "quark:share", "status": "created",
+            "source_provider_kind": "quark", "source_form": "share_link",
+            "source_url": "source-record:abc@1", "status": "created",
             "raw_data": {"source": {"record_id": "abc", "revision": 1}},
             "idempotency_key": key, "config_revision": 1,
             "executor_id": "test", "destination_id": "target-a", "plan_version": 1,

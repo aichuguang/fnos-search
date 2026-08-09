@@ -43,7 +43,7 @@ def organizer_v1_plan(
         "native_save": "native",
         "native_offline": "native_offline",
         "rclone_copy": "rclone",
-        "relay_upload_mobile": "mobile_relay",
+        "relay_upload_provider": "provider_relay",
     }.get(strategy, "native")
     destination_final_ref = {
         "kind": "openlist" if strategy == "rclone_copy" else "native",
@@ -64,7 +64,7 @@ def organizer_v1_plan(
             "identity_root": identity_root,
         },
     }
-    if strategy in {"rclone_copy", "relay_upload_mobile"}:
+    if strategy in {"rclone_copy", "relay_upload_provider"}:
         paths["source_landing"] = {
             "kind": "openlist",
             "namespace_id": "openlist:source:landing",
@@ -76,7 +76,7 @@ def organizer_v1_plan(
             "namespace_id": namespace,
             "path": str(destination_staging or organizer_root),
         }
-    if strategy == "relay_upload_mobile":
+    if strategy == "relay_upload_provider":
         paths["local_temp"] = {
             "kind": "relay",
             "namespace_id": "local:relay",
@@ -163,6 +163,8 @@ def organizer_v1_job(
         "id": job_id,
         "title": title,
         "category": str(plan["category"]),
+        "source_provider_kind": str(plan["source"]["provider_kind"]),
+        "source_form": str(plan["source"]["source_form"]),
         "destination_id": str(plan["destination"]["id"]),
         "plan_version": 1,
         "status": status,
@@ -181,6 +183,11 @@ def attach_organizer_v1_task(
         {
             "job_id": int(plan["job_id"]),
             "category": str(plan["category"]),
+            **(
+                {"revision": max(1, int(task.get("revision") or 1))}
+                if task.get("id")
+                else {}
+            ),
             "openlist_root_path": str(plan["paths"]["organizer"]["path"]),
             # The immutable plan is owned by import_execution_plans.  Keep the
             # old-looking field only as a non-executable test payload when a

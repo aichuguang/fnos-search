@@ -9,6 +9,55 @@ from .planning.job_plan import plan_path, validated_v1_execution_plan_from_job
 from .public_web import _sixpan_parse_summary
 
 
+def map_execution_path_to_organizer(
+    path: Any,
+    plan: dict[str, Any] | None,
+) -> str:
+    """Map a frozen V1 staging path into its frozen Organizer namespace.
+
+    The mapping is deliberately plan-local: it never reads category paths,
+    current mounts, or retired staging configuration.
+    """
+
+    value_plan = plan if isinstance(plan, dict) else {}
+    paths = value_plan.get("paths") if isinstance(value_plan.get("paths"), dict) else {}
+    staging = paths.get("destination_staging")
+    organizer = paths.get("organizer")
+    if not isinstance(staging, dict) or not isinstance(organizer, dict):
+        return ""
+    value = _normalize_execution_path(path)
+    source_root = _normalize_execution_path(staging.get("path"))
+    visible_root = _normalize_execution_path(organizer.get("path"))
+    if (
+        not value
+        or not source_root
+        or not visible_root
+        or _has_unsafe_execution_path_segments(value)
+        or _has_unsafe_execution_path_segments(source_root)
+        or _has_unsafe_execution_path_segments(visible_root)
+    ):
+        return ""
+    value_folded = value.casefold()
+    source_folded = source_root.casefold()
+    if value_folded == source_folded:
+        return f"/{visible_root}"
+    if value_folded.startswith(f"{source_folded}/"):
+        return f"/{visible_root}/{value[len(source_root) + 1:]}"
+    return ""
+
+
+def _normalize_execution_path(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    while "//" in text:
+        text = text.replace("//", "/")
+    return text.strip("/")
+
+
+def _has_unsafe_execution_path_segments(value: Any) -> bool:
+    text = str(value or "").strip().replace("\\", "/")
+    return any(part in {".", ".."} for part in text.split("/"))
+
+
 def _join_virtual_path(*parts: Any) -> str:
     cleaned: list[str] = []
     for part in parts:

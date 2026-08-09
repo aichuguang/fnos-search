@@ -1,23 +1,7 @@
-from .registry import UnknownStorageDriver, get_driver, registered_driver_kinds
-from .types import (
-    DestinationPathPlan,
-    PathRef,
-    StorageCapabilities,
-    StorageDriver,
-    StorageTarget,
-    TargetCategoryConfig,
-    WorkerSpec,
-)
+"""V1 storage services package.
 
-__all__ = [
-    "DestinationPathPlan",
-    "PathRef",
-    "StorageCapabilities",
-    "StorageDriver",
-    "StorageTarget",
-    "TargetCategoryConfig",
-    "UnknownStorageDriver",
-    "WorkerSpec",
-    "get_driver",
-    "registered_driver_kinds",
-]
+The package initializer deliberately imports nothing.  Composition roots must
+import the concrete assignment, target, setup or blueprint module they need.
+"""
+
+__all__: tuple[str, ...] = ()

@@ -24,7 +24,7 @@ class OrganizerScanLease:
     def __init__(
         self,
         *,
-        database: Any,
+        repository: Any,
         task_id: int,
         owner_id: str,
         revision: int,
@@ -32,7 +32,7 @@ class OrganizerScanLease:
         heartbeat_interval_seconds: float | None = None,
         log: Callable[[str], None] | None = None,
     ) -> None:
-        self.database = database
+        self.repository = repository
         self.task_id = int(task_id)
         self.owner_id = str(owner_id)
         self.revision = max(1, int(revision or 1))
@@ -44,12 +44,8 @@ class OrganizerScanLease:
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread: threading.Thread | None = None
-        self._renew_supported = callable(getattr(database, "renew_organizer_scan", None))
-        self._owns_supported = callable(getattr(database, "owns_organizer_scan", None))
 
     def start(self) -> None:
-        if not self._renew_supported:
-            return
         if not self._renew():
             raise OrganizerScanLeaseLost("Organizer 扫描租约已失效，停止继续扫描")
 
@@ -74,21 +70,14 @@ class OrganizerScanLease:
             self._thread.join(timeout=max(1.0, min(5.0, self.heartbeat_interval_seconds + 1.0)))
 
     def ensure_owned(self) -> None:
-        if not (self._renew_supported and self._owns_supported):
-            return
         try:
             owned = bool(
-                self.database.owns_organizer_scan(
+                self.repository.owns_organizer_scan(
                     self.task_id,
                     self.owner_id,
                     expected_revision=self.revision,
                 )
             )
-        except TypeError:
-            try:
-                owned = bool(self.database.owns_organizer_scan(self.task_id, self.owner_id))
-            except Exception:  # noqa: BLE001
-                owned = False
         except Exception:  # noqa: BLE001
             owned = False
         if self._lost.is_set() or not owned:
@@ -98,24 +87,13 @@ class OrganizerScanLease:
     def _renew(self) -> bool:
         try:
             return bool(
-                self.database.renew_organizer_scan(
+                self.repository.renew_organizer_scan(
                     self.task_id,
                     self.owner_id,
                     lease_seconds=self.lease_seconds,
                     expected_revision=self.revision,
                 )
             )
-        except TypeError:
-            try:
-                return bool(
-                    self.database.renew_organizer_scan(
-                        self.task_id,
-                        self.owner_id,
-                        lease_seconds=self.lease_seconds,
-                    )
-                )
-            except Exception:  # noqa: BLE001
-                return False
         except Exception:  # noqa: BLE001
             return False
 
@@ -126,14 +104,14 @@ class OrganizerRunLease:
     def __init__(
         self,
         *,
-        database: Any,
+        repository: Any,
         run_id: int,
         owner_id: str,
         lease_seconds: int,
         heartbeat_interval_seconds: float | None = None,
         log: Callable[[str], None] | None = None,
     ) -> None:
-        self.database = database
+        self.repository = repository
         self.run_id = int(run_id)
         self.owner_id = str(owner_id)
         self.lease_seconds = max(1, int(lease_seconds))
@@ -144,13 +122,8 @@ class OrganizerRunLease:
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread: threading.Thread | None = None
-        self._supported = callable(getattr(database, "renew_organizer_run", None)) and callable(
-            getattr(database, "owns_organizer_run", None)
-        )
 
     def __enter__(self) -> "OrganizerRunLease":
-        if not self._supported:
-            return self
         if not self._renew():
             raise OrganizerRunLeaseLost("Organizer 运行租约已失效，停止继续整理")
 
@@ -176,11 +149,8 @@ class OrganizerRunLease:
             self._thread.join(timeout=max(1.0, min(5.0, self.heartbeat_interval_seconds + 1.0)))
 
     def ensure_owned(self) -> None:
-        if not self._supported:
-            return
-        owns = getattr(self.database, "owns_organizer_run")
         try:
-            owned = bool(owns(self.run_id, self.owner_id))
+            owned = bool(self.repository.owns_organizer_run(self.run_id, self.owner_id))
         except Exception:  # noqa: BLE001
             owned = False
         if self._lost.is_set() or not owned:
@@ -188,10 +158,9 @@ class OrganizerRunLease:
             raise OrganizerRunLeaseLost("Organizer 运行租约已失效，停止继续整理")
 
     def _renew(self) -> bool:
-        renew = getattr(self.database, "renew_organizer_run")
         try:
             return bool(
-                renew(
+                self.repository.renew_organizer_run(
                     self.run_id,
                     self.owner_id,
                     lease_seconds=self.lease_seconds,

@@ -30,9 +30,11 @@ config/config.yaml
 
 .pytest_cache/
 .pytest_tmp/
+.test-tmp/
 tests/.runtime/
 codex_tmp/
 audit_tmp_local/
+_audit_tmp_*/
 _codex_test_tmp*/
 _tmp_run/
 .mypy_cache/

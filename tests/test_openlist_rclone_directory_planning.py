@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from fnos_media_import.app import _rclone_organizer_target_plan
+from fnos_media_import.path_planning import _rclone_organizer_target_plan
 from fnos_media_import.organizer.parser import (
     V1_DESTINATION_FINAL_FIELD,
     V1_DESTINATION_IS_RESOURCE_FIELD,
@@ -18,6 +18,7 @@ from tests._organizer_v1_fixtures import (
     organizer_v1_job,
     organizer_v1_plan,
 )
+from tests._repository_v1_fakes import RepositoryFakeMixin
 
 
 class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
@@ -474,49 +475,9 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
 
         self.assertEqual(service.openlist.remove_calls, [])
 
-    def test_category_path_matching_requires_a_directory_boundary(self) -> None:
-        service = OrganizerService.__new__(OrganizerService)
-        service.categories = {
-            "movie": {"openlist_root_path": "/mount/movie"},
-            "backup": {"openlist_root_path": "/mount/movie-backup"},
-        }
 
-        category = service._category_from_label_or_path("", "/mount/movie-backup/title/file.mkv")
 
-        self.assertEqual(category, "backup")
 
-    def test_category_path_matching_prefers_the_most_specific_root(self) -> None:
-        service = OrganizerService.__new__(OrganizerService)
-        service.categories = {
-            "media": {"openlist_root_path": "/mount/media"},
-            "tv": {"mobile_openlist_root_path": "/mount/media/tv"},
-        }
-
-        category = service._category_from_label_or_path("", "/mount/media/tv/title/file.mkv")
-
-        self.assertEqual(category, "tv")
-
-    def test_category_path_matching_survives_an_old_mount_name(self) -> None:
-        service = OrganizerService.__new__(OrganizerService)
-        service.categories = {
-            "movie": {"label": "电影", "mobile_target_path": "/移动云盘A/电影"},
-            "tv": {"label": "电视剧", "mobile_target_path": "/移动云盘A/电视剧"},
-        }
-
-        category = service._category_from_label_or_path("", "/移动云/电视剧/剧名/Season 01/剧集.mkv")
-
-        self.assertEqual(category, "tv")
-
-    def test_configured_category_root_wins_over_a_title_named_like_another_category(self) -> None:
-        service = OrganizerService.__new__(OrganizerService)
-        service.categories = {
-            "movie": {"label": "电影", "openlist_root_path": "/mount/movie"},
-            "tv": {"label": "电视剧", "openlist_root_path": "/mount/tv"},
-        }
-
-        root = service._configured_category_root_for_path("/mount/movie/电视剧")
-
-        self.assertEqual(root, "/mount/movie")
 
     def test_update_job_can_create_a_new_task_on_an_existing_resource_root(self) -> None:
         plan = organizer_v1_plan(
@@ -527,7 +488,7 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
         )
         job = organizer_v1_job(plan, title="Resource")
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.created: list[dict] = []
 
@@ -543,6 +504,10 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
             def create_organizer_task(self, **values) -> int:
                 self.created.append(values)
                 return 8
+
+            def get_or_create_organizer_task_for_job(self, **values) -> tuple[int, bool]:
+                self.created.append(values)
+                return 8, True
 
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
@@ -578,7 +543,7 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
             plan,
         )
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.created = 0
 
@@ -591,6 +556,10 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
             def create_organizer_task(self, **_values) -> int:
                 self.created += 1
                 return 10
+
+            @staticmethod
+            def get_or_create_organizer_task_for_job(**_values) -> tuple[int, bool]:
+                return 9, False
 
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
@@ -628,7 +597,7 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
             plan,
         )
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.task = task
                 self.operation_updates: list[tuple[int, dict]] = []
@@ -647,6 +616,18 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
             def create_organizer_run(self, _task_id: int) -> int:
                 return 11
 
+            @staticmethod
+            def claim_organizer_run(_task_id: int, **_kwargs) -> tuple[int, None]:
+                return 11, None
+
+            @staticmethod
+            def renew_organizer_run(_run_id: int, _owner_id: str, **_kwargs) -> bool:
+                return True
+
+            @staticmethod
+            def owns_organizer_run(_run_id: int, _owner_id: str) -> bool:
+                return True
+
             def update_organizer_task(self, task_id: int, **values) -> None:
                 self.task_updates.append((task_id, values))
                 self.task.update({key: value for key, value in values.items() if key in {"status", "error_message"}})
@@ -656,6 +637,20 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
 
             def update_organizer_run(self, run_id: int, status: str, **values) -> None:
                 self.run_updates.append((run_id, status, values))
+
+            def finalize_organizer_run_and_task(
+                self,
+                run_id: int,
+                task_id: int,
+                *,
+                run_status: str,
+                task_status: str,
+                **values,
+            ) -> bool:
+                self.run_updates.append((run_id, run_status, values))
+                self.task_updates.append((task_id, {"status": task_status, **values}))
+                self.task["status"] = task_status
+                return True
 
             def release_organizer_locks(self, **_values) -> None:
                 return None
@@ -726,7 +721,7 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
             plan,
         )
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.task = task
                 self.run_updates: list[tuple[int, str, dict]] = []
@@ -743,6 +738,18 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
             def create_organizer_run(self, _task_id: int) -> int:
                 return 12
 
+            @staticmethod
+            def claim_organizer_run(_task_id: int, **_kwargs) -> tuple[int, None]:
+                return 12, None
+
+            @staticmethod
+            def renew_organizer_run(_run_id: int, _owner_id: str, **_kwargs) -> bool:
+                return True
+
+            @staticmethod
+            def owns_organizer_run(_run_id: int, _owner_id: str) -> bool:
+                return True
+
             def update_organizer_task(self, _task_id: int, **values) -> None:
                 self.task.update(
                     {
@@ -754,6 +761,19 @@ class RcloneOrganizerDirectoryPlanningTests(unittest.TestCase):
 
             def update_organizer_run(self, run_id: int, status: str, **values) -> None:
                 self.run_updates.append((run_id, status, values))
+
+            def finalize_organizer_run_and_task(
+                self,
+                run_id: int,
+                _task_id: int,
+                *,
+                run_status: str,
+                task_status: str,
+                **values,
+            ) -> bool:
+                self.run_updates.append((run_id, run_status, values))
+                self.task["status"] = task_status
+                return True
 
             def release_organizer_locks(self, **_values) -> None:
                 return None

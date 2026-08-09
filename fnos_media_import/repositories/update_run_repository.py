@@ -48,7 +48,7 @@ class UpdateRunRepository:
             self._recover_in_connection(
                 connection,
                 now=now,
-                legacy_cutoff=_utc_before(lease_seconds),
+                missing_lease_cutoff=_utc_before(lease_seconds),
                 subscription_id=int(subscription_id),
             )
             active = connection.execute(
@@ -132,7 +132,7 @@ class UpdateRunRepository:
             return self._recover_in_connection(
                 connection,
                 now=now,
-                legacy_cutoff=_utc_before(older_than_seconds),
+                missing_lease_cutoff=_utc_before(older_than_seconds),
                 message=message,
             )
 
@@ -156,12 +156,12 @@ class UpdateRunRepository:
         connection: sqlite3.Connection,
         *,
         now: str,
-        legacy_cutoff: str,
+        missing_lease_cutoff: str,
         subscription_id: int | None = None,
         message: str = INTERRUPTED_MESSAGE,
     ) -> list[dict[str, Any]]:
         where = ["status = 'running'", "(lease_expires_at <= ? OR (lease_expires_at IS NULL AND started_at <= ?))"]
-        values: list[Any] = [now, legacy_cutoff]
+        values: list[Any] = [now, missing_lease_cutoff]
         if subscription_id is not None:
             where.append("subscription_id = ?")
             values.append(int(subscription_id))

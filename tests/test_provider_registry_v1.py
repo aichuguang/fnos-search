@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 
 from fnos_media_import.accounts.auth_sessions import (
@@ -14,7 +16,7 @@ from fnos_media_import.providers.registry import ProviderRegistry, ProviderRegis
 from fnos_media_import.storage.assignment_service import SourceAssignmentService
 
 
-class _Adapter:
+class _Adapter(RepositoryFakeMixin):
     def __init__(self, provider_manifest):
         self.manifest = provider_manifest
         self.kind = provider_manifest.provider_kind
@@ -159,7 +161,11 @@ class ProviderRegistryV1Tests(unittest.TestCase):
             source_catalog_provider=registry.search_sources,
         )
         resolver = SourceResolver(
-            lambda _url: {"source_type": "115_share"},
+            lambda _url: {
+                "provider_kind": "115",
+                "source_form": "share",
+                "search_source_id": "115",
+            },
             source_catalog_provider=registry.search_sources,
         )
         descriptor = resolver.resolve({"url": "https://115.com/s/example"})

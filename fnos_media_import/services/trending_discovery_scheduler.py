@@ -69,7 +69,7 @@ class TrendingDiscoveryScheduler:
         self.stop_event.set()
         self.thread = None
         try:
-            self.database.release_scheduler_lease(self.lease_name, self.owner_id)
+            self.database.scheduler_leases.release(self.lease_name, self.owner_id)
         except Exception:  # noqa: BLE001
             self.log.exception("release trending scheduler lease failed")
 
@@ -116,7 +116,7 @@ class TrendingDiscoveryScheduler:
                 break
             acquired_lease = False
             try:
-                acquired_lease = bool(self.database.acquire_scheduler_lease(self.lease_name, self.owner_id, 3600))
+                acquired_lease = bool(self.database.scheduler_leases.acquire(self.lease_name, self.owner_id, 3600))
                 if not acquired_lease:
                     continue
                 result = self.service.run(trigger_type="schedule", lease_held=True)
@@ -128,7 +128,7 @@ class TrendingDiscoveryScheduler:
             finally:
                 if acquired_lease:
                     try:
-                        self.database.release_scheduler_lease(self.lease_name, self.owner_id)
+                        self.database.scheduler_leases.release(self.lease_name, self.owner_id)
                     except Exception:  # noqa: BLE001
                         self.log.exception("release trending scheduler lease failed")
 

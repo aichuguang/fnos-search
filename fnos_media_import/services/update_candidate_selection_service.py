@@ -58,7 +58,7 @@ class UpdateCandidateSelectionService:
         skipped = 0
         for source_candidate in candidates:
             if source_candidate.get("error"):
-                self.database.add_update_event(
+                self.database.update.add_update_event(
                     subscription_id,
                     run_id,
                     "warn",
@@ -84,7 +84,7 @@ class UpdateCandidateSelectionService:
                 if decision == "auto_import"
                 else f"{match.reason}；定时追更不要求人工确认，未满足自动入库条件则等待下次检查"
             )
-            candidate_id = self.database.create_update_candidate(
+            candidate_id = self.database.update.create_update_candidate(
                 {
                     "subscription_id": subscription_id,
                     "run_id": run_id,
@@ -115,7 +115,7 @@ class UpdateCandidateSelectionService:
         summary["kept_count"] = candidate_count
         summary["ignored_count"] = max(0, discovered_count - candidate_count)
         if candidate_count == 0:
-            self.database.add_update_event(
+            self.database.update.add_update_event(
                 subscription_id,
                 run_id,
                 "info",

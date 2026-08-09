@@ -9,7 +9,8 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from ..constants import JOB_STATUS_LABELS
-from ..database import Database, utc_now
+from ..database import utc_now
+from ..repositories.repository_set import UpdateRepositories
 from ..organizer.openlist_client import VIDEO_EXTENSIONS, basename, dirname, join_path
 from ..organizer.parser import parse_file_name
 from ..media_path_rules import format_title_year, sanitize_resource_dir_name, split_title_year
@@ -43,7 +44,7 @@ OpenListSessionResolver = Callable[[dict[str, Any], str], dict[str, Any] | None]
 class UpdateService:
     def __init__(
         self,
-        db: Database,
+        db: UpdateRepositories,
         config: dict[str, Any],
         categories: dict[str, dict[str, Any]],
         search_service: Any,
@@ -242,11 +243,13 @@ class UpdateService:
         return max(30, int(self._scheduler_config().get("run_lease_seconds") or 120))
 
     def recover_stale_runs(self) -> list[dict[str, Any]]:
-        recover = getattr(self.db, "recover_stale_update_runs", None)
-        if not callable(recover):
-            return []
         try:
-            return list(recover(older_than_seconds=self._run_lease_seconds()) or [])
+            return list(
+                self.db.update.recover_stale_update_runs(
+                    older_than_seconds=self._run_lease_seconds()
+                )
+                or []
+            )
         except Exception:  # noqa: BLE001
             logger.exception("recover stale update runs failed")
             return []
@@ -284,17 +287,17 @@ class UpdateService:
         return self.subscription_commands.update(subscription_id, payload)
 
     def _refresh_subscription_root_context_and_path_health(self, subscription_id: int) -> dict[str, Any]:
-        subscription = self.db.get_update_subscription(subscription_id, include_sources=True) or {"id": subscription_id}
+        subscription = self.db.update.get_update_subscription(subscription_id, include_sources=True) or {"id": subscription_id}
         if subscription.get("id"):
             self._resolve_update_root_context(subscription)
-            subscription = self.db.get_update_subscription(subscription_id, include_sources=True) or subscription
+            subscription = self.db.update.get_update_subscription(subscription_id, include_sources=True) or subscription
         category_key = str(subscription.get("category") or "movie")
         category = self.categories.get(category_key, {})
         raw_data = subscription.get("raw_data") if isinstance(subscription.get("raw_data"), dict) else {}
         raw_data = dict(raw_data)
         raw_data["path_health"] = self._subscription_path_health(category_key, category, raw_data)
         if subscription.get("id"):
-            self.db.update_update_subscription(subscription_id, {"raw_data": raw_data})
+            self.db.update.update_update_subscription(subscription_id, {"raw_data": raw_data})
         subscription["raw_data"] = raw_data
         return subscription
 
@@ -457,7 +460,7 @@ class UpdateService:
 
     def _run_stage(self, run_id: int, stage: str, message: str, raw_data: Any = None) -> None:
         try:
-            self.db.append_update_run_log(run_id, stage, message, raw_data)
+            self.db.update.append_update_run_log(run_id, stage, message, raw_data)
         except Exception:  # noqa: BLE001
             logger.debug("append update run log failed", exc_info=True)
 
@@ -477,7 +480,7 @@ class UpdateService:
         )
 
     def _mark_candidate_import_failed(self, candidate_id: int, message: str) -> None:
-        self.db.update_update_candidate(
+        self.db.update.update_update_candidate(
             candidate_id,
             decision="failed",
             reason=f"单集入库异常，将在后续追更任务重试：{message}",
@@ -593,9 +596,9 @@ class UpdateService:
         raw_data["fixed_source_gate"] = state
         subscription_id = int(subscription.get("id") or 0)
         if subscription_id:
-            self.db.update_update_subscription(subscription_id, {"raw_data": raw_data})
+            self.db.update.update_update_subscription(subscription_id, {"raw_data": raw_data})
             if search_allowed and not bool(previous.get("search_allowed")) and not target_hit:
-                self.db.add_update_event(subscription_id, run_id, "warn", "固定追更源已达到综合搜索兜底阈值", state)
+                self.db.update.add_update_event(subscription_id, run_id, "warn", "固定追更源已达到综合搜索兜底阈值", state)
         return raw_data
 
     def _candidates_hit_target(self, subscription: dict[str, Any], candidates: list[dict[str, Any]], target_episodes: set[tuple[int | None, int]]) -> bool:
@@ -763,7 +766,7 @@ class UpdateService:
             new_health[key] = health_item
             summary_items.append({k: health_item.get(k) for k in ("source_id", "type", "name", "status", "message", "checked_count", "consecutive_error", "consecutive_empty", "latest_episode", "repair_suggested")})
             if consecutive_error >= threshold and int(previous.get("consecutive_error") or 0) < threshold:
-                self.db.add_update_event(
+                self.db.update.add_update_event(
                     subscription_id,
                     run_id,
                     "warn",
@@ -771,13 +774,13 @@ class UpdateService:
                     health_item,
                 )
         raw_data["source_health"] = new_health
-        self.db.update_update_subscription(subscription_id, {"raw_data": raw_data})
+        self.db.update.update_update_subscription(subscription_id, {"raw_data": raw_data})
         return {"updated": True, "raw_data": raw_data, "summary": {"items": summary_items, "checked_at": now_text}}
 
     def _mark_candidate_seen(self, subscription: dict[str, Any], candidate_row: dict[str, Any], candidate: dict[str, Any], candidate_id: int, job: dict[str, Any], *, auto: bool, completion_state: str) -> None:
         raw = candidate_row.get("raw_data") if isinstance(candidate_row.get("raw_data"), dict) else {}
         match = raw.get("match") if isinstance(raw.get("match"), dict) else {}
-        self.db.upsert_update_seen_item(
+        self.db.update.upsert_update_seen_item(
             {
                 "subscription_id": subscription.get("id"),
                 "fingerprint": str(match.get("fingerprint") or candidate.get("fingerprint") or candidate_row.get("source_url_hash")),
@@ -792,11 +795,11 @@ class UpdateService:
         )
 
     def reject_candidate(self, candidate_id: int, reason: str = "管理员拒绝候选") -> dict[str, Any]:
-        candidate = self.db.get_update_candidate(candidate_id)
+        candidate = self.db.update.get_update_candidate(candidate_id)
         if not candidate:
             raise ValueError("候选不存在")
-        self.db.update_update_candidate(candidate_id, decision="rejected", reason=reason)
-        self.db.add_update_event(int(candidate["subscription_id"]), candidate.get("run_id"), "warn", f"候选已拒绝：{reason}", {"candidate_id": candidate_id})
+        self.db.update.update_update_candidate(candidate_id, decision="rejected", reason=reason)
+        self.db.update.add_update_event(int(candidate["subscription_id"]), candidate.get("run_id"), "warn", f"候选已拒绝：{reason}", {"candidate_id": candidate_id})
         return {"success": True, "message": "已拒绝候选"}
 
     def _resolve_update_root_context(self, subscription: dict[str, Any]) -> dict[str, Any]:
@@ -924,9 +927,9 @@ class UpdateService:
         subscription["raw_data"] = raw_data
         if int(subscription.get("id") or 0):
             if previous_resolution.get("canonical_openlist_root") != context.get("canonical_openlist_root") or previous_resolution.get("needs_manual_selection") != context.get("needs_manual_selection"):
-                self.db.update_update_subscription(int(subscription["id"]), {"raw_data": raw_data})
+                self.db.update.update_update_subscription(int(subscription["id"]), {"raw_data": raw_data})
                 level = "info" if resolved else "warn"
-                self.db.add_update_event(
+                self.db.update.add_update_event(
                     int(subscription["id"]),
                     None,
                     level,
@@ -1226,7 +1229,7 @@ class UpdateService:
         if allow_full_scan and not force_refresh and (not configured_root or configured_root == category_root):
             allow_full_scan = False
         if not root:
-            self.db.add_update_event(
+            self.db.update.add_update_event(
                 int(subscription.get("id") or 0) or None,
                 None,
                 "warn",
@@ -1235,7 +1238,7 @@ class UpdateService:
             )
             return seen
         snapshot_ttl = int(self._scheduler_config().get("snapshot_ttl_seconds") or 1800)
-        snapshot = self.db.get_update_path_snapshot(int(subscription.get("id") or 0), root) if subscription.get("id") and not force_refresh else None
+        snapshot = self.db.update.get_update_path_snapshot(int(subscription.get("id") or 0), root) if subscription.get("id") and not force_refresh else None
         if snapshot:
             files = snapshot.get("files_json") if isinstance(snapshot.get("files_json"), list) else []
             episodes = self._episodes_from_snapshot(subscription, files)
@@ -1249,7 +1252,7 @@ class UpdateService:
         try:
             items = openlist.scan_videos(root, max_depth=8, max_files=1200)
         except Exception as exc:  # noqa: BLE001
-            self.db.add_update_event(int(subscription.get("id") or 0) or None, None, "warn", f"OpenList 基线扫描失败：{exc}", {"root": root})
+            self.db.update.add_update_event(int(subscription.get("id") or 0) or None, None, "warn", f"OpenList 基线扫描失败：{exc}", {"root": root})
             return seen
         title_norms = [_norm(subscription.get("title")), *[_norm(item) for item in subscription.get("aliases") or []]]
         expected_season = _to_season(subscription.get("season"))
@@ -1271,7 +1274,7 @@ class UpdateService:
             latest_episode = max((episode for _season, episode in episodes), default=None)
             latest_season = next((season for season, episode in episodes if episode == latest_episode), None) if latest_episode else None
             try:
-                self.db.upsert_update_path_snapshot(
+                self.db.update.upsert_update_path_snapshot(
                     subscription_id=int(subscription["id"]),
                     openlist_path=root,
                     files=files,
@@ -1338,7 +1341,7 @@ class UpdateService:
             if target_episodes and all(_episode_in_set(season, episode, result) for season, episode in target_episodes):
                 break
         if result:
-            self.db.add_update_event(
+            self.db.update.add_update_event(
                 int(subscription.get("id") or 0) or None,
                 None,
                 "info",
@@ -1424,7 +1427,7 @@ class UpdateService:
         fingerprint_raw = f"openlist|{path or name}|S{_season_key(season)}E{episode}"
         fingerprint = "openlist:" + hashlib.sha256(fingerprint_raw.encode("utf-8", "ignore")).hexdigest()
         try:
-            self.db.upsert_update_seen_item(
+            self.db.update.upsert_update_seen_item(
                 {
                     "subscription_id": subscription_id,
                     "fingerprint": fingerprint,
@@ -1446,7 +1449,7 @@ class UpdateService:
         if not subscription_id:
             return set()
         try:
-            rows = self.db.list_update_seen_episodes(subscription_id)
+            rows = self.db.update.list_update_seen_episodes(subscription_id)
             return _episodes_for_season(rows, _to_season(subscription.get("season")))
         except Exception:  # noqa: BLE001
             logger.debug("list update seen episodes failed", exc_info=True)
@@ -1454,7 +1457,7 @@ class UpdateService:
 
     def _inflight_episodes(self, subscription_id: int) -> set[tuple[int | None, int]]:
         try:
-            rows = self.db.list_update_candidates(subscription_id=subscription_id, limit=500)
+            rows = self.db.update.list_update_candidates(subscription_id=subscription_id, limit=500)
         except Exception:  # noqa: BLE001
             logger.debug("list inflight update candidates failed", exc_info=True)
             return set()
@@ -1472,14 +1475,14 @@ class UpdateService:
         return result
 
     def refresh_snapshot(self, subscription_id: int) -> dict[str, Any]:
-        subscription = self.db.get_update_subscription(subscription_id, include_sources=True)
+        subscription = self.db.update.get_update_subscription(subscription_id, include_sources=True)
         if not subscription:
             raise ValueError("追更订阅不存在")
         episodes = self.scan_existing_episodes(subscription, force_refresh=True)
         return {"success": True, "subscription_id": subscription_id, "episodes": sorted([episode for _season, episode in episodes]), "count": len(episodes)}
 
     def preview_sources(self, subscription_id: int) -> dict[str, Any]:
-        subscription = self.db.get_update_subscription(subscription_id, include_sources=True)
+        subscription = self.db.update.get_update_subscription(subscription_id, include_sources=True)
         if not subscription:
             raise ValueError("追更订阅不存在")
         indexed_existing = self._seen_episodes(subscription)
@@ -1572,15 +1575,15 @@ class UpdateService:
             current_next = _to_int(subscription.get("next_episode"))
             if not current_next or (last_success_episode is not None and current_next <= last_success_episode) or hint_episode < current_next:
                 updates["next_episode"] = hint_episode
-        self.db.update_update_subscription(int(subscription["id"]), updates)
-        self.db.add_update_event(
+        self.db.update.update_update_subscription(int(subscription["id"]), updates)
+        self.db.update.add_update_event(
             int(subscription["id"]),
             run_id,
             "info",
             "已刷新 TMDB 下一集播出信息",
             {"old": old_hint, "new": hint},
         )
-        return self.db.get_update_subscription(int(subscription["id"]), include_sources=True) or {**subscription, **updates}
+        return self.db.update.get_update_subscription(int(subscription["id"]), include_sources=True) or {**subscription, **updates}
 
     def _episodes_from_snapshot(self, subscription: dict[str, Any], files: list[dict[str, Any]]) -> set[tuple[int | None, int]]:
         title_norms = [_norm(subscription.get("title")), *[_norm(item) for item in subscription.get("aliases") or []]]
@@ -1825,7 +1828,7 @@ class UpdateService:
                 if result_episode:
                     values.append(result_episode)
                     continue
-                candidate = self.db.get_update_candidate(int(result.get("candidate_id") or 0)) if result.get("candidate_id") else None
+                candidate = self.db.update.get_update_candidate(int(result.get("candidate_id") or 0)) if result.get("candidate_id") else None
                 if candidate and candidate.get("episode"):
                     values.append(int(candidate["episode"]))
         return max(values) if values else None

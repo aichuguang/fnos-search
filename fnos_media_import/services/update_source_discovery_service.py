@@ -66,7 +66,7 @@ class UpdateSourceDiscoveryService:
         should_search = bool(source_plan.get("fallback_sources")) and bool(target_episodes) and not fixed_target_hit and search_allowed
         if should_search:
             search_used = True
-            self.database.add_update_event(
+            self.database.update.add_update_event(
                 subscription_id,
                 run_id,
                 "warn",
@@ -91,7 +91,7 @@ class UpdateSourceDiscoveryService:
             if gate_raw:
                 subscription["raw_data"] = gate_raw
         if not candidates:
-            self.database.add_update_event(
+            self.database.update.add_update_event(
                 subscription_id,
                 run_id,
                 "info",

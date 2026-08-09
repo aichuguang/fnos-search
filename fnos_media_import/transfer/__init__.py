@@ -1,13 +1,13 @@
 """V1.0 传输执行器与编排（Transfer Orchestrator + Executors）包。
 
 本包只执行 V1 冻结执行计划（docs/V1.0多链路设计文档.md §12-§13）：
-四种策略 native_save / native_offline / rclone_copy / relay_upload_mobile，
+四种策略 native_save / native_offline / rclone_copy / relay_upload_provider，
 由 TransferOrchestrator 驱动 §13.1 状态机，执行器只负责各自的链路操作。
 
 约束（§0 / §13.3）：
 - 原生转存失败绝不降级为跨盘。
 - 磁链只能保存到六盘（native_offline）。
-- relay_upload_mobile 只允许目标为移动云。
+- relay_upload_provider 由目标 Provider 的原生上传器完成最终写入。
 - 来源落地与本地缓存在「目标校验成功 + 应用 ACK」之前绝不删除。
 - Provider 返回未知结果时进入人工复核，绝不重复创建原生转存。
 """
@@ -244,7 +244,7 @@ class TransferVerifyResult:
 
 @dataclass(frozen=True)
 class UploadOutcome:
-    """移动云中继上传结果。"""
+    """Provider 原生中继上传结果。"""
 
     status: str  # done | running | failed | auth_expired | unknown
     message: str = ""
@@ -372,7 +372,7 @@ class TransferPlan:
     def _validate_path_contract(self) -> None:
         """Apply the same minimal path contract as Planner/PlanValidator.
 
-        ``relay_upload_mobile`` has no destination staging step: its frozen
+        Provider relay has no destination staging step: its frozen
         paths are source landing, local relay cache and destination final.
         ``destination_staging`` is mandatory only for ``rclone_copy``.  The
         check is intentionally structural and does not consult live config.
@@ -380,24 +380,25 @@ class TransferPlan:
 
         strategy = str(self.transfer.get("strategy") or "").strip().lower()
         required: list[str] = []
+        relay_strategies = {"relay_upload_provider"}
         if strategy in {
             "native_save",
             "native_offline",
             "rclone_copy",
-            "relay_upload_mobile",
+            "relay_upload_provider",
         }:
             required.append("destination_final")
-        if strategy in {"rclone_copy", "relay_upload_mobile"}:
+        if strategy == "rclone_copy" or strategy in relay_strategies:
             required.append("source_landing")
         if strategy == "rclone_copy":
             required.append("destination_staging")
-        elif strategy == "relay_upload_mobile":
+        elif strategy in relay_strategies:
             required.append("local_temp")
 
-        if strategy == "relay_upload_mobile" and self.paths.get("destination_staging") not in (None, {}):
+        if strategy in relay_strategies and self.paths.get("destination_staging") not in (None, {}):
             raise TransferError(
                 ErrorCode.INVALID_PLAN,
-                "relay_upload_mobile 不允许 destination_staging",
+                f"{strategy} 不允许 destination_staging",
             )
 
         for key in required:
@@ -412,7 +413,7 @@ class TransferPlan:
             if not namespace or not raw_path:
                 raise TransferError(ErrorCode.INVALID_PLAN, f"{strategy} 的 paths.{key} 不完整")
             if key == "local_temp" and not namespace.lower().startswith("local:"):
-                raise TransferError(ErrorCode.INVALID_PLAN, "relay_upload_mobile 的 local_temp 必须位于 local 命名空间")
+                raise TransferError(ErrorCode.INVALID_PLAN, f"{strategy} 的 local_temp 必须位于 local 命名空间")
             if key == "destination_final":
                 # The planner emits an explicit ``kind``.  Keep the parser
                 # tolerant of old hand-built descriptors that predate the
@@ -423,11 +424,11 @@ class TransferPlan:
                 explicit_kind = str(value.get("kind") or "").strip().lower()
                 lowered = namespace.lower()
                 if explicit_kind:
-                    if strategy in {"native_save", "native_offline", "relay_upload_mobile"} and explicit_kind != "native":
+                    if strategy in {"native_save", "native_offline", *relay_strategies} and explicit_kind != "native":
                         raise TransferError(ErrorCode.INVALID_PLAN, f"{strategy} 的 destination_final 必须是 native kind")
                     if strategy == "rclone_copy" and explicit_kind == "native":
                         raise TransferError(ErrorCode.INVALID_PLAN, "rclone_copy 的 destination_final 不能是 native kind")
-                elif strategy in {"native_save", "native_offline"} and not lowered.startswith("native:"):
+                elif strategy in {"native_save", "native_offline", *relay_strategies} and not lowered.startswith("native:"):
                     # Native strategies have no meaningful untyped OpenList
                     # final path even in compatibility-shaped test plans.
                     raise TransferError(ErrorCode.INVALID_PLAN, f"{strategy} 的 destination_final 必须位于 native 命名空间")
@@ -927,10 +928,9 @@ from .cleanup import (  # noqa: E402,F401
 )
 from .verifier import ListedFiles, TransferVerifier, VerifyRequest  # noqa: E402,F401
 from .native_executor import (  # noqa: E402,F401
-    LegacyNativeAdapter,
     NativeSourceMaterializer,
     NativeTransferExecutor,
 )
 from .rclone_executor import RcloneTransferExecutor  # noqa: E402,F401
-from .mobile_relay_executor import CmccMobileUploader, MobileRelayExecutor  # noqa: E402,F401
+from .mobile_relay_executor import CmccMobileUploader  # noqa: E402,F401
 from .orchestrator import TransferOrchestrator  # noqa: E402,F401

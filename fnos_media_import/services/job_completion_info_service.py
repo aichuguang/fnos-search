@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..constants import JOB_PROVIDER_SUBMITTING, JOB_WAITING_TRANSFER
+from ..planning import is_data_plane_strategy
 from ..planning.job_plan import plan_path, plan_strategy, validated_v1_execution_plan_from_job
 
 
@@ -13,33 +14,17 @@ class JobCompletionInfoService:
     def __init__(
         self,
         *,
-        category: Callable[[str], dict[str, Any]],
-        uses_rclone_staging: Callable[[dict[str, Any]], bool],
-        is_staging_path: Callable[[str, dict[str, Any]], bool],
         common_virtual_path: Callable[[list[str]], str],
-        rclone_completed_root: Callable[..., str],
-        cloud139_plan: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], dict[str, Any]],
-        sixpan_plan: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]],
-        map_category_path: Callable[[str, dict[str, Any]], str],
         path_health_checks: Callable[..., list[dict[str, Any]]],
         plan_loader: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
-        self.category = category
-        self.uses_rclone_staging = uses_rclone_staging
-        self.is_staging_path = is_staging_path
         self.common_virtual_path = common_virtual_path
-        self.rclone_completed_root = rclone_completed_root
-        self.cloud139_plan = cloud139_plan
-        self.sixpan_plan = sixpan_plan
-        self.map_category_path = map_category_path
         self.path_health_checks = path_health_checks
         self.plan_loader = plan_loader or validated_v1_execution_plan_from_job
 
     def build(self, job: dict[str, Any]) -> dict[str, Any]:
         raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
         completion = raw_data.get("completion") if isinstance(raw_data.get("completion"), dict) else {}
-        category_key = str(job.get("category") or "").strip()
-        category = self.category(category_key)
         # V1 jobs carry their immutable paths in execution_plan.  Resolve this
         # branch before any historical category/staging fallback so a mutable
         # config edit can never change the status view or organizer root.
@@ -50,6 +35,12 @@ class JobCompletionInfoService:
             # Never rebuild paths from mutable category/config fields.
             message = f"completion view requires a valid V1 execution_plan: {exc}"
             return {
+                "source_provider_kind": str(job.get("source_provider_kind") or ""),
+                "source_form": str(job.get("source_form") or ""),
+                "search_source_id": "",
+                "transfer_strategy": "",
+                "destination_id": str(job.get("destination_id") or ""),
+                "destination_provider_kind": "",
                 "official_save_path": "",
                 "rclone_target_path": "",
                 "openlist_visible_path": "",
@@ -62,13 +53,28 @@ class JobCompletionInfoService:
             }
         if execution_plan:
             strategy = plan_strategy(execution_plan)
+            source = (
+                execution_plan.get("source")
+                if isinstance(execution_plan.get("source"), dict)
+                else {}
+            )
+            routing = (
+                execution_plan.get("routing")
+                if isinstance(execution_plan.get("routing"), dict)
+                else {}
+            )
+            destination = (
+                execution_plan.get("destination")
+                if isinstance(execution_plan.get("destination"), dict)
+                else {}
+            )
             final_ref = plan_path(execution_plan, "destination_final")
             staging_ref = plan_path(execution_plan, "destination_staging")
             landing_ref = plan_path(execution_plan, "source_landing")
             organizer_ref = plan_path(execution_plan, "organizer")
             official_save_path = str(
                 completion.get("official_save_path")
-                or (landing_ref if strategy in {"rclone_copy", "relay_upload_mobile"} else final_ref).get("path")
+                or (landing_ref if is_data_plane_strategy(strategy) else final_ref).get("path")
                 or job.get("target_path")
                 or ""
             ).strip()
@@ -82,7 +88,7 @@ class JobCompletionInfoService:
             organizer_path = str(completion.get("organizer_scan_path") or organizer_ref.get("path") or openlist_path).strip()
             organized_path = self._organized_target_path(job, completion)
             stage = str(completion.get("stage") or job.get("status") or "").strip()
-            data_plane = strategy in {"rclone_copy", "relay_upload_mobile"}
+            data_plane = is_data_plane_strategy(strategy)
             rclone_pending = data_plane and stage in {
                 JOB_PROVIDER_SUBMITTING,
                 "waiting_transfer",
@@ -103,6 +109,16 @@ class JobCompletionInfoService:
                 organizer_required=not rclone_pending,
             )
             return {
+                "source_provider_kind": str(source.get("provider_kind") or ""),
+                "source_form": str(source.get("source_form") or ""),
+                "search_source_id": str(
+                    source.get("search_source_id")
+                    or routing.get("search_source_id")
+                    or ""
+                ),
+                "transfer_strategy": strategy,
+                "destination_id": str(destination.get("id") or job.get("destination_id") or ""),
+                "destination_provider_kind": str(destination.get("provider_kind") or ""),
                 "official_save_path": official_save_path,
                 "rclone_target_path": rclone_target_path,
                 "openlist_visible_path": openlist_path,
@@ -114,6 +130,12 @@ class JobCompletionInfoService:
         # Unreachable: validated_v1_execution_plan_from_job either returned a plan or
         # the method returned the manual-review view above.
         return {
+            "source_provider_kind": str(job.get("source_provider_kind") or ""),
+            "source_form": str(job.get("source_form") or ""),
+            "search_source_id": "",
+            "transfer_strategy": "",
+            "destination_id": str(job.get("destination_id") or ""),
+            "destination_provider_kind": "",
             "official_save_path": "",
             "rclone_target_path": "",
             "openlist_visible_path": "",

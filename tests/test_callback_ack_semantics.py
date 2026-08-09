@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import copy
 import io
 import json
@@ -22,7 +24,7 @@ def _safe_int(value, default, minimum, maximum) -> int:
     return max(minimum, min(parsed, maximum))
 
 
-class _CallbackDatabase:
+class _CallbackDatabase(RepositoryFakeMixin):
     def __init__(self, job_status: str) -> None:
         self.job = rclone_v1_job(job_id=42, status=job_status)
         self.updates: list[dict] = []
@@ -36,6 +38,12 @@ class _CallbackDatabase:
     def update_job(self, _job_id: int, **changes) -> None:
         self.updates.append(copy.deepcopy(changes))
         self.job.update(copy.deepcopy(changes))
+
+    def update_job_if_status(self, _job_id: int, expected_statuses, **changes) -> bool:
+        if str(self.job.get("status") or "") not in {str(value) for value in expected_statuses}:
+            return False
+        self.update_job(_job_id, **changes)
+        return True
 
     def add_event(self, *args) -> None:
         self.job_events.append(copy.deepcopy(args))
@@ -55,7 +63,6 @@ def _callback_service(database: _CallbackDatabase) -> RcloneCallbackService:
             rclone=SimpleNamespace(),
             safe_int=_safe_int,
             callback_level=lambda _status: "info",
-            enqueue_organizer=lambda *_args: None,
             cancelled_status="cancelled",
         )
     )
@@ -117,19 +124,14 @@ class CallbackTerminalAckTests(unittest.TestCase):
         self.assertEqual(database.updates, [])
         self.assertEqual(database.file_events[0]["status"], "ignored_cancelled")
 
-    def test_cancelled_category_summary_does_not_enter_finalizer(self) -> None:
+    def test_cancelled_category_summary_is_diagnostic_only(self) -> None:
         database = _CallbackDatabase("cancelled")
-        finalizer_calls: list[tuple] = []
-        organizer_calls: list[tuple] = []
         service = RcloneCallbackService(
             CallbackDependencies(
                 db=database,
-                rclone=SimpleNamespace(
-                    finalize_category_imports=lambda *args: finalizer_calls.append(args)
-                ),
+                rclone=SimpleNamespace(),
                 safe_int=_safe_int,
                 callback_level=lambda _status: "info",
-                enqueue_organizer=lambda *args: organizer_calls.append(args),
                 cancelled_status="cancelled",
             )
         )
@@ -147,8 +149,26 @@ class CallbackTerminalAckTests(unittest.TestCase):
         self.assertEqual(status_code, 200)
         self.assertEqual(response["disposition"], "ignored_cancelled")
         self.assertIs(response["delete_source_allowed"], False)
-        self.assertEqual(finalizer_calls, [])
-        self.assertEqual(organizer_calls, [])
+        self.assertEqual(database.updates, [])
+
+    def test_active_category_summary_never_finalizes_or_dispatches_organizer(self) -> None:
+        database = _CallbackDatabase("transferring")
+        response, status_code = _callback_service(database).handle(
+            {
+                "run_id": 9,
+                "job_id": 42,
+                "status": "category_done",
+                "category": "tv",
+                "message": "category summary",
+            }
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(response["disposition"], "accepted")
+        self.assertTrue(response["category_summary"]["diagnostic_only"])
+        self.assertNotIn("organizer", response)
+        self.assertNotIn("category_refresh", response)
+        self.assertEqual(database.updates, [])
 
     def test_late_file_callbacks_are_acked_without_rolling_back_later_job_status(self) -> None:
         later_job_statuses = (
@@ -225,7 +245,7 @@ class CallbackTerminalAckTests(unittest.TestCase):
         self.assertEqual(database.file_events[0]["status"], "done")
 
 
-class _FakeHttpResponse:
+class _FakeHttpResponse(RepositoryFakeMixin):
     def __init__(self, body: bytes) -> None:
         self.body = body
 
@@ -250,7 +270,7 @@ class WorkerHttpCallbackAckTests(unittest.TestCase):
         python_end = script.index("\nPY\n}", python_start)
         cls.callback_python = script[python_start:python_end]
 
-    def _run_callback_python(self, response: object, *, job_dir: str = "") -> int:
+    def _run_callback_python(self, response: object, *, job_dir: str = "job-7") -> int:
         body = response if isinstance(response, bytes) else json.dumps(response).encode("utf-8")
         environment = {
             "CALLBACK_URL": "http://callback.invalid/rclone",
@@ -275,11 +295,33 @@ class WorkerHttpCallbackAckTests(unittest.TestCase):
         return 0
 
     def test_requires_json_object_with_literal_success_true(self) -> None:
-        self.assertEqual(self._run_callback_python({"success": True}), 0)
+        self.assertEqual(
+            self._run_callback_python(
+                {
+                    "success": True,
+                    "disposition": "accepted",
+                    "delete_source_allowed": True,
+                }
+            ),
+            0,
+        )
         self.assertEqual(self._run_callback_python(b"<html>ok</html>"), 1)
         self.assertEqual(self._run_callback_python({"success": False}), 1)
         self.assertEqual(self._run_callback_python([{"success": True}]), 1)
         self.assertEqual(self._run_callback_python({"success": 1}), 1)
+
+    def test_rejects_missing_or_invalid_frozen_job_directory(self) -> None:
+        acknowledged = {
+            "success": True,
+            "disposition": "accepted",
+            "delete_source_allowed": True,
+        }
+        for job_dir in ("", "7", "job-0", "job--7", "job-7/child"):
+            with self.subTest(job_dir=job_dir):
+                self.assertEqual(
+                    self._run_callback_python(acknowledged, job_dir=job_dir),
+                    1,
+                )
 
     def test_rejects_mismatched_response_job_id(self) -> None:
         self.assertEqual(

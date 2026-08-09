@@ -13,7 +13,11 @@
         let workbenchKeyword = "";
         let supplementController = null;
 
-        const sourceLabels = { tencent: "腾讯视频", iqiyi: "爱奇艺", youku: "优酷" };
+        const sourceLabels = {
+            tencent: "腾讯视频", iqiyi: "爱奇艺", youku: "优酷",
+            quark: "夸克网盘", mobile: "移动云", tianyi: "天翼云盘",
+            sixpan: "六盘", btbtla: "BTBTLA",
+        };
         const typeLabels = { tv: "电视剧", movie: "电影", anime: "动漫", variety: "综艺", other: "其他" };
 
         function ensureSchedulerTimeOptions() {
@@ -397,7 +401,7 @@
         }
 
         function resourceSourceLabel(item) {
-            return sourceLabels[item.source] || item.source_type || item.source || "-";
+            return sourceLabels[item.provider_kind] || sourceLabels[item.search_source_id] || item.provider_kind || item.search_source_id || "-";
         }
 
         function resourceSourceIcon(item) {
@@ -438,13 +442,13 @@
             return `<section class="resource-detail-panel glass-panel soft">
                 <div class="section-title compact"><div><h3>资源详情</h3><p>${escapeHtml(detail.title || workbenchCandidate.title || "-")}</p></div><span class="pill ${inspection.success === false ? "error" : "ok"}">${escapeHtml(inspection.message || (inspection.success === false ? "检测未通过" : "已读取"))}</span></div>
                 <div class="resource-detail-grid">
-                    <div><span>来源</span><strong>${escapeHtml(detail.source_type || detail.link?.source_type || "-")}</strong></div>
+                    <div><span>来源</span><strong>${escapeHtml(resourceSourceLabel(detail.link || detail))}</strong></div>
                     <div><span>文件数</span><strong>${escapeHtml(summary.file_count || workbench.detailItems(state.response).length || "-")}</strong></div>
                     <div><span>总大小</span><strong>${escapeHtml(summary.total_size_text || detail.size_text || "-")}</strong></div>
                     <div><span>建议分类</span><strong>${escapeHtml(detail.category_suggestion?.label || typeLabels[workbenchCandidate.media_type] || workbenchCandidate.media_type || "-")}</strong></div>
                 </div>
                 <div class="notice-box" style="margin-top:12px;">可选择文件或文件夹；不选时沿用原有默认全部入库规则。</div>
-                ${workbench.renderFileSelection(state.response, { publicId, selected: selection, escapeHtml, sourceType: detail.source_type || detail.link?.source_type || "" })}
+                ${workbench.renderFileSelection(state.response, { publicId, selected: selection, escapeHtml, providerKind: detail.provider_kind || detail.link?.provider_kind || "" })}
             </section>`;
         }
 
@@ -535,7 +539,7 @@
             if (response.success === false) return toast(response.message || "文件夹读取失败", "error");
             const inspection = detail.inspection || (detail.inspection = {});
             const source = workbenchItems.find((item) => String(item.public_id || "") === String(publicId)) || {};
-            const kind = workbench.sourceKind(source.source_type || source.source || detail.source_type || detail.link?.source_type || "");
+            const kind = workbench.sourceKind(source.provider_kind ? source : detail);
             if (kind === "quark" && parent) {
                 detail._workbench_selection_context = {
                     mode: "subdir_items",
@@ -628,7 +632,7 @@
             if (!confirmed) return;
             const detailState = workbenchDetails[publicId];
             const resource = workbenchItems.find((item) => String(item.public_id || "") === String(publicId)) || {};
-            const selection = workbench.selectionPayload(detailState?.response || {}, workbenchSelections[publicId] || new Set(), resource.source_type || resource.source || "");
+            const selection = workbench.selectionPayload(detailState?.response || {}, workbenchSelections[publicId] || new Set(), resource.provider_kind || "");
             const body = { public_id: publicId, category: candidate.media_type || "movie", ...selection };
             const data = await api(`/api/admin/trending/candidates/${encodeURIComponent(id)}/import`, { method: "POST", body: JSON.stringify(body), allowFailure: true });
             toast(data.message || (data.success ? "首入库任务已创建" : "首入库任务创建失败"), data.success ? "success" : "error");

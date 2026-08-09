@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import copy
 import uuid
 import unittest
@@ -8,6 +10,7 @@ from typing import Any
 
 from fnos_media_import.accounts.service import ProviderAccountService
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.domain.models import (
     AccountTestResult,
     LocalLocator,
@@ -21,6 +24,7 @@ from fnos_media_import.planning.destination_resolver import DestinationResolver
 from fnos_media_import.planning.job_plan import attach_plan_integrity
 from fnos_media_import.planning.plan_validator import PlanValidationDeps, validate_plan
 from fnos_media_import.planning.planner import ImportPlanner
+from fnos_media_import.providers.adapters import QuarkProviderAdapter
 from fnos_media_import.providers.registry import ProviderRegistry
 from fnos_media_import.services.source_record_service import SourceRecordService
 from fnos_media_import.storage.assignment_service import (
@@ -29,13 +33,12 @@ from fnos_media_import.storage.assignment_service import (
     assignment_id,
 )
 from fnos_media_import.storage.target_service import StorageTargetService
-from fnos_media_import.transfer.native_executor import LegacyNativeAdapter
 
 
 KEY = bytes.fromhex("42" * 32)
 
 
-def _database(testcase: unittest.TestCase) -> Database:
+def _database(testcase: unittest.TestCase) -> RepositorySet:
     path = Path(__file__).with_name(f"_planning_revision_{uuid.uuid4().hex}.db")
 
     def cleanup() -> None:
@@ -48,10 +51,10 @@ def _database(testcase: unittest.TestCase) -> Database:
     testcase.addCleanup(cleanup)
     database = Database(path)
     database.init_schema()
-    return database
+    return RepositorySet.from_database(database)
 
 
-class _WebDAV:
+class _WebDAV(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
         self.directories: set[str] = set()
@@ -223,8 +226,15 @@ class PlanningRevisionGuardTests(unittest.TestCase):
             {"url": "https://pan.quark.cn/s/abc", "password": ""},
         )
         mounts = OpenListMountService(database)
+        importer = object()
         registry = ProviderRegistry(
-            [LegacyNativeAdapter(None, "quark", supports_native_save=True)]
+            [
+                QuarkProviderAdapter(
+                    importer_factory=lambda _account_id, _revision: importer,
+                    account_importer_factory=lambda _values: importer,
+                    source_record_service=sources,
+                )
+            ]
         )
         resolver = DestinationResolver(assignments, targets, accounts)
         planner = ImportPlanner(

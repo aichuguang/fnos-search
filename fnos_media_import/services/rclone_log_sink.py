@@ -37,7 +37,7 @@ class RcloneLogSink:
         if self.database and run_id:
             lowered = text.lower()
             level = EVENT_ERROR if any(token in lowered for token in ("失败", "异常", "error", "failed")) else EVENT_INFO
-            self.database.add_rclone_event(run_id, level, text)
+            self.database.rclone.add_rclone_event(run_id, level, text)
 
     def list(self, limit: int = 200) -> list[str]:
         with self._lock:

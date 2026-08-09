@@ -33,7 +33,6 @@ class SearchCacheCommandRepository:
     def save_many(
         self,
         records: list[tuple[str, dict[str, Any]]],
-        *,
         keyword: str,
         expires_minutes: int = 60,
     ) -> list[int]:
@@ -89,6 +88,21 @@ class SearchCacheCommandRepository:
                     ids_by_public_id[str(row["public_id"])] = int(row["id"])
         return [ids_by_public_id.get(str(public_id), 0) for public_id, _item in records]
 
+    def save(
+        self,
+        public_id: str,
+        keyword: str,
+        item: dict[str, Any],
+        expires_minutes: int = 60,
+    ) -> int:
+        """Persist one cache row without a compatibility forwarding layer."""
+
+        return self.save_many(
+            [(public_id, item)],
+            keyword=keyword,
+            expires_minutes=expires_minutes,
+        )[0]
+
     def update(self, public_id: str, item: dict[str, Any], expires_minutes: int = 60) -> bool:
         source_url = str(item.get("url") or item.get("source_url") or "")
         raw_data = item.get("raw_data", item)
@@ -110,7 +124,7 @@ class SearchCacheCommandRepository:
             )
             return cursor.rowcount > 0
 
-    def prune_expired(self, *, limit: int = 1000) -> int:
+    def prune_expired(self, limit: int = 1000) -> int:
         """Delete one bounded batch of expired cache rows."""
         now = _utc_now()
         normalized_limit = max(1, int(limit or 1000))

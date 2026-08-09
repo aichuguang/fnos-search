@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import re
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
@@ -9,10 +8,6 @@ from ..constants import JOB_FAILED, JOB_SUBMITTED
 from ..http_client import HttpClient
 from ..media_path_rules import append_resource_dir, should_force_resource_dir
 from .base import AdapterCheckResult, ImportResult
-
-
-logger = logging.getLogger(__name__)
-
 
 class QuarkApiError(RuntimeError):
     """Raised when the Quark web API rejects a request."""
@@ -357,7 +352,12 @@ class QuarkImporter:
         except Exception as exc:  # noqa: BLE001
             return {"status": "running", "message": f"夸克任务暂时无法查询：{exc}"}
 
-    def verify_native_result(self, receipt: Any) -> dict[str, Any]:
+    def verify_native_result(self, request: Any) -> dict[str, Any]:
+        from ..transfer.verifier import VerifyRequest
+
+        if not isinstance(request, VerifyRequest):
+            raise TypeError("verify_native_result requires VerifyRequest")
+        receipt = request.operation
         status = self.poll_operation(receipt)
         if status.get("status") == "failed":
             return {"status": "missing", "message": status.get("message") or "夸克转存失败"}
@@ -764,73 +764,4 @@ class QuarkImporter:
         )
 
 
-class ActiveQuarkImporter:
-    """Delegates calls to the currently active account revision.
-
-    The runtime used to keep a process-wide Cookie as a fallback.  That made
-    an account-selection typo look like a successful request under a different
-    account.  The active-account resolver is now mandatory; when it cannot
-    resolve an account we expose a deterministic unavailable importer instead
-    of ever touching the legacy global configuration.
-    """
-
-    def __init__(self, fallback: QuarkImporter) -> None:
-        # Keep the constructor signature for callers that build the wrapper,
-        # but deliberately do not use the supplied legacy instance.
-        del fallback
-        self._fallback = QuarkImporter(
-            {}, configuration_error="当前夸克账号未配置或未激活"
-        )
-        self._resolver: Any = None
-        self._last_resolution_error = ""
-        self._resolution_error_importer: QuarkImporter | None = None
-
-    def set_resolver(self, resolver: Any) -> None:
-        self._resolver = resolver
-        self._last_resolution_error = ""
-        self._resolution_error_importer = None
-
-    @staticmethod
-    def _resolution_error_message(exc: Exception) -> str:
-        detail = str(exc or "").strip()
-        if not detail:
-            detail = type(exc).__name__
-        # Resolver exceptions are expected to be operator-facing diagnostics,
-        # not provider secrets.  Keep the message bounded in case a third-party
-        # adapter accidentally includes a very large response body.
-        return f"当前夸克账号不可用：{detail[:300]}"
-
-    def _current(self) -> QuarkImporter:
-        if callable(self._resolver):
-            try:
-                value = self._resolver()
-                if value is not None:
-                    self._last_resolution_error = ""
-                    self._resolution_error_importer = None
-                    return value
-            except Exception as exc:  # noqa: BLE001
-                message = self._resolution_error_message(exc)
-                if message != self._last_resolution_error:
-                    logger.warning("夸克当前账号解析失败：%s", message, exc_info=True)
-                    self._last_resolution_error = message
-                # An active account must never silently fall back to the old
-                # global cookie.  Return a provider-shaped unavailable client
-                # so all existing callers receive a deterministic, useful
-                # error instead of operating under a different account.
-                if (
-                    self._resolution_error_importer is None
-                    or self._resolution_error_importer.configuration_error != message
-                ):
-                    self._resolution_error_importer = QuarkImporter(
-                        {}, configuration_error=message
-                    )
-                return self._resolution_error_importer
-            self._last_resolution_error = ""
-            self._resolution_error_importer = None
-        return self._fallback
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._current(), name)
-
-
-__all__ = ["ActiveQuarkImporter", "QuarkApiError", "QuarkImporter"]
+__all__ = ["QuarkApiError", "QuarkImporter"]

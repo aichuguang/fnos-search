@@ -92,14 +92,6 @@ class WorkerTaskDispatcher:
             reactivate_terminal=True,
         )
 
-    def rclone_repair(self, *, limit: int = 50, recovery_key: str = "startup") -> dict[str, Any] | None:
-        return self.dispatch(
-            "rclone_repair",
-            {"limit": int(limit)},
-            f"rclone-repair:{recovery_key}",
-            reactivate_terminal=True,
-        )
-
     def import_retry(self, job_id: int, *, reason: str = "") -> dict[str, Any] | None:
         return self.dispatch(
             "import_retry",

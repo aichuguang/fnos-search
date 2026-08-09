@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.organizer.run_lease import OrganizerScanLease
 from fnos_media_import.organizer.service import OrganizerService
 from tests._organizer_v1_fixtures import (
@@ -17,14 +18,16 @@ from tests._organizer_v1_fixtures import (
     organizer_v1_job,
     organizer_v1_plan,
 )
+from tests._repository_v1_fakes import RepositoryFakeMixin
 
 
 class _DatabaseTestCase(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"organizer-revision-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -36,21 +39,23 @@ class _DatabaseTestCase(unittest.TestCase):
 class OrganizerCancellationCasTests(_DatabaseTestCase):
     def _create_job_and_task(self, *, status: str) -> tuple[int, int]:
         suffix = uuid.uuid4().hex
-        job_id, created = self.database.create_job(
+        job_id, created = self.database.job_commands.create(
             {
                 "title": f"Organizer cancellation {suffix}",
                 "category": "tv",
                 "category_label": "TV",
-                "source_type": "quark",
+                "source_provider_kind": "quark",
+                "source_form": "share",
                 "source_url": f"https://pan.quark.cn/s/{suffix}",
-                "target_route": "quark_to_mobile",
                 "target_path": f"/mobile/staging/tv/job-{suffix}",
                 "status": "waiting_organizer",
+                "destination_id": "native-main",
+                "plan_version": 1,
                 "idempotency_key": f"organizer-cancel-cas:{suffix}",
             }
         )
         self.assertTrue(created)
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             job_id=job_id,
             category="tv",
             openlist_root_path=f"/cloud/staging/tv/job-{job_id}",
@@ -67,23 +72,25 @@ class OrganizerCancellationCasTests(_DatabaseTestCase):
 
     def test_stale_cancel_snapshot_cannot_overwrite_concurrent_done(self) -> None:
         job_id, task_id = self._create_job_and_task(status="manual_confirmed")
-        run_id, active = self.database.claim_organizer_run(task_id, owner_id="worker-a", lease_seconds=60)
+        run_id, active = self.database.organizer.claim_organizer_run(task_id, owner_id="worker-a", lease_seconds=60)
         self.assertIsNone(active)
         self.assertIsNotNone(run_id)
-        claimed = self.database.get_organizer_task(task_id, include_children=False)
+        claimed = self.database.organizer.get_organizer_task(task_id, include_children=False)
         claimed_revision = int((claimed or {})["revision"])
 
-        class FinalizeAfterListDatabase:
+        class FinalizeAfterListDatabase(RepositoryFakeMixin):
             def __init__(self, database: Database) -> None:
                 self.database = database
+                self.organizer = self
+                self.job_queries = database.job_queries
                 self.finalized = False
 
             def __getattr__(self, name: str) -> Any:
-                return getattr(self.database, name)
+                return getattr(self.database.organizer, name)
 
             def list_organizer_tasks_by_job(self, linked_job_id: int, limit: int = 20) -> list[dict[str, Any]]:
-                stale_tasks = self.database.list_organizer_tasks_by_job(linked_job_id, limit=limit)
-                self.finalized = self.database.finalize_organizer_run_and_task(
+                stale_tasks = self.database.organizer.list_organizer_tasks_by_job(linked_job_id, limit=limit)
+                self.finalized = self.database.organizer.finalize_organizer_run_and_task(
                     int(run_id or 0),
                     task_id,
                     owner_id="worker-a",
@@ -99,23 +106,23 @@ class OrganizerCancellationCasTests(_DatabaseTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["cancelled_task_ids"], [])
         self.assertEqual(result["conflict_task_ids"], [])
-        current = self.database.get_organizer_task(task_id, include_children=False)
+        current = self.database.organizer.get_organizer_task(task_id, include_children=False)
         self.assertEqual((current or {})["status"], "done")
         self.assertEqual(int((current or {})["revision"]), claimed_revision)
-        run = next(item for item in self.database.list_organizer_runs() if item["id"] == run_id)
+        run = next(item for item in self.database.organizer.list_organizer_runs() if item["id"] == run_id)
         self.assertEqual(run["status"], "done")
 
     def test_active_task_is_cancelled_and_scan_lease_is_invalidated(self) -> None:
         job_id, task_id = self._create_job_and_task(status="pending")
         self.assertTrue(
-            self.database.claim_organizer_task_for_scan(
+            self.database.organizer.claim_organizer_task_for_scan(
                 task_id,
                 allowed_statuses={"pending"},
                 owner_id="scanner-a",
                 lease_seconds=60,
             )
         )
-        claimed = self.database.get_organizer_task(task_id, include_children=False)
+        claimed = self.database.organizer.get_organizer_task(task_id, include_children=False)
         claimed_revision = int((claimed or {})["revision"])
 
         result = self._service(self.database).cancel_job_tasks(job_id, reason="linked job cancelled")
@@ -123,7 +130,7 @@ class OrganizerCancellationCasTests(_DatabaseTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["cancelled_task_ids"], [task_id])
         self.assertEqual(result["conflict_task_ids"], [])
-        current = self.database.get_organizer_task(task_id, include_children=False)
+        current = self.database.organizer.get_organizer_task(task_id, include_children=False)
         self.assertEqual((current or {})["status"], "cancelled")
         self.assertEqual((current or {})["error_message"], "linked job cancelled")
         self.assertGreater(int((current or {})["revision"]), claimed_revision)
@@ -133,14 +140,14 @@ class OrganizerCancellationCasTests(_DatabaseTestCase):
 
 class OrganizerScanRevisionTests(_DatabaseTestCase):
     def test_skip_during_scan_is_rejected_without_invalidating_owner(self) -> None:
-        job_id, created = self.database.create_job(
+        job_id, created = self.database.job_commands.create(
             {
                 "title": "扫描期间跳过",
                 "category": "tv",
                 "category_label": "TV",
-                "source_type": "quark",
+                "source_provider_kind": "quark",
+                "source_form": "share",
                 "source_url": f"source-record:scan-skip-{uuid.uuid4().hex}",
-                "target_route": "native_save",
                 "target_path": "/cloud/tv",
                 "status": "waiting_organizer",
                 "destination_id": "native-main",
@@ -155,7 +162,7 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
             organizer_root="/cloud/staging/tv/job-1",
             destination_final="/cloud/tv",
         )
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             job_id=job_id,
             category="tv",
             openlist_root_path="/cloud/staging/tv/job-1",
@@ -163,14 +170,14 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
             raw_data=attach_organizer_v1_task({}, plan)["raw_data"],
         )
         self.assertTrue(
-            self.database.claim_organizer_task_for_scan(
+            self.database.organizer.claim_organizer_task_for_scan(
                 task_id,
                 allowed_statuses={"pending"},
                 owner_id="scanner-a",
                 lease_seconds=60,
             )
         )
-        claimed = self.database.get_organizer_task(task_id, include_children=False)
+        claimed = self.database.organizer.get_organizer_task(task_id, include_children=False)
         revision = int(claimed["revision"])
 
         service = OrganizerService.__new__(OrganizerService)
@@ -180,13 +187,13 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
 
         self.assertFalse(skipped["success"])
         self.assertTrue(skipped["conflict"])
-        current = self.database.get_organizer_task(task_id, include_children=False)
+        current = self.database.organizer.get_organizer_task(task_id, include_children=False)
         self.assertEqual(current["status"], "scanning")
         self.assertEqual(int(current["revision"]), revision)
         self.assertEqual(current["scan_owner"], "scanner-a")
         self.assertTrue(current["scan_lease_expires_at"])
         self.assertTrue(
-            self.database.replace_organizer_plan(
+            self.database.organizer.replace_organizer_plan(
                 task_id,
                 files=[{"path": "/cloud/staging/tv/job-1/stale.mkv", "name": "stale.mkv"}],
                 mappings=[],
@@ -195,26 +202,26 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
                 owner_id="scanner-a",
             )
         )
-        self.assertEqual(len(self.database.get_organizer_task(task_id)["files"]), 1)
+        self.assertEqual(len(self.database.organizer.get_organizer_task(task_id)["files"]), 1)
 
     def test_expired_scan_can_be_taken_over_but_old_revision_cannot_write(self) -> None:
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             category="tv",
             openlist_root_path="/cloud/staging/tv/job-2",
             status="pending",
         )
         self.assertTrue(
-            self.database.claim_organizer_task_for_scan(
+            self.database.organizer.claim_organizer_task_for_scan(
                 task_id,
                 allowed_statuses={"pending"},
                 owner_id="scanner-a",
                 lease_seconds=60,
             )
         )
-        first = self.database.get_organizer_task(task_id, include_children=False)
+        first = self.database.organizer.get_organizer_task(task_id, include_children=False)
         first_revision = int(first["revision"])
         self.assertTrue(
-            self.database.renew_organizer_scan(
+            self.database.organizer.renew_organizer_scan(
                 task_id,
                 "scanner-a",
                 lease_seconds=60,
@@ -222,7 +229,7 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
             )
         )
         self.assertTrue(
-            self.database.owns_organizer_scan(
+            self.database.organizer.owns_organizer_scan(
                 task_id,
                 "scanner-a",
                 expected_revision=first_revision,
@@ -236,25 +243,27 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
             )
 
         self.assertFalse(
-            self.database.owns_organizer_scan(
+            self.database.organizer.owns_organizer_scan(
                 task_id,
                 "scanner-a",
                 expected_revision=first_revision,
             )
         )
         self.assertTrue(
-            Database(self.db_path).claim_organizer_task_for_scan(
+            RepositorySet.from_database(
+                Database(self.db_path)
+            ).organizer.claim_organizer_task_for_scan(
                 task_id,
                 allowed_statuses={"pending"},
                 owner_id="scanner-b",
                 lease_seconds=60,
             )
         )
-        second = self.database.get_organizer_task(task_id, include_children=False)
+        second = self.database.organizer.get_organizer_task(task_id, include_children=False)
         self.assertEqual(second["scan_owner"], "scanner-b")
         self.assertGreater(int(second["revision"]), first_revision)
         self.assertFalse(
-            self.database.replace_organizer_plan(
+            self.database.organizer.replace_organizer_plan(
                 task_id,
                 files=[],
                 mappings=[],
@@ -282,7 +291,7 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
 
         database = FakeDatabase()
         lease = OrganizerScanLease(
-            database=database,
+            repository=database,
             task_id=1,
             owner_id="scanner",
             revision=2,
@@ -302,18 +311,18 @@ class OrganizerScanRevisionTests(_DatabaseTestCase):
 
 class OrganizerRunRevisionTests(_DatabaseTestCase):
     def test_revision_change_prevents_old_run_from_finalizing_task(self) -> None:
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             category="tv",
             openlist_root_path="/cloud/staging/tv/job-3",
             status="manual_confirmed",
         )
-        run_id, active = self.database.claim_organizer_run(task_id, owner_id="worker-a", lease_seconds=60)
+        run_id, active = self.database.organizer.claim_organizer_run(task_id, owner_id="worker-a", lease_seconds=60)
         self.assertIsNone(active)
         self.assertIsNotNone(run_id)
-        task = self.database.get_organizer_task(task_id, include_children=False)
+        task = self.database.organizer.get_organizer_task(task_id, include_children=False)
         old_revision = int(task["revision"])
         self.assertTrue(
-            self.database.update_organizer_task(
+            self.database.organizer.update_organizer_task(
                 task_id,
                 expected_revision=old_revision,
                 expected_statuses={"executing"},
@@ -322,7 +331,7 @@ class OrganizerRunRevisionTests(_DatabaseTestCase):
             )
         )
 
-        finalized = self.database.finalize_organizer_run_and_task(
+        finalized = self.database.organizer.finalize_organizer_run_and_task(
             int(run_id or 0),
             task_id,
             owner_id="worker-a",
@@ -331,24 +340,24 @@ class OrganizerRunRevisionTests(_DatabaseTestCase):
         )
 
         self.assertFalse(finalized)
-        current = self.database.get_organizer_task(task_id, include_children=False)
+        current = self.database.organizer.get_organizer_task(task_id, include_children=False)
         self.assertEqual(current["status"], "executing")
         self.assertEqual(current["error_message"], "superseded")
-        run = next(item for item in self.database.list_organizer_runs() if item["id"] == run_id)
+        run = next(item for item in self.database.organizer.list_organizer_runs() if item["id"] == run_id)
         self.assertEqual(run["status"], "running")
-        self.assertFalse(self.database.owns_organizer_run(int(run_id or 0), "worker-a"))
+        self.assertFalse(self.database.organizer.owns_organizer_run(int(run_id or 0), "worker-a"))
 
 
 class OrganizerPersistedOperationRecoveryTests(_DatabaseTestCase):
     def test_retry_after_crash_reuses_done_and_pending_operation_rows(self) -> None:
-        job_id, created = self.database.create_job(
+        job_id, created = self.database.job_commands.create(
             {
                 "title": "持久化操作恢复",
                 "category": "tv",
                 "category_label": "TV",
-                "source_type": "quark",
+                "source_provider_kind": "quark",
+                "source_form": "share",
                 "source_url": f"source-record:operation-recovery-{uuid.uuid4().hex}",
-                "target_route": "native_save",
                 "target_path": "/cloud/tv/show",
                 "status": "waiting_organizer",
                 "destination_id": "native-main",
@@ -363,7 +372,7 @@ class OrganizerPersistedOperationRecoveryTests(_DatabaseTestCase):
             organizer_root="/cloud/staging/tv/job-4",
             destination_final="/cloud/tv/show",
         )
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             job_id=job_id,
             category="tv",
             openlist_root_path="/cloud/staging/tv/job-4",
@@ -372,7 +381,7 @@ class OrganizerPersistedOperationRecoveryTests(_DatabaseTestCase):
             raw_data=attach_organizer_v1_task({}, plan)["raw_data"],
         )
         self.assertTrue(
-            self.database.replace_organizer_plan(
+            self.database.organizer.replace_organizer_plan(
                 task_id,
                 files=[],
                 mappings=[],
@@ -392,13 +401,13 @@ class OrganizerPersistedOperationRecoveryTests(_DatabaseTestCase):
                 ],
             )
         )
-        old_run_id, _active = self.database.claim_organizer_run(task_id, owner_id="crashed-worker", lease_seconds=60)
+        old_run_id, _active = self.database.organizer.claim_organizer_run(task_id, owner_id="crashed-worker", lease_seconds=60)
         with self.database.connect() as connection:
             connection.execute(
                 "UPDATE organizer_runs SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
                 (old_run_id,),
             )
-        recovered = self.database.recover_stale_organizer_runs()
+        recovered = self.database.organizer.recover_stale_organizer_runs()
         self.assertEqual(recovered["count"], 1)
 
         service = OrganizerService.__new__(OrganizerService)
@@ -429,7 +438,7 @@ class OrganizerPersistedOperationRecoveryTests(_DatabaseTestCase):
 
         service._execute_operation = execute
         bind_task_openlist_resolver(service, None, plan)
-        before = self.database.get_organizer_task(task_id)
+        before = self.database.organizer.get_organizer_task(task_id)
         done_id = int(next(item for item in before["operations"] if item["status"] == "done")["id"])
         pending_id = int(next(item for item in before["operations"] if item["status"] == "pending")["id"])
 
@@ -437,7 +446,7 @@ class OrganizerPersistedOperationRecoveryTests(_DatabaseTestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(executed, [pending_id])
-        after = self.database.get_organizer_task(task_id)
+        after = self.database.organizer.get_organizer_task(task_id)
         self.assertEqual(after["status"], "done")
         statuses = {int(item["id"]): item["status"] for item in after["operations"]}
         self.assertEqual(statuses[done_id], "done")
@@ -558,89 +567,7 @@ class OrganizerStrmCompletionTests(unittest.TestCase):
         self.assertEqual(finalized[-1]["task_status"], "waiting_review")
         self.assertEqual(cleanup_calls, [])
 
-    def test_legacy_pending_task_is_reconciled_without_strm_probe_or_cleanup(self) -> None:
-        service, finalized, cleanup_calls = _strm_service()
-        path = "/strm/tv/New Show"
-        service._capture_strm_targets = lambda *_args, **_kwargs: self.fail(
-            "历史待确认任务也不应继续探测 STRM"
-        )
-        service._schedule_task_after = lambda *_args, **_kwargs: self.fail(
-            "历史待确认任务不应再次安排等待"
-        )
-        state = {
-            "version": 1,
-            "status": "pending",
-            "attempts": 2,
-            "resource_names": ["New Show"],
-            "refresh_paths": [path],
-            "refresh_prefix": "/strm/tv",
-            "summary": {"task_id": 1},
-            "undo": [],
-            "confirmation": {"success": True},
-            "task_evidence": {},
-        }
-        task = {
-            "id": 1,
-            "status": "executing",
-            "category": "tv",
-            "raw_data": {"strm_completion": state},
-            "evidence": {},
-        }
 
-        result = service._resume_strm_completion(1, 12, task, state, _Lease())
-
-        self.assertEqual(result["status"], "done")
-        self.assertEqual(finalized[-1]["task_status"], "done")
-        completion = finalized[-1]["raw_data"]["strm_completion"]
-        self.assertEqual(completion["status"], "refresh_accepted")
-        self.assertTrue(completion["legacy_pending_reconciled"])
-        self.assertEqual(cleanup_calls, [])
-
-    def test_startup_requeues_v1_strm_pending_state_for_immediate_reconciliation(self) -> None:
-        plan = organizer_v1_plan(
-            7,
-            category="tv",
-            organizer_root="/cloud/staging/tv/job-7",
-            destination_final="/cloud/tv",
-        )
-        job = organizer_v1_job(plan, status="organizing")
-        task = attach_organizer_v1_task(
-            {
-                "id": 7,
-                "status": "strm_pending",
-                "raw_data": {
-                    "strm_completion": {
-                        "status": "pending",
-                        "next_retry_at": "2000-01-01T00:00:00Z",
-                    },
-                },
-            },
-            plan,
-        )
-
-        class FakeDatabase:
-            @staticmethod
-            def list_organizer_tasks(*, limit: int, status: str, offset: int = 0) -> list[dict[str, Any]]:
-                del limit, offset
-                return [task] if status == "strm_pending" else []
-
-            @staticmethod
-            def get_job(_job_id: int) -> dict[str, Any]:
-                return job
-
-        service = OrganizerService.__new__(OrganizerService)
-        service.db = FakeDatabase()
-        service.organizer_config = {"enabled": True}
-        service.openlist = SimpleNamespace(configured=True)
-        service._task_abort_reason = lambda *_args, **_kwargs: ""
-        service._sync_linked_job = lambda *_args, **_kwargs: None
-        scheduled: list[tuple[int, int]] = []
-        service._schedule_task_after = lambda task_id, delay: scheduled.append((task_id, delay)) or True
-        bind_task_openlist_resolver(service, None, plan)
-
-        service._recover_transient_scan_tasks_on_startup(include_scanning=False)
-
-        self.assertEqual(scheduled, [(7, 0)])
 
 
 if __name__ == "__main__":

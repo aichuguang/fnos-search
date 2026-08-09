@@ -1,18 +1,33 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 
 from fnos_media_import.transfer.dispatch import TransferDispatchError, TransferDispatchService
+from fnos_media_import.transfer.provider_relay_executor import ProviderRelayExecutor
 
 
-class _Adapter:
+class _Adapter(RepositoryFakeMixin):
+    def __init__(self, *, supports_relay: bool = False) -> None:
+        self.calls: list[tuple[str, int]] = []
+        self.supports_relay = supports_relay
+
+    def capabilities(self):
+        return {"supports_relay_upload": self.supports_relay}
+
     def relay_uploader_for(self, _account_id: str, _revision: int):
+        self.calls.append((_account_id, _revision))
         return object()
 
 
-class _Registry:
+class _Registry(RepositoryFakeMixin):
     def __init__(self) -> None:
-        self.adapters = {"quark": _Adapter(), "mobile": _Adapter()}
+        self.adapters = {
+            "quark": _Adapter(),
+            "mobile": _Adapter(supports_relay=True),
+            "tianyi": _Adapter(supports_relay=True),
+        }
 
     def get(self, kind: str):
         return self.adapters[kind]
@@ -54,11 +69,28 @@ class TransferDispatchTests(unittest.TestCase):
         plan["destination"]["provider_kind"] = "quark"
         self.assertIn("rclone_copy", self._service().build_executors(plan))
 
-    def test_builds_mobile_relay_executor_from_frozen_account(self) -> None:
-        self.assertIn(
-            "relay_upload_mobile",
-            self._service().build_executors(_plan("relay_upload_mobile")),
+    def test_builds_provider_relay_executor_from_frozen_account(self) -> None:
+        service = self._service()
+        executors = service.build_executors(_plan("relay_upload_provider"))
+        self.assertIsInstance(executors["relay_upload_provider"], ProviderRelayExecutor)
+        self.assertEqual(service.registry.adapters["mobile"].calls, [("acc_mobile", 1)])
+
+    def test_builds_tianyi_provider_relay_from_frozen_account(self) -> None:
+        service = self._service()
+        plan = _plan("relay_upload_provider")
+        plan["destination"].update(
+            {
+                "id": "tianyi_main",
+                "provider_kind": "tianyi",
+                "account_id": "acc_tianyi",
+                "account_revision": 7,
+            }
         )
+
+        executors = service.build_executors(plan)
+
+        self.assertIsInstance(executors["relay_upload_provider"], ProviderRelayExecutor)
+        self.assertEqual(service.registry.adapters["tianyi"].calls, [("acc_tianyi", 7)])
 
     def test_unknown_strategy_fails_closed(self) -> None:
         with self.assertRaises(TransferDispatchError):

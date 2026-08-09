@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from fnos_media_import.constants import ROUTE_QUARK_TO_MOBILE
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.organizer.service import OrganizerService
 from fnos_media_import.services.organizer_admin_service import (
     OrganizerAdminCommandDependencies,
@@ -21,7 +23,7 @@ from tests._organizer_v1_fixtures import (
 )
 
 
-class _TreeOpenList:
+class _TreeOpenList(RepositoryFakeMixin):
     def __init__(self, rows: dict[str, list[tuple[str, bool]]]) -> None:
         self.rows = rows
 
@@ -38,7 +40,7 @@ class _TreeOpenList:
         ]
 
 
-class _MemoryOpenList:
+class _MemoryOpenList(RepositoryFakeMixin):
     def __init__(self, *, files: set[str], directories: set[str]) -> None:
         self.files = set(files)
         self.directories = set(directories)
@@ -109,8 +111,9 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"organizer-passthrough-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -126,14 +129,14 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         organizer_root: str,
         destination_final: str,
     ) -> tuple[int, dict[str, Any]]:
-        job_id, created = self.database.create_job(
+        job_id, created = self.database.job_commands.create(
             {
                 "title": title,
                 "category": "movie",
                 "category_label": "电影",
-                "source_type": "quark",
+                "source_provider_kind": "quark",
+                "source_form": "share",
                 "source_url": f"source-record:passthrough-{uuid.uuid4().hex}",
-                "target_route": ROUTE_QUARK_TO_MOBILE,
                 "target_path": destination_final,
                 "status": status,
                 "destination_id": "native-main",
@@ -159,7 +162,7 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         )
         self.assertEqual(job_id, 1)
         task_payload = attach_organizer_v1_task({}, plan)
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             category="movie",
             category_label="电影",
             title="电影资源",
@@ -192,7 +195,7 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         self.assertTrue(result["ready_for_apply"])
         self.assertTrue(result["passthrough"])
         self.assertEqual(result["file_count"], 5)
-        task = self.database.get_organizer_task(task_id)
+        task = self.database.organizer.get_organizer_task(task_id)
         self.assertEqual(task["status"], "manual_confirmed")
         targets = {item["target_path"] for item in task["mappings"]}
         self.assertEqual(
@@ -221,7 +224,7 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         result = service.skip_task(task_id)
 
         self.assertTrue(result["success"], result)
-        task = self.database.get_organizer_task(task_id)
+        task = self.database.organizer.get_organizer_task(task_id)
         self.assertEqual(
             {item["target_path"] for item in task["mappings"]},
             {
@@ -233,10 +236,10 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
     def test_task_state_race_rejects_passthrough_without_replacing_plan(self) -> None:
         root = "/旧挂载/_入库暂存/电影/job-1"
         service, task_id = self._create_staging_task({root: [("电影.mkv", False)]})
-        original_replace = self.database.replace_organizer_plan
+        original_replace = self.database.organizer.replace_organizer_plan
 
         def racing_replace(*args: Any, **kwargs: Any) -> bool:
-            self.database.update_organizer_task(
+            self.database.organizer.update_organizer_task(
                 task_id,
                 status="cancelled",
                 expected_statuses={"waiting_review"},
@@ -244,19 +247,19 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
             )
             return original_replace(*args, **kwargs)
 
-        self.database.replace_organizer_plan = racing_replace  # type: ignore[method-assign]
+        self.database.organizer.replace_organizer_plan = racing_replace  # type: ignore[method-assign]
 
         result = service.skip_task(task_id)
 
         self.assertFalse(result["success"], result)
         self.assertTrue(result["conflict"])
-        task = self.database.get_organizer_task(task_id)
+        task = self.database.organizer.get_organizer_task(task_id)
         self.assertEqual(task["status"], "cancelled")
         self.assertEqual(task["mappings"], [])
         self.assertEqual(task["operations"], [])
 
     def test_unlinked_legacy_skip_is_moved_to_manual_review(self) -> None:
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             category="movie",
             openlist_root_path="/旧挂载/电影/已入库电影",
             status="waiting_review",
@@ -270,54 +273,9 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         self.assertFalse(result["success"], result)
         self.assertTrue(result["manual_review"])
         self.assertEqual(
-            self.database.get_organizer_task(task_id, include_children=False)["status"],
+            self.database.organizer.get_organizer_task(task_id, include_children=False)["status"],
             "waiting_review",
         )
-
-    def test_linked_legacy_skip_does_not_complete_job_or_guest_request(self) -> None:
-        job_id, _created = self.database.create_job(
-            {
-                "title": "已在正式目录的电影",
-                "category": "movie",
-                "category_label": "电影",
-                "source_type": "magnet",
-                "source_url": "magnet:?xt=urn:btih:skip-linked-status",
-                "target_route": ROUTE_QUARK_TO_MOBILE,
-                "target_path": "/媒体/电影/已在正式目录的电影",
-                "status": "review",
-            }
-        )
-        request_id = self.database.create_guest_request(
-            {
-                "request_token": uuid.uuid4().hex,
-                "job_id": job_id,
-                "title": "已在正式目录的电影",
-                "category": "movie",
-                "source_type": "magnet",
-                "source_url": "magnet:?xt=urn:btih:skip-linked-status",
-                "status": "review",
-                "public_status": "等待审核",
-            }
-        )
-        task_id = self.database.create_organizer_task(
-            job_id=job_id,
-            category="movie",
-            openlist_root_path="/媒体/电影/已在正式目录的电影",
-            status="waiting_review",
-        )
-        service = OrganizerService.__new__(OrganizerService)
-        service.db = self.database
-        service.categories = {"movie": {"openlist_root_path": "/媒体/电影"}}
-
-        result = service.skip_task(task_id)
-
-        self.assertFalse(result["success"], result)
-        self.assertTrue(result["manual_review"])
-        self.assertEqual(self.database.get_job(job_id)["status"], "review")
-        guest_request = self.database.get_guest_request(request_id)
-        self.assertEqual(guest_request["status"], "review")
-        self.assertEqual(guest_request["public_status"], "等待审核")
-        self.assertNotIn("status_sync", guest_request.get("raw_data") or {})
 
     def test_startup_repairs_confirmed_skipped_task_but_not_unconfirmed_staging_task(self) -> None:
         repaired_root = "/暂存/电影/job-confirmed"
@@ -327,7 +285,7 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
             organizer_root=repaired_root,
             destination_final="/媒体/电影",
         )
-        repaired_request_id = self.database.create_guest_request(
+        repaired_request_id = self.database.guest_request_commands.create(
             {
                 "request_token": uuid.uuid4().hex,
                 "job_id": repaired_job_id,
@@ -339,7 +297,7 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
                 "public_status": "等待审核",
             }
         )
-        repaired_task_id = self.database.create_organizer_task(
+        repaired_task_id = self.database.organizer.create_organizer_task(
             job_id=repaired_job_id,
             category="movie",
             openlist_root_path=repaired_root,
@@ -348,36 +306,32 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
             evidence={"completion_confirmation": {"success": True, "confirmed_count": 3}},
         )
 
-        blocked_job_id, _created = self.database.create_job(
-            {
-                "title": "仍在暂存区的合集",
-                "category": "movie",
-                "category_label": "电影",
-                "source_type": "magnet",
-                "source_url": "magnet:?xt=urn:btih:unconfirmed-skipped",
-                "target_route": ROUTE_QUARK_TO_MOBILE,
-                "target_path": "/暂存/电影/job-unconfirmed",
-                "status": "review",
-            }
+        blocked_root = "/\u6682\u5b58/\u7535\u5f71/job-unconfirmed"
+        blocked_job_id, blocked_plan = self._create_v1_job(
+            title="\u4ecd\u5728\u6682\u5b58\u533a\u7684\u5408\u96c6",
+            status="review",
+            organizer_root=blocked_root,
+            destination_final="/\u5a92\u4f53/\u7535\u5f71",
         )
-        self.database.create_organizer_task(
+        self.database.organizer.create_organizer_task(
             job_id=blocked_job_id,
             category="movie",
-            openlist_root_path="/暂存/电影/job-unconfirmed",
+            openlist_root_path=blocked_root,
             status="skipped",
-            raw_data={"staging_plan": {"enabled": True}},
+            raw_data=attach_organizer_v1_task({}, blocked_plan)["raw_data"],
+            evidence={},
         )
         service = OrganizerService.__new__(OrganizerService)
         service.db = self.database
-        bind_organizer_v1_execution_repository(service, repaired_plan)
+        bind_organizer_v1_execution_repository(service, repaired_plan, blocked_plan)
 
         result = service._recover_completed_linked_jobs_on_startup()
 
         self.assertIn(repaired_task_id, result["recovered_task_ids"])
-        self.assertEqual(self.database.get_job(repaired_job_id)["status"], "done")
-        self.assertEqual(self.database.get_guest_request(repaired_request_id)["status"], "done")
-        self.assertEqual(self.database.get_guest_request(repaired_request_id)["public_status"], "已完成")
-        self.assertEqual(self.database.get_job(blocked_job_id)["status"], "review")
+        self.assertEqual(self.database.job_queries.get(repaired_job_id)["status"], "done")
+        self.assertEqual(self.database.guest_request_queries.get(repaired_request_id)["status"], "done")
+        self.assertEqual(self.database.guest_request_queries.get(repaired_request_id)["public_status"], "已完成")
+        self.assertEqual(self.database.job_queries.get(blocked_job_id)["status"], "review")
 
     def test_startup_repairs_guest_when_linked_job_is_already_done(self) -> None:
         organizer_root = "/媒体/电影/状态补偿测试"
@@ -387,7 +341,7 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
             organizer_root=organizer_root,
             destination_final="/媒体/电影",
         )
-        request_id = self.database.create_guest_request(
+        request_id = self.database.guest_request_commands.create(
             {
                 "request_token": uuid.uuid4().hex,
                 "job_id": job_id,
@@ -399,7 +353,7 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
                 "public_status": "等待审核",
             }
         )
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             job_id=job_id,
             category="movie",
             openlist_root_path=organizer_root,
@@ -413,8 +367,8 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         result = service._recover_completed_linked_jobs_on_startup()
 
         self.assertIn(task_id, result["recovered_task_ids"])
-        self.assertEqual(self.database.get_guest_request(request_id)["status"], "done")
-        self.assertEqual(self.database.get_guest_request(request_id)["public_status"], "已完成")
+        self.assertEqual(self.database.guest_request_queries.get(request_id)["status"], "done")
+        self.assertEqual(self.database.guest_request_queries.get(request_id)["public_status"], "已完成")
 
     def test_passthrough_completion_never_starts_openlist_global_scan(self) -> None:
         service = OrganizerService.__new__(OrganizerService)
@@ -474,9 +428,9 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
         self.assertNotIn(source, memory.files)
         self.assertIn(target, memory.files)
         self.assertEqual(memory.refresh_calls, [])
-        task = self.database.get_organizer_task(task_id, include_children=False)
+        task = self.database.organizer.get_organizer_task(task_id, include_children=False)
         self.assertEqual(task["status"], "done")
-        self.assertEqual(self.database.get_job(1)["status"], "done")
+        self.assertEqual(self.database.job_queries.get(1)["status"], "done")
 
 
 class OrganizerPassthroughDispatchTests(unittest.TestCase):

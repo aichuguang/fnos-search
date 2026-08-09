@@ -32,14 +32,14 @@ class PublicSubmissionPreflightService:
         sixpan_importer: Any | None = None,
         tianyi_importer: Any | None = None,
     ) -> dict[str, Any]:
-        source = str(getattr(link, "source_type", "") or "").strip().lower()
+        source = str(getattr(link, "provider_kind", "") or "").strip().lower()
         fallback_size = raw.get("size") or raw.get("size_text") or ""
-        if source in {"quark", "uc"}:
+        if source == "quark":
             ok, data = quark_importer.check_share(getattr(link, "url", ""), title)
             inspection = self.quark_summary(ok, data, fallback_size=fallback_size)
             message = inspection.get("message") or ("资源链接有效" if ok else "资源链接无效或已失效")
             return self._checked("quark", ok, message, inspection)
-        if source == "cloud139":
+        if source == "mobile":
             if bool(getattr(link, "supported", False)) and not cloud139_importer.configured:
                 inspection = self.cloud139_summary(
                     False,
@@ -49,7 +49,7 @@ class PublicSubmissionPreflightService:
                 return {
                     "allowed": False,
                     "checked": False,
-                    "provider": "cloud139",
+                    "provider": "mobile",
                     "message": "提交前检测失败：快速入库服务未配置，请联系管理员",
                     "inspection": inspection,
                 }
@@ -61,8 +61,8 @@ class PublicSubmissionPreflightService:
                 )
                 inspection = self.cloud139_summary(ok, data, fallback_size=fallback_size)
                 message = inspection.get("message") or ("资源有效，可快速入库" if ok else "资源可能已失效，请更换资源")
-                return self._checked("cloud139", ok, message, inspection)
-        if source == "cloud189":
+                return self._checked("mobile", ok, message, inspection)
+        if source == "tianyi":
             summary = self.tianyi_summary
             configured = self._configured(tianyi_importer)
             if not configured:
@@ -71,7 +71,7 @@ class PublicSubmissionPreflightService:
                     summary(False, {"success": False, "message": message}, fallback_size=fallback_size)
                     if callable(summary)
                     else {
-                        "provider": "cloud189",
+                        "provider": "tianyi",
                         "status": "unconfigured",
                         "success": False,
                         "message": message,
@@ -81,7 +81,7 @@ class PublicSubmissionPreflightService:
                 )
                 inspection = {
                     **inspection,
-                    "provider": "cloud189",
+                    "provider": "tianyi",
                     "status": "unconfigured",
                     "success": False,
                     "message": message,
@@ -89,7 +89,7 @@ class PublicSubmissionPreflightService:
                 return {
                     "allowed": False,
                     "checked": False,
-                    "provider": "cloud189",
+                    "provider": "tianyi",
                     "message": f"\u63d0\u4ea4\u524d\u68c0\u6d4b\u5931\u8d25\uff1a{message}",
                     "inspection": inspection,
                 }
@@ -106,7 +106,7 @@ class PublicSubmissionPreflightService:
                 summary(ok, data_payload, fallback_size=fallback_size)
                 if callable(summary)
                 else {
-                    "provider": "cloud189",
+                    "provider": "tianyi",
                     "status": "ok" if ok else "failed",
                     "success": bool(ok),
                     "message": str(data_payload.get("message") or ""),
@@ -119,8 +119,8 @@ class PublicSubmissionPreflightService:
                 if ok
                 else "\u5929\u7ffc\u4e91\u8d44\u6e90\u65e0\u6548\u6216\u5df2\u5931\u6548"
             )
-            return self._checked("cloud189", ok, message, inspection)
-        if source in {"magnet", "torrent"} and not bool(
+            return self._checked("tianyi", ok, message, inspection)
+        if source == "sixpan" and not bool(
             sixpan_importer and getattr(sixpan_importer, "configured", False)
         ):
             message = "快速入库服务暂不可用，请联系管理员"

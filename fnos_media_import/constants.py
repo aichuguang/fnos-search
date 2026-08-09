@@ -29,10 +29,6 @@ SOURCE_BAIDU = "baidu"
 SOURCE_UC = "uc"
 SOURCE_UNKNOWN = "unknown"
 
-ROUTE_QUARK_TO_MOBILE = "quark_to_mobile"
-ROUTE_CLOUD139_DIRECT = "cloud139_direct"
-ROUTE_CLOUD189_DIRECT = "cloud189_direct"
-ROUTE_SIXPAN_OFFLINE = "sixpan_offline"
 ROUTE_UNSUPPORTED = "unsupported"
 
 JOB_CREATED = "created"

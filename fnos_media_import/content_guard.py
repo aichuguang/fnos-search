@@ -48,28 +48,6 @@ def evaluate_submission_content_risk(
     )
 
 
-def evaluate_bt_content_risk(
-    *,
-    title: str = "",
-    source_type: str = "",
-    source_url: str = "",
-    files: list[dict[str, Any]] | None = None,
-    ignore_files: list[str] | None = None,
-    parse_error: str = "",
-) -> dict[str, Any]:
-    """Backward-compatible wrapper used by older tests/imports."""
-
-    return evaluate_submission_content_risk(
-        config={},
-        title=title,
-        source_type=source_type,
-        source_url=source_url,
-        files=files,
-        ignore_files=ignore_files,
-        parse_error=parse_error,
-    )
-
-
 class ContentGuard:
     def __init__(self, raw_config: dict[str, Any]) -> None:
         self.raw_config = raw_config if isinstance(raw_config, dict) else {}

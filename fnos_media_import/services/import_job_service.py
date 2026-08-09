@@ -186,17 +186,10 @@ class ImportJobCreationService:
         *,
         database: Any,
         config: Any,
-        detect_link: Callable[..., Any] | None = None,
-        job_source_url: Callable[[str, dict[str, Any]], str] | None = None,
-        target_path: Callable[..., str] | None = None,
-        staging_plan: Callable[..., dict[str, Any]] | None = None,
-        submit_quark: Callable[..., dict[str, Any]] | None = None,
-        submit_cloud139: Callable[..., dict[str, Any]] | None = None,
-        submit_generic: Callable[..., dict[str, Any]] | None = None,
-        source_resolver: Any | None = None,
-        destination_resolver: Any | None = None,
-        plan_import: Callable[..., dict[str, Any]] | None = None,
-        validate_plan: Callable[..., Any] | None = None,
+        source_resolver: Any,
+        destination_resolver: Any,
+        plan_import: Callable[..., dict[str, Any]],
+        validate_plan: Callable[..., Any],
         plan_validation_deps: Any | None = None,
         execution_repository: Any | None = None,
         enqueue_transfer: Callable[[int], Any] | None = None,
@@ -207,15 +200,6 @@ class ImportJobCreationService:
     ) -> None:
         self.database = database
         self.config = config
-        self.detect_link = detect_link
-        self.job_source_url = job_source_url or (lambda url, _payload: url)
-        self.target_path = target_path
-        self.staging_plan = staging_plan
-        self.submit_quark = submit_quark
-        self.submit_cloud139 = submit_cloud139
-        self.submit_generic = submit_generic
-        # V1 planning dependencies. Injected by tests / the integration layer;
-        # defaults are lazily imported from the planning package.
         self.source_resolver = source_resolver
         self.destination_resolver = destination_resolver
         self.plan_import = plan_import
@@ -323,10 +307,10 @@ class ImportJobCreationService:
                     "title": title,
                     "category": category_key,
                     "category_label": category_label,
-                    "source_type": source.provider_kind,
+                    "source_provider_kind": source.provider_kind,
+                    "source_form": source.source_form,
                     "source_url": self._job_source_reference(source),
                     "password": "",
-                    "target_route": _source_route(source),
                     "target_path": "",
                     "status": JOB_CREATED,
                     "raw_data": raw_data,
@@ -427,21 +411,21 @@ class ImportJobCreationService:
 
         if duplicate_job_id:
             return {
-                "job": self.database.get_job(duplicate_job_id) or {},
+                "job": self.database.job_queries.get(duplicate_job_id) or {},
                 "created": False,
                 "message": "相同来源快照、选集、分类、目标和账号修订的任务已存在",
                 "idempotency_key": duplicate_idempotency_key,
             }
 
-        self.database.add_event(job_id, EVENT_INFO, f"创建入库任务：{title}")
-        self.database.add_event(
+        self.database.job_commands.add_event(job_id, EVENT_INFO, f"创建入库任务：{title}")
+        self.database.job_commands.add_event(
             job_id,
             EVENT_INFO,
             f"已解析保存目标：{destination.destination_id}（{destination.provider_kind}）",
             self._destination_dict(destination),
         )
         return {
-            "job": self.database.get_job(job_id),
+            "job": self.database.job_queries.get(job_id),
             "created": True,
             "message": "已创建入库任务",
             "success": True,
@@ -477,11 +461,8 @@ class ImportJobCreationService:
         public_id = str(payload.get("public_id") or payload.get("resource_id") or "").strip()
         if not public_id:
             return None
-        getter = getattr(self.database, "get_search_cache", None)
-        if not callable(getter):
-            return None
         try:
-            record = getter(public_id)
+            record = self.database.search_cache_queries.get_active(public_id)
         except Exception:  # noqa: BLE001
             return None
         if not isinstance(record, dict):
@@ -513,16 +494,12 @@ class ImportJobCreationService:
         return merged
 
     def _source_resolver(self) -> Any:
-        if self.source_resolver is not None:
-            return self.source_resolver
-        resolver_cls = _load_planning_dependency("source_resolver")
-        detect_link = self.detect_link
-        if detect_link is None:
-            from ..classifiers.link_classifier import detect_link
-        return resolver_cls(
-            detect_link=detect_link,
-            config=self._raw_config(),
-        )
+        if self.source_resolver is None:
+            raise V1PlanningError(
+                "V1 来源解析器未装配",
+                code="PLANNING_UNAVAILABLE",
+            )
+        return self.source_resolver
 
     def _destination_resolver(self) -> Any:
         if self.destination_resolver is not None:
@@ -733,9 +710,6 @@ class ImportJobRetryService:
         *,
         database: Any,
         config: Any,
-        submit_quark: Callable[..., dict[str, Any]] | None = None,
-        submit_cloud139: Callable[..., dict[str, Any]] | None = None,
-        submit_generic: Callable[..., dict[str, Any]] | None = None,
         validate_plan: Callable[..., Any] | None = None,
         plan_validation_deps: Any | None = None,
         execution_repository: Any | None = None,
@@ -743,23 +717,20 @@ class ImportJobRetryService:
     ) -> None:
         self.database = database
         self.config = config
-        self.submit_quark = submit_quark
-        self.submit_cloud139 = submit_cloud139
-        self.submit_generic = submit_generic
         self.validate_plan = validate_plan
         self.plan_validation_deps = plan_validation_deps
         self.execution_repository = execution_repository
         self.enqueue_transfer = enqueue_transfer
 
     def retry(self, job_id: int) -> dict[str, Any]:
-        job = self.database.get_job(job_id)
+        job = self.database.job_queries.get(job_id)
         if not job:
             raise ValueError("任务不存在")
         try:
             persisted_plan_version = int(job.get("plan_version") or 0)
         except (TypeError, ValueError) as exc:
             message = f"任务 plan_version 无效，已停止重试：{exc}"
-            self.database.add_event(job_id, EVENT_WARN, message)
+            self.database.job_commands.add_event(job_id, EVENT_WARN, message)
             return {
                 "job": job,
                 "created": False,
@@ -773,7 +744,7 @@ class ImportJobRetryService:
                 f"仅支持执行 schema v{EXECUTION_PLAN_VERSION} 计划；"
                 f"已拒绝重试，请按当前配置重新提交为新任务"
             )
-            self.database.add_event(job_id, EVENT_WARN, message)
+            self.database.job_commands.add_event(job_id, EVENT_WARN, message)
             return {
                 "job": job,
                 "created": False,
@@ -787,7 +758,7 @@ class ImportJobRetryService:
         plan = self.execution_repository.plan(job_id) if self.execution_repository is not None else None
         if not plan:
             message = "任务没有 V1 不可变执行计划，已拒绝重试"
-            self.database.add_event(job_id, EVENT_WARN, message)
+            self.database.job_commands.add_event(job_id, EVENT_WARN, message)
             return {
                 "job": job,
                 "created": False,
@@ -799,7 +770,7 @@ class ImportJobRetryService:
             self._validate_plan(plan, job_record=job)
         except V1PlanningError as exc:
             message = f"持久化 V1 执行计划无效，已拒绝重试：{exc}"
-            self.database.add_event(job_id, EVENT_WARN, message)
+            self.database.job_commands.add_event(job_id, EVENT_WARN, message)
             return {
                 "job": job,
                 "created": False,
@@ -826,7 +797,7 @@ class ImportJobRetryService:
                 "已取消或人工复核任务不能复用原外部操作栅栏；"
                 "请按当前来源与管理员路由创建新一代入库任务"
             )
-            self.database.add_event(job_id, EVENT_WARN, message)
+            self.database.job_commands.add_event(job_id, EVENT_WARN, message)
             return {
                 "job": job,
                 "created": False,
@@ -840,11 +811,11 @@ class ImportJobRetryService:
             queued = self.enqueue_transfer(job_id)
         except Exception as exc:  # noqa: BLE001
             message = str(exc)
-            self.database.add_event(job_id, EVENT_WARN, message)
+            self.database.job_commands.add_event(job_id, EVENT_WARN, message)
             return {"job": job, "created": False, "message": message, "success": False}
-        self.database.add_event(job_id, EVENT_INFO, "V1 持久执行任务已重新入队")
+        self.database.job_commands.add_event(job_id, EVENT_INFO, "V1 持久执行任务已重新入队")
         return {
-            "job": self.database.get_job(job_id),
+            "job": self.database.job_queries.get(job_id),
             "created": False,
             "message": "V1 执行状态已恢复并重新入队",
             "success": True,
@@ -867,10 +838,6 @@ class ImportJobRetryService:
             raise V1PlanningError(
                 f"V1 执行计划校验失败：{exc}", code="PLANNING_VALIDATION_FAILED"
             ) from exc
-
-
-def _source_route(source: SourceDescriptor) -> str:
-    return f"{source.provider_kind}:{source.source_form}"
 
 
 def _first_secret_path(value: Any, prefix: str = "plan") -> str:
@@ -906,7 +873,7 @@ def _claim_provider_submission(
     provider: str,
     require_not_started_fence: bool,
 ) -> tuple[bool, dict[str, Any], str]:
-    current = database.get_job(job_id) or {}
+    current = database.job_queries.get(job_id) or {}
     current_status = str(current.get("status") or "").strip().lower()
     normalized_expected = str(expected_status or "").strip().lower()
     if not current or current_status != normalized_expected:
@@ -919,9 +886,7 @@ def _claim_provider_submission(
             current,
             "任务缺少可证明网盘接口尚未调用的提交栅栏，已停止自动提交并等待人工核对",
         )
-    updater = getattr(database, "update_job_if_status", None)
-    if not callable(updater):
-        return False, current, "任务存储不支持原子提交栅栏，已停止调用网盘接口"
+    updater = database.job_commands.update_if_status
 
     raw_data = current.get("raw_data") if isinstance(current.get("raw_data"), dict) else {}
     previous_fence = (
@@ -950,10 +915,10 @@ def _claim_provider_submission(
             raw_data={**raw_data, PROVIDER_SUBMISSION_FENCE_KEY: fence},
         )
     )
-    latest = database.get_job(job_id) or current
+    latest = database.job_queries.get(job_id) or current
     if not claimed:
         return False, latest, "任务状态并发变化，未调用网盘接口，请刷新后重试"
-    database.add_event(
+    database.job_commands.add_event(
         job_id,
         EVENT_INFO,
         "已建立网盘提交原子栅栏，开始调用外部接口",
@@ -963,10 +928,7 @@ def _claim_provider_submission(
 
 
 def _update_created_job(database: Any, job_id: int, **updates: Any) -> bool:
-    updater = getattr(database, "update_job_if_status", None)
-    if not callable(updater):
-        return False
-    return bool(updater(job_id, {JOB_CREATED}, **updates))
+    return bool(database.job_commands.update_if_status(job_id, {JOB_CREATED}, **updates))
 
 
 def _mark_creation_failed(
@@ -976,7 +938,7 @@ def _mark_creation_failed(
     *,
     status: str = JOB_FAILED,
 ) -> bool:
-    current = database.get_job(job_id) or {}
+    current = database.job_queries.get(job_id) or {}
     raw_data = current.get("raw_data") if isinstance(current.get("raw_data"), dict) else {}
     return _update_created_job(
         database,

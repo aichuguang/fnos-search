@@ -17,7 +17,8 @@ class SearchAggregator:
     聚合后做强去重与受控排序：
     - 强去重：相同分享 ID、magnet hash、规范化 URL、同来源同标题同大小。
     - 不做影视标题强合并，避免把 1080P / 4K / 防和谐简写资源误合并。
-    - 标题相关度优先，线路便利性最多抵消 20 分相关度，不做内容类型过滤。
+    - 标题相关度优先；来源可用性只用于过滤和同相关度候选排序。
+    - 不推测传输策略或目标，二者只在创建任务后由冻结执行计划确定。
     """
 
     def __init__(self, providers: list[SearchProvider] | None = None, aliases: dict[str, list[str]] | None = None):
@@ -239,9 +240,6 @@ def _query_title_relevance(keyword: str, title: str) -> int:
 
 def _ranking_score(item: dict[str, Any], relevance_score: int) -> int:
     relevance = max(0, min(100, int(relevance_score)))
-    route_tier = _route_tier(item)
-    route_bonus = {3: 20, 2: 10}.get(route_tier, 0)
-    adjusted_relevance = relevance + route_bonus
 
     quality = item.get("quality_tags") or _quality_tags(str(item.get("title") or ""))
     quality_score = 0
@@ -261,29 +259,18 @@ def _ranking_score(item: dict[str, Any], relevance_score: int) -> int:
     metadata_bonus = int(bool(item.get("size") or item.get("size_text"))) * 4 + int(bool(item.get("datetime"))) * 2
     tie_breaker = min(99, quality_score + provider_bonus + duplicate_bonus + metadata_bonus)
 
-    # The leading component is the only cross-result score. Route convenience
-    # can offset at most 20 relevance points; quality and provider metadata only
-    # break ties after adjusted relevance, support and route tier.
+    # Source availability is a filter/tie-breaker only. Transfer strategy and
+    # destination are unknown until the server freezes an execution plan, so
+    # search ranking must never infer route convenience.
     return (
-        adjusted_relevance * 1_000_000
+        relevance * 1_000_000
         + int(bool(item.get("supported"))) * 100_000
-        + route_tier * 10_000
         + relevance * 100
         + tie_breaker
     )
 
 
-def _route_tier(item: dict[str, Any]) -> int:
-    if _is_cloud139_item(item):
-        return 3
-    if _is_sixpan_fast_item(item):
-        return 2
-    return 1
-
-
 def _is_better_duplicate(candidate: dict[str, Any], existing: dict[str, Any]) -> bool:
-    if _is_cloud139_item(candidate) != _is_cloud139_item(existing):
-        return _is_cloud139_item(candidate)
     if bool(candidate.get("supported")) != bool(existing.get("supported")):
         return bool(candidate.get("supported"))
     candidate_priority = int(candidate.get("provider_priority") or 100)
@@ -295,35 +282,6 @@ def _is_better_duplicate(candidate: dict[str, Any], existing: dict[str, Any]) ->
     if candidate_has_size != existing_has_size:
         return candidate_has_size
     return len(str(candidate.get("title") or "")) > len(str(existing.get("title") or ""))
-
-
-def _is_cloud139_item(item: dict[str, Any]) -> bool:
-    source_type = str(item.get("source_type") or "").strip().lower()
-    if source_type == "cloud139":
-        return True
-    url = str(item.get("url") or item.get("source_url") or "").strip().lower()
-    source_hint = str(item.get("source_hint") or item.get("source") or "").strip().lower()
-    return "yun.139.com" in url or "caiyun.139.com" in url or "mobile" in source_hint or "移动" in source_hint
-
-
-def _is_sixpan_fast_item(item: dict[str, Any]) -> bool:
-    source_type = str(item.get("source_type") or "").strip().lower()
-    if source_type in {"magnet", "torrent", "bt"}:
-        return True
-    url = str(item.get("url") or item.get("source_url") or "").strip().lower()
-    source_hint = str(item.get("source_hint") or item.get("source") or item.get("provider") or "").strip().lower()
-    route = str(item.get("route") or "").strip().lower()
-    return (
-        url.startswith("magnet:")
-        or ".torrent" in url
-        or "magnet" in source_hint
-        or "torrent" in source_hint
-        or "bt" in source_hint
-        or "磁链" in source_hint
-        or "种子" in source_hint
-        or route == "sixpan_offline"
-    )
-
 
 def _dedupe_keys(item: dict[str, Any]) -> list[str]:
     url = str(item.get("url") or item.get("source_url") or "").strip()

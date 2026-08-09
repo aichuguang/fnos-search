@@ -8,9 +8,13 @@ import requests
 
 from fnos_media_import.constants import JOB_SUBMITTED
 from fnos_media_import.importers.base import AdapterCheckResult
-from fnos_media_import.importers.quark import ActiveQuarkImporter, QuarkImporter
+from fnos_media_import.importers.quark import QuarkImporter
+from fnos_media_import.providers.active import (
+    ActiveProviderImporter,
+    ActiveProviderUnavailable,
+)
+from fnos_media_import.providers.adapters import QuarkProviderAdapter
 from fnos_media_import.runtime_builder import RuntimeBuilder
-from fnos_media_import.transfer.native_executor import LegacyNativeAdapter
 
 
 class QuarkImporterV1Tests(unittest.TestCase):
@@ -22,29 +26,24 @@ class QuarkImporterV1Tests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "unconfigured")
 
-    def test_active_account_is_preferred_over_legacy_fallback(self) -> None:
+    def test_active_provider_proxy_uses_resolved_account(self) -> None:
         active = QuarkImporter({"cookie": "new-account-cookie"})
-        wrapper = ActiveQuarkImporter(QuarkImporter({"cookie": "legacy-cookie"}))
-        wrapper.set_resolver(lambda: active)
+        wrapper = ActiveProviderImporter("夸克", lambda: active)
 
         result = wrapper.check_configuration()
 
         self.assertTrue(result.ok)
         self.assertEqual(wrapper.cookie, "new-account-cookie")
 
-    def test_resolver_failure_does_not_silently_use_legacy_cookie(self) -> None:
-        wrapper = ActiveQuarkImporter(QuarkImporter({"cookie": "legacy-cookie"}))
-
+    def test_resolver_failure_fails_without_fallback(self) -> None:
         def fail_resolution():
             raise RuntimeError("账号凭证解密失败")
 
-        wrapper.set_resolver(fail_resolution)
+        wrapper = ActiveProviderImporter("夸克", fail_resolution)
 
-        result = wrapper.check_configuration()
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "account_unavailable")
-        self.assertIn("账号凭证解密失败", result.message)
-        self.assertEqual(wrapper.check_share("https://pan.quark.cn/s/example")[1]["message"], result.message)
+        with self.assertRaisesRegex(ActiveProviderUnavailable, "账号凭证解密失败"):
+            wrapper.check_configuration()
+        self.assertFalse(wrapper.configured)
 
     def test_active_wrapper_recovers_after_resolver_becomes_available(self) -> None:
         active = QuarkImporter({"cookie": "new-account-cookie"})
@@ -57,30 +56,36 @@ class QuarkImporterV1Tests(unittest.TestCase):
                 raise RuntimeError("数据库暂时不可用")
             return active
 
-        wrapper = ActiveQuarkImporter(QuarkImporter({"cookie": "legacy-cookie"}))
-        wrapper.set_resolver(resolve)
+        wrapper = ActiveProviderImporter("夸克", resolve)
 
-        self.assertEqual(wrapper.check_configuration().status, "account_unavailable")
+        with self.assertRaises(ActiveProviderUnavailable):
+            wrapper.check_configuration()
         self.assertTrue(wrapper.check_configuration().ok)
         self.assertEqual(wrapper.cookie, "new-account-cookie")
 
     def test_runtime_builder_binds_resolver_for_replacement_builds(self) -> None:
         active = QuarkImporter({"cookie": "new-account-cookie"})
-        builder = RuntimeBuilder(object(), lambda _tokens: True)
-        builder.set_quark_resolver(lambda: active)
+        builder = RuntimeBuilder(
+            object(),
+            organizer_repositories=object(),  # type: ignore[arg-type]
+            provider_importer_resolver=lambda _provider_kind: active,
+        )
 
-        wrapper = builder._build_quark_importer(SimpleNamespace(raw={"quark": {}}))
+        wrapper = builder._build_quark_importer()
 
         self.assertTrue(wrapper.check_configuration().ok)
         self.assertEqual(wrapper.cookie, "new-account-cookie")
 
     def test_account_probe_builds_candidate_importer_instead_of_active_wrapper(self) -> None:
-        wrapper = ActiveQuarkImporter(QuarkImporter({}))
-        adapter = LegacyNativeAdapter(
-            wrapper,
-            "quark",
-            supports_native_save=True,
+        class _SourceRecords:
+            @staticmethod
+            def resolve(_source_record_id, _revision):
+                return {}
+
+        adapter = QuarkProviderAdapter(
+            importer_factory=lambda _account_id, _revision: QuarkImporter({}),
             account_importer_factory=QuarkImporter,
+            source_record_service=_SourceRecords(),
         )
         with patch.object(
             QuarkImporter,

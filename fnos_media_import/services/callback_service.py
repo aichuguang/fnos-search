@@ -34,6 +34,7 @@ from ..constants import (
     JOB_WAITING_OPENLIST,
     JOB_WAITING_ORGANIZER,
 )
+from ..planning import is_data_plane_strategy
 from ..planning.job_plan import plan_path, plan_strategy
 from .execution_plan_guard import v1_plan_or_review
 
@@ -89,7 +90,6 @@ class CallbackDependencies:
     rclone: Any
     safe_int: Callable[[Any, int, int, int], int]
     callback_level: Callable[[str], str]
-    enqueue_organizer: Callable[[dict[str, Any], dict[str, Any]], Any]
     cancelled_status: str
     execution_repository: Any = None
 
@@ -112,20 +112,20 @@ class RcloneCallbackService:
         target_path = str(payload.get("target_path") or "").strip()
         level = self.deps.callback_level(status)
         normalized_status = status.lower()
-        explicit_job = db.get_job(job_id) if job_id else None
+        explicit_job = db.job_queries.get(job_id) if job_id else None
         explicit_plan: dict[str, Any] = {}
         if explicit_job and str(explicit_job.get("status") or "").strip().lower() == self.deps.cancelled_status:
             # A category summary can arrive after an administrator cancelled the
             # job.  Do not hand it to the finalizer/Organizer, and most
             # importantly never issue an ACK that permits source deletion.
             if normalized_status in {CALLBACK_STATUS_CATEGORY_DONE, CALLBACK_STATUS_CATEGORY_FAILED}:
-                db.add_event(job_id, "warn", f"已忽略取消任务的 rclone 分类汇总回调：{message}", payload)
+                db.job_commands.add_event(job_id, "warn", f"已忽略取消任务的 rclone 分类汇总回调：{message}", payload)
                 return {
                     "success": True,
                     "message": "任务已取消，分类汇总仅记录不执行后续处理",
                     "disposition": "ignored_cancelled",
                     "delete_source_allowed": False,
-                    "job": db.get_job(job_id) or explicit_job,
+                    "job": db.job_queries.get(job_id) or explicit_job,
                 }, 200
             if normalized_status in {CALLBACK_STATUS_RESOLVE_FOLDER, CALLBACK_STATUS_NAMING_PLAN}:
                 return {
@@ -142,7 +142,7 @@ class RcloneCallbackService:
                 execution_repository=self.deps.execution_repository,
             )
             if rejection:
-                db.add_rclone_event(
+                db.rclone.add_rclone_event(
                     run_id or None,
                     "error",
                     rejection["message"],
@@ -155,7 +155,7 @@ class RcloneCallbackService:
                     "delete_source_allowed": False,
                 }, 409
         if not explicit_job:
-            db.add_rclone_event(
+            db.rclone.add_rclone_event(
                 run_id or None,
                 "error",
                 "unowned rclone callback rejected: matching V1 job_id is required",
@@ -198,34 +198,37 @@ class RcloneCallbackService:
                 for key, value in payload.items()
                 if key != "manifest_paths"
             }
-        db.add_rclone_event(run_id or None, level, message, rclone_event_payload)
+        db.rclone.add_rclone_event(run_id or None, level, message, rclone_event_payload)
         if normalized_status in {CALLBACK_STATUS_CATEGORY_DONE, CALLBACK_STATUS_CATEGORY_FAILED}:
-            category_refresh = rclone.finalize_category_imports(run_id, category, payload) if normalized_status == CALLBACK_STATUS_CATEGORY_DONE else {"success": True, "skipped": True, "message": "分类存在失败文件，等待下一轮或 run 结束兜底"}
-            latest_explicit = db.get_job(job_id) if job_id else None
+            latest_explicit = db.job_queries.get(job_id) if job_id else None
             cancelled_during_finalize = bool(
                 latest_explicit
                 and str(latest_explicit.get("status") or "").strip().lower()
                 == self.deps.cancelled_status
             )
-            organizer = (
-                self.deps.enqueue_organizer(category_refresh, payload)
-                if normalized_status == CALLBACK_STATUS_CATEGORY_DONE and not cancelled_during_finalize
-                else None
-            )
+            diagnostic = {
+                "success": True,
+                "skipped": True,
+                "diagnostic_only": True,
+                "message": (
+                    "rclone 分类汇总仅作为 V1 传输诊断记录，完成与 Organizer 均由 durable execution 接管"
+                    if normalized_status == CALLBACK_STATUS_CATEGORY_DONE
+                    else "rclone 分类失败汇总仅作为 V1 传输诊断记录"
+                ),
+            }
             return {
                 "success": True,
                 "message": (
-                    "分类处理期间任务已取消，未继续分发 Organizer"
+                    "分类处理期间任务已取消，汇总仅记录"
                     if cancelled_during_finalize
-                    else "已收到 rclone 分类汇总回调"
+                    else diagnostic["message"]
                 ),
-                "category_refresh": category_refresh,
-                "organizer": organizer,
+                "category_summary": diagnostic,
                 "payload": payload,
                 "disposition": "ignored_cancelled" if cancelled_during_finalize else "accepted",
                 "delete_source_allowed": False,
             }, 200
-        job = explicit_job or (db.get_job(job_id) if job_id else None)
+        job = explicit_job or (db.job_queries.get(job_id) if job_id else None)
         plan = explicit_plan
         if job and not plan:
             plan, rejection = v1_plan_or_review(
@@ -263,15 +266,15 @@ class RcloneCallbackService:
                     "disposition": "ignored_cancelled",
                     "delete_source_allowed": False,
                 }, 409
-            db.add_event(job_id, "warn", f"已忽略取消任务的 rclone 回调：{message}", payload)
+            db.job_commands.add_event(job_id, "warn", f"已忽略取消任务的 rclone 回调：{message}", payload)
             if filename:
-                db.add_rclone_file_event(run_id=run_id or None, job_id=int(job["id"]), status="ignored_cancelled", level="warn", category=category, filename=filename, source_path=source_path, target_path=target_path, message=message, raw_data=payload)
+                db.rclone.add_rclone_file_event(run_id=run_id or None, job_id=int(job["id"]), status="ignored_cancelled", level="warn", category=category, filename=filename, source_path=source_path, target_path=target_path, message=message, raw_data=payload)
             return {
                 "success": True,
                 "message": "任务已取消，回调仅记录不更新状态",
                 "disposition": "ignored_cancelled",
                 "delete_source_allowed": False,
-                "job": db.get_job(job_id),
+                "job": db.job_queries.get(job_id),
             }, 200
         if normalized_status == CALLBACK_STATUS_STAGING_MANIFEST:
             if not job:
@@ -294,7 +297,7 @@ class RcloneCallbackService:
                 "[ignored_terminal] 已忽略迟到的 rclone 文件回调，"
                 f"任务保持 {current_job_status}：{message}"
             )
-            db.add_rclone_file_event(
+            db.rclone.add_rclone_file_event(
                 run_id=run_id or None,
                 job_id=int(job["id"]),
                 status="ignored_terminal",
@@ -306,20 +309,20 @@ class RcloneCallbackService:
                 message=ignored_message,
                 raw_data=ignored_payload,
             )
-            db.add_event(job_id, "warn", ignored_message, ignored_payload)
+            db.job_commands.add_event(job_id, "warn", ignored_message, ignored_payload)
             return {
                 "success": True,
                 "message": "任务已进入后续不可回退阶段，迟到文件回调已幂等确认",
                 "ignored": True,
                 "disposition": "ignored_terminal",
                 "delete_source_allowed": normalized_status in _COMPLETION_CALLBACK_STATUSES,
-                "job": db.get_job(job_id) or job,
+                "job": db.job_queries.get(job_id) or job,
             }, 200
         if filename:
-            db.add_rclone_file_event(run_id=run_id or None, job_id=int(job["id"]) if job else None, status=status or "unknown", level=level, category=category, filename=filename, source_path=source_path, target_path=target_path, message=message, raw_data=payload)
+            db.rclone.add_rclone_file_event(run_id=run_id or None, job_id=int(job["id"]) if job else None, status=status or "unknown", level=level, category=category, filename=filename, source_path=source_path, target_path=target_path, message=message, raw_data=payload)
         if not job:
             return {"success": False, "message": "任务不存在"}, 404
-        db.add_event(job_id, level, message, payload)
+        db.job_commands.add_event(job_id, level, message, payload)
         updates: dict[str, Any] | None = None
         if normalized_status in {
             CALLBACK_STATUS_TRANSFERRING,
@@ -340,7 +343,7 @@ class RcloneCallbackService:
         elif normalized_status in {CALLBACK_STATUS_FAILED, CALLBACK_STATUS_ERROR}:
             updates = {"status": "transferring", "error_message": message}
         elif normalized_status in {CALLBACK_STATUS_CATEGORY_DONE, CALLBACK_STATUS_CATEGORY_FAILED}:
-            db.add_event(job_id, "info" if normalized_status == CALLBACK_STATUS_CATEGORY_DONE else "warn", "rclone 分类搬运结束，等待 run 完整结束兜底判定", payload)
+            db.job_commands.add_event(job_id, "info" if normalized_status == CALLBACK_STATUS_CATEGORY_DONE else "warn", "rclone 分类搬运结束，等待 run 完整结束兜底判定", payload)
         else:
             updates = {"status": normalized_status, "error_message": message}
         if updates is not None:
@@ -349,7 +352,7 @@ class RcloneCallbackService:
                 return self._state_changed_response(job_id, job, payload, normalized_status, message)
         return {
             "success": True,
-            "job": db.get_job(job_id) or job,
+            "job": db.job_queries.get(job_id) or job,
             "organizer": None,
             "disposition": "accepted",
             "delete_source_allowed": normalized_status in _COMPLETION_CALLBACK_STATUSES,
@@ -364,7 +367,7 @@ class RcloneCallbackService:
         plan: dict[str, Any],
     ) -> str:
         strategy = plan_strategy(plan)
-        if strategy not in {"rclone_copy", "relay_upload_mobile"}:
+        if not is_data_plane_strategy(strategy):
             return "当前 V1 任务不是数据面传输策略，已拒绝文件回调"
         source_job_root = _normalize_manifest_path(plan_path(plan, "source_landing").get("path"))
         target_path_name = (
@@ -399,7 +402,7 @@ class RcloneCallbackService:
         *,
         plan: dict[str, Any],
     ) -> tuple[dict[str, Any], int]:
-        if plan_strategy(plan) not in {"rclone_copy", "relay_upload_mobile"}:
+        if not is_data_plane_strategy(plan_strategy(plan)):
             return {
                 "success": False,
                 "message": "当前 V1 任务不是数据面传输策略，已拒绝文件清单",
@@ -464,7 +467,7 @@ class RcloneCallbackService:
             job,
             raw_data={**raw_data, "rclone_staging_manifest": manifest},
         ):
-            latest = self.deps.db.get_job(job_id) or job
+            latest = self.deps.db.job_queries.get(job_id) or job
             latest_status = str(latest.get("status") or "").strip().lower()
             cancelled = latest_status == self.deps.cancelled_status
             return {
@@ -478,7 +481,7 @@ class RcloneCallbackService:
                 "delete_source_allowed": False,
                 "job": latest,
             }, 409
-        self.deps.db.add_event(
+        self.deps.db.job_commands.add_event(
             job_id,
             "info",
             f"已固化任务级 rclone 文件清单：累计 {len(merged_paths)} 个文件",
@@ -493,7 +496,7 @@ class RcloneCallbackService:
             "success": True,
             "message": "已确认任务级 rclone 文件清单",
             "manifest": manifest,
-            "job": self.deps.db.get_job(job_id) or job,
+            "job": self.deps.db.job_queries.get(job_id) or job,
         }, 200
 
     def _update_job_from_snapshot(self, job: dict[str, Any], **updates: Any) -> bool:
@@ -501,14 +504,13 @@ class RcloneCallbackService:
         expected_status = str(job.get("status") or "").strip()
         if job_id <= 0 or not expected_status or expected_status.lower() in _IMMUTABLE_JOB_STATUSES:
             return False
-        updater = getattr(self.deps.db, "update_job_if_status", None)
-        if callable(updater):
-            return bool(updater(job_id, {expected_status}, **updates))
-        latest = self.deps.db.get_job(job_id) or {}
-        if str(latest.get("status") or "").strip() != expected_status:
-            return False
-        self.deps.db.update_job(job_id, **updates)
-        return True
+        return bool(
+            self.deps.db.job_commands.update_if_status(
+                job_id,
+                {expected_status},
+                **updates,
+            )
+        )
 
     def _state_changed_response(
         self,
@@ -518,7 +520,7 @@ class RcloneCallbackService:
         callback_status: str,
         message: str,
     ) -> tuple[dict[str, Any], int]:
-        latest = self.deps.db.get_job(job_id) or stale_job
+        latest = self.deps.db.job_queries.get(job_id) or stale_job
         latest_status = str(latest.get("status") or "").strip().lower()
         cancelled = latest_status == self.deps.cancelled_status
         disposition = "ignored_cancelled" if cancelled else "ignored_state_changed"
@@ -528,7 +530,7 @@ class RcloneCallbackService:
             "ignored_callback_status": callback_status,
             "preserved_job_status": latest_status,
         }
-        self.deps.db.add_event(
+        self.deps.db.job_commands.add_event(
             job_id,
             "warn",
             (

@@ -58,7 +58,7 @@ class SearchCacheMaintenanceWorker:
         acquired = False
         try:
             acquired = bool(
-                self.database.acquire_scheduler_lease(
+                self.database.scheduler_leases.acquire(
                     self.lease_name,
                     self.owner_id,
                     self.lease_ttl_seconds,
@@ -71,7 +71,7 @@ class SearchCacheMaintenanceWorker:
             batches = 0
             while deleted_total < self.max_delete_per_run and not self.stop_event.is_set():
                 limit = min(self.batch_size, self.max_delete_per_run - deleted_total)
-                deleted = max(0, int(self.database.prune_expired_search_cache(limit=limit) or 0))
+                deleted = max(0, int(self.database.search_cache_commands.prune_expired(limit=limit) or 0))
                 deleted_total += deleted
                 batches += 1
                 if deleted < limit:
@@ -91,7 +91,7 @@ class SearchCacheMaintenanceWorker:
         finally:
             if acquired:
                 try:
-                    self.database.release_scheduler_lease(self.lease_name, self.owner_id)
+                    self.database.scheduler_leases.release(self.lease_name, self.owner_id)
                 except Exception as exc:  # noqa: BLE001
                     self._safe_log(f"Search cache maintenance lease release failed: {exc}")
 

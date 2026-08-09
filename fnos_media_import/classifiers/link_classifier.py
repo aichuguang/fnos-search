@@ -1,38 +1,33 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from urllib.parse import urlparse
-
-from ..constants import (
-    ROUTE_CLOUD139_DIRECT,
-    ROUTE_CLOUD189_DIRECT,
-    ROUTE_QUARK_TO_MOBILE,
-    ROUTE_SIXPAN_OFFLINE,
-    ROUTE_UNSUPPORTED,
-    SOURCE_ALIYUN,
-    SOURCE_BAIDU,
-    SOURCE_CLOUD139,
-    SOURCE_CLOUD189,
-    SOURCE_MAGNET,
-    SOURCE_QUARK,
-    SOURCE_TORRENT,
-    SOURCE_UC,
-    SOURCE_UNKNOWN,
-)
 
 
 @dataclass(frozen=True)
 class LinkInfo:
-    source_type: str
+    provider_kind: str
+    source_form: str
+    search_source_id: str
     url: str
     password: str = ""
     supported: bool = False
-    route: str = ROUTE_UNSUPPORTED
     reason: str = ""
+    # Resource/search tables intentionally keep their classification field.
+    # It is not part of the V1 detection API contract.
+    resource_kind: str = "unknown"
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "provider_kind": self.provider_kind,
+            "source_form": self.source_form,
+            "search_source_id": self.search_source_id,
+            "url": self.url,
+            "password": self.password,
+            "supported": self.supported,
+            "reason": self.reason,
+        }
 
 
 PASSWORD_PATTERNS = [
@@ -54,75 +49,83 @@ def normalize_url(url: str) -> str:
 
 
 def detect_link(url: str, routes: dict | None = None, password: str = "") -> LinkInfo:
+    """Classify a source without choosing a transfer route.
+
+    Destination and transfer strategy are selected later from the immutable
+    assignment and execution plan. The optional ``routes`` argument remains
+    accepted only so callers can be migrated independently; its contents are
+    deliberately ignored.
+    """
+
+    del routes
     normalized = normalize_url(url)
     lower = normalized.lower()
     parsed = urlparse(normalized if "://" in normalized else f"https://{normalized}")
     host = parsed.netloc.lower()
     detected_password = password or extract_password(normalized)
 
-    source_type = SOURCE_UNKNOWN
-    route = ROUTE_UNSUPPORTED
+    provider_kind = "unknown"
+    source_form = ""
+    search_source_id = ""
+    resource_kind = "unknown"
+    supported = False
     reason = "暂不支持该资源类型"
 
     if lower.startswith("magnet:?xt="):
-        source_type = SOURCE_MAGNET
-        route = ROUTE_SIXPAN_OFFLINE
-        reason = "磁链资源，后续接入 6盘离线"
-    elif lower.endswith(".torrent") or ".torrent?" in lower:
-        source_type = SOURCE_TORRENT
-        route = ROUTE_SIXPAN_OFFLINE
-        reason = "种子资源，后续接入 6盘离线"
-    elif "pan.quark.cn" in host:
-        source_type = SOURCE_QUARK
-        route = ROUTE_QUARK_TO_MOBILE
-        reason = "夸克资源，走 Quark 转存到移动云线路"
-    elif "drive.uc.cn" in host:
-        source_type = SOURCE_UC
-        route = ROUTE_QUARK_TO_MOBILE
-        reason = "UC 资源，后续可复用夸克类线路"
-    elif "yun.139.com" in host or "caiyun.139.com" in host:
-        source_type = SOURCE_CLOUD139
-        route = ROUTE_CLOUD139_DIRECT
-        reason = "移动云资源，后续直接入库移动云"
-    elif "cloud.189.cn" in host:
-        source_type = SOURCE_CLOUD189
-        route = ROUTE_CLOUD189_DIRECT
-        reason = "天翼云资源，后续直接入库天翼云"
-    elif "alipan.com" in host or "aliyundrive.com" in host:
-        source_type = SOURCE_ALIYUN
-        reason = "阿里云盘资源，当前版本暂不支持"
-    elif "pan.baidu.com" in host:
-        source_type = SOURCE_BAIDU
-        reason = "百度网盘资源，当前版本暂不支持"
-
-    route_config = (routes or {}).get(source_type, {})
-    supported = _as_bool(route_config.get("enabled", False))
-    if route_config.get("route"):
-        route = route_config["route"]
-    if not supported and source_type in {SOURCE_QUARK, SOURCE_CLOUD189} and not route_config:
-        # V1 路由由 Provider 账号与管理员 assignment 决定，不再依赖已删除的
-        # 全局 routes 配置。Quark 与天翼均已有内置 Provider 实现；这里将
-        # ``supported`` 表示为“存在实现”，账号不可用则由详情/提交预检失败关闭。
+        provider_kind = "sixpan"
+        source_form = "magnet"
+        search_source_id = "sixpan_magnet"
+        resource_kind = "magnet"
         supported = True
-
-    if source_type == SOURCE_UNKNOWN:
-        supported = False
-    elif not supported:
-        reason = f"已识别为 {source_type}，但当前配置未启用该线路"
+        reason = "已识别六盘磁链来源"
+    elif lower.endswith(".torrent") or ".torrent?" in lower:
+        provider_kind = "sixpan"
+        source_form = "magnet"
+        search_source_id = "sixpan_magnet"
+        resource_kind = "torrent"
+        supported = True
+        reason = "已识别六盘种子来源"
+    elif "pan.quark.cn" in host:
+        provider_kind = "quark"
+        source_form = "share"
+        search_source_id = "quark"
+        resource_kind = "quark"
+        supported = True
+        reason = "已识别夸克分享来源"
+    elif "drive.uc.cn" in host:
+        resource_kind = "uc"
+        reason = "UC 分享尚未接入 V1 Provider"
+    elif "yun.139.com" in host or "caiyun.139.com" in host:
+        provider_kind = "mobile"
+        source_form = "share"
+        search_source_id = "mobile"
+        resource_kind = "cloud139"
+        supported = True
+        reason = "已识别移动云盘分享来源"
+    elif "cloud.189.cn" in host:
+        provider_kind = "tianyi"
+        source_form = "share"
+        search_source_id = "tianyi"
+        resource_kind = "cloud189"
+        supported = True
+        reason = "已识别天翼云盘分享来源"
+    elif "alipan.com" in host or "aliyundrive.com" in host:
+        resource_kind = "aliyun"
+        reason = "阿里云盘资源当前版本暂不支持"
+    elif "pan.baidu.com" in host:
+        resource_kind = "baidu"
+        reason = "百度网盘资源当前版本暂不支持"
 
     return LinkInfo(
-        source_type=source_type,
+        provider_kind=provider_kind,
+        source_form=source_form,
+        search_source_id=search_source_id,
         url=normalized,
         password=detected_password,
         supported=supported,
-        route=route,
         reason=reason,
+        resource_kind=resource_kind,
     )
 
 
-def _as_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+__all__ = ["LinkInfo", "detect_link", "extract_password", "normalize_url"]

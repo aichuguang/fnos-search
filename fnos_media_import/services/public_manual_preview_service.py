@@ -43,16 +43,21 @@ class PublicManualPreviewService:
             "title": title,
             "url": link.url,
             "password": link.password,
-            "source_type": link.source_type,
-            "source": link.source_type,
+            "source_type": link.resource_kind,
+            "source": link.resource_kind,
+            "provider_kind": link.provider_kind,
+            "source_form": link.source_form,
+            "search_source_id": link.search_source_id,
             "supported": link.supported,
-            "route": link.route,
             "reason": link.reason,
             "raw_data": {
                 "title": title,
                 "url": link.url,
                 "password": link.password,
-                "source_type": link.source_type,
+                "source_type": link.resource_kind,
+                "provider_kind": link.provider_kind,
+                "source_form": link.source_form,
+                "search_source_id": link.search_source_id,
                 "source": "manual_link",
             },
         }
@@ -60,7 +65,7 @@ class PublicManualPreviewService:
         cached = self.cache.get_search_cache(public_id) or {
             "public_id": public_id,
             "title": title,
-            "source_type": link.source_type,
+            "source_type": link.resource_kind,
             "source_url": link.url,
             "password": link.password,
             "raw_data": cache_item["raw_data"],
@@ -79,7 +84,13 @@ class PublicManualPreviewService:
             tianyi_importer=tianyi,
         )
         item = self.present_item(
-            {**cache_item, "title": title, "url": link.url, "source_type": link.source_type, "supported": link.supported},
+            {
+                **cache_item,
+                "title": title,
+                "url": link.url,
+                "source_type": link.resource_kind,
+                "supported": link.supported,
+            },
             public_id=public_id,
             hide_full_links=hidden,
         )
@@ -89,12 +100,13 @@ class PublicManualPreviewService:
             "item": item,
             "detail": detail,
             "link": {
-                "source_type": link.source_type,
+                "provider_kind": link.provider_kind,
+                "source_form": link.source_form,
+                "search_source_id": link.search_source_id,
                 "supported": link.supported,
                 "reason": "已识别资源类型，提交前请预览并确认内容" if link.supported else link.reason,
-                "route": link.route,
                 "detail_capability": self.detail_capability(
-                    link.source_type,
+                    link.provider_kind,
                     cloud139_importer=cloud139,
                     sixpan_importer=sixpan,
                     tianyi_importer=tianyi,

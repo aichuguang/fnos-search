@@ -7,6 +7,8 @@ guard tests.
 
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -20,7 +22,7 @@ class _CmccClientWithLookupFailure:
         raise ConnectionResetError("query reset")
 
 
-class _CmccClientWithoutPostCompleteVisibility:
+class _CmccClientWithoutPostCompleteVisibility(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.lookup_count = 0
 

@@ -7,7 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.organizer.service import OrganizerService
+from tests._repository_v1_fakes import RepositoryFakeMixin
 from tests._organizer_v1_fixtures import (
     attach_organizer_v1_task,
     bind_organizer_v1_execution_repository,
@@ -24,14 +26,14 @@ def _create_import_job(
     organizer_root: str | None = None,
     strategy: str = "native_save",
 ) -> tuple[int, dict]:
-    job_id, created = database.create_job(
+    job_id, created = database.job_commands.create(
         {
             "title": f"Atomic organizer task {suffix}",
             "category": "tv",
             "category_label": "TV",
-            "source_type": "quark",
+            "source_provider_kind": "quark",
+            "source_form": "share",
             "source_url": f"source-record:organizer-task-{suffix}",
-            "target_route": strategy,
             "target_path": "/openlist/tv",
             "status": "waiting_organizer",
             "destination_id": "native-main",
@@ -70,8 +72,9 @@ class OrganizerTaskDatabaseIdempotencyTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"organizer-task-idempotency-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -81,16 +84,19 @@ class OrganizerTaskDatabaseIdempotencyTests(unittest.TestCase):
 
     def test_two_database_instances_create_only_one_task_for_the_same_job(self) -> None:
         job_id, plan = _create_import_job(self.database, uuid.uuid4().hex)
-        databases = [Database(self.db_path), Database(self.db_path)]
+        databases = [
+            RepositorySet.from_database(Database(self.db_path)),
+            RepositorySet.from_database(Database(self.db_path)),
+        ]
         start = threading.Barrier(2)
         results: list[tuple[int, bool]] = []
         errors: list[BaseException] = []
         result_lock = threading.Lock()
 
-        def create_task(database: Database) -> None:
+        def create_task(database: RepositorySet) -> None:
             try:
                 start.wait(timeout=5)
-                result = database.get_or_create_organizer_task_for_job(**_task_values(job_id, plan))
+                result = database.organizer.get_or_create_organizer_task_for_job(**_task_values(job_id, plan))
                 with result_lock:
                     results.append(result)
             except BaseException as exc:  # noqa: BLE001
@@ -108,25 +114,27 @@ class OrganizerTaskDatabaseIdempotencyTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(len({task_id for task_id, _created in results}), 1)
         self.assertEqual(sorted(created for _task_id, created in results), [False, True])
-        self.assertEqual(len(self.database.list_organizer_tasks_by_job(job_id, limit=10)), 1)
+        self.assertEqual(len(self.database.organizer.list_organizer_tasks_by_job(job_id, limit=10)), 1)
 
     def test_historical_duplicate_rows_are_left_unchanged_and_the_newest_is_reused(self) -> None:
         job_id, plan = _create_import_job(self.database, uuid.uuid4().hex)
         values = _task_values(job_id, plan)
-        first_id = self.database.create_organizer_task(**values)
-        second_id = self.database.create_organizer_task(**values)
+        first_id = self.database.organizer.create_organizer_task(**values)
+        second_id = self.database.organizer.create_organizer_task(**values)
 
-        task_id, created = Database(self.db_path).get_or_create_organizer_task_for_job(**values)
+        task_id, created = RepositorySet.from_database(
+            Database(self.db_path)
+        ).organizer.get_or_create_organizer_task_for_job(**values)
 
         self.assertFalse(created)
         self.assertEqual(task_id, second_id)
         self.assertNotEqual(first_id, second_id)
-        self.assertEqual(len(self.database.list_organizer_tasks_by_job(job_id, limit=10)), 2)
+        self.assertEqual(len(self.database.organizer.list_organizer_tasks_by_job(job_id, limit=10)), 2)
 
     def test_done_task_repairs_linked_job_after_completion_crash_window(self) -> None:
         job_id, plan = _create_import_job(self.database, uuid.uuid4().hex)
-        self.database.update_job(job_id, status="confirming")
-        task_id = self.database.create_organizer_task(
+        self.database.job_commands.update(job_id, status="confirming")
+        task_id = self.database.organizer.create_organizer_task(
             **{
                 **_task_values(job_id, plan),
                 "status": "done",
@@ -147,8 +155,8 @@ class OrganizerTaskDatabaseIdempotencyTests(unittest.TestCase):
             }
         )
         cancelled_job_id, cancelled_plan = _create_import_job(self.database, uuid.uuid4().hex)
-        self.database.update_job(cancelled_job_id, status="cancelled")
-        self.database.create_organizer_task(
+        self.database.job_commands.update(cancelled_job_id, status="cancelled")
+        self.database.organizer.create_organizer_task(
             **{
                 **_task_values(cancelled_job_id, cancelled_plan),
                 "status": "done",
@@ -161,18 +169,18 @@ class OrganizerTaskDatabaseIdempotencyTests(unittest.TestCase):
 
         result = service._recover_completed_linked_jobs_on_startup()
 
-        repaired = self.database.get_job(job_id)
+        repaired = self.database.job_queries.get(job_id)
         self.assertIn(task_id, result["recovered_task_ids"])
         self.assertEqual(repaired["status"], "done")
         completion = repaired["raw_data"]["completion"]
         self.assertEqual(completion["organized_target_path"], "/媒体库/测试剧 (2026)")
         self.assertEqual(completion["target_dirs"], ["/媒体库/测试剧 (2026)"])
         self.assertEqual(completion["strm_completion"]["handled_by"], "openlist")
-        self.assertEqual(self.database.get_job(cancelled_job_id)["status"], "cancelled")
+        self.assertEqual(self.database.job_queries.get(cancelled_job_id)["status"], "cancelled")
 
 
 class OrganizerTaskServiceIdempotencyTests(unittest.TestCase):
-    class AtomicReuseDatabase:
+    class AtomicReuseDatabase(RepositoryFakeMixin):
         def __init__(self, task_id: int, job: dict, task: dict) -> None:
             self.task_id = task_id
             self.job = job
@@ -289,8 +297,9 @@ class OrganizerCrossJobRootIsolationTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"organizer-cross-job-root-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -310,7 +319,7 @@ class OrganizerCrossJobRootIsolationTests(unittest.TestCase):
             uuid.uuid4().hex,
             organizer_root=shared_root,
         )
-        first_task_id = self.database.create_organizer_task(
+        first_task_id = self.database.organizer.create_organizer_task(
             **{
                 **_task_values(first_job_id, first_plan),
                 "openlist_root_path": shared_root,
@@ -326,7 +335,7 @@ class OrganizerCrossJobRootIsolationTests(unittest.TestCase):
         bind_task_openlist_resolver(service, None, first_plan, second_plan)
 
         result = service.enqueue_from_completed_directory(
-            job=self.database.get_job(second_job_id),
+            job=self.database.job_queries.get(second_job_id),
             category_label="TV",
             root_path=shared_root,
             payload={},
@@ -334,12 +343,12 @@ class OrganizerCrossJobRootIsolationTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertNotEqual(result["task_id"], first_task_id)
-        second_tasks = self.database.list_organizer_tasks_by_job(second_job_id, limit=10)
+        second_tasks = self.database.organizer.list_organizer_tasks_by_job(second_job_id, limit=10)
         self.assertEqual([item["id"] for item in second_tasks], [result["task_id"]])
 
 
 class OrganizerRollbackPaginationTests(unittest.TestCase):
-    def test_old_run_beyond_first_500_rows_can_be_rolled_back(self) -> None:
+    def test_run_is_loaded_by_identity_for_rollback(self) -> None:
         plan = organizer_v1_plan(
             99,
             category="tv",
@@ -350,25 +359,18 @@ class OrganizerRollbackPaginationTests(unittest.TestCase):
             {"id": 99, "status": "done"},
             plan,
         )
-        pages = {
-            0: [{"id": value, "undo_data": []} for value in range(1001, 501, -1)],
-            500: [
-                {
-                    "id": 7,
-                    "task_id": 99,
-                    "undo_data": [{"type": "move_file", "source_path": "/b", "target_path": "/a"}],
-                }
+        run = {
+            "id": 7,
+            "task_id": 99,
+            "undo_data": [
+                {"type": "move_file", "source_path": "/b", "target_path": "/a"}
             ],
         }
-        offsets: list[int] = []
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             @staticmethod
-            def list_organizer_runs(*, limit: int, offset: int = 0) -> list[dict]:
-                if limit != 500:
-                    raise AssertionError(f"unexpected page size: {limit}")
-                offsets.append(offset)
-                return pages.get(offset, [])
+            def get_organizer_run(run_id: int) -> dict | None:
+                return dict(run) if run_id == 7 else None
 
             @staticmethod
             def get_organizer_task(_task_id: int, include_children: bool = True) -> dict:
@@ -388,12 +390,11 @@ class OrganizerRollbackPaginationTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["done"], 1)
-        self.assertEqual(offsets, [0, 500])
-        self.assertEqual(inverses, pages[500][0]["undo_data"])
+        self.assertEqual(inverses, run["undo_data"])
 
 
 class OrganizerStagingTaskReuseSafetyTests(unittest.TestCase):
-    class MismatchedTaskDatabase:
+    class MismatchedTaskDatabase(RepositoryFakeMixin):
         def __init__(self, job: dict, task: dict) -> None:
             self.job = job
             self.task = task
@@ -412,6 +413,16 @@ class OrganizerStagingTaskReuseSafetyTests(unittest.TestCase):
 
         def update_job(self, job_id: int, **updates) -> None:
             self.job_updates.append((job_id, updates))
+            self.job.update(updates)
+
+        def update_job_if_status(
+            self,
+            job_id: int,
+            _expected_statuses: set[str],
+            **updates,
+        ) -> bool:
+            self.update_job(job_id, **updates)
+            return True
 
         def add_event(self, *args) -> None:
             self.events.append(args)

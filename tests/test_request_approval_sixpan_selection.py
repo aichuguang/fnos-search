@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import copy
 import unittest
 from types import SimpleNamespace
 
 from flask import Flask, jsonify, request
 
-from fnos_media_import.app import (
+from fnos_media_import.public_web import (
     _public_request_payload,
     _safe_public_sixpan_selection,
     _safe_public_string_list,
@@ -18,7 +20,7 @@ from fnos_media_import.services.request_approval_service import (
 )
 
 
-class _Requests:
+class _Requests(RepositoryFakeMixin):
     def __init__(self, item: dict) -> None:
         self.item = copy.deepcopy(item)
 
@@ -28,7 +30,7 @@ class _Requests:
         return copy.deepcopy(self.item)
 
 
-class _Commands:
+class _Commands(RepositoryFakeMixin):
     def __init__(self, requests: _Requests) -> None:
         self.requests = requests
 

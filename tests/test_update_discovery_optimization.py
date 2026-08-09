@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -8,7 +10,7 @@ from fnos_media_import.services.update_next_run_policy import UpdateNextRunPolic
 from fnos_media_import.services.update_service import UpdateService
 
 
-class _FakeDb:
+class _FakeDb(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.saved: dict[int, dict[str, Any]] = {}
         self.events: list[tuple[Any, ...]] = []

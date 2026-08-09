@@ -1,14 +1,14 @@
 (function () {
     function resultKey(item = {}) {
-        return String(item.result_key || item.public_id || item.resource_id || item.source_url || item.source_url_masked || `${item.source_type || item.source || ""}:${item.title || ""}:${item.size_text || item.size || ""}`).trim();
+        return String(item.result_key || item.public_id || item.resource_id || item.source_url || item.source_url_masked || `${item.provider_kind || ""}:${item.source_form || ""}:${item.title || ""}:${item.size_text || item.size || ""}`).trim();
     }
 
     function sourceIconKey(item = {}) {
-        const raw = [item.source_type, item.source_hint, item.source, item.source_url, item.source_url_masked].filter(Boolean).join(" ").toLowerCase();
-        if (raw.includes("139") || raw.includes("mobile") || raw.includes("mcloud") || raw.includes("移动")) return "cloud139";
-        if (raw.includes("189") || raw.includes("tianyi") || raw.includes("天翼")) return "cloud189";
-        if (raw.includes("magnet") || raw.includes("torrent") || raw.includes("bt") || raw.includes("磁链") || raw.includes("种子")) return "bt";
-        if (raw.includes("quark") || raw.includes("夸克") || raw.includes("uc")) return "quark";
+        const kind = sourceKind(item);
+        if (kind === "cloud139") return "cloud139";
+        if (kind === "tianyi") return "cloud189";
+        if (kind === "sixpan" || kind === "btbtla") return "bt";
+        if (kind === "quark") return "quark";
         return "other";
     }
 
@@ -112,11 +112,16 @@
     }
 
     function sourceKind(value = "") {
-        const type = String(value || "").toLowerCase();
-        if (type.includes("quark") || type.includes("uc") || type.includes("夸克")) return "quark";
-        if (type.includes("139") || type.includes("mobile") || type.includes("移动")) return "cloud139";
-        if (type.includes("189") || type.includes("tianyi") || type.includes("天翼")) return "tianyi";
-        if (type.includes("magnet") || type.includes("torrent") || type.includes("sixpan") || type.includes("bt")) return "sixpan";
+        const item = value && typeof value === "object" ? value : {};
+        const link = item.link && typeof item.link === "object" ? item.link : {};
+        const provider = String(item.provider_kind || link.provider_kind || value || "").toLowerCase();
+        const sourceForm = String(item.source_form || link.source_form || "").toLowerCase();
+        const searchSource = String(item.search_source_id || link.search_source_id || "").toLowerCase();
+        if (provider === "quark") return "quark";
+        if (provider === "mobile") return "cloud139";
+        if (provider === "tianyi") return "tianyi";
+        if (provider === "btbtla" || searchSource === "btbtla") return "btbtla";
+        if (provider === "sixpan" || sourceForm === "magnet") return "sixpan";
         return "generic";
     }
 
@@ -125,7 +130,7 @@
         const selected = options.selected || new Set();
         const publicId = String(options.publicId || "");
         const detail = detailValue(response);
-        const kind = sourceKind(options.sourceType || detail.source_type || detail.link?.source_type || "");
+        const kind = sourceKind(options.providerKind || detail);
         const selectionContext = detail._workbench_selection_context || {};
         const items = detailItems(response);
         if (!items.length) return `<div class="empty-cell">${escapeHtml(options.emptyMessage || "未提供可选择的文件列表")}</div>`;
@@ -150,11 +155,11 @@
         return detailItems(response).filter((item) => chosen.has(itemKey(item)));
     }
 
-    function selectionPayload(response, selected, sourceType = "") {
+    function selectionPayload(response, selected, providerKind = "") {
         const detail = detailValue(response);
         const items = detailItems(response);
         const chosen = selectedItems(response, selected);
-        const kind = sourceKind(sourceType || detail.source_type || detail.link?.source_type || "");
+        const kind = sourceKind(providerKind || detail);
         if (kind === "quark") {
             const selectionContext = detail._workbench_selection_context || {};
             if (selectionContext.mode === "subdir_items" && selectionContext.base_dir) {

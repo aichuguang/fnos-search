@@ -169,8 +169,8 @@ def rclone_v1_job(
         "plan_version": 1,
         "category": str(plan.get("category") or "tv"),
         "destination_id": str((plan.get("destination") or {}).get("id") or "library-main"),
-        "source_type": "quark",
-        "target_route": "quark_to_tianyi",
+        "source_provider_kind": "quark",
+        "source_form": "share",
         "raw_data": payload,
         "_canonical_execution_plan": plan,
     }

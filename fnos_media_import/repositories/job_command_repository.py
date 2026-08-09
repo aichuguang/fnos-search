@@ -113,14 +113,14 @@ class JobCommandRepository:
         cursor = connection.execute(
                 """
                 INSERT INTO import_jobs
-                (title, category, category_label, source_type, source_url, password, target_route,
+                (title, category, category_label, source_provider_kind, source_form, source_url, password,
                  target_path, status, external_task_id, error_message, raw_data, created_at, updated_at,
                  idempotency_key, config_revision, executor_id, destination_id, plan_version)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    data["title"], data["category"], data["category_label"], data["source_type"],
-                    source_url, password, data["target_route"],
+                    data["title"], data["category"], data["category_label"],
+                    data["source_provider_kind"], data["source_form"], source_url, password,
                     data.get("target_path"), data["status"], data.get("external_task_id"),
                     data.get("error_message"), raw_text, now, now, idempotency_key,
                     self._safe_revision(data.get("config_revision")), str(data.get("executor_id") or ""),
@@ -144,7 +144,13 @@ class JobCommandRepository:
         except (TypeError, ValueError):
             return 1
 
-    def update(self, job_id: int, updates: dict[str, Any]) -> None:
+    def update(
+        self,
+        job_id: int,
+        updates: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> None:
+        updates = {**(updates or {}), **fields}
         if not updates:
             return
         values_to_write = {**updates, "updated_at": _utc_now()}
@@ -165,8 +171,10 @@ class JobCommandRepository:
         self,
         job_id: int,
         expected_statuses: set[str] | list[str] | tuple[str, ...],
-        updates: dict[str, Any],
+        updates: dict[str, Any] | None = None,
+        **fields: Any,
     ) -> bool:
+        updates = {**(updates or {}), **fields}
         statuses = sorted({str(value or "").strip() for value in expected_statuses if str(value or "").strip()})
         if not updates or not statuses:
             return False
@@ -189,15 +197,67 @@ class JobCommandRepository:
             self._emit_status_transition(connection, previous, values_to_write, cursor.rowcount)
             return cursor.rowcount == 1
 
+    def update_unless_status_with_connection(
+        self,
+        connection: sqlite3.Connection,
+        job_id: int,
+        excluded_statuses: set[str] | list[str] | tuple[str, ...],
+        updates: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> bool:
+        """Update a job inside a caller-owned transaction unless it is terminal.
+
+        Transfer execution state and the public job state must commit together.
+        Keeping this operation on the command repository preserves transition
+        event emission without exposing Database forwarding methods.
+        """
+
+        values_to_write = {**(updates or {}), **fields}
+        statuses = sorted(
+            {
+                str(value or "").strip().lower()
+                for value in excluded_statuses
+                if str(value or "").strip()
+            }
+        )
+        if not values_to_write:
+            return False
+        assignments: list[str] = []
+        values: list[Any] = []
+        for key, value in values_to_write.items():
+            if key == "raw_data" and value is not None:
+                value = json.dumps(value, ensure_ascii=False)
+            assignments.append(f"{key} = ?")
+            values.append(value)
+        previous = self._transition_row(connection, int(job_id))
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            clause = f"AND LOWER(COALESCE(status, '')) NOT IN ({placeholders})"
+        else:
+            clause = ""
+        cursor = connection.execute(
+            f"UPDATE import_jobs SET {', '.join(assignments)} WHERE id = ? {clause}",
+            (*values, int(job_id), *statuses),
+        )
+        self._emit_status_transition(
+            connection,
+            previous,
+            values_to_write,
+            cursor.rowcount,
+        )
+        return cursor.rowcount == 1
+
     def update_if_status_and_claim_token(
         self,
         job_id: int,
         expected_statuses: set[str] | list[str] | tuple[str, ...],
         expected_claim_token: str | None,
-        updates: dict[str, Any],
+        updates: dict[str, Any] | None = None,
+        **fields: Any,
     ) -> bool:
         """Atomically update a job only while its durable refresh claim still matches."""
 
+        updates = {**(updates or {}), **fields}
         statuses = sorted({str(value or "").strip() for value in expected_statuses if str(value or "").strip()})
         if not updates or not statuses:
             return False
@@ -237,7 +297,7 @@ class JobCommandRepository:
     def _transition_row(connection: sqlite3.Connection, job_id: int) -> dict[str, Any] | None:
         row = connection.execute(
             """
-            SELECT id, title, category, category_label, source_type, status,
+            SELECT id, title, category, category_label, source_provider_kind, source_form, status,
                    error_message, raw_data, updated_at
             FROM import_jobs WHERE id=?
             """,

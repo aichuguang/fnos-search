@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from types import SimpleNamespace
 from typing import Any
 
-from fnos_media_import.app import (
-    _create_subscription_from_hot_candidate,
-    _find_hot_existing_subscription,
-    _hot_identity_matches,
+from fnos_media_import.services.trending_subscription_helpers import (
+    create_from_candidate as _create_subscription_from_hot_candidate,
+    find_existing_subscription as _find_hot_existing_subscription,
+    identity_matches as _hot_identity_matches,
 )
 from fnos_media_import.services.trending_discovery_service import TrendingDiscoveryService
 
 
-class _TmdbStub:
+class _TmdbStub(RepositoryFakeMixin):
     def __init__(self, rows: list[dict[str, Any]] | None = None, configured: bool = True, error: Exception | None = None) -> None:
         self._rows = rows or []
         self.configured = configured
@@ -150,7 +152,7 @@ class HotCandidateSubscribeTests(unittest.TestCase):
 
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["canonical_key"], "年份未知作品|tv")
-        self.assertEqual(merged[0]["legacy_canonical_key"], "年份未知作品|tv")
+        self.assertEqual(merged[0]["base_canonical_key"], "年份未知作品|tv")
 
     def test_stale_item_subscription_id_is_not_trusted_without_tmdb_validation(self) -> None:
         item = {"id": 1, "title": "仙逆", "media_type": "tv", "subscription_id": 88}

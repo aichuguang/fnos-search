@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone as datetime_timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ..repositories.repository_set import NotificationRepositories
 from ..time_utils import utc_now_iso, utc_now_iso_offset
 from . import config as notify_config
 from . import events as event_defs
@@ -23,7 +24,7 @@ class NotificationDigestScheduler:
     def __init__(
         self,
         *,
-        database: Any,
+        database: NotificationRepositories,
         owner_id: str = "",
         hour: int = 9,
         interval_seconds: int = 60,
@@ -66,7 +67,7 @@ class NotificationDigestScheduler:
         acquired = False
         try:
             acquired = bool(
-                self.database.acquire_scheduler_lease(
+                self.database.scheduler_leases.acquire(
                     self.lease_name, self.owner_id, ttl_seconds=60
                 )
             )
@@ -91,13 +92,13 @@ class NotificationDigestScheduler:
             date_key = now.strftime("%Y-%m-%d")
             if date_key != self._last_pruned_date:
                 retention_days = max(7, int(config.get("delivery_retention_days") or 90))
-                self.database.prune_notification_deliveries(
+                self.database.notification_deliveries.prune(
                     before=utc_now_iso_offset(days=-retention_days)
                 )
                 self._last_pruned_date = date_key
             if date_key != self._last_anonymized_date:
                 anonymize_days = max(7, int(config.get("guest_anonymize_days") or 30))
-                anonymized = self.database.anonymize_guest_notification_subscriptions(
+                anonymized = self.database.guest_notification_subscriptions.anonymize_terminal(
                     older_than=utc_now_iso_offset(days=-anonymize_days)
                 )
                 if anonymized:
@@ -119,7 +120,7 @@ class NotificationDigestScheduler:
         finally:
             if acquired:
                 try:
-                    self.database.release_scheduler_lease(self.lease_name, self.owner_id)
+                    self.database.scheduler_leases.release(self.lease_name, self.owner_id)
                 except Exception as exc:  # noqa: BLE001
                     self._safe_log(f"notification digest lease release failed: {exc}")
             self._run_lock.release()

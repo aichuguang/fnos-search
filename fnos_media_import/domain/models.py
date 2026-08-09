@@ -18,7 +18,7 @@ TransferStrategy = Literal[
     "native_save",
     "native_offline",
     "rclone_copy",
-    "relay_upload_mobile",
+    "relay_upload_provider",
 ]
 Audience = Literal["admin", "guest"]
 TargetKind = Literal["provider", "local", "openlist_generic"]

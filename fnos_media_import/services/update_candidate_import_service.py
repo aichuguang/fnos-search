@@ -33,10 +33,10 @@ class UpdateCandidateImportService:
         auto: bool = False,
         candidate_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        candidate_row = self.database.get_update_candidate(candidate_id)
+        candidate_row = self.database.update.get_update_candidate(candidate_id)
         if not candidate_row:
             raise ValueError("候选不存在")
-        subscription = self.database.get_update_subscription(
+        subscription = self.database.update.get_update_subscription(
             int(candidate_row["subscription_id"]),
             include_sources=True,
         )
@@ -97,7 +97,7 @@ class UpdateCandidateImportService:
             "submitted_at": utc_now(),
             "auto": auto,
         }
-        self.database.update_update_candidate(
+        self.database.update.update_update_candidate(
             candidate_id,
             decision=decision,
             job_id=job.get("id"),
@@ -119,7 +119,7 @@ class UpdateCandidateImportService:
             event_message = "候选资源已完整整理入库" if completed else "候选资源已提交入库，等待 OpenList/Organizer 完整确认"
         else:
             event_message = "候选资源入库失败"
-        self.database.add_update_event(
+        self.database.update.add_update_event(
             int(subscription["id"]),
             candidate_row.get("run_id"),
             "info" if succeeded else "error",

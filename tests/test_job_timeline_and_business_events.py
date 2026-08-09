@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.services.job_service import JobService
 from fnos_media_import.web_input import _recent_business_events, _task_log_summaries
 
 
-class _TimelineDatabase:
+class _TimelineDatabase(RepositoryFakeMixin):
+    def __init__(self) -> None:
+        self.worker_tasks = SimpleNamespace(list_related=lambda **_kwargs: [])
+
     def get_job(self, job_id: int) -> dict[str, object]:
         return {
             "id": job_id,
@@ -79,20 +86,24 @@ class JobTimelineTests(unittest.TestCase):
 class BusinessEventQueryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.database = Database(Path(self.temp_dir.name) / "events.db")
-        self.database.init_schema()
+        self._database_infrastructure = Database(Path(self.temp_dir.name) / "events.db")
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
         with self.database.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO import_jobs (
-                    title, category, category_label, source_type, source_url,
-                    target_route, status, created_at, updated_at
-                ) VALUES ('没有事件的任务', 'movie', '电影', 'quark', 'https://example.invalid/1',
-                          'quark_to_mobile', 'created', '2026-08-04T10:00:00Z', '2026-08-04T10:00:00Z')
+                    title, category, category_label, source_provider_kind,
+                    source_form, source_url, status, created_at, updated_at,
+                    destination_id, plan_version, idempotency_key
+                ) VALUES ('没有事件的任务', 'movie', '电影', 'quark', 'share',
+                          'https://example.invalid/1', 'created',
+                          '2026-08-04T10:00:00Z', '2026-08-04T10:00:00Z',
+                          'test-destination', 1, 'timeline-job-1')
                 """
             )
             self.job_id = int(cursor.lastrowid)
-        rclone_event_id = self.database.add_rclone_file_event(
+        rclone_event_id = self.database.rclone.add_rclone_file_event(
             job_id=self.job_id,
             status="done",
             level="info",

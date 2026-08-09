@@ -105,7 +105,7 @@
                         <td><code>${escapeHtml(item.request_token)}</code></td>
                         <td>${escapeHtml(item.title)}</td>
                         <td>${escapeHtml(item.category_label || item.category)}</td>
-                        <td>${escapeHtml(sourceText(item.source_type || "网盘分享"))}</td>
+                        <td>${escapeHtml(sourceText(item.source_provider_kind || "网盘分享"))}</td>
                         <td>${escapeHtml(formatDate(item.created_at))}</td>
                         <td>${statusPill(item.status)}</td>
                         <td>${riskPill(item)}</td>
@@ -151,6 +151,41 @@
                 torrent: "种子",
             };
             return map[value] || value || "-";
+        }
+
+        function providerText(value) {
+            const map = {
+                quark: "夸克网盘",
+                mobile: "移动云",
+                tianyi: "天翼云盘",
+                sixpan: "六盘",
+            };
+            const key = String(value || "").toLowerCase();
+            return map[key] || value || "-";
+        }
+
+        function sourceFormText(value) {
+            const map = { share: "分享链接", magnet: "磁链/种子", local: "本地文件", http: "HTTP 资源" };
+            const key = String(value || "").toLowerCase();
+            return map[key] || value || "-";
+        }
+
+        function jobSourceText(item = {}) {
+            const provider = providerText(item.source_provider_kind);
+            const form = sourceFormText(item.source_form);
+            return provider === "-" ? form : form === "-" ? provider : `${provider} · ${form}`;
+        }
+
+        function transferStrategyText(value) {
+            const map = {
+                native_save: "同源原生转存",
+                native_offline: "原生离线任务",
+                rclone_copy: "OpenList / rclone 跨盘搬运",
+                relay_upload_provider: "Provider 中继上传",
+                relay_upload_mobile: "移动云中继上传",
+            };
+            const key = String(value || "").toLowerCase();
+            return map[key] || value || "-";
         }
 
         function riskPill(item) {
@@ -210,7 +245,7 @@
                     </div>
                     <div class="detail-block">
                         <span>来源类型</span>
-                        <strong>${escapeHtml(sourceText(item.source_type || "网盘分享"))}</strong>
+                        <strong>${escapeHtml(sourceText(item.source_provider_kind || "网盘分享"))}</strong>
                     </div>
                     <div class="detail-block">
                         <span>当前状态</span>
@@ -344,11 +379,10 @@
         function isMediaRefreshOnlyJob(item = {}) {
             const rawData = item.raw_data && typeof item.raw_data === "object" ? item.raw_data : {};
             const completion = rawData.completion && typeof rawData.completion === "object" ? rawData.completion : {};
-            const legacyRefresh = rawData.sixpan_legacy_refresh && typeof rawData.sixpan_legacy_refresh === "object" ? rawData.sixpan_legacy_refresh : {};
-            const refreshOnly = [completion, legacyRefresh].some(
-                (marker) => Boolean(marker.provider_completed) && String(marker.retry_action || "").toLowerCase() === "media_refresh_only"
-            );
-            return String(item.target_route || "").toLowerCase() === "sixpan_offline"
+            const refreshOnly = Boolean(completion.provider_completed)
+                && String(completion.retry_action || "").toLowerCase() === "media_refresh_only";
+            return String(item.source_provider_kind || "").toLowerCase() === "sixpan"
+                && String(item.source_form || "").toLowerCase() === "magnet"
                 && ["review", "refreshing"].includes(String(item.status || "").toLowerCase())
                 && refreshOnly;
         }
@@ -372,7 +406,7 @@
                         <td>${escapeHtml(item.title)}</td>
                         <td>${escapeHtml(item.category_label || item.category)}</td>
                         <td>${statusPill(item.status)}</td>
-                        <td>${escapeHtml(item.source_type)}</td>
+                        <td>${escapeHtml(jobSourceText(item))}</td>
                         <td>${escapeHtml(formatDate(item.updated_at))}</td>
                         <td class="table-actions">${jobActionButtons(item)}</td>
                     </tr>
@@ -421,7 +455,7 @@
                         <div class="dashboard-task-cover">${icon(categoryIconName(item.category))}</div>
                         <div class="dashboard-task-main">
                             <strong title="${escapeHtml(item.title || "未命名任务")}">${escapeHtml(item.title || "未命名任务")}</strong>
-                            <small>${escapeHtml(sourceText(item.source_type))} · ${escapeHtml(item.category_label || item.category || "未分类")}</small>
+                            <small>${escapeHtml(jobSourceText(item))} · ${escapeHtml(item.category_label || item.category || "未分类")}</small>
                         </div>
                         <div class="dashboard-task-stage">
                             <span>${escapeHtml(dashboardStageLabel(item.status))}</span>
@@ -484,7 +518,7 @@
                     <span class="dashboard-selected-icon">${icon(categoryIconName(item.category))}</span>
                     <div>
                         <strong>${escapeHtml(item.title || "未命名任务")}</strong>
-                        <small>#${escapeHtml(item.id)} · ${escapeHtml(sourceText(item.source_type))}</small>
+                        <small>#${escapeHtml(item.id)} · ${escapeHtml(jobSourceText(item))}</small>
                     </div>
                     ${statusPill(item.status)}
                 </div>
@@ -658,7 +692,8 @@
             const technicalEvents = Array.isArray(job.technical_events) ? job.technical_events : [];
             const timelineSummary = job.timeline_summary || {};
             const checks = Array.isArray(job.completion_checks) ? job.completion_checks : [];
-            const rcloneStaging = String(job.target_route || "").toLowerCase() === "quark_to_mobile" || ["quark", "uc"].includes(String(job.source_type || "").toLowerCase());
+            const strategy = String(job.transfer_strategy || "").toLowerCase();
+            const rcloneStaging = ["rclone_copy", "relay_upload_provider", "relay_upload_mobile"].includes(strategy);
             const stagingPath = job.official_save_path || job.target_path || "-";
             const rcloneTargetPath = job.rclone_target_path || "未配置";
             const openlistVisiblePath = job.openlist_visible_path || (rcloneStaging ? "等待 rclone 搬运完成后生成" : "-");
@@ -674,7 +709,7 @@
                     <div><span>标题</span>${escapeHtml(job.title || "-")}</div>
                     <div><span>状态</span>${statusPill(job.status)}</div>
                     <div><span>分类</span>${escapeHtml(job.category_label || job.category || "-")}</div>
-                    <div><span>来源</span>${escapeHtml(sourceText(job.source_type || "-"))}</div>
+                    <div><span>来源</span>${escapeHtml(jobSourceText(job))}</div>
                     <div><span>保存位置</span>${escapeHtml(finalPath)}</div>
                     <div><span>更新时间</span>${escapeHtml(formatDate(job.updated_at || job.created_at))}</div>
                 </div>
@@ -684,7 +719,10 @@
                     <summary>查看处理路径</summary>
                     <div class="detail-grid">
                         <div><span>完成阶段</span>${escapeHtml(statusText(job.completion_stage || job.status || "-"))}</div>
-                        <div><span>处理线路</span>${escapeHtml(job.target_route || "-")}</div>
+                        <div><span>传输策略</span>${escapeHtml(transferStrategyText(job.transfer_strategy))}</div>
+                        <div><span>来源标识</span>${escapeHtml(job.search_source_id || "-")}</div>
+                        <div><span>保存目标</span>${escapeHtml(job.destination_id || "-")}</div>
+                        <div><span>目标 Provider</span>${escapeHtml(providerText(job.destination_provider_kind))}</div>
                         ${
                             rcloneStaging
                                 ? `

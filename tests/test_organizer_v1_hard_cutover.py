@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
+import inspect
 import unittest
 
 from fnos_media_import.domain.models import SelectionSnapshot
@@ -96,7 +99,7 @@ def _plan(job_id: int = 7) -> dict:
     return attach_plan_integrity(plan)
 
 
-class _Database:
+class _Database(RepositoryFakeMixin):
     def __init__(self, task: dict | None = None, job: dict | None = None) -> None:
         self.task = task or {}
         self.job = job
@@ -117,15 +120,12 @@ class _Database:
 
 
 class OrganizerV1HardCutoverTests(unittest.TestCase):
-    def test_category_root_rejects_legacy_paths_outside_diagnostics(self) -> None:
+    def test_category_root_has_no_runtime_legacy_path_escape_hatch(self) -> None:
         with self.assertRaises(ValueError):
             category_target_root({"openlist_root_path": "/旧分类"})
-        self.assertEqual(
-            category_target_root(
-                {"openlist_root_path": "/旧分类"},
-                allow_legacy_diagnostic=True,
-            ),
-            "/旧分类",
+        self.assertNotIn(
+            "allow_legacy_diagnostic",
+            inspect.signature(category_target_root).parameters,
         )
 
     def test_target_category_uses_frozen_plan_and_ignores_runtime_paths(self) -> None:

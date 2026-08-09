@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from typing import Any
 
 from fnos_media_import.services.update_completion_sync_service import UpdateCompletionSyncService
 
 
-class _FakeDb:
+class _FakeDb(RepositoryFakeMixin):
     def __init__(
         self,
         subscription: dict[str, Any],
@@ -28,8 +30,14 @@ class _FakeDb:
     def get_update_subscription(self, subscription_id: int, include_sources: bool = True) -> dict[str, Any] | None:
         return dict(self._subscription)
 
-    def list_update_candidates(self, subscription_id: int, limit: int = 500) -> list[dict[str, Any]]:
-        return [dict(item) for item in self._candidates]
+    def list_update_candidates(
+        self,
+        subscription_id: int,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        del subscription_id
+        return [dict(item) for item in self._candidates[offset : offset + limit]]
 
     def get_job(self, job_id: int) -> dict[str, Any] | None:
         return self._jobs.get(int(job_id))
@@ -81,7 +89,7 @@ def test_completion_sync_reads_candidates_beyond_first_500_rows() -> None:
     candidates = [{"id": index} for index in range(1, 751)]
     calls: list[tuple[int, int]] = []
 
-    class PaginatedDatabase:
+    class PaginatedDatabase(RepositoryFakeMixin):
         @staticmethod
         def list_update_candidates(*, subscription_id: int, limit: int, offset: int = 0) -> list[dict[str, Any]]:
             assert subscription_id == 7

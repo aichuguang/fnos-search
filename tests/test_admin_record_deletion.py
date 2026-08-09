@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.openapi import get_openapi_spec
 from fnos_media_import.organizer.service import OrganizerService
 from fnos_media_import.services.job_admin_command_service import (
@@ -19,8 +20,9 @@ class AdminRecordDeletionTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"admin-record-deletion-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -29,14 +31,17 @@ class AdminRecordDeletionTests(unittest.TestCase):
                 candidate.unlink()
 
     def _create_job(self, status: str) -> int:
-        job_id, created = self.database.create_job(
+        job_id, created = self.database.job_commands.create(
             {
                 "title": f"删除测试-{status}",
                 "category": "movie",
                 "category_label": "电影",
-                "source_type": "magnet",
+                "source_provider_kind": "sixpan",
+                "source_form": "magnet",
                 "source_url": f"magnet:?xt=urn:btih:{uuid.uuid4().hex}",
-                "target_route": "sixpan_offline",
+                "destination_id": "test-destination",
+                "plan_version": 1,
+                "idempotency_key": f"admin-delete:{uuid.uuid4().hex}",
                 "status": status,
             }
         )
@@ -45,8 +50,8 @@ class AdminRecordDeletionTests(unittest.TestCase):
 
     def test_completed_job_delete_removes_only_job_record_and_events(self) -> None:
         job_id = self._create_job("done")
-        self.database.add_event(job_id, "info", "已完成")
-        request_id = self.database.create_guest_request(
+        self.database.job_commands.add_event(job_id, "info", "已完成")
+        request_id = self.database.guest_request_commands.create(
             {
                 "request_token": uuid.uuid4().hex,
                 "job_id": job_id,
@@ -58,7 +63,7 @@ class AdminRecordDeletionTests(unittest.TestCase):
                 "public_status": "已完成",
             }
         )
-        organizer_id = self.database.create_organizer_task(
+        organizer_id = self.database.organizer.create_organizer_task(
             job_id=job_id,
             category="movie",
             openlist_root_path="/媒体/电影/删除测试",
@@ -67,7 +72,8 @@ class AdminRecordDeletionTests(unittest.TestCase):
         service = JobAdminCommandService(
             JobAdminCommandDependencies(
                 imports=SimpleNamespace(retry_job=lambda _job_id: {}),
-                jobs=self.database,
+                job_queries=self.database.job_queries,
+                job_commands=self.database.job_commands,
                 auto_start_rclone=lambda _result, _reason: None,
             )
         )
@@ -77,17 +83,18 @@ class AdminRecordDeletionTests(unittest.TestCase):
         self.assertEqual(status_code, 200)
         self.assertTrue(result["deleted"])
         self.assertEqual(result["message"], "记录已删除")
-        self.assertIsNone(self.database.get_job(job_id))
-        self.assertEqual(self.database.list_events(job_id), [])
-        self.assertIsNone(self.database.get_guest_request(request_id)["job_id"])
-        self.assertIsNone(self.database.get_organizer_task(organizer_id, include_children=False)["job_id"])
+        self.assertIsNone(self.database.job_queries.get(job_id))
+        self.assertEqual(self.database.job_queries.list_events(job_id), [])
+        self.assertIsNone(self.database.guest_request_queries.get(request_id)["job_id"])
+        self.assertIsNone(self.database.organizer.get_organizer_task(organizer_id, include_children=False)["job_id"])
 
     def test_active_job_delete_is_rejected(self) -> None:
         job_id = self._create_job("waiting_organizer")
         service = JobAdminCommandService(
             JobAdminCommandDependencies(
                 imports=SimpleNamespace(retry_job=lambda _job_id: {}),
-                jobs=self.database,
+                job_queries=self.database.job_queries,
+                job_commands=self.database.job_commands,
                 auto_start_rclone=lambda _result, _reason: None,
             )
         )
@@ -96,15 +103,15 @@ class AdminRecordDeletionTests(unittest.TestCase):
 
         self.assertEqual(status_code, 409)
         self.assertFalse(result["success"])
-        self.assertIsNotNone(self.database.get_job(job_id))
+        self.assertIsNotNone(self.database.job_queries.get(job_id))
 
     def test_completed_organizer_delete_cascades_its_plan_records(self) -> None:
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             category="movie",
             openlist_root_path="/媒体/电影/删除整理记录",
             status="done",
         )
-        replaced = self.database.replace_organizer_plan(
+        replaced = self.database.organizer.replace_organizer_plan(
             task_id,
             files=[
                 {
@@ -142,7 +149,7 @@ class AdminRecordDeletionTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["message"], "记录已删除")
-        self.assertIsNone(self.database.get_organizer_task(task_id))
+        self.assertIsNone(self.database.organizer.get_organizer_task(task_id))
         with self.database.connect() as connection:
             for table in ("organizer_files", "organizer_mappings", "organizer_operations"):
                 count = connection.execute(
@@ -152,7 +159,7 @@ class AdminRecordDeletionTests(unittest.TestCase):
                 self.assertEqual(count, 0, table)
 
     def test_active_organizer_delete_is_rejected(self) -> None:
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             category="movie",
             openlist_root_path="/媒体/电影/正在执行",
             status="executing",
@@ -165,7 +172,7 @@ class AdminRecordDeletionTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertTrue(result["conflict"])
         self.assertEqual(result["message"], "只能删除已完成或已取消的记录")
-        self.assertIsNotNone(self.database.get_organizer_task(task_id))
+        self.assertIsNotNone(self.database.organizer.get_organizer_task(task_id))
 
 
 class AdminRecordDeletionContractTests(unittest.TestCase):

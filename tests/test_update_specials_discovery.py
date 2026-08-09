@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from datetime import datetime, timezone
 from typing import Any
@@ -10,7 +12,7 @@ from fnos_media_import.updater.discovery import UpdateDiscovery
 from fnos_media_import.updater.matcher import UpdateMatcher, episode_from_text
 
 
-class _CandidateDb:
+class _CandidateDb(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.seen = {(None, 1), (0, 2), (1, 3)}
         self.candidates = [
@@ -30,7 +32,7 @@ class _CandidateDb:
         return True
 
 
-class _Tmdb:
+class _Tmdb(RepositoryFakeMixin):
     configured = True
 
     def __init__(self) -> None:

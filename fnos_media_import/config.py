@@ -478,7 +478,6 @@ def _default_config() -> dict[str, Any]:
             "source_settle_rounds": int(os.getenv("RCLONE_SOURCE_SETTLE_ROUNDS", "2")),
             "source_appear_wait_seconds": int(os.getenv("RCLONE_SOURCE_APPEAR_WAIT_SECONDS", "180")),
             "source_appear_poll_seconds": int(os.getenv("RCLONE_SOURCE_APPEAR_POLL_SECONDS", "15")),
-            "history_repair_interval_seconds": int(os.getenv("RCLONE_HISTORY_REPAIR_INTERVAL_SECONDS", "300")),
             "staging_retry_delay_seconds": int(os.getenv("RCLONE_STAGING_RETRY_DELAY_SECONDS", "30")),
             "staging_retry_max_delay_seconds": int(os.getenv("RCLONE_STAGING_RETRY_MAX_DELAY_SECONDS", "300")),
             "staging_retry_max_attempts": int(os.getenv("RCLONE_STAGING_RETRY_MAX_ATTEMPTS", "8")),
@@ -497,7 +496,6 @@ def _default_config() -> dict[str, Any]:
             "verify_size_delay": int(os.getenv("RCLONE_VERIFY_SIZE_DELAY", "5")),
             "local_oversize_bytes": int(os.getenv("RCLONE_LOCAL_OVERSIZE_BYTES", str(10 * 1024 * 1024))),
             "lock_file": os.getenv("RCLONE_LOCK_FILE", "/tmp/fnos_media_import_rclone.lock"),
-            "auto_interval_minutes": int(os.getenv("RCLONE_AUTO_INTERVAL_MINUTES", "0")),
             "log_lines": 500,
             "app_callback_url": os.getenv("RCLONE_APP_CALLBACK_URL", ""),
         },
@@ -736,7 +734,6 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
         ("rclone", "source_settle_rounds"): "RCLONE_SOURCE_SETTLE_ROUNDS",
         ("rclone", "source_appear_wait_seconds"): "RCLONE_SOURCE_APPEAR_WAIT_SECONDS",
         ("rclone", "source_appear_poll_seconds"): "RCLONE_SOURCE_APPEAR_POLL_SECONDS",
-        ("rclone", "history_repair_interval_seconds"): "RCLONE_HISTORY_REPAIR_INTERVAL_SECONDS",
         ("rclone", "staging_retry_delay_seconds"): "RCLONE_STAGING_RETRY_DELAY_SECONDS",
         ("rclone", "staging_retry_max_delay_seconds"): "RCLONE_STAGING_RETRY_MAX_DELAY_SECONDS",
         ("rclone", "staging_retry_max_attempts"): "RCLONE_STAGING_RETRY_MAX_ATTEMPTS",
@@ -755,7 +752,6 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
         ("rclone", "verify_size_delay"): "RCLONE_VERIFY_SIZE_DELAY",
         ("rclone", "local_oversize_bytes"): "RCLONE_LOCAL_OVERSIZE_BYTES",
         ("rclone", "lock_file"): "RCLONE_LOCK_FILE",
-        ("rclone", "auto_interval_minutes"): "RCLONE_AUTO_INTERVAL_MINUTES",
         ("rclone", "app_callback_url"): "RCLONE_APP_CALLBACK_URL",
     }
     for path, env_name in env_map.items():
@@ -771,8 +767,8 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
     # revisions at planning time.  Rejecting the old aliases is intentional:
     # silently ignoring them would make a deployment appear configured while
     # the new database model remained empty.
-    legacy_env_names = set(_REMOVED_ENV_NAMES)
-    legacy_env_names.update(
+    removed_env_names = set(_REMOVED_ENV_NAMES)
+    removed_env_names.update(
         {
             "RCLONE_SRC_MOVIE_DIR",
             "RCLONE_SRC_TV_DIR",
@@ -791,11 +787,13 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
             "SIXPAN_SAVE_OTHER_PATH",
         }
     )
-    configured_legacy = sorted(name for name in legacy_env_names if str(os.getenv(name) or "").strip())
-    if configured_legacy:
+    configured_removed = sorted(
+        name for name in removed_env_names if str(os.getenv(name) or "").strip()
+    )
+    if configured_removed:
         raise ValueError(
             "检测到已删除的旧版配置环境变量："
-            + "、".join(configured_legacy)
+            + "、".join(configured_removed)
             + "；请改用后台 V1 存储目标与 OpenList 挂载配置"
         )
     category_env_map = {
@@ -880,19 +878,6 @@ class AppConfig:
     def category(self, category_key: str) -> dict[str, Any]:
         categories = self.categories
         return categories.get(category_key) or categories[CATEGORY_MOVIE]
-
-    def route_config(self, source_type: str) -> dict[str, Any]:
-        """Return a neutral route view for legacy callers.
-
-        V1 routing is persisted in the database assignment workspace and is
-        resolved by the planning layer.  The process configuration no longer
-        has a global ``routes`` section, so this accessor must never recreate
-        one or consult user-provided legacy values.
-        """
-
-        del source_type
-        return {"enabled": False, "route": "unsupported"}
-
 
 def load_config(config_path: str | os.PathLike[str] | None = None) -> AppConfig:
     _load_dotenv(BASE_DIR / ".env")

@@ -11,7 +11,6 @@ from typing import Any, Callable
 
 from ..constants import (
     COMPLETION_STAGE_REVIEW,
-    COMPLETION_STAGE_WAITING_ORGANIZER,
     EVENT_ERROR,
     EVENT_INFO,
     EVENT_WARN,
@@ -23,10 +22,10 @@ from ..constants import (
     RCLONE_RUN_RUNNING,
     RCLONE_RUN_SUCCESS,
 )
-from ..database import Database
-from ..fnos_paths import match_actual_dirs, match_library, normalize_library_name, normalize_remote_hint, path_tails, split_values
+from ..repositories.repository_set import RcloneRepositories
+from ..fnos_paths import normalize_library_name, normalize_remote_hint
 from ..media_path_rules import EPISODIC_CATEGORY_KEYS, FALLBACK_ORGANIZE_DIR, build_standard_naming_plan, sanitize_resource_dir_name
-from ..media.fnos import FnosMediaRefresher
+from ..planning import is_data_plane_strategy, is_relay_upload_strategy
 from ..planning.job_plan import plan_path, plan_strategy
 from .execution_plan_guard import (
     reject_non_v1_job,
@@ -41,14 +40,8 @@ from .rclone_process_controller import RcloneProcessController
 from .rclone_run_queue import RcloneRunQueue
 from .rclone_run_state import RcloneRunState
 from .rclone_run_completion_service import RcloneRunCompletionService
-from .rclone_job_feasibility import RcloneJobFeasibilityEvaluator
-from .rclone_scheduler import RcloneScheduler
 from .rclone_worker_command import RcloneWorkerCommandBuilder
-from .rclone_category_finalizer import RcloneCategoryFinalizer
-from .rclone_ready_items_completion_service import RcloneReadyItemsCompletionService
 from .rclone_cancelled_task_cleanup_service import RcloneCancelledTaskCleanupService
-from .rclone_waiting_job_recovery_service import RcloneWaitingJobRecoveryService
-from .rclone_run_import_finalizer import RcloneRunImportFinalizer
 
 
 class RcloneService:
@@ -64,13 +57,12 @@ class RcloneService:
         config: dict[str, Any],
         base_dir: Path,
         fnos_config: dict[str, Any],
-        db: Database | None = None,
+        db: RcloneRepositories | None = None,
         categories: dict[str, dict[str, Any]] | None = None,
         cmcc_upload_config: dict[str, Any] | None = None,
         cloud139_config: dict[str, Any] | None = None,
         storage_config: dict[str, Any] | None = None,
         owner_id: str = "",
-        scheduler_allowed: bool = True,
     ):
         self.config = config
         self.base_dir = base_dir
@@ -102,9 +94,6 @@ class RcloneService:
             max_lines=config.get("log_lines", 500),
         )
         self.run_queue = RcloneRunQueue()
-        self._run_ready_handler: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None
-        self._direct_ready_handler: Callable[[dict[str, Any], str], Any] | None = None
-        self._pending_run_ready_results: list[tuple[dict[str, Any], dict[str, Any]]] = []
         self._startup_recovery_activated = False
         self._staging_retry_timers: dict[int, threading.Timer] = {}
         self._staging_retry_attempts: dict[int, int] = {}
@@ -119,13 +108,6 @@ class RcloneService:
         self._stop_requested_job_ids: set[int] = set()
         self._shutdown_requested = False
         self.owner_id = str(owner_id or f"rclone-scheduler-{os.getpid()}-{id(self)}")
-        self.scheduler_allowed = bool(scheduler_allowed)
-        self.scheduler = RcloneScheduler(
-            database=self.db,
-            owner_id=self.owner_id,
-            submit=self.start,
-            log=self._append_log,
-        )
         self.environment_checker = RcloneEnvironmentChecker(self.config)
         self.process_runner = RcloneProcessRunner()
         self.process_controller = RcloneProcessController()
@@ -136,21 +118,6 @@ class RcloneService:
             state_lock=self.lock,
             log=self._append_log,
             now=self._now,
-            finalize_imports=self._finalize_run_imports,
-        )
-        self.category_finalizer = RcloneCategoryFinalizer(
-            database=self.db,
-            categories=lambda: self.categories,
-            category_key=self._rclone_category_key_from_callback,
-            event_matches=self._rclone_event_matches_category,
-            feasibility=self._rclone_job_feasibility,
-            finish_ready=self._finish_ready_rclone_items,
-            execution_repository=self._v1_execution_repository,
-        )
-        self.ready_items_completion = RcloneReadyItemsCompletionService(
-            database=self.db,
-            config=lambda: self.config,
-            refresh_media=self._refresh_media_after_rclone,
         )
         self.cancelled_task_cleanup = RcloneCancelledTaskCleanupService(
             database=self.db,
@@ -162,23 +129,6 @@ class RcloneService:
             cleanup_remote_dirs=self._cleanup_empty_remote_dirs,
             delete_temp_file=self._delete_local_temp_file,
             cleanup_temp_dirs=self._delete_empty_local_temp_dirs,
-        )
-        self.waiting_job_recovery = RcloneWaitingJobRecoveryService(
-            database=self.db,
-            state_lock=self.lock,
-            is_running=self.is_running_locked,
-            file_identity=self._rclone_event_file_identity,
-            is_pollution_file=self._is_rclone_log_pollution_file,
-            finalize_run=self._finalize_run_imports,
-        )
-        self.run_import_finalizer = RcloneRunImportFinalizer(
-            database=self.db,
-            categories=lambda: self.categories,
-            log=self._append_log,
-            feasibility=self._rclone_job_feasibility,
-            finish_ready=self._finish_ready_rclone_items,
-            dispatch_ready=self._dispatch_run_ready_to_organizer,
-            execution_repository=self._v1_execution_repository,
         )
 
     def set_v1_locator_resolver(
@@ -251,24 +201,8 @@ class RcloneService:
     # Keep a descriptive alias for internal call sites and tests.
     derive_v1_copy_run = build_v1_copy_run
 
-    def set_run_ready_handler(
-        self,
-        handler: Callable[[dict[str, Any], dict[str, Any]], Any],
-        *,
-        direct_handler: Callable[[dict[str, Any], str], Any] | None = None,
-    ) -> None:
-        """Connect run-end fallback completion to the app-level Organizer dispatcher."""
-
-        with self.lock:
-            self._run_ready_handler = handler
-            self._direct_ready_handler = direct_handler
-            pending = list(self._pending_run_ready_results)
-            self._pending_run_ready_results.clear()
-        for category_refresh, payload in pending:
-            self._dispatch_run_ready_to_organizer(category_refresh, payload)
-
     def activate_startup_recovery(self) -> dict[str, Any]:
-        """Run durable staging recovery once after the app is fully assembled."""
+        """Recover only task-scoped V1 rclone runs after app assembly."""
 
         with self.lock:
             if getattr(self, "_startup_recovery_activated", False):
@@ -280,391 +214,27 @@ class RcloneService:
             self._startup_recovery_activated = True
         try:
             scoped = self.recover_scoped_runs()
-            cloud139 = self.recover_submitted_cloud139_staging_dispatches()
-            organizer = self.recover_waiting_organizer_dispatches()
-            transfer = self.recover_unstarted_staging_jobs()
         except Exception:
             # 初始化期间若数据库暂时不可用，允许上层稍后显式重试；正常成功后
             # 始终保持一次性语义，避免重复启动同一批持久化任务。
             with self.lock:
                 self._startup_recovery_activated = False
             raise
-        success = (
-            scoped.get("success") is not False
-            and cloud139.get("success") is not False
-            and organizer.get("success") is not False
-            and transfer.get("success") is not False
-        )
+        success = scoped.get("success") is not False
         return {
             "success": success,
             "message": "rclone 启动恢复已完成" if success else "rclone 启动恢复存在未完成任务",
             "scoped_runs": scoped,
-            "submitted_cloud139": cloud139,
-            "waiting_organizer": organizer,
-            "waiting_transfer": transfer,
-        }
-
-    def recover_submitted_cloud139_staging_dispatches(
-        self,
-        limit: int = 200,
-    ) -> dict[str, Any]:
-        """Audit submitted jobs without recreating removed provider recovery."""
-
-        return self._audit_recovery_jobs(
-            statuses=("submitted",),
-            limit=limit,
-            context="startup submitted-job recovery: ",
-        )
-
-    def recover_unstarted_staging_jobs(self, limit: int = 500) -> dict[str, Any]:
-        """Delegate valid V1 transfer recovery to the durable worker."""
-
-        result = self._audit_recovery_jobs(
-            statuses=(JOB_WAITING_TRANSFER, "transferring", JOB_FAILED),
-            limit=limit,
-            context="startup transfer recovery: ",
-        )
-        result.setdefault("requeued_job_ids", [])
-        result.setdefault("requeue_failed_job_ids", [])
-        result.setdefault("completed_evidence_job_ids", [])
-        result.setdefault("organizer_recovered_job_ids", [])
-        result.setdefault("organizer_review_job_ids", [])
-        result.setdefault("invalid_plan_review_job_ids", result.get("review_job_ids", []))
-        result.setdefault("exhausted_retry_job_ids", [])
-        result.setdefault("failed_without_staging_evidence_job_ids", [])
-        return result
-
-    def recover_waiting_organizer_dispatches(self, limit: int = 200) -> dict[str, Any]:
-        """Delegate valid V1 Organizer recovery to the durable worker."""
-
-        return self._audit_recovery_jobs(
-            statuses=(JOB_WAITING_ORGANIZER,),
-            limit=limit,
-            context="startup Organizer recovery: ",
-        )
-
-    def _audit_recovery_jobs(
-        self,
-        *,
-        statuses: tuple[str, ...],
-        limit: int,
-        context: str,
-    ) -> dict[str, Any]:
-        if not getattr(self, "db", None):
-            return {
-                "success": True,
-                "skipped": True,
-                "message": "database is not configured; no V1 recovery audit is required",
-                "recovered_job_ids": [],
-                "review_job_ids": [],
-                "delegated_v1_job_ids": [],
-            }
-
-        wanted = max(1, min(int(limit or 200), 5000))
-        unique: dict[int, dict[str, Any]] = {}
-        for status in statuses:
-            offset = 0
-            while len(unique) < wanted:
-                page_size = min(200, wanted - len(unique))
-                page = self.db.list_jobs(limit=page_size, status=status, offset=offset)
-                for job in page:
-                    job_id = self._int_value(job.get("id"))
-                    if job_id > 0:
-                        unique[job_id] = job
-                if len(page) < page_size:
-                    break
-                offset += len(page)
-            if len(unique) >= wanted:
-                break
-
-        reviewed: list[int] = []
-        delegated: list[int] = []
-        for job_id, job in unique.items():
-            plan, rejection = v1_plan_or_review(
-                self.db,
-                job,
-                context=context,
-            )
-            if rejection:
-                reviewed.append(job_id)
-                continue
-            delegated.append(job_id)
-            self.db.add_event(
-                job_id,
-                EVENT_INFO,
-                "legacy rclone recovery skipped; V1 durable recovery owns this job",
-                {
-                    "strategy": plan_strategy(plan),
-                    "startup_recovery": True,
-                    "delegated_to_v1_worker": True,
-                },
-            )
-        return {
-            "success": True,
-            "message": (
-                f"V1 recovery audit completed: {len(delegated)} delegated, "
-                f"{len(reviewed)} moved to manual review"
-            ),
-            "recovered_job_ids": [],
-            "review_job_ids": reviewed,
-            "delegated_v1_job_ids": delegated,
         }
 
 
-    def _all_rclone_file_events(self, **filters: Any) -> list[dict[str, Any]]:
-        if not self.db:
-            return []
-        loader = getattr(self.db, "list_all_rclone_file_events", None)
-        if callable(loader):
-            return loader(**filters)
-        return self.db.list_rclone_file_events(limit=1000, **filters)
 
-    @classmethod
-    def _latest_terminal_file_events(
-        cls,
-        events: list[dict[str, Any]],
-        *,
-        job: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        return RcloneJobFeasibilityEvaluator.latest_terminal_events(
-            events,
-            prefer_source=RcloneJobFeasibilityEvaluator.requires_staging_manifest(job or {}),
-        )
 
-    def _dispatch_run_ready_to_organizer(
-        self,
-        category_refresh: dict[str, Any],
-        payload: dict[str, Any],
-    ) -> Any:
-        completed_items = category_refresh.get("completed_items") if isinstance(category_refresh, dict) else None
-        if not isinstance(completed_items, list) or not completed_items:
-            return None
-        queued = False
-        with self.lock:
-            handler = self._run_ready_handler
-            if handler is None:
-                self._pending_run_ready_results.append((dict(category_refresh), dict(payload)))
-                queued = True
-        if queued:
-            self._append_log("rclone run 兜底已确认任务，等待 Organizer 分发器就绪")
-            return {"success": True, "queued": True, "message": "等待 Organizer 分发器就绪"}
-        try:
-            return handler(category_refresh, payload)
-        except Exception as exc:  # noqa: BLE001
-            message = f"rclone run 兜底移交 Organizer 异常：{exc}"
-            self._append_log(message)
-            self._mark_run_ready_items_review(completed_items, message)
-            return {"success": False, "message": message}
 
-    def _handoff_completed_staging_job_to_organizer(
-        self,
-        job: dict[str, Any],
-        terminal_events: list[dict[str, Any]],
-        verdict: dict[str, Any],
-        *,
-        trigger: str,
-        run_id: int = 0,
-    ) -> dict[str, Any]:
-        """Promote durable completion evidence into the Organizer pipeline.
 
-        A process can stop after the final file ACK was persisted but before
-        the run/category finalizer updates the Job and creates an Organizer
-        task.  Recovery and delayed retry callbacks share this idempotent
-        handoff so a complete manifest never remains stranded in a transfer
-        state.
-        """
 
-        if not self.db:
-            return {"success": False, "message": "数据库未初始化，无法补投 Organizer"}
-        job_id = self._int_value(job.get("id"))
-        if job_id <= 0:
-            return {"success": False, "message": "任务 ID 无效，无法补投 Organizer"}
-        latest = self.db.get_job(job_id) or job
-        plan, rejection = v1_plan_or_review(
-            self.db,
-            latest,
-            context="completed rclone handoff: ",
-        )
-        if rejection:
-            return rejection
-        if plan_strategy(plan) not in {"rclone_copy", "relay_upload_mobile"}:
-            rejection = reject_non_v1_job(
-                self.db,
-                latest,
-                context="completed rclone handoff: ",
-                error="the V1 strategy does not use rclone",
-            )
-            return rejection
-        status = str(latest.get("status") or "").strip().lower()
-        if status == JOB_WAITING_ORGANIZER:
-            existing_tasks = self.db.list_organizer_tasks_by_job(job_id, limit=1)
-            if existing_tasks:
-                return {
-                    "success": True,
-                    "skipped": True,
-                    "job_id": job_id,
-                    "message": "任务已存在 Organizer 标准化任务，无需重复补投",
-                }
-        if status in {
-            "organizing",
-            "confirming",
-            JOB_REVIEW,
-            "done",
-            "success",
-            "skipped_existing",
-            "cancelled",
-        }:
-            return {
-                "success": status not in {JOB_REVIEW, "cancelled"},
-                "skipped": True,
-                "job_id": job_id,
-                "message": f"任务状态 {status} 已离开搬运阶段，无需重复补投",
-            }
 
-        completed_events = [
-            event
-            for event in terminal_events
-            if str(event.get("status") or "").strip().lower()
-            in RcloneJobFeasibilityEvaluator.COMPLETED_STATUSES
-        ]
-        if not verdict.get("ready") or not completed_events:
-            message = str(verdict.get("message") or "rclone 完整性证据不足，无法补投 Organizer")
-            self._mark_run_ready_items_review([{"job_id": job_id, "job": latest}], message)
-            return {"success": False, "review": True, "job_id": job_id, "message": message}
 
-        category_key = str(latest.get("category") or "movie").strip() or "movie"
-        category = self.categories.get(category_key, {})
-        resolved_run_id = self._int_value(run_id) or max(
-            (self._int_value(event.get("run_id")) for event in completed_events),
-            default=0,
-        )
-        completion_message = "rclone 完整搬运证据已确认，等待 Organizer 标准化整理与标准目录确认"
-        raw_data = latest.get("raw_data") if isinstance(latest.get("raw_data"), dict) else {}
-        completion = raw_data.get("completion") if isinstance(raw_data.get("completion"), dict) else {}
-        completion = {
-            **completion,
-            "stage": COMPLETION_STAGE_WAITING_ORGANIZER,
-            "message": completion_message,
-            "official_save_path": latest.get("target_path") or completion.get("official_save_path") or "",
-            "rclone_run_id": resolved_run_id,
-            "rclone_trigger": trigger,
-        }
-        if not self._update_job_from_snapshot(
-            latest,
-            status=JOB_WAITING_ORGANIZER,
-            error_message="",
-            raw_data={**raw_data, "completion": completion},
-        ):
-            current = self.db.get_job(job_id) or latest
-            return {
-                "success": False,
-                "skipped": True,
-                "job_id": job_id,
-                "message": f"任务状态已变化为 {current.get('status') or '未知'}，未用过期 rclone 证据补投 Organizer",
-            }
-        promoted_job = self.db.get_job(job_id) or {
-            **latest,
-            "status": JOB_WAITING_ORGANIZER,
-            "error_message": "",
-            "raw_data": {**raw_data, "completion": completion},
-        }
-        item = {
-            "job_id": job_id,
-            "job": promoted_job,
-            "category": category_key,
-            "category_label": category.get("label") or promoted_job.get("category_label") or category_key,
-            "target_paths": _dedupe_texts(event.get("target_path") for event in completed_events),
-            "source_paths": _dedupe_texts(event.get("source_path") for event in completed_events),
-            "file_count": len(completed_events),
-            "verdict": verdict,
-        }
-        category_refresh = {
-            "success": True,
-            "skipped": True,
-            "deferred_to_organizer": True,
-            "library": category.get("fnos_lib") or category.get("label") or category_key,
-            "message": "rclone 完整证据恢复后补投 Organizer 接管",
-            "completed_items": [item],
-        }
-        dispatch_result = self._dispatch_run_ready_to_organizer(
-            category_refresh,
-            {
-                "run_id": resolved_run_id,
-                "status": "completion_evidence_recovery",
-                "category": category_key,
-                "trigger": trigger,
-            },
-        )
-        if not isinstance(dispatch_result, dict) or dispatch_result.get("success") is not True:
-            detail = str(
-                dispatch_result.get("message")
-                if isinstance(dispatch_result, dict)
-                else "Organizer 分发器未返回可用结果"
-            ).strip()
-            message = f"rclone 完整证据已确认，但补投 Organizer 失败：{detail or '未知错误'}"
-            self._mark_run_ready_items_review([item], message)
-            return {
-                "success": False,
-                "review": True,
-                "job_id": job_id,
-                "message": message,
-                "organizer": dispatch_result,
-            }
-        self.db.add_event(
-            job_id,
-            EVENT_INFO,
-            "rclone 完整搬运证据已恢复并补投 Organizer",
-            {
-                "trigger": trigger,
-                "run_id": resolved_run_id,
-                "expected_file_count": verdict.get("expected_file_count"),
-                "completed_file_count": verdict.get("completed_file_count"),
-                "organizer": dispatch_result,
-            },
-        )
-        return {
-            "success": True,
-            "queued": True,
-            "job_id": job_id,
-            "organizer": dispatch_result,
-        }
-
-    def _mark_run_ready_items_review(self, completed_items: list[dict[str, Any]], message: str) -> None:
-        if not self.db:
-            return
-        for item in completed_items:
-            if not isinstance(item, dict):
-                continue
-            try:
-                job_id = int(item.get("job_id") or (item.get("job") or {}).get("id") or 0)
-            except (TypeError, ValueError):
-                job_id = 0
-            if job_id <= 0:
-                continue
-            job = self.db.get_job(job_id) or {}
-            raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
-            completion = raw_data.get("completion") if isinstance(raw_data.get("completion"), dict) else {}
-            if not self._update_job_from_snapshot(
-                job,
-                status=JOB_REVIEW,
-                error_message=message,
-                raw_data={
-                    **raw_data,
-                    "completion": {
-                        **completion,
-                        "stage": COMPLETION_STAGE_REVIEW,
-                        "message": message,
-                        "retryable": True,
-                    },
-                },
-            ):
-                continue
-            self.db.add_event(
-                job_id,
-                EVENT_WARN,
-                message,
-                {"rclone_run_fallback": True, "retryable": True},
-            )
 
 
     def apply_runtime_config(
@@ -683,8 +253,6 @@ class RcloneService:
             cloud139_config=cloud139_config,
             storage_config=storage_config,
         )
-        old_interval = int(self.config.get("auto_interval_minutes", 0) or 0)
-        new_interval = int(config.get("auto_interval_minutes", 0) or 0)
         self.config = config
         self.fnos_config = fnos_config
         self.categories = categories or {}
@@ -693,9 +261,6 @@ class RcloneService:
         self.worker_command.apply_config(config)
         self.log_sink.resize(config.get("log_lines", 500))
 
-        if old_interval == new_interval or not self.scheduler_allowed:
-            return
-        self.scheduler.restart(new_interval)
 
     # ------------------------------------------------------------------
     # V1 durable task-scoped operation contract
@@ -739,7 +304,7 @@ class RcloneService:
             return {"success": False, "message": error or "V1 rclone descriptor 无效"}
         job_id = self._int_value(persisted.get("job_id"))
         try:
-            run, created = self.db.create_scoped_rclone_run(
+            run, created = self.db.rclone.create_scoped_rclone_run(
                 trigger_reason=f"transfer:{job_id}:rclone_copy",
                 operation_key=key,
                 job_id=job_id,
@@ -767,7 +332,7 @@ class RcloneService:
             staging_run=scoped_descriptor,
         )
         if result.get("success") is False:
-            self.db.mark_scoped_rclone_run_status(
+            self.db.rclone.mark_scoped_rclone_run_status(
                 run_id,
                 RCLONE_RUN_FAILED,
                 error_message=str(result.get("message") or "rclone 提交失败"),
@@ -788,7 +353,7 @@ class RcloneService:
     def find_run_by_operation_key(self, operation_key: str) -> dict[str, Any] | None:
         if not self.db:
             return None
-        run = self.db.find_rclone_run_by_operation_key(operation_key)
+        run = self.db.rclone.find_rclone_run_by_operation_key(operation_key)
         if not run:
             return None
         # A failed copy is safe to resubmit against the same frozen paths; let
@@ -858,7 +423,7 @@ class RcloneService:
         job_id = self._int_value(run.get("job_id"))
         outcome = self.cancel_job(job_id, stop_running=True)
         active = bool(outcome.get("active_match"))
-        self.db.mark_scoped_rclone_run_status(
+        self.db.rclone.mark_scoped_rclone_run_status(
             normalized,
             "cancel_pending" if active else "cancelled",
             error_message="用户请求取消 rclone 运行",
@@ -874,7 +439,7 @@ class RcloneService:
     def recover_scoped_runs(self, limit: int = 100) -> dict[str, Any]:
         """Requeue durable V1 copies left by a stopped worker process."""
 
-        database = getattr(self, "db", None)
+        database = self.db
         if not database:
             return {
                 "success": True,
@@ -882,15 +447,7 @@ class RcloneService:
                 "message": "rclone 数据库不可用，已跳过持久运行恢复",
                 "recovered": 0,
             }
-        loader = getattr(database, "list_recoverable_scoped_rclone_runs", None)
-        if not callable(loader):
-            return {
-                "success": True,
-                "skipped": True,
-                "message": "durable scoped-run recovery is not available on this database adapter",
-                "recovered": 0,
-            }
-        rows = loader(limit)
+        rows = database.rclone.list_recoverable_scoped_rclone_runs(limit)
         recovered = 0
         cancelled = 0
         errors: list[str] = []
@@ -898,7 +455,7 @@ class RcloneService:
             run_id = self._int_value(run.get("id"))
             status = str(run.get("status") or "").strip().lower()
             if status == "cancel_pending":
-                database.mark_scoped_rclone_run_status(
+                database.rclone.mark_scoped_rclone_run_status(
                     run_id,
                     "cancelled",
                     error_message="进程重启时完成取消收敛",
@@ -909,7 +466,7 @@ class RcloneService:
             descriptor = run.get("copy_descriptor") if isinstance(run.get("copy_descriptor"), dict) else {}
             key = str(run.get("operation_key") or "").strip()
             if not descriptor or not key:
-                database.mark_scoped_rclone_run_status(
+                database.rclone.mark_scoped_rclone_run_status(
                     run_id,
                     RCLONE_RUN_FAILED,
                     error_message="持久 rclone descriptor 缺失",
@@ -917,7 +474,7 @@ class RcloneService:
                 )
                 errors.append(f"run #{run_id} descriptor 缺失")
                 continue
-            database.mark_scoped_rclone_run_status(run_id, "recovering")
+            database.rclone.mark_scoped_rclone_run_status(run_id, "recovering")
             result = self.start(
                 reason=f"recovery:{run_id}",
                 staging_run={
@@ -930,7 +487,7 @@ class RcloneService:
                 recovered += 1
             else:
                 message = str(result.get("message") or "恢复提交失败")
-                database.mark_scoped_rclone_run_status(
+                database.rclone.mark_scoped_rclone_run_status(
                     run_id,
                     RCLONE_RUN_FAILED,
                     error_message=message,
@@ -982,7 +539,7 @@ class RcloneService:
             staging_job_id = self._int_value((staging_run or {}).get("job_id"))
             execution_job_id = staging_job_id or self._int_value((file_retry or {}).get("job_id"))
             if execution_job_id > 0 and self.db:
-                latest_job = self.db.get_job(execution_job_id) or {}
+                latest_job = self.db.job_queries.get(execution_job_id) or {}
                 latest_status = str(latest_job.get("status") or "").strip().lower()
                 if self._staging_status_blocks_execution(latest_status):
                     return {
@@ -1111,7 +668,7 @@ class RcloneService:
                 "status": self.status(),
             }
         job_id = self._int_value(file_event.get("job_id"))
-        job = self.db.get_job(job_id) if self.db and job_id > 0 else None
+        job = self.db.job_queries.get(job_id) if self.db and job_id > 0 else None
         if not isinstance(job, dict):
             return {
                 "success": False,
@@ -1144,7 +701,7 @@ class RcloneService:
         )
         if rejection:
             return {**rejection, "status": self.status()}
-        if plan_strategy(plan) not in {"rclone_copy", "relay_upload_mobile"}:
+        if not is_data_plane_strategy(plan_strategy(plan)):
             return {
                 "success": False,
                 "rejected": True,
@@ -1283,7 +840,6 @@ class RcloneService:
             **self.run_state.snapshot(),
             **queue_status,
             "script_path": str(self._script_path()),
-            "auto_interval_minutes": int(self.config.get("auto_interval_minutes", 0) or 0),
             "directory_mapping": self._category_dir_env(os.environ.copy()),
         }
 
@@ -1293,12 +849,12 @@ class RcloneService:
     def list_runs(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         if not self.db:
             return []
-        return self.db.list_rclone_runs(limit=limit, offset=offset)
+        return self.db.rclone.list_rclone_runs(limit=limit, offset=offset)
 
     def list_events(self, run_id: int | None = None, limit: int = 200) -> list[dict[str, Any]]:
         if not self.db:
             return []
-        return self.db.list_rclone_events(run_id=run_id, limit=limit)
+        return self.db.rclone.list_rclone_events(run_id=run_id, limit=limit)
 
     def list_file_events(
         self,
@@ -1312,7 +868,7 @@ class RcloneService:
     ) -> list[dict[str, Any]]:
         if not self.db:
             return []
-        return self.db.list_rclone_file_events(
+        return self.db.rclone.list_rclone_file_events(
             run_id=run_id,
             job_id=job_id,
             status=status,
@@ -1360,7 +916,7 @@ class RcloneService:
                 "warnings": [],
                 "errors": [],
             }
-        if plan_strategy(plan) not in {"rclone_copy", "relay_upload_mobile"}:
+        if not is_data_plane_strategy(plan_strategy(plan)):
             return {
                 "success": True,
                 "skipped": True,
@@ -1418,7 +974,7 @@ class RcloneService:
         except ValueError:
             return []
         strategy = plan_strategy(plan)
-        if strategy not in {"rclone_copy", "relay_upload_mobile"}:
+        if not is_data_plane_strategy(strategy):
             return []
         try:
             copy_run = self.build_v1_copy_run(job, plan)
@@ -1466,7 +1022,7 @@ class RcloneService:
             plan = self._validated_v1_plan(job)
         except ValueError:
             return []
-        if plan_strategy(plan) not in {"rclone_copy", "relay_upload_mobile"}:
+        if not is_data_plane_strategy(plan_strategy(plan)):
             return []
         try:
             copy_run = self.build_v1_copy_run(job, plan)
@@ -1597,7 +1153,7 @@ class RcloneService:
             plan = self._validated_v1_plan(job)
         except ValueError:
             return ""
-        if plan_strategy(plan) != "relay_upload_mobile":
+        if not is_relay_upload_strategy(plan_strategy(plan)):
             return ""
         source_path = self._without_remote_prefix(
             self._clean_remote_file_path(spec.get("source_path"))
@@ -1750,19 +1306,11 @@ class RcloneService:
             return True
         return len(normalized_stem) >= 4 and normalized_stem in normalized_title
 
-    def start_scheduler(self) -> None:
-        if not self.scheduler_allowed:
-            return
-        with self.lock:
-            self._shutdown_requested = False
-        self.scheduler.start(int(self.config.get("auto_interval_minutes", 0) or 0))
-
-    def shutdown_scheduler(self) -> None:
+    def shutdown(self) -> None:
         with self.lock:
             self._shutdown_requested = True
         self.run_queue.request_stop()
         self._cancel_all_staging_retries()
-        self.scheduler.shutdown()
 
     def is_running_locked(self) -> bool:
         return bool(self.worker_thread and self.worker_thread.is_alive())
@@ -1793,7 +1341,7 @@ class RcloneService:
             queued_file_retry = next_run.file_retry if isinstance(next_run.file_retry, dict) else {}
             queued_file_job_id = self._int_value(queued_file_retry.get("job_id"))
             if queued_file_job_id > 0 and self.db:
-                latest_file_job = self.db.get_job(queued_file_job_id)
+                latest_file_job = self.db.job_queries.get(queued_file_job_id)
                 file_job_status = str((latest_file_job or {}).get("status") or "").strip().lower()
                 if self._staging_status_blocks_execution(file_job_status):
                     self._append_log(
@@ -1805,14 +1353,14 @@ class RcloneService:
                 persisted, staging_error = self._database_bound_staging_run(staging_run)
                 job_id = self._int_value(staging_run.get("job_id"))
                 scoped_run_id = self._int_value(staging_run.get("_scoped_run_id"))
-                latest = self.db.get_job(job_id) if self.db and job_id > 0 else None
+                latest = self.db.job_queries.get(job_id) if self.db and job_id > 0 else None
                 status = str((latest or {}).get("status") or "").strip().lower()
                 if self._staging_status_blocks_execution(status):
                     self._append_log(
                         f"已跳过队列中的任务级 rclone 搬运：任务 #{job_id} 当前状态为 {status}"
                     )
                     if scoped_run_id > 0 and self.db:
-                        self.db.mark_scoped_rclone_run_status(
+                        self.db.rclone.mark_scoped_rclone_run_status(
                             scoped_run_id,
                             "cancelled",
                             error_message=f"job #{job_id} status {status} blocks rclone execution",
@@ -1823,13 +1371,13 @@ class RcloneService:
                 if not persisted:
                     message = staging_error or "队列中的任务级 staging 参数已失效"
                     if latest:
-                        self._mark_run_ready_items_review(
-                            [{"job_id": job_id, "job": latest}],
+                        self._mark_job_review(
+                            latest,
                             f"队列中的 rclone 搬运在执行前复核失败，已转人工审核：{message}",
                         )
                     self._append_log(f"已拒绝队列中的任务级 rclone 搬运：{message}")
                     if scoped_run_id > 0 and self.db:
-                        self.db.mark_scoped_rclone_run_status(
+                        self.db.rclone.mark_scoped_rclone_run_status(
                             scoped_run_id,
                             RCLONE_RUN_FAILED,
                             error_message=message,
@@ -1904,7 +1452,7 @@ class RcloneService:
                 "message": "no validated V1 rclone descriptor was attached to this run",
             }
         job_id = self._int_value(copy_run.get("job_id"))
-        job = self.db.get_job(job_id) if self.db and job_id > 0 else None
+        job = self.db.job_queries.get(job_id) if self.db and job_id > 0 else None
         if isinstance(job, dict):
             plan, rejection = v1_plan_or_review(
                 self.db,
@@ -1913,7 +1461,7 @@ class RcloneService:
             )
             if rejection:
                 return rejection
-            if plan_strategy(plan) not in {"rclone_copy", "relay_upload_mobile"}:
+            if not is_data_plane_strategy(plan_strategy(plan)):
                 return {
                     "success": False,
                     "rejected": True,
@@ -1960,7 +1508,7 @@ class RcloneService:
         exit_code: int,
     ) -> None:
         job_id = self._int_value(job.get("id"))
-        latest = self.db.get_job(job_id) or job
+        latest = self.db.job_queries.get(job_id) or job
         raw_data = latest.get("raw_data") if isinstance(latest.get("raw_data"), dict) else {}
         completion = raw_data.get("completion") if isinstance(raw_data.get("completion"), dict) else {}
         self._update_job_from_snapshot(
@@ -1993,7 +1541,7 @@ class RcloneService:
         job_id = self._int_value(job.get("id"))
         if job_id <= 0 or not self.db:
             return {"success": False, "queued": False, "message": "任务级 staging 自动补跑已耗尽，但任务不存在"}
-        latest = self.db.get_job(job_id) or job
+        latest = self.db.job_queries.get(job_id) or job
         status = str(latest.get("status") or "").strip().lower()
         if status in {
             "done",
@@ -2039,7 +1587,7 @@ class RcloneService:
                 },
             },
         ):
-            current = self.db.get_job(job_id) or latest
+            current = self.db.job_queries.get(job_id) or latest
             self._clear_staging_retry(job_id)
             return {
                 "success": True,
@@ -2047,7 +1595,7 @@ class RcloneService:
                 "queued": False,
                 "message": f"任务状态已变化为 {current.get('status') or '未知'}，未覆盖 staging 补跑结果",
             }
-        self.db.add_event(
+        self.db.job_commands.add_event(
             job_id,
             EVENT_ERROR,
             message,
@@ -2106,9 +1654,9 @@ class RcloneService:
     ) -> None:
         started_at = self._now()
         scoped_run_id = self._int_value((staging_run or {}).get("_scoped_run_id"))
-        run_id = scoped_run_id or (self.db.create_rclone_run(reason) if self.db else None)
+        run_id = scoped_run_id or (self.db.rclone.create_rclone_run(reason) if self.db else None)
         if scoped_run_id > 0 and self.db:
-            if not self.db.mark_scoped_rclone_run_started(scoped_run_id):
+            if not self.db.rclone.mark_scoped_rclone_run_started(scoped_run_id):
                 self._append_log(
                     f"rclone run #{scoped_run_id} 已取消或处于不可执行状态，跳过启动"
                 )
@@ -2212,19 +1760,7 @@ class RcloneService:
     def _finish(self, exit_code: int, error: str) -> None:
         self.run_completion.finish(exit_code, error)
 
-    def repair_waiting_jobs_from_history(self, limit: int = 50) -> dict[str, Any]:
-        return self.waiting_job_recovery.repair(limit)
 
-    def _finalize_run_imports(self, run_id: int, exit_code: int) -> None:
-        self.run_import_finalizer.finalize(run_id, exit_code)
-
-    def finalize_category_imports(
-        self,
-        run_id: int,
-        category_label: str,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        return self.category_finalizer.finalize(run_id, category_label, payload)
 
     def resolve_resource_folder(self, category_label: str, filename: str, source_path: str = "", target_path: str = "") -> dict[str, Any]:
         """worker 遇到剧集类根目录文件时，尽量用任务标题给它补资源目录。"""
@@ -2235,7 +1771,7 @@ class RcloneService:
 
         matched = None
         if self.db:
-            matched = self.db.find_job_for_rclone_callback(
+            matched = self.db.rclone.find_job_for_rclone_callback(
                 category=category_label,
                 filename=filename,
                 source_path=source_path,
@@ -2270,7 +1806,7 @@ class RcloneService:
         category_key = self._rclone_category_key_from_callback(category_label, target_path)
         matched = None
         if self.db:
-            matched = self.db.find_job_for_rclone_callback(
+            matched = self.db.rclone.find_job_for_rclone_callback(
                 category=category_label,
                 filename=filename,
                 source_path=source_path,
@@ -2391,34 +1927,7 @@ class RcloneService:
         return target_norm
 
 
-    def _finish_ready_rclone_items(
-        self,
-        run_id: int,
-        category_key: str,
-        category: dict[str, Any],
-        items: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]],
-        events: list[dict[str, Any]],
-        *,
-        trigger: str,
-        success_message: str,
-    ) -> dict[str, Any]:
-        return self.ready_items_completion.finish(
-            run_id,
-            category_key,
-            category,
-            items,
-            events,
-            trigger=trigger,
-            success_message=success_message,
-        )
 
-    def _rclone_job_feasibility(
-        self,
-        job: dict[str, Any],
-        events: list[dict[str, Any]],
-        exit_code: int,
-    ) -> dict[str, Any]:
-        return RcloneJobFeasibilityEvaluator.evaluate(job, events, exit_code)
 
     def _update_job_from_snapshot(self, job: dict[str, Any], **updates: Any) -> bool:
         if not self.db:
@@ -2434,18 +1943,43 @@ class RcloneService:
             "rejected",
         }:
             return False
-        updater = getattr(self.db, "update_job_if_status", None)
-        if callable(updater):
-            return bool(updater(job_id, {expected_status}, **updates))
-        latest = self.db.get_job(job_id) or {}
-        if str(latest.get("status") or "").strip() != expected_status:
-            return False
-        self.db.update_job(job_id, **updates)
-        return True
+        return bool(self.db.job_commands.update_if_status(job_id, {expected_status}, **updates))
 
-    @staticmethod
-    def _rclone_event_file_identity(event: dict[str, Any]) -> str:
-        return RcloneJobFeasibilityEvaluator.file_identity(event)
+    def _mark_job_review(self, job: dict[str, Any], message: str) -> bool:
+        """Fail a currently executable V1 job closed without invoking old finalizers."""
+
+        if not self.db:
+            return False
+        job_id = self._int_value(job.get("id"))
+        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
+        completion = (
+            raw_data.get("completion")
+            if isinstance(raw_data.get("completion"), dict)
+            else {}
+        )
+        updated = self._update_job_from_snapshot(
+            job,
+            status=JOB_REVIEW,
+            error_message=message,
+            raw_data={
+                **raw_data,
+                "completion": {
+                    **completion,
+                    "stage": COMPLETION_STAGE_REVIEW,
+                    "message": message,
+                    "retryable": True,
+                },
+            },
+        )
+        if updated and job_id > 0:
+            self.db.job_commands.add_event(
+                job_id,
+                EVENT_WARN,
+                message,
+                {"v1_rclone_validation": True, "retryable": True},
+            )
+        return updated
+
 
     @staticmethod
     def _int_value(value: Any, default: int = 0) -> int:
@@ -2471,30 +2005,6 @@ class RcloneService:
         return "movie"
 
 
-    def _rclone_event_matches_category(
-        self,
-        event: dict[str, Any],
-        *,
-        category_label: str,
-        category_key: str,
-        category: dict[str, Any],
-        target_path: str = "",
-    ) -> bool:
-        event_category = self._normalize_fnos_library_name(event.get("category") or "")
-        aliases = self._rclone_category_aliases(category_key, category)
-        wanted = self._normalize_fnos_library_name(category_label)
-        if event_category and (event_category in aliases or (wanted and event_category == wanted)):
-            return True
-        event_target = self._normalize_remote_hint(event.get("target_path") or "")
-        target_norm = self._normalize_remote_hint(target_path)
-        return bool(
-            event_target
-            and target_norm
-            and (
-                event_target == target_norm
-                or event_target.startswith(f"{target_norm.rstrip('/')}/")
-            )
-        )
 
 
     @classmethod
@@ -2511,228 +2021,34 @@ class RcloneService:
             values.append(category.get(key))
         return {cls._normalize_fnos_library_name(value) for value in values if cls._normalize_fnos_library_name(value)}
 
-    @classmethod
-    def _rclone_target_path_matches_category(
-        cls,
-        target_path: str,
-        category: dict[str, Any],
-    ) -> bool:
-        """Use display labels only; mutable category path aliases are retired."""
-
-        target_norm = cls._normalize_remote_hint(target_path)
-        label = cls._normalize_remote_hint(category.get("label") or "").strip("/")
-        if not target_norm or not label:
-            return False
-        return label in [part for part in target_norm.strip("/").split("/") if part]
 
 
-    @staticmethod
-    def _is_rclone_log_pollution_file(value: str) -> bool:
-        return RcloneJobFeasibilityEvaluator.is_log_pollution(value)
-
-    def _expected_file_count(self, job: dict[str, Any]) -> int:
-        return RcloneJobFeasibilityEvaluator.expected_file_count(job)
-
-    def _refresh_media_after_rclone(self, category_key: str, category: dict[str, Any], events: list[dict[str, Any]], *, trigger: str = "rclone_run_finished") -> dict[str, Any]:
-        library_info = self._rclone_fnos_library_info(category_key, category, events)
-        library = library_info["library"]
-        dir_list = library_info["dir_list"]
-        if not dir_list:
-            return {
-                "success": False,
-                "message": "未匹配到飞牛媒体库真实刷新目录，已跳过扫描；请先在媒体库管理中确认分类 dir_list",
-                "library": library,
-                "dir_list": [],
-                "target_hints": library_info.get("target_hints") or [],
-            }
-        request_payload = {
-            "library": library,
-            "guid": library_info.get("guid") or "",
-            "dir_list": dir_list,
-            "target_hints": library_info.get("target_hints") or [],
-            "trigger": trigger,
-        }
-        try:
-            refresher = FnosMediaRefresher(self.fnos_config or {})
-            if library_info.get("guid"):
-                result = refresher.refresh_guid(str(library_info["guid"]), library=library, dir_list=dir_list)
-            else:
-                result = refresher.refresh(library, dir_list=dir_list)
-        except Exception as exc:  # noqa: BLE001
-            result = {"success": False, "message": f"飞牛媒体库刷新异常：{exc}", **request_payload}
-        else:
-            result = {**request_payload, **(result if isinstance(result, dict) else {"success": False, "message": str(result)})}
-        trigger_text = "分类完成后" if trigger == "rclone_category_done" else "run 结束后"
-        self._append_log(f"rclone {trigger_text}刷新媒体库：{library} dir_list={dir_list} success={result.get('success')}")
-        return result
-
-    def _rclone_fnos_library_info(self, category_key: str, category: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
-        library = str(category.get("fnos_lib") or category.get("label") or category_key).strip()
-        target_hints = self._rclone_target_hints(category_key, category, events)
-        fallback_dirs = self._absolute_fnos_dirs(category.get("fnos_dir_list") or category.get("fnos_dirs") or [])
-        try:
-            libraries = FnosMediaRefresher(self.fnos_config or {}).refresh_libraries()
-        except Exception:  # noqa: BLE001
-            libraries = {}
-        items = libraries.get("items") if isinstance(libraries, dict) and isinstance(libraries.get("items"), list) else []
-        matched = self._match_fnos_library(items, library)
-        if matched:
-            actual_dirs = self._match_fnos_target_dirs(matched.get("dir_list"), target_hints)
-            return {
-                "library": str(matched.get("name") or matched.get("title") or library),
-                "guid": str(matched.get("guid") or ""),
-                "dir_list": actual_dirs or fallback_dirs,
-                "target_hints": target_hints,
-            }
-        return {"library": library, "guid": "", "dir_list": fallback_dirs, "target_hints": target_hints}
-
-    def _rclone_target_hints(
-        self,
-        category_key: str,
-        category: dict[str, Any],
-        events: list[dict[str, Any]],
-    ) -> list[str]:
-        specific_values: list[Any] = []
-        fallback_values: list[Any] = []
-        for event in events:
-            target_path = str(event.get("target_path") or "").strip()
-            if not target_path:
-                continue
-            status = str(event.get("status") or "").strip().lower()
-            filename = str(event.get("filename") or "").strip()
-            if status.startswith("category_") and not filename:
-                fallback_values.append(target_path)
-                continue
-            refresh_dir = self._rclone_refresh_dir_for_file(category_key, target_path)
-            if not refresh_dir:
-                continue
-            variants = self._rclone_refresh_hint_variants(refresh_dir, category)
-            if status in {"done", "success", "skipped_existing"}:
-                specific_values.extend(variants)
-            else:
-                fallback_values.extend(variants)
-        result: list[str] = []
-        for value in specific_values or fallback_values:
-            for item in self._split_fnos_values(value):
-                normalized = self._normalize_remote_hint(item)
-                if normalized and normalized not in result:
-                    result.append(normalized)
-        return result
 
 
-    @classmethod
-    def _rclone_refresh_dir_for_file(cls, category_key: str, target_path: str) -> str:
-        target_norm = cls._normalize_remote_hint(target_path)
-        if not target_norm:
-            return ""
-        parent = posixpath.dirname(target_norm.strip("/"))
-        if not parent or parent == ".":
-            return ""
-        if str(category_key or "").strip().lower() in EPISODIC_CATEGORY_KEYS:
-            basename = posixpath.basename(parent.rstrip("/"))
-            if re.fullmatch(r"(?i)season\s+\d{1,4}", basename):
-                show_dir = posixpath.dirname(parent.rstrip("/"))
-                if show_dir and show_dir != ".":
-                    return show_dir.strip("/")
-        return parent.strip("/")
-
-    @classmethod
-    def _rclone_refresh_hint_variants(
-        cls,
-        refresh_dir: str,
-        category: dict[str, Any],
-    ) -> list[str]:
-        normalized = cls._normalize_remote_hint(refresh_dir)
-        if not normalized:
-            return []
-        variants: list[str] = [normalized]
-        label = cls._normalize_remote_hint(category.get("label")).strip("/")
-        if label:
-            parts = [part for part in normalized.strip("/").split("/") if part]
-            for index, part in enumerate(parts):
-                if part == label:
-                    candidate = "/".join(parts[index:])
-                    if candidate and candidate not in variants:
-                        variants.append(candidate)
-                    break
-        return variants
 
 
-    def _rclone_mount_refresh_hint_variants(
-        self,
-        refresh_dir: str,
-        category: dict[str, Any],
-    ) -> list[str]:
-        """Mount aliases are frozen in V1 bindings and are not inferred here."""
-
-        del refresh_dir, category
-        return []
 
 
-    @classmethod
-    def _match_fnos_library(cls, items: list[Any], library: str) -> dict[str, Any] | None:
-        return match_library(items, library)
+
+
+
+
+
 
     @staticmethod
     def _normalize_fnos_library_name(value: Any) -> str:
         return normalize_library_name(value)
 
-    @classmethod
-    def _match_fnos_target_dirs(cls, actual_value: Any, target_hints: list[str]) -> list[str]:
-        actual_dirs = cls._absolute_fnos_dirs(actual_value)
-        if not actual_dirs or not target_hints:
-            return []
-        for hint in target_hints:
-            matches = cls._match_actual_fnos_dirs(actual_dirs, hint)
-            if matches and (cls._hint_segment_count(hint) >= 2 or len(matches) == 1 or hint.startswith("/")):
-                return matches[:1] if len(matches) > 1 else matches
-        return []
 
-    @classmethod
-    def _match_actual_fnos_dirs(cls, actual_dirs: list[str], hint: str) -> list[str]:
-        return match_actual_dirs(actual_dirs, hint)
 
-    @staticmethod
-    def _path_tails(path: str) -> list[str]:
-        return path_tails(path)
 
-    @classmethod
-    def _hint_segment_count(cls, value: str) -> int:
-        return len([part for part in cls._normalize_remote_hint(value).strip("/").split("/") if part])
 
     @staticmethod
     def _normalize_remote_hint(value: Any) -> str:
         return normalize_remote_hint(value)
 
-    @staticmethod
-    def _split_fnos_values(value: Any) -> list[str]:
-        return split_values(value)
 
-    @classmethod
-    def _absolute_fnos_dirs(cls, value: Any) -> list[str]:
-        result: list[str] = []
-        for item in cls._split_fnos_values(value):
-            normalized = cls._normalize_remote_hint(item)
-            if normalized.startswith("/") and normalized not in result:
-                result.append(normalized)
-        return result
 
-    @classmethod
-    def _find_first_value(cls, payload: Any, keys: set[str]) -> Any:
-        if isinstance(payload, dict):
-            for key, value in payload.items():
-                if key in keys and value not in (None, ""):
-                    return value
-            for value in payload.values():
-                found = cls._find_first_value(value, keys)
-                if found not in (None, ""):
-                    return found
-        if isinstance(payload, list):
-            for item in payload:
-                found = cls._find_first_value(item, keys)
-                if found not in (None, ""):
-                    return found
-        return None
 
     def _append_log(self, message: str) -> None:
         self.log_sink.append(message)
@@ -3019,7 +2335,7 @@ class RcloneService:
             return {}, "database is unavailable; the V1 plan cannot be verified"
 
         job_id = self._int_value(requested.get("job_id"))
-        job = self.db.get_job(job_id) if job_id > 0 else None
+        job = self.db.job_queries.get(job_id) if job_id > 0 else None
         if not isinstance(job, dict):
             return {}, f"job #{job_id or '?'} does not exist"
         status = str(job.get("status") or "").strip().lower()
@@ -3036,7 +2352,7 @@ class RcloneService:
         )
         if rejection:
             return {}, str(rejection.get("message") or "invalid V1 execution plan")
-        if plan_strategy(plan) not in {"rclone_copy", "relay_upload_mobile"}:
+        if not is_data_plane_strategy(plan_strategy(plan)):
             return {}, f"job #{job_id} does not use an rclone V1 strategy"
         declared_operation_key = str(
             (

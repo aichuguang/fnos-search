@@ -109,12 +109,20 @@ class AdminSettingsUiTests(unittest.TestCase):
         self.assertIn("系统仍在后台等待授权结果", source)
         self.assertNotIn("请继续扫码", source)
         self.assertIn(".storage-auth-error", styles)
+        self.assertIn("function usesNativeFolderBrowser(provider)", source)
+        self.assertIn('data-native-directory-action="enter"', source)
+        self.assertIn("/storage-setup/accounts/${encodeURIComponent(accountId)}/folders", source)
+        self.assertIn("native_root_name: raw.native_root_name || null", source)
+        self.assertIn("location.native_upload_capable", source)
+        self.assertIn(".storage-native-browser", styles)
+        self.assertIn(".storage-native-folder-list", styles)
+        self.assertIn(".storage-capability-list", styles)
         self.assertIn("@media (max-width: 700px)", styles)
         self.assertIn(".storage-route-row { grid-template-columns: 1fr;", styles)
 
     def test_provider_auth_script_cache_version_is_current(self) -> None:
         self.assertIn(
-            '/static/admin-storage-v1.js?v=20260809-provider-auth-v015',
+            '/static/admin-storage-v1.js?v=20260809-v1-cutover-v001',
             self.template,
         )
 

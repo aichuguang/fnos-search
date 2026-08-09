@@ -162,13 +162,13 @@ class RcloneWorkerClient:
         return response
 
     def list_runs(self, *, limit: int, offset: int) -> list[dict[str, Any]]:
-        return self.database.list_rclone_runs(limit=limit, offset=offset)
+        return self.database.rclone.list_rclone_runs(limit=limit, offset=offset)
 
     def list_events(self, *, run_id: int | None, limit: int) -> list[dict[str, Any]]:
-        return self.database.list_rclone_events(run_id=run_id, limit=limit)
+        return self.database.rclone.list_rclone_events(run_id=run_id, limit=limit)
 
     def list_file_events(self, **filters: Any) -> list[dict[str, Any]]:
-        return self.database.list_rclone_file_events(**filters)
+        return self.database.rclone.list_rclone_file_events(**filters)
 
     def close(self) -> None:
         self.session.close()

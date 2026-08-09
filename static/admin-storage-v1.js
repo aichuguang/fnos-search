@@ -13,6 +13,9 @@
         notice: { message: "正在读取配置…", kind: "" },
         directoryOptions: [],
         directoryError: "",
+        nativeDirectoryOptions: [],
+        nativeDirectoryError: "",
+        nativeDirectoryTrail: [],
         preflight: null,
         authSession: null,
         authSessionHidden: false,
@@ -185,7 +188,7 @@
                 <div class="storage-setup-title">
                     <span class="storage-setup-kicker">网盘入库</span>
                     <h3>多链路入库</h3>
-                    <p>保存位置由管理员统一设置，系统自动选择同源直转、rclone 或移动云中继。</p>
+                    <p>\u4fdd\u5b58\u4f4d\u7f6e\u7531\u7ba1\u7406\u5458\u7edf\u4e00\u8bbe\u7f6e\uff0c\u7cfb\u7edf\u81ea\u52a8\u9009\u62e9\u540c\u6e90\u76f4\u8f6c\u3001rclone \u6216 Provider \u539f\u751f\u4e2d\u7ee7\u4e0a\u4f20\u3002</p>
                 </div>
                 <div class="storage-setup-header-actions">
                     <span class="storage-progress-label ${progress.ready ? "is-ready" : ""}">${progress.ready ? "已就绪" : `${progress.completed}/${progress.total} 已完成`}</span>
@@ -221,6 +224,56 @@
 
     function schemaFields(schema) {
         return Array.isArray(schema?.fields) ? schema.fields.filter((field) => field && field.name) : [];
+    }
+
+    function nativeLocatorField(provider) {
+        return schemaFields(provider?.native_locator_schema)[0] || null;
+    }
+
+    function usesNativeFolderBrowser(provider) {
+        return nativeLocatorField(provider)?.name === "folder_id";
+    }
+
+    function resetNativeDirectoryState() {
+        state.nativeDirectoryOptions = [];
+        state.nativeDirectoryError = "";
+        state.nativeDirectoryTrail = [];
+    }
+
+    function nativeDirectoryCurrent() {
+        const trail = state.nativeDirectoryTrail || [];
+        return trail[trail.length - 1] || { folder_id: "-11", name: "\u6839\u76ee\u5f55" };
+    }
+
+    function nativeDirectoryDisplayName(trail = state.nativeDirectoryTrail) {
+        const items = Array.isArray(trail) ? trail : [];
+        const names = items.slice(1).map((item) => String(item?.name || "").trim()).filter(Boolean);
+        return names.length ? `/${names.join("/")}` : "\u6839\u76ee\u5f55";
+    }
+
+    function renderNativeDirectoryBrowser(values, locatorField) {
+        const selectedName = values.native_root_name || (values.native_root ? `ID: ${values.native_root}` : "");
+        const current = nativeDirectoryCurrent();
+        const trail = state.nativeDirectoryTrail.length
+            ? state.nativeDirectoryTrail
+            : [{ folder_id: "-11", name: "\u6839\u76ee\u5f55" }];
+        const folders = state.nativeDirectoryOptions || [];
+        return `<section class="storage-native-browser span-2" aria-label="${esc(locatorField?.label || "\u4e91\u76d8\u539f\u751f\u76ee\u5f55")}">
+            <input type="hidden" name="native_root" value="${esc(values.native_root || "")}">
+            <input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}">
+            <header>
+                <div><strong>${esc(locatorField?.label || "\u4e91\u76d8\u4fdd\u5b58\u6839\u76ee\u5f55")}</strong><small>${selectedName ? `\u5df2\u9009\uff1a${esc(selectedName)}` : "\u8bf7\u4ece\u4e0b\u65b9\u76ee\u5f55\u4e2d\u9009\u62e9"}</small></div>
+                <button type="button" class="secondary mini" data-native-directory-action="select-current" ${current.folder_id ? "" : "disabled"}>\u9009\u62e9\u5f53\u524d\u76ee\u5f55</button>
+            </header>
+            <div class="storage-native-breadcrumbs" aria-label="\u539f\u751f\u76ee\u5f55\u8def\u5f84">
+                ${trail.map((item, index) => `<button type="button" class="secondary mini" data-native-directory-action="breadcrumb" data-index="${index}">${esc(item.name || (index ? item.folder_id : "\u6839\u76ee\u5f55"))}</button>`).join('<span aria-hidden="true">/</span>')}
+            </div>
+            <div class="storage-native-folder-list">
+                ${folders.length ? folders.map((item) => `<button type="button" class="storage-native-folder" data-native-directory-action="enter" data-folder-id="${esc(item.folder_id)}" data-folder-name="${esc(item.name || item.folder_id)}"><span class="icon-slot icon-folder" aria-hidden="true"></span><span>${esc(item.name || item.folder_id)}</span><small>\u8fdb\u5165</small></button>`).join("") : `<div class="storage-empty-inline">${state.nativeDirectoryError ? "\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25" : "\u5f53\u524d\u76ee\u5f55\u6ca1\u6709\u5b50\u76ee\u5f55"}</div>`}
+            </div>
+            ${state.nativeDirectoryError ? `<div class="storage-inline-error" role="alert">${esc(state.nativeDirectoryError)}</div>` : ""}
+            <label class="storage-native-selection"><span>\u5df2\u9009\u539f\u751f\u76ee\u5f55</span><input name="native_root_selection" required readonly value="${esc(selectedName)}" placeholder="\u8bf7\u9009\u62e9\u4e00\u4e2a\u4e91\u76d8\u76ee\u5f55"></label>
+        </section>`;
     }
 
     function authInputSchema(provider, authDefinition) {
@@ -325,11 +378,19 @@
     function renderLocationRow(location) {
         const provider = providerFor(location.provider_kind);
         const typeLabel = location.kind === "local" ? "本地目录" : location.kind === "generic" ? "OpenList 通用盘" : provider?.display_name || location.provider_kind;
+        const nativeStatus = location.native_upload_capable ? `
+            <div class="storage-capability-list">
+                <span class="${location.native_upload_verified ? "is-success" : "is-warning"}">${location.native_upload_verified ? "\u539f\u751f\u4e0a\u4f20\u5df2\u9a8c\u8bc1" : "\u539f\u751f\u4e0a\u4f20\u5f85\u9a8c\u8bc1"}</span>
+                <span class="${location.organizer_mutation_verified ? "is-success" : "is-warning"}">${location.organizer_mutation_verified ? "OpenList \u6574\u7406\u5df2\u9a8c\u8bc1" : "OpenList \u6574\u7406\u5f85\u9a8c\u8bc1"}</span>
+                ${location.native_only ? '<span class="is-neutral">WebDAV \u53ea\u8bfb</span>' : ""}
+            </div>` : "";
         return `<article class="storage-location-row">
             <span class="storage-provider-mark kind-${esc(location.provider_kind)}">${esc(provider?.icon_text || (location.kind === "local" ? "本" : "盘"))}</span>
             <div class="storage-record-main">
                 <div class="storage-record-title"><strong>${esc(location.name)}</strong><span class="storage-status ${location.ready ? "is-success" : "is-warning"}">${location.ready ? "可用" : "待检查"}</span></div>
                 <p>${esc(typeLabel)}${location.account_name ? ` · ${esc(location.account_name)}` : ""}${location.webdav_root ? ` · ${esc(location.webdav_root)}` : ""}</p>
+                ${location.native_root_name ? `<small>\u539f\u751f\u76ee\u5f55\uff1a${esc(location.native_root_name)}</small>` : ""}
+                ${nativeStatus}
                 <small>${esc(location.status_message)}</small>
             </div>
             <div class="storage-row-actions"><button type="button" class="secondary mini" data-location-action="edit" data-id="${esc(location.destination_id)}">编辑</button><button type="button" class="danger mini" data-location-action="delete" data-id="${esc(location.destination_id)}">删除</button></div>
@@ -359,7 +420,8 @@
         const selectedProviderKind = values.provider_kind || selectedAccount?.provider_kind || providerKinds[0] || "";
         const accounts = allAccounts.filter((item) => item.provider_kind === selectedProviderKind && (item.last_test_status === "ok" || item.account_id === values.account_id));
         const provider = providerFor(selectedProviderKind);
-        const locatorField = schemaFields(provider?.native_locator_schema)[0];
+        const locatorField = nativeLocatorField(provider);
+        const nativeBrowser = usesNativeFolderBrowser(provider);
         const connections = (state.data.connections || []).filter((item) => item.enabled);
         return `<form id="storageLocationForm" class="storage-editor-form">
             ${editorHeader(values.destination_id ? "编辑保存位置" : "添加保存位置", "locations")}
@@ -369,7 +431,10 @@
                 ${kind === "provider" ? `<label><span>网盘类型</span><select name="provider_kind" required ${values.destination_id ? "disabled" : ""}><option value="">请选择网盘</option>${providerKinds.map((providerKind) => `<option value="${esc(providerKind)}" ${providerKind === selectedProviderKind ? "selected" : ""}>${esc(providerFor(providerKind)?.display_name || providerKind)}</option>`).join("")}</select></label><label><span>云盘账号</span><select name="account_id" required><option value="">请选择账号</option>${accounts.map((item) => `<option value="${esc(item.account_id)}" ${item.account_id === values.account_id ? "selected" : ""}>${esc(item.name)}${item.last_test_status === "ok" ? "" : "（待检测）"}</option>`).join("")}</select></label>` : ""}
                 ${kind !== "local" ? `<label><span>OpenList 连接</span><select name="connection_id" required><option value="">请选择连接</option>${connections.map((item) => `<option value="${esc(item.connection_id)}" ${item.connection_id === values.connection_id ? "selected" : ""}>${esc(item.name)}${item.last_test_status === "ok" ? "" : "（待检测）"}</option>`).join("")}</select></label>
                 <label class="span-2"><span>OpenList 中的目录</span><input name="webdav_root" list="storageDirectoryOptions" required value="${esc(values.webdav_root || "")}" placeholder="例如：/夸克/媒体库"><datalist id="storageDirectoryOptions">${state.directoryOptions.map((item) => `<option value="${esc(item.path)}">${esc(item.name || item.path)}</option>`).join("")}</datalist></label>` : ""}
-                ${kind === "provider" ? `<label class="span-2"><span>${esc(locatorField?.label || "云盘保存根目录")}</span><input name="native_root" required value="${esc(values.native_root || "")}" placeholder="同源直转和跨盘落地使用"></label>` : ""}
+                ${kind === "provider" ? (nativeBrowser
+                    ? renderNativeDirectoryBrowser(values, locatorField)
+                    : `<label class="span-2"><span>${esc(locatorField?.label || "\u4e91\u76d8\u4fdd\u5b58\u6839\u76ee\u5f55")}</span><input name="native_root" required value="${esc(values.native_root || "")}" placeholder="\u540c\u6e90\u76f4\u8f6c\u548c\u8de8\u76d8\u843d\u5730\u4f7f\u7528"><input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}"></label>`)
+                    : ""}
                 ${kind !== "local" ? `<label class="span-2 storage-identity-confirm"><input name="confirm_identity" type="checkbox" value="true" required><span>我确认该 OpenList 目录确实对应上面选择的账号或存储位置。修改目录、账号或挂载关系时会重新确认。</span></label>` : ""}
             </div>
             ${state.directoryError ? `<div class="storage-inline-error" role="alert">${esc(state.directoryError)}</div>` : ""}
@@ -409,7 +474,7 @@
         if (!location) return "尚未设置保存位置";
         if (sourceId === "sixpan_magnet") return "六盘离线后直接入库";
         if (route?.provider_kind === location.provider_kind) return "同源直转，不经过本地";
-        if (location.provider_kind === "mobile") return "来源落地后下载到本地，再由移动云 API 上传";
+        if (location.native_upload_capable) return "\u6765\u6e90\u843d\u5730\u540e\u4e0b\u8f7d\u5230\u672c\u5730\uff0c\u518d\u7531\u76ee\u6807\u4e91\u76d8\u539f\u751f API \u4e0a\u4f20";
         if (location.kind === "local") return "来源落地后通过 rclone 下载到本地";
         return "来源落地后通过 rclone 搬运到目标网盘";
     }
@@ -598,9 +663,18 @@
             connection_id: raw.connection_id || null,
             webdav_root: raw.webdav_root || null,
             native_root: raw.native_root || null,
+            native_root_name: raw.native_root_name || null,
             confirm_identity: raw.confirm_identity === "true",
             expected_revision: values.current_revision,
         };
+        const selectedProvider = providerFor(payload.provider_kind);
+        if (
+            payload.kind === "provider"
+            && usesNativeFolderBrowser(selectedProvider)
+            && !payload.native_root
+        ) {
+            throw new Error("\u8bf7\u9009\u62e9\u4e91\u76d8\u539f\u751f\u4fdd\u5b58\u76ee\u5f55");
+        }
         const path = values.destination_id ? `/api/admin/storage-setup/locations/${values.destination_id}` : "/api/admin/storage-setup/locations";
         try {
             await request(path, { method: values.destination_id ? "PATCH" : "POST", body: JSON.stringify(payload) });
@@ -824,8 +898,13 @@
             provider_kind: readyAccount?.provider_kind || "",
             account_id: readyAccount?.account_id || "",
         };
+        resetNativeDirectoryState();
         state.editor = { type: "location", values };
         await loadDirectoryOptions(values.connection_id);
+        const provider = providerFor(values.provider_kind || readyAccount?.provider_kind || "");
+        if (values.account_id && usesNativeFolderBrowser(provider)) {
+            await loadNativeDirectoryOptions(values.account_id);
+        }
         render();
     }
 
@@ -839,6 +918,25 @@
         } catch (error) {
             state.directoryOptions = [];
             state.directoryError = error.message || "OpenList 目录读取失败";
+        }
+    }
+
+    async function loadNativeDirectoryOptions(accountId, parentId = "-11", trail = null) {
+        state.nativeDirectoryOptions = [];
+        state.nativeDirectoryError = "";
+        if (!accountId) {
+            state.nativeDirectoryTrail = [];
+            return;
+        }
+        state.nativeDirectoryTrail = Array.isArray(trail) && trail.length
+            ? trail
+            : [{ folder_id: "-11", name: "\u6839\u76ee\u5f55" }];
+        try {
+            const result = await request(`/api/admin/storage-setup/accounts/${encodeURIComponent(accountId)}/folders?parent_id=${encodeURIComponent(parentId || "-11")}`);
+            state.nativeDirectoryOptions = (result.items || []).filter((item) => item?.folder_id);
+        } catch (error) {
+            state.nativeDirectoryOptions = [];
+            state.nativeDirectoryError = error.message || "\u539f\u751f\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25";
         }
     }
 
@@ -870,7 +968,29 @@
         if (form && ["kind", "provider_kind", "account_id", "connection_id"].includes(event.target.name)) {
             const raw = formValues(form);
             state.editor.values = { ...state.editor.values, ...raw, kind: raw.kind || state.editor.values.kind };
-            if (event.target.name === "provider_kind") state.editor.values.account_id = "";
+            if (event.target.name === "kind" && raw.kind !== "provider") {
+                state.editor.values.provider_kind = "";
+                state.editor.values.account_id = "";
+                state.editor.values.native_root = "";
+                state.editor.values.native_root_name = "";
+                resetNativeDirectoryState();
+            }
+            if (event.target.name === "provider_kind") {
+                state.editor.values.account_id = "";
+                state.editor.values.native_root = "";
+                state.editor.values.native_root_name = "";
+                resetNativeDirectoryState();
+            }
+            if (event.target.name === "account_id") {
+                state.editor.values.native_root = "";
+                state.editor.values.native_root_name = "";
+                resetNativeDirectoryState();
+                const account = (state.data.accounts || []).find((item) => item.account_id === raw.account_id);
+                const provider = providerFor(account?.provider_kind || state.editor.values.provider_kind);
+                if (raw.account_id && usesNativeFolderBrowser(provider)) {
+                    await loadNativeDirectoryOptions(raw.account_id);
+                }
+            }
             if (event.target.name === "connection_id") await loadDirectoryOptions(raw.connection_id);
             render();
             return;
@@ -906,6 +1026,44 @@
                 setNotice(state.preflight.message, state.preflight.ok ? "is-success" : "is-error");
             } catch (error) { setNotice(error.message, "is-error"); }
             finally { setBusy(false); }
+            return;
+        }
+
+        const nativeDirectoryAction = button.dataset.nativeDirectoryAction;
+        if (nativeDirectoryAction) {
+            const accountId = state.editor?.values?.account_id || "";
+            if (!accountId) {
+                state.nativeDirectoryError = "\u8bf7\u5148\u9009\u62e9\u4e91\u76d8\u8d26\u53f7";
+                render();
+                return;
+            }
+            if (nativeDirectoryAction === "select-current") {
+                const current = nativeDirectoryCurrent();
+                state.editor.values.native_root = current.folder_id;
+                state.editor.values.native_root_name = nativeDirectoryDisplayName();
+                render();
+                return;
+            }
+            setBusy(true);
+            try {
+                if (nativeDirectoryAction === "enter") {
+                    const next = {
+                        folder_id: button.dataset.folderId || "",
+                        name: button.dataset.folderName || button.dataset.folderId || "",
+                    };
+                    const trail = [...(state.nativeDirectoryTrail || []), next];
+                    await loadNativeDirectoryOptions(accountId, next.folder_id, trail);
+                }
+                if (nativeDirectoryAction === "breadcrumb") {
+                    const index = Math.max(0, Number(button.dataset.index || 0));
+                    const trail = (state.nativeDirectoryTrail || []).slice(0, index + 1);
+                    const current = trail[trail.length - 1] || { folder_id: "-11", name: "\u6839\u76ee\u5f55" };
+                    await loadNativeDirectoryOptions(accountId, current.folder_id, trail);
+                }
+                render();
+            } finally {
+                setBusy(false);
+            }
             return;
         }
 

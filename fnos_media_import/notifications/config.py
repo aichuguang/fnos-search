@@ -56,7 +56,7 @@ _ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def read_config(db: Any) -> dict[str, Any]:
-    settings = db.get_app_settings()
+    settings = db.app_settings.get_all()
     stored = settings.get(NOTIFICATIONS_SETTING_KEY)
     if not isinstance(stored, dict):
         stored = {}
@@ -64,7 +64,7 @@ def read_config(db: Any) -> dict[str, Any]:
 
 
 def write_config(db: Any, config: dict[str, Any]) -> None:
-    db.set_app_settings({NOTIFICATIONS_SETTING_KEY: config})
+    db.app_settings.set_many({NOTIFICATIONS_SETTING_KEY: config})
 
 
 def normalize(payload: dict[str, Any], *, current: dict[str, Any] | None = None) -> dict[str, Any]:

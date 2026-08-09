@@ -22,24 +22,28 @@ from ..domain.models import (
     AccountSelection,
     OpenListMount,
     ProviderAccount,
-    ProviderCapabilities,
     StorageTarget,
 )
-from ..providers.registry import ProviderRegistry, ProviderRegistryError
+from ..providers.base import ProviderAdapter
 
 # ---- 传输策略常量（§3.3 / §12.3） ------------------------------------------
 
 STRATEGY_NATIVE_SAVE = "native_save"
 STRATEGY_NATIVE_OFFLINE = "native_offline"
 STRATEGY_RCLONE_COPY = "rclone_copy"
-STRATEGY_RELAY_UPLOAD_MOBILE = "relay_upload_mobile"
+STRATEGY_RELAY_UPLOAD_PROVIDER = "relay_upload_provider"
+
+RELAY_UPLOAD_STRATEGIES = frozenset({STRATEGY_RELAY_UPLOAD_PROVIDER})
+DATA_PLANE_STRATEGIES = frozenset(
+    {STRATEGY_RCLONE_COPY, *RELAY_UPLOAD_STRATEGIES}
+)
 
 VALID_STRATEGIES = frozenset(
     {
         STRATEGY_NATIVE_SAVE,
         STRATEGY_NATIVE_OFFLINE,
         STRATEGY_RCLONE_COPY,
-        STRATEGY_RELAY_UPLOAD_MOBILE,
+        STRATEGY_RELAY_UPLOAD_PROVIDER,
     }
 )
 
@@ -48,8 +52,16 @@ STRATEGY_EXECUTOR = {
     STRATEGY_NATIVE_SAVE: "native",
     STRATEGY_NATIVE_OFFLINE: "native_offline",
     STRATEGY_RCLONE_COPY: "rclone",
-    STRATEGY_RELAY_UPLOAD_MOBILE: "mobile_relay",
+    STRATEGY_RELAY_UPLOAD_PROVIDER: "provider_relay",
 }
+
+
+def is_relay_upload_strategy(value: Any) -> bool:
+    return str(value or "").strip().lower() in RELAY_UPLOAD_STRATEGIES
+
+
+def is_data_plane_strategy(value: Any) -> bool:
+    return str(value or "").strip().lower() in DATA_PLANE_STRATEGIES
 
 # 部署级本地根（可被 config 的 FNOS_LOCAL_TARGET_ROOT / FNOS_RELAY_ROOT 覆盖）。
 DEFAULT_LOCAL_TARGET_ROOT = "/storage-targets"
@@ -229,21 +241,6 @@ def path_leaf(path: Any) -> str:
 # 服务）在后续阶段按同一接口接入，无需修改本包。
 
 
-class ProviderAdapter(Protocol):
-    kind: str
-
-    def capabilities(self) -> ProviderCapabilities: ...
-
-    def can_native_transfer(
-        self,
-        source: Any,
-        destination: Any,
-        account: Any,
-    ) -> CapabilityDecision: ...
-
-    def relay_uploader(self) -> Any: ...
-
-
 class AdapterRegistry(Protocol):
     def get(self, provider_kind: str) -> ProviderAdapter: ...
 
@@ -318,7 +315,11 @@ __all__ = [
     "STRATEGY_NATIVE_SAVE",
     "STRATEGY_NATIVE_OFFLINE",
     "STRATEGY_RCLONE_COPY",
-    "STRATEGY_RELAY_UPLOAD_MOBILE",
+    "STRATEGY_RELAY_UPLOAD_PROVIDER",
+    "RELAY_UPLOAD_STRATEGIES",
+    "DATA_PLANE_STRATEGIES",
+    "is_relay_upload_strategy",
+    "is_data_plane_strategy",
     "VALID_STRATEGIES",
     "STRATEGY_EXECUTOR",
     "DEFAULT_LOCAL_TARGET_ROOT",
@@ -371,38 +372,4 @@ __all__ = [
     "plan_strategy",
     "validated_v1_execution_plan_from_job",
     "v1_execution_plan_from_job",
-    "DefaultAdapterRegistry",
 ]
-
-
-class DefaultAdapterRegistry(ProviderRegistry):
-    """V1 唯一 Provider 注册表，同时服务 Planner、账号和来源目录。
-
-    名称保留是为了不让 Composition Root 出现第二套注册表实现；行为已经完全
-    委托给严格的 :class:`ProviderRegistry`。新增 Provider 只需注册 Adapter 或
-    加载 ``fnos_media_import.providers`` entry point。
-    """
-
-    def __init__(
-        self,
-        adapters: dict[str, ProviderAdapter] | None = None,
-    ) -> None:
-        values = list((adapters or {}).values()) if isinstance(adapters, dict) else adapters
-        try:
-            super().__init__(values)
-        except ProviderRegistryError as exc:
-            raise PlanningError(str(exc), code="PROVIDER_REGISTRY_INVALID") from exc
-
-    def register(self, adapter: ProviderAdapter) -> None:
-        try:
-            super().register(adapter)
-        except ProviderRegistryError as exc:
-            raise PlanningError(str(exc), code="PROVIDER_REGISTRY_INVALID") from exc
-
-    def get(self, provider_kind: str) -> ProviderAdapter:
-        try:
-            return super().get(provider_kind)  # type: ignore[return-value]
-        except ProviderRegistryError as exc:
-            raise PlanningError(
-                f"未注册 Provider Adapter：{provider_kind}", code="PROVIDER_UNAVAILABLE"
-            ) from exc

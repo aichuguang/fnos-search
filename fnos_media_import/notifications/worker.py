@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from ..repositories.repository_set import NotificationRepositories
 from .sender import deliver_task
 
 
 def make_notification_deliver_handler(
-    db: Any,
+    db: NotificationRepositories,
 ) -> Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None]:
     """构造供 DurableWorkerRuntime 注册的 ``notification_deliver`` handler。"""
 

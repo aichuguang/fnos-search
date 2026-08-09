@@ -18,17 +18,13 @@ class RuntimeReloadResult:
 
 def finalize_organizer_runtime_transition(
     *,
-    dispatcher: Any,
     previous_build: Any,
     candidate_build: Any,
     retirement: Any,
     activate_background: bool = True,
 ) -> None:
-    """Publish the Organizer only after the app has updated its closures."""
+    """Finish Organizer lifecycle handoff after RuntimeInstaller publication."""
 
-    dispatcher_setter = getattr(dispatcher, "set_organizer", None)
-    if callable(dispatcher_setter):
-        dispatcher_setter(candidate_build.organizer_service)
     old_organizer = getattr(previous_build, "organizer_service", None)
     suspend_old = getattr(old_organizer, "suspend_background", None)
     if callable(suspend_old):
@@ -60,8 +56,7 @@ class RuntimeReloadService:
         config_int: Callable[[dict[str, Any], str, int], int],
         rollback_logger: Callable[[], None],
         advanced_config_key: str,
-        organizer_dispatcher: Any | None = None,
-        openlist_config_provider: Callable[[], dict[str, Any]] | None = None,
+        install_candidate: Callable[[Any, Any], None] | None = None,
     ) -> None:
         self.load_config = load_config
         self.builder = builder
@@ -77,13 +72,9 @@ class RuntimeReloadService:
         self.config_int = config_int
         self.rollback_logger = rollback_logger
         self.advanced_config_key = advanced_config_key
-        self.openlist_config_provider = (
-            openlist_config_provider if callable(openlist_config_provider) else None
+        self.install_candidate = (
+            install_candidate if callable(install_candidate) else None
         )
-        # Kept as an optional constructor argument for compatibility with
-        # existing composition tests. Dispatcher publication belongs to the
-        # app closure, after its config/service references have been updated.
-        _ = organizer_dispatcher
 
     def reload(self, current_config: Any, current_build: Any) -> RuntimeReloadResult:
         reloaded_config = self.load_config()
@@ -91,9 +82,13 @@ class RuntimeReloadService:
         candidate = self.builder.build(reloaded_config, recover_background=False)
         try:
             self._apply_mutable_runtime(reloaded_config, candidate)
+            if self.install_candidate is not None:
+                self.install_candidate(candidate, reloaded_config)
         except Exception:
             try:
                 self._apply_mutable_runtime(current_config, current_build)
+                if self.install_candidate is not None:
+                    self.install_candidate(current_build, current_config)
             except Exception:  # noqa: BLE001
                 self.rollback_logger()
             candidate.close()
@@ -163,7 +158,7 @@ class RuntimeReloadService:
             run_at=str(hot_discovery.get("run_at") or "08:30"),
         )
         self.rclone_service.apply_runtime_config(
-            rclone_runtime_config(config, self.openlist_config_provider),
+            rclone_runtime_config(config),
             config.raw["fnos"],
             config.categories,
             # Provider credentials, destinations and mount identities are

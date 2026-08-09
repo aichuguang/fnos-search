@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import copy
 import threading
 import unittest
@@ -59,7 +61,7 @@ def _plan(
     }
 
 
-class _MountService:
+class _MountService(RepositoryFakeMixin):
     def __init__(self, revision: dict | None) -> None:
         self.revision = revision
         self.calls: list[tuple[str, int]] = []
@@ -69,7 +71,7 @@ class _MountService:
         return copy.deepcopy(self.revision)
 
 
-class _ConnectionService:
+class _ConnectionService(RepositoryFakeMixin):
     def __init__(self, revision: dict | None, credentials: dict | None) -> None:
         self.revision = revision
         self.credentials = credentials
@@ -85,7 +87,7 @@ class _ConnectionService:
         return copy.deepcopy(self.credentials)
 
 
-class _Database:
+class _Database(RepositoryFakeMixin):
     def __init__(self, tasks: dict[int, dict], jobs: dict[int, dict]) -> None:
         self.tasks = tasks
         self.jobs = jobs
@@ -109,7 +111,7 @@ class _Database:
         return True
 
 
-class _Client:
+class _Client(RepositoryFakeMixin):
     configured = True
 
     def __init__(self, name: str) -> None:

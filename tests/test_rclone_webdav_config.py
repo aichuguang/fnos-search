@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import json
 import subprocess
 import unittest
@@ -17,7 +19,7 @@ from fnos_media_import.services.rclone_webdav_config_service import (
 )
 
 
-class FakeRcloneRunner:
+class FakeRcloneRunner(RepositoryFakeMixin):
     def __init__(self, configs: dict[str, dict[str, Any]] | None = None) -> None:
         self.configs = json.loads(json.dumps(configs or {}))
         self.backup: dict[str, dict[str, Any]] | None = None

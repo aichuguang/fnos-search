@@ -25,9 +25,10 @@ _ADVANCED_DOCUMENT_METADATA_FIELDS = frozenset(
 
 CATEGORY_KEYS = [CATEGORY_MOVIE, CATEGORY_TV, CATEGORY_ANIME, CATEGORY_VARIETY, CATEGORY_OTHER]
 
-# Fields from pre-V1 configuration documents.  New imports still fail with an
-# actionable path.  Existing database values are filtered once during startup
-# so an upgrade cannot be blocked by options that no longer have a V1 owner.
+# Fields from pre-V1 configuration documents.  New imports and runtime reads
+# fail with an actionable path.  Existing database values are filtered only by
+# the v29 offline migration so the running application never maintains a
+# second, compatibility configuration model.
 DEPRECATED_ADVANCED_FIELDS: dict[str, frozenset[str]] = {
     "quark": frozenset({"auto_save_url", "token", "check_before_save", "run_immediately"}),
     "cloud189": frozenset({"auto_save_url", "endpoint", "token", "timeout", "refresh_after_submit"}),
@@ -259,7 +260,6 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "enabled": "bool",
         "remote_name": "str",
         "upload_backend": "str",
-        "auto_interval_minutes": "int",
         "staging_retry_delay_seconds": "int",
         "staging_retry_max_delay_seconds": "int",
         "staging_retry_max_attempts": "int",
@@ -304,9 +304,10 @@ def persisted_config_from_settings(settings: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "数据库高级配置不是 V1 存储覆盖项；请清空该项并通过版本化配置文件重新录入"
         )
-    migrated, _removed_paths = migrate_stored_advanced_config(raw)
+    _reject_deprecated_advanced_paths(raw)
+    _reject_unknown_advanced_paths(raw)
     return sanitize_advanced_config(
-        migrated,
+        raw,
         current={},
         preserve_secret_placeholders=False,
     )
@@ -331,31 +332,6 @@ def migrate_stored_advanced_config(raw: dict[str, Any]) -> tuple[dict[str, Any],
     return cleaned, _removed_config_paths(raw, cleaned)
 
 
-def migrate_persisted_advanced_config_setting(
-    database: Any,
-) -> tuple[dict[str, Any], list[str]]:
-    """CAS-persist the stored V1 compatibility cleanup during startup."""
-
-    settings = database.get_app_settings()
-    for _attempt in range(3):
-        raw = settings.get(ADVANCED_CONFIG_KEY)
-        if not isinstance(raw, dict):
-            return settings, []
-        cleaned, removed_paths = migrate_stored_advanced_config(raw)
-        if not removed_paths:
-            return settings, []
-        if database.compare_and_set_app_setting(
-            ADVANCED_CONFIG_KEY,
-            raw,
-            cleaned,
-        ):
-            migrated_settings = copy.deepcopy(settings)
-            migrated_settings[ADVANCED_CONFIG_KEY] = cleaned
-            return migrated_settings, removed_paths
-        settings = database.get_app_settings()
-    return settings, []
-
-
 def _removed_config_paths(
     original: dict[str, Any],
     cleaned: dict[str, Any],
@@ -376,9 +352,11 @@ def _removed_config_paths(
 def normalize_advanced_config_payload(payload: dict[str, Any], current_stored: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("高级配置格式不正确")
-    migrated_current, _removed_current_paths = migrate_stored_advanced_config(
-        current_stored or {}
-    )
+    current = current_stored or {}
+    if not isinstance(current, dict):
+        raise ValueError("数据库高级配置必须是对象")
+    _reject_deprecated_advanced_paths(current)
+    _reject_unknown_advanced_paths(current)
     requested_mode = str(payload.get("mode") or "").strip().lower()
     # Imports and updates use one versioned document shape.  Bare section
     # dictionaries were accepted by the pre-V1 UI and are intentionally
@@ -462,7 +440,7 @@ def normalize_advanced_config_payload(payload: dict[str, Any], current_stored: d
 
     normalized = sanitize_advanced_config(
         config_payload,
-        current=migrated_current if mode == "merge" else {},
+        current=current if mode == "merge" else {},
         preserve_secret_placeholders=mode == "merge",
     )
     for path in clear_secrets:

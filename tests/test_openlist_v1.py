@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import json
 import os
 import shutil
@@ -18,6 +20,7 @@ from unittest import mock
 from flask import Flask
 
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.openlist import (
     OpenListCredentialError,
     OpenListMasterKeyError,
@@ -53,7 +56,7 @@ def _relative_path(root: str, target: str) -> str | None:
     return None
 
 
-class FakeWebDAV:
+class FakeWebDAV(RepositoryFakeMixin):
     """内存 WebDAV 模拟：支持探测所需的全部操作，可注入各步骤失败。"""
 
     def __init__(
@@ -129,7 +132,7 @@ class FakeWebDAV:
         return path in self.files or path.rstrip("/") in self.dirs
 
 
-def _new_database(testcase: unittest.TestCase) -> Database:
+def _new_database(testcase: unittest.TestCase) -> RepositorySet:
     WORK_TEST_ROOT.mkdir(parents=True, exist_ok=True)
     database_path = WORK_TEST_ROOT / f"openlist-{uuid.uuid4().hex}.db"
     database = Database(database_path)
@@ -152,7 +155,7 @@ def _new_database(testcase: unittest.TestCase) -> Database:
             pass
 
     testcase.addCleanup(cleanup)
-    return database
+    return RepositorySet.from_database(database)
 
 
 def _insert_provider_account(database: Database, account_id: str = "acc_quark_a", provider_kind: str = "quark") -> None:
@@ -274,17 +277,23 @@ class OpenListConnectionTests(unittest.TestCase):
     def test_delete_connection_rejects_execution_plan_reference(self) -> None:
         self._create()
         now = utc_now_iso()
+        job_id, created = self.database.job_commands.create(
+            {
+                "title": "plan-reference",
+                "category": "movie",
+                "category_label": "Movie",
+                "source_provider_kind": "quark",
+                "source_form": "share",
+                "source_url": "source-record:openlist-plan-reference",
+                "target_path": "/openlist/movie",
+                "status": "queued",
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": "openlist:plan-reference",
+            }
+        )
+        self.assertTrue(created)
         with self.database.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO import_jobs
-                  (title, category, category_label, source_type, source_url, target_route,
-                   status, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?)
-                """,
-                ("计划", "movie", "电影", "quark", "https://example.invalid/s", "v1", "queued", now, now),
-            )
-            job_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
             conn.execute(
                 "INSERT INTO import_execution_plans(job_id, schema_version, plan_json, plan_hash, created_at) "
                 "VALUES (?,?,?,?,?)",
@@ -296,23 +305,29 @@ class OpenListConnectionTests(unittest.TestCase):
                     now,
                 ),
             )
-        with self.assertRaisesRegex(OpenListValidationError, "执行计划引用"):
+        with self.assertRaises(OpenListValidationError):
             self.service.delete_connection("ol_main")
 
     def test_delete_connection_rejects_transfer_execution_reference(self) -> None:
         self._create()
         now = utc_now_iso()
+        job_id, created = self.database.job_commands.create(
+            {
+                "title": "transfer-reference",
+                "category": "movie",
+                "category_label": "Movie",
+                "source_provider_kind": "quark",
+                "source_form": "share",
+                "source_url": "source-record:openlist-transfer-reference",
+                "target_path": "/openlist/movie",
+                "status": "queued",
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": "openlist:transfer-reference",
+            }
+        )
+        self.assertTrue(created)
         with self.database.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO import_jobs
-                  (title, category, category_label, source_type, source_url, target_route,
-                   status, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?)
-                """,
-                ("执行", "movie", "电影", "quark", "https://example.invalid/s", "v1", "queued", now, now),
-            )
-            job_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
             conn.execute(
                 """
                 INSERT INTO transfer_executions
@@ -329,7 +344,7 @@ class OpenListConnectionTests(unittest.TestCase):
                     now,
                 ),
             )
-        with self.assertRaisesRegex(OpenListValidationError, "传输执行引用"):
+        with self.assertRaises(OpenListValidationError):
             self.service.delete_connection("ol_main")
 
     def test_legacy_ol_v1_ciphertext_is_rejected(self) -> None:

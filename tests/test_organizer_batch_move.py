@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import re
 import unittest
 from typing import Any
@@ -19,14 +21,14 @@ def _go_replacement_to_python(value: str) -> str:
     return converted.replace(literal_dollar, "$")
 
 
-class _Item:
+class _Item(RepositoryFakeMixin):
     def __init__(self, name: str, *, path: str = "", is_dir: bool = False) -> None:
         self.name = name
         self.path = path
         self.is_dir = is_dir
 
 
-class _FakeOpenList:
+class _FakeOpenList(RepositoryFakeMixin):
     def __init__(
         self,
         source_names: set[str],
@@ -119,7 +121,7 @@ class _FakeOpenList:
         return self.move_many(source_dir, target_dir, [name], **kwargs)
 
 
-class _TreeFakeOpenList:
+class _TreeFakeOpenList(RepositoryFakeMixin):
     def __init__(self, files: set[str]) -> None:
         self.files = {self._normalize(path): path for path in files}
         self.batch_rename_calls: list[tuple[str, list[tuple[str, str]]]] = []
@@ -336,7 +338,7 @@ class OrganizerBatchMoveTests(unittest.TestCase):
         self.assertTrue(all(item[1] == "done" for item in verdicts))
         self.assertEqual(len(fake.batch_rename_calls), 1)
 
-    def test_unsupported_batch_rename_endpoint_falls_back_to_legacy_renames(self) -> None:
+    def test_unsupported_batch_rename_endpoint_falls_back_to_individual_renames(self) -> None:
         class _NoBatchRename(_FakeOpenList):
             def batch_rename(self, *args: Any, **kwargs: Any) -> bool:
                 raise OpenListEndpointUnsupported("404")
@@ -634,7 +636,7 @@ class OrganizerBatchMoveTests(unittest.TestCase):
         self.assertEqual(fake.source_identity["b.mp4"], "B.mp4")
         self.assertEqual(len(fake.batch_rename_calls), 2)
 
-    def test_bulk_switch_off_preserves_legacy_two_phase_renames(self) -> None:
+    def test_bulk_switch_off_preserves_two_phase_individual_renames(self) -> None:
         fake = _FakeOpenList({"a.mp4", "b.mp4"}, set())
         svc = _svc(fake)
         svc.organizer_config["bulk_operations_enabled"] = False

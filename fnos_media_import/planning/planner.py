@@ -16,6 +16,7 @@ from ..storage.assignment_service import assignment_id
 from . import (
     DEFAULT_LOCAL_TARGET_ROOT,
     DEFAULT_RELAY_ROOT,
+    DATA_PLANE_STRATEGIES,
     EXECUTION_PLAN_VERSION,
     INGRESS_DIR,
     STAGING_DIR,
@@ -23,7 +24,7 @@ from . import (
     STRATEGY_NATIVE_OFFLINE,
     STRATEGY_NATIVE_SAVE,
     STRATEGY_RCLONE_COPY,
-    STRATEGY_RELAY_UPLOAD_MOBILE,
+    STRATEGY_RELAY_UPLOAD_PROVIDER,
     AdapterRegistry,
     AccountsService,
     DestinationAccountUnavailable,
@@ -44,12 +45,9 @@ from . import (
     native_namespace,
     normalize_path,
     openlist_namespace,
+    is_relay_upload_strategy,
 )
 from .job_plan import attach_plan_integrity, compute_operation_key
-
-# 需要来源落地区可读（OpenList 数据面）的策略。
-_DATA_PLANE_STRATEGIES = frozenset({STRATEGY_RCLONE_COPY, STRATEGY_RELAY_UPLOAD_MOBILE})
-
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -464,19 +462,25 @@ class ImportPlanner:
         return result
 
     def _resolve_destination_mount(self, category: Any, strategy: str) -> dict[str, Any] | None:
-        if strategy != STRATEGY_RCLONE_COPY:
+        if strategy != STRATEGY_RCLONE_COPY and not is_relay_upload_strategy(strategy):
             return None
         locator = category.rclone_locator
         if not isinstance(locator, RcloneLocator):
+            locator = category.organizer_locator
+        if locator is None or not getattr(locator, "mount_id", None):
+            if is_relay_upload_strategy(strategy):
+                raise OpenlistUnavailable("Provider relay 目标缺少 OpenList mount")
             return None
         current = self.mount_service.get_mount(locator.mount_id)
         if current is None:
-            raise OpenlistUnavailable("目标 rclone 定位器挂载不存在")
+            raise OpenlistUnavailable("目标定位器挂载不存在")
         frozen = self._freeze_mount(current, role="目标")
         if str(frozen.get("connection_id") or "") != locator.connection_id:
             raise OpenlistUnavailable("目标 locator connection 与 mount 修订不一致")
-        if not bool(frozen.get("writable")):
+        if strategy == STRATEGY_RCLONE_COPY and not bool(frozen.get("writable")):
             raise OpenlistUnavailable("目标 mount 修订不可写")
+        if is_relay_upload_strategy(strategy) and not self._mount_supports_provider_upload(frozen):
+            raise OpenlistUnavailable("目标 mount 尚未通过 Provider 原生上传探测")
         return frozen
 
     def _resolve_organizer_mount(
@@ -496,9 +500,28 @@ class ImportPlanner:
         frozen = self._freeze_mount(current, role="Organizer")
         if str(frozen.get("connection_id") or "") != locator.connection_id:
             raise OpenlistUnavailable("Organizer locator connection 与 mount 修订不一致")
-        if not bool(frozen.get("readable")) or not bool(frozen.get("writable")):
-            raise OpenlistUnavailable("Organizer mount 修订必须可读写")
+        if not self._mount_supports_organizer(frozen):
+            raise OpenlistUnavailable("Organizer mount 修订未通过读取与整理能力探测")
         return frozen
+
+    @staticmethod
+    def _mount_supports_provider_upload(mount: Mapping[str, Any]) -> bool:
+        native = mount.get("native_locator") if isinstance(mount.get("native_locator"), Mapping) else {}
+        if (
+            mount.get("readable")
+            and native.get("upload_verified")
+            and native.get("organizer_mutation_verified")
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _mount_supports_organizer(mount: Mapping[str, Any]) -> bool:
+        native = mount.get("native_locator") if isinstance(mount.get("native_locator"), Mapping) else {}
+        return bool(
+            mount.get("readable")
+            and (mount.get("writable") or native.get("organizer_mutation_verified"))
+        )
 
     # ---- 策略选择（§12.2） ---------------------------------------------------
 
@@ -539,28 +562,41 @@ class ImportPlanner:
                 raise NativeTransferUnavailable(f"same-provider native transfer unavailable: {decision.reason}")
             return STRATEGY_NATIVE_SAVE
 
-        if target_provider == "mobile":
+        if target_provider not in {"local", "generic", "openlist_generic"}:
+            target_adapter = self.registry.get(target_provider)
+            target_caps = self._adapter_capabilities(target_adapter)
+        else:
+            target_adapter = None
+            target_caps = None
+
+        if target_adapter is not None and target_caps.supports_relay_upload:
             if source_mount is None or not source_mount.get("readable"):
                 raise SourceLandingUnavailable("source has no readable landing mount")
             if destination_account is None:
-                raise DestinationAccountUnavailable("mobile target has no bound account")
-            mobile_adapter = self.registry.get("mobile")
-            caps = self._adapter_capabilities(mobile_adapter)
-            if not caps.supports_relay_upload or mobile_adapter.relay_uploader() is None:
-                raise DestinationAccountUnavailable("mobile Adapter lacks relay upload capability")
+                raise DestinationAccountUnavailable(
+                    f"{target_provider} target has no bound account"
+                )
+            if category.native_locator is None:
+                raise DestinationAccountUnavailable(
+                    f"{target_provider} target lacks a native upload locator"
+                )
+            uploader_factory = getattr(target_adapter, "relay_uploader", None)
+            if not callable(uploader_factory) or uploader_factory() is None:
+                raise DestinationAccountUnavailable(
+                    f"{target_provider} Adapter lacks relay upload capability"
+                )
             source_adapter = self.registry.get(source.provider_kind)
             if not self._adapter_capabilities(source_adapter).supports_source_materialization:
                 raise SourceLandingUnavailable("source Adapter cannot materialize to landing")
-            return STRATEGY_RELAY_UPLOAD_MOBILE
+            return STRATEGY_RELAY_UPLOAD_PROVIDER
 
         if source_mount is None or not source_mount.get("readable"):
             raise SourceLandingUnavailable("source has no readable landing mount")
         source_adapter = self.registry.get(source.provider_kind)
         if not self._adapter_capabilities(source_adapter).supports_source_materialization:
             raise SourceLandingUnavailable("source Adapter cannot materialize to landing")
-        if target_provider not in {"local", "generic", "openlist_generic"}:
-            target_adapter = self.registry.get(target_provider)
-            if not self._adapter_capabilities(target_adapter).supports_rclone_dest:
+        if target_adapter is not None:
+            if not target_caps.supports_rclone_dest:
                 raise OpenlistUnavailable("target Adapter does not support rclone destination")
         self._require_writable_target(category, target)
         return STRATEGY_RCLONE_COPY
@@ -574,11 +610,6 @@ class ImportPlanner:
         if callable(method):
             try:
                 value = method()
-            except TypeError:
-                try:
-                    value = method(account=None)
-                except Exception:  # noqa: BLE001 - capability failures fail closed
-                    return ProviderCapabilities()
             except Exception:  # noqa: BLE001 - capability failures fail closed
                 return ProviderCapabilities()
             if isinstance(value, ProviderCapabilities):
@@ -631,7 +662,7 @@ class ImportPlanner:
         organizer: dict[str, str] | None = None
         local_temp: dict[str, str] | None = None
 
-        if strategy in _DATA_PLANE_STRATEGIES:
+        if strategy in DATA_PLANE_STRATEGIES:
             if source_mount is None or not source_mount.get("readable"):
                 raise SourceLandingUnavailable("来源落地区不可读")
             source_landing = {
@@ -650,7 +681,11 @@ class ImportPlanner:
             destination_staging, destination_final = self._rclone_paths(
                 category, target, category_key, job, destination_mount=destination_mount
             )
-        elif strategy in {STRATEGY_NATIVE_SAVE, STRATEGY_NATIVE_OFFLINE, STRATEGY_RELAY_UPLOAD_MOBILE}:
+        elif strategy in {
+            STRATEGY_NATIVE_SAVE,
+            STRATEGY_NATIVE_OFFLINE,
+            STRATEGY_RELAY_UPLOAD_PROVIDER,
+        }:
             native = category.native_locator
             if native is None:
                 raise NativeTransferUnavailable(f"{strategy} 缺少 native 定位器")
@@ -661,7 +696,7 @@ class ImportPlanner:
                 "path": native.value,
                 "locator_kind": native.kind,
             }
-            if strategy == STRATEGY_RELAY_UPLOAD_MOBILE:
+            if is_relay_upload_strategy(strategy):
                 # Relay cache is a distinct, controlled local namespace.  It
                 # is not a destination staging directory and must be frozen
                 # explicitly so cleanup cannot infer it from current config.
@@ -810,7 +845,7 @@ class ImportPlanner:
             "organizer_connection_id": None,
             "organizer_connection_revision": None,
         }
-        if strategy in _DATA_PLANE_STRATEGIES and source_mount is not None:
+        if strategy in DATA_PLANE_STRATEGIES and source_mount is not None:
             bindings["source_mount_id"] = source_mount["mount_id"]
             bindings["source_mount_revision"] = source_mount["revision"]
             bindings["source_mount_namespace_id"] = source_mount.get("namespace_id")
@@ -827,18 +862,19 @@ class ImportPlanner:
                 "kind": str(native_locator["kind"]),
                 "value": str(native_locator["value"]),
             }
-        if strategy == STRATEGY_RCLONE_COPY:
+        if strategy == STRATEGY_RCLONE_COPY or is_relay_upload_strategy(strategy):
             locator = category.rclone_locator
-            if isinstance(locator, RcloneLocator):
-                mount = destination_mount
-                if mount is not None:
-                    bindings["destination_mount_id"] = mount["mount_id"]
-                    bindings["destination_mount_revision"] = mount["revision"]
-                    bindings["destination_mount_namespace_id"] = mount.get("namespace_id")
-                    bindings["destination_mount_storage_identity_id"] = mount.get("storage_identity_id") or None
-                    bindings["destination_mount_identity_root"] = mount.get("identity_root") or "/"
-                    bindings["destination_connection_id"] = mount["connection_id"]
-                    bindings["destination_connection_revision"] = mount.get("connection_revision")
+            if not isinstance(locator, RcloneLocator):
+                locator = category.organizer_locator
+            mount = destination_mount
+            if locator is not None and mount is not None:
+                bindings["destination_mount_id"] = mount["mount_id"]
+                bindings["destination_mount_revision"] = mount["revision"]
+                bindings["destination_mount_namespace_id"] = mount.get("namespace_id")
+                bindings["destination_mount_storage_identity_id"] = mount.get("storage_identity_id") or None
+                bindings["destination_mount_identity_root"] = mount.get("identity_root") or "/"
+                bindings["destination_connection_id"] = mount["connection_id"]
+                bindings["destination_connection_revision"] = mount.get("connection_revision")
 
         if organizer_mount is not None:
             bindings["organizer_mount_id"] = organizer_mount.get("mount_id")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 
 from fnos_media_import.public_web import _public_resource_item
@@ -11,7 +13,7 @@ from fnos_media_import.search.aggregator import (
 )
 
 
-class _StaticProvider:
+class _StaticProvider(RepositoryFakeMixin):
     key = "pansou"
     name = "PanSou"
     priority = 10
@@ -83,7 +85,7 @@ class SearchTokenScoringTests(unittest.TestCase):
 
         self.assertGreaterEqual(_relevance_score(item, "超时空同居"), 92)
 
-    def test_specific_title_magnet_can_outrank_exact_regular_cloud_result(self) -> None:
+    def test_exact_title_outranks_noisy_release_title_regardless_of_source_kind(self) -> None:
         magnet = {
             "title": (
                 "不太灵免费影视网站 www.butailing.com "
@@ -103,17 +105,16 @@ class SearchTokenScoringTests(unittest.TestCase):
 
         result = SearchAggregator([_StaticProvider([cloud, magnet])]).search("超时空同居")
 
-        self.assertEqual(magnet["title"], result["items"][0]["title"])
+        self.assertEqual(cloud["title"], result["items"][0]["title"])
 
-    def test_route_advantage_is_limited_to_ten_or_twenty_relevance_points(self) -> None:
+    def test_source_kind_never_adds_route_convenience_to_ranking(self) -> None:
         mobile = {"source_type": "cloud139", "supported": True}
         magnet = {"source_type": "magnet", "supported": True}
         cloud = {"source_type": "quark", "supported": True}
 
-        self.assertGreater(_ranking_score(mobile, 80), _ranking_score(cloud, 100))
-        self.assertGreater(_ranking_score(magnet, 90), _ranking_score(cloud, 100))
-        self.assertGreater(_ranking_score(mobile, 80), _ranking_score(magnet, 90))
-        self.assertGreater(_ranking_score(cloud, 100), _ranking_score(mobile, 79))
+        self.assertEqual(_ranking_score(mobile, 90), _ranking_score(magnet, 90))
+        self.assertEqual(_ranking_score(magnet, 90), _ranking_score(cloud, 90))
+        self.assertGreater(_ranking_score(cloud, 100), _ranking_score(mobile, 99))
 
     def test_unrelated_magnet_does_not_outrank_exact_cloud_match(self) -> None:
         magnet = {

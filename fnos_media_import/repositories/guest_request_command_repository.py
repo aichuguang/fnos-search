@@ -96,7 +96,13 @@ class GuestRequestCommandRepository:
         )
         return int(cursor.lastrowid)
 
-    def update(self, request_id: int, updates: dict[str, Any]) -> None:
+    def update(
+        self,
+        request_id: int,
+        updates: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> None:
+        updates = {**(updates or {}), **fields}
         if not updates:
             return
         values_to_write = {**updates, "updated_at": _utc_now()}

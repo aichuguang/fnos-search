@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import sqlite3
 import unittest
 from contextlib import contextmanager
@@ -163,8 +165,8 @@ def _relay_plan() -> dict:
     )
     plan["transfer"].update(
         {
-            "strategy": "relay_upload_mobile",
-            "executor": "mobile_relay",
+            "strategy": "relay_upload_provider",
+            "executor": "provider_relay",
         }
     )
     native_target = {
@@ -392,7 +394,7 @@ class ManagedDescriptorTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, ErrorCode.INVALID_PLAN)
 
 
-class _MemoryDatabase:
+class _MemoryDatabase(RepositoryFakeMixin):
     def __init__(self, plan: dict) -> None:
         self.connection = sqlite3.connect(":memory:", check_same_thread=False)
         self.connection.row_factory = sqlite3.Row

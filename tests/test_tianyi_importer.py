@@ -323,7 +323,11 @@ class TianyiImporterTests(unittest.TestCase):
                 return_value=[_item("1", "a.mkv"), _item("2", "Season 01", folder=True)],
             ),
         ):
-            verified = self.importer.verify_native_result(receipt)
+            from fnos_media_import.transfer.verifier import VerifyRequest
+
+            verified = self.importer.verify_native_result(
+                VerifyRequest(operation=receipt)
+            )
         self.assertEqual(verified["status"], "ok")
 
     def test_share_code_supports_reference_project_url_formats(self) -> None:

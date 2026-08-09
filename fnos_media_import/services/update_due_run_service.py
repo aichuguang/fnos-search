@@ -31,7 +31,7 @@ class UpdateDueRunService:
         requested_limit = _positive_int(limit or 10, 10)
         max_limit = _positive_int(scheduler.get("max_subscriptions_per_tick"), requested_limit)
         effective_limit = min(requested_limit, max_limit)
-        due = self.database.list_update_subscriptions(
+        due = self.database.update.list_update_subscriptions(
             limit=effective_limit,
             due_before=utc_now(),
             include_sources=True,

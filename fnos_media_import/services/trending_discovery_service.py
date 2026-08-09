@@ -33,6 +33,7 @@ class TrendingDiscoveryService:
         *,
         sources: Iterable[Any],
         repository: Any,
+        scheduler_leases: Any,
         media_exists: Callable[[dict[str, Any]], bool] | None = None,
         task_exists: Callable[[dict[str, Any]], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -43,6 +44,7 @@ class TrendingDiscoveryService:
     ) -> None:
         self.sources = list(sources)
         self.repository = repository
+        self.scheduler_leases = scheduler_leases
         self.media_exists = media_exists or (lambda _item: False)
         self.task_exists = task_exists or (lambda _item: False)
         self.clock = clock or (lambda: datetime.now(UTC))
@@ -60,11 +62,15 @@ class TrendingDiscoveryService:
         acquired_lease = False
         try:
             if not lease_held:
-                acquire = getattr(self.repository, "acquire_scheduler_lease", None)
-                if callable(acquire):
-                    acquired_lease = bool(acquire(self.lease_name, self.owner_id, self.lease_seconds))
-                    if not acquired_lease:
-                        return {"success": True, "skipped": True, "message": "其他进程正在执行热榜发现"}
+                acquired_lease = bool(
+                    self.scheduler_leases.acquire(
+                        self.lease_name,
+                        self.owner_id,
+                        self.lease_seconds,
+                    )
+                )
+                if not acquired_lease:
+                    return {"success": True, "skipped": True, "message": "其他进程正在执行热榜发现"}
             self._running = True
             result = self._execute(trigger_type=trigger_type)
             self._last_result = result
@@ -72,17 +78,15 @@ class TrendingDiscoveryService:
         finally:
             self._running = False
             if acquired_lease:
-                release = getattr(self.repository, "release_scheduler_lease", None)
-                if callable(release):
-                    try:
-                        release(self.lease_name, self.owner_id)
-                    except Exception:  # noqa: BLE001
-                        self.log.exception("release trending discovery lease failed")
+                try:
+                    self.scheduler_leases.release(self.lease_name, self.owner_id)
+                except Exception:  # noqa: BLE001
+                    self.log.exception("release trending discovery lease failed")
             self._run_lock.release()
 
     def _execute(self, *, trigger_type: str) -> dict[str, Any]:
         started_at = self._time_text(self.clock())
-        run_id = self.repository.create_trending_run(
+        run_id = self.repository.create_run(
             trigger_type=str(trigger_type or "manual"),
             source_count=len(self.sources),
             started_at=started_at,
@@ -122,7 +126,7 @@ class TrendingDiscoveryService:
 
         try:
             for item in snapshots:
-                self.repository.upsert_trending_snapshot(run_id=run_id, item=item)
+                self.repository.upsert_snapshot(run_id=run_id, item=item)
             for item in candidates:
                 item_raw = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
                 item_raw["last_run_id"] = run_id
@@ -135,7 +139,7 @@ class TrendingDiscoveryService:
                     item["status"] = "task_exists"
                 else:
                     item["status"] = "discovered"
-                self.repository.upsert_trending_candidate(item=item)
+                self.repository.upsert_candidate(item=item)
                 saved_candidates += 1
         except Exception as exc:  # noqa: BLE001
             status = "failed"
@@ -143,8 +147,8 @@ class TrendingDiscoveryService:
             self.log.exception("persist trending discovery failed")
 
         finished_at = self._time_text(self.clock())
-        self.repository.finish_trending_run(
-            run_id=run_id,
+        self.repository.finish_run(
+            run_id,
             status=status,
             finished_at=finished_at,
             raw_item_count=len(snapshots),
@@ -166,15 +170,7 @@ class TrendingDiscoveryService:
         }
 
     def status(self) -> dict[str, Any]:
-        latest = None
-        getter = getattr(self.repository, "get_latest_trending_run", None)
-        if callable(getter):
-            latest = getter()
-        else:
-            list_runs = getattr(self.repository, "list_trending_runs", None)
-            if callable(list_runs):
-                rows = list_runs(limit=1, offset=0)
-                latest = rows[0] if rows else None
+        latest = self.repository.get_latest_run()
         return {"running": self._running, "latest_run": latest, "last_result": self._last_result}
 
     def list_candidates(
@@ -195,24 +191,12 @@ class TrendingDiscoveryService:
             "source": source,
             "last_run_id": last_run_id,
         }
-        try:
-            items = self.repository.list_trending_candidates(
-                limit=safe_per_page,
-                offset=(safe_page - 1) * safe_per_page,
-                **filters,
-            )
-            total = self.repository.count_trending_candidates(**filters)
-        except TypeError:
-            # Compatibility with repositories created before current-run and
-            # multi-platform source filtering were added.
-            filters.pop("last_run_id", None)
-            filters.pop("source", None)
-            items = self.repository.list_trending_candidates(
-                limit=safe_per_page,
-                offset=(safe_page - 1) * safe_per_page,
-                **filters,
-            )
-            total = self.repository.count_trending_candidates(**filters)
+        items = self.repository.list_candidates(
+            limit=safe_per_page,
+            offset=(safe_page - 1) * safe_per_page,
+            **filters,
+        )
+        total = self.repository.count_candidates(**filters)
         return {"items": items, "total": total, "page": safe_page, "per_page": safe_per_page}
 
     def grouped_candidates(
@@ -225,25 +209,22 @@ class TrendingDiscoveryService:
         safe_limit = min(25, max(1, int(limit or 20)))
         latest = self.status().get("latest_run") or {}
         if isinstance(latest, Mapping) and str(latest.get("status") or "") not in {"success", "partial"}:
-            list_runs = getattr(self.repository, "list_trending_runs", None)
-            if callable(list_runs):
-                latest = next(
-                    (
-                        row
-                        for row in list_runs(limit=20, offset=0)
-                        if isinstance(row, Mapping) and str(row.get("status") or "") in {"success", "partial"}
-                    ),
-                    {},
-                )
+            latest = next(
+                (
+                    row
+                    for row in self.repository.list_runs(limit=20, offset=0)
+                    if isinstance(row, Mapping)
+                    and str(row.get("status") or "") in {"success", "partial"}
+                ),
+                {},
+            )
         latest_run_id = int(latest.get("id") or latest.get("run_id") or 0) if isinstance(latest, Mapping) else 0
         use_current_run = False
         if latest_run_id:
-            try:
-                marker_total = int(self.repository.count_trending_candidates(last_run_id=latest_run_id))
-                use_current_run = marker_total > 0 or int(latest.get("candidate_count") or 0) == 0
-            except TypeError:
-                # Old repository facade: retain the historical fallback below.
-                use_current_run = False
+            marker_total = int(
+                self.repository.count_candidates(last_run_id=latest_run_id)
+            )
+            use_current_run = marker_total > 0 or int(latest.get("candidate_count") or 0) == 0
 
         result: dict[str, dict[str, Any]] = {}
         for media_type in ("tv", "movie", "variety", "anime"):
@@ -266,7 +247,7 @@ class TrendingDiscoveryService:
         return result
 
     def get_candidate(self, candidate_id: int) -> dict[str, Any] | None:
-        return self.repository.get_trending_candidate(int(candidate_id))
+        return self.repository.get_candidate(int(candidate_id))
 
     @staticmethod
     def _fetch(source: Any) -> list[Any]:
@@ -350,8 +331,12 @@ class TrendingDiscoveryService:
             # are present.  Known conflicting years are never merged.
             identity_year = year if year is not None else next(iter(known_years)) if len(known_years) == 1 else None
             key = (*base_key, identity_year)
-            legacy_key = "|".join(str(value or "") for value in base_key)
-            canonical_key = f"{legacy_key}|{identity_year}" if identity_year is not None else legacy_key
+            base_canonical_key = "|".join(str(value or "") for value in base_key)
+            canonical_key = (
+                f"{base_canonical_key}|{identity_year}"
+                if identity_year is not None
+                else base_canonical_key
+            )
             candidate = merged.get(key)
             source_ref = {
                 "source": snapshot["source"],
@@ -363,7 +348,7 @@ class TrendingDiscoveryService:
             if candidate is None:
                 candidate = {
                     "canonical_key": canonical_key,
-                    "legacy_canonical_key": legacy_key,
+                    "base_canonical_key": base_canonical_key,
                     "source": snapshot["source"],
                     "source_id": snapshot.get("source_id") or "",
                     "title": snapshot["title"],

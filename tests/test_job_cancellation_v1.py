@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import copy
 import unittest
 from dataclasses import dataclass, field
@@ -17,7 +19,7 @@ from fnos_media_import.services.job_admin_command_service import (
 from fnos_media_import.transfer.dispatch import TransferDispatchService
 
 
-class _Jobs:
+class _Jobs(RepositoryFakeMixin):
     def __init__(self, *, status: str = "transferring") -> None:
         self.job = {"id": 42, "status": status, "raw_data": {}}
         self.events: list[tuple[Any, ...]] = []
@@ -45,7 +47,7 @@ class _Jobs:
         return len(self.events)
 
 
-class _Cleaner:
+class _Cleaner(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.cancel_calls: list[tuple[int, bool]] = []
 
@@ -66,7 +68,7 @@ class _Execution:
     receipt: dict[str, Any] | None = None
 
 
-class _ExecutionRepository:
+class _ExecutionRepository(RepositoryFakeMixin):
     def __init__(self, execution: _Execution | None) -> None:
         self.execution = execution
 
@@ -80,7 +82,6 @@ def _service(
     *,
     execution: _Execution | None,
     enqueue: Any = None,
-    sixpan_importer: Any = None,
 ) -> JobCancellationService:
     return JobCancellationService(
         JobCancellationDependencies(
@@ -91,7 +92,6 @@ def _service(
             cancelled_status="cancelled",
             execution_repository=_ExecutionRepository(execution),
             enqueue_transfer=enqueue,
-            sixpan_importer=sixpan_importer,
         )
     )
 
@@ -132,24 +132,19 @@ class JobCancellationV1Tests(unittest.TestCase):
         jobs = _Jobs(status="submitted")
         jobs.job.update(
             {
-                "source_type": "magnet",
-                "target_route": "sixpan_offline",
+                "source_provider_kind": "sixpan",
+                "source_form": "magnet",
                 "external_task_id": "sixpan-task-42",
                 "plan_version": 1,
             }
         )
         cleaner = _Cleaner()
         provider_calls: list[str] = []
-        importer = SimpleNamespace(
-            delete_offline_tasks=lambda task_ids, **_kwargs: provider_calls.extend(task_ids)
-        )
-
         result = _service(
             jobs,
             cleaner,
             execution=_Execution("native_submitting", {}),
             enqueue=lambda _job_id, **_kwargs: {"success": True, "created": True},
-            sixpan_importer=lambda: importer,
         ).cancel(
             copy.deepcopy(jobs.job),
             reason="admin cancel",
@@ -436,17 +431,12 @@ class JobRetryCommandV1Tests(unittest.TestCase):
                     "message": "需要创建新一代任务",
                 }
 
-        class _Dispatcher:
-            @staticmethod
-            def import_retry(*_args, **_kwargs):
-                raise AssertionError("retry preflight must not be hidden behind another worker task")
-
         service = JobAdminCommandService(
             JobAdminCommandDependencies(
                 imports=_Imports(),
-                jobs=SimpleNamespace(),
+                job_queries=SimpleNamespace(),
+                job_commands=SimpleNamespace(),
                 auto_start_rclone=lambda result, _reason: auto_start_calls.append(result),
-                worker_dispatcher=_Dispatcher(),
             )
         )
 

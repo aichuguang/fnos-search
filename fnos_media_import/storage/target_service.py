@@ -30,7 +30,8 @@ from ..domain.models import (
     TargetCategory,
 )
 from ..time_utils import utc_now_iso
-from ._pathutil import normalize_path, resolve_local_target
+from ..storage_paths import normalize_storage_path as normalize_path
+from ..storage_paths import resolve_local_target
 
 _DESTINATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ALLOWED_TARGET_KINDS = frozenset({"provider", "local", "openlist_generic"})

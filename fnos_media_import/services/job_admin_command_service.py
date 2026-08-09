@@ -8,9 +8,12 @@ class ImportCommands(Protocol):
     def retry_job(self, job_id: int) -> dict[str, Any]: ...
 
 
-class JobRecords(Protocol):
-    def get_job(self, job_id: int) -> dict[str, Any] | None: ...
-    def delete_job_if_status(
+class JobQueries(Protocol):
+    def get(self, job_id: int) -> dict[str, Any] | None: ...
+
+
+class JobCommands(Protocol):
+    def delete_if_status(
         self,
         job_id: int,
         expected_statuses: set[str] | list[str] | tuple[str, ...],
@@ -20,9 +23,9 @@ class JobRecords(Protocol):
 @dataclass(frozen=True)
 class JobAdminCommandDependencies:
     imports: ImportCommands
-    jobs: JobRecords
+    job_queries: JobQueries
+    job_commands: JobCommands
     auto_start_rclone: Callable[[dict[str, Any], str], dict[str, Any] | None]
-    worker_dispatcher: Any | None = None
 
 
 class JobAdminCommandService:
@@ -41,14 +44,14 @@ class JobAdminCommandService:
         return {"success": bool(result.get("success", True)), **result}
 
     def delete(self, job_id: int) -> tuple[dict[str, Any], int]:
-        job = self._deps.jobs.get_job(job_id)
+        job = self._deps.job_queries.get(job_id)
         if not job:
             return {"success": False, "message": "任务不存在"}, 404
         status = str(job.get("status") or "").strip().lower()
         deletable_statuses = {"done", "success", "completed", "cancelled"}
         if status not in deletable_statuses:
             return {"success": False, "message": "只能删除已完成或已取消的任务记录"}, 409
-        if not self._deps.jobs.delete_job_if_status(job_id, deletable_statuses):
+        if not self._deps.job_commands.delete_if_status(job_id, deletable_statuses):
             return {"success": False, "message": "任务状态已变化，删除未执行，请刷新后重试"}, 409
         return {
             "success": True,

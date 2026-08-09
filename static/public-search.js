@@ -10,7 +10,6 @@
             formatDate,
             categoryLabel,
             sourceLabel,
-            publicRouteLabel,
             publicMessageForDisplay,
             showGlobalLoading,
             hideGlobalLoading,
@@ -130,32 +129,22 @@
             });
         }
 
-        function sourceIconKey(item) {
-            const raw = [
-                item?.source_type,
-                item?.source_hint,
-                item?.source,
-                item?.source_url,
-                item?.source_url_masked,
-            ].filter(Boolean).join(" ").toLowerCase();
-            if (raw.includes("139") || raw.includes("mobile") || raw.includes("mcloud") || raw.includes("移动")) return "cloud139";
-            if (raw.includes("189") || raw.includes("tianyi") || raw.includes("天翼")) return "cloud189";
-            if (raw.includes("magnet") || raw.includes("torrent") || raw.includes("bt") || raw.includes("磁链") || raw.includes("种子")) return "bt";
-            if (raw.includes("quark") || raw.includes("夸克") || raw.includes("uc")) return "quark";
-            return "other";
+        function sourceDescriptor(item = {}) {
+            const link = item?.link && typeof item.link === "object" ? item.link : {};
+            return {
+                providerKind: String(item?.provider_kind || link.provider_kind || "").toLowerCase(),
+                sourceForm: String(item?.source_form || link.source_form || "").toLowerCase(),
+                searchSourceId: String(item?.search_source_id || link.search_source_id || "").toLowerCase(),
+            };
         }
 
-        function isInstantImportResource(item) {
-            const raw = [
-                item?.instant_import,
-                item?.speed_tag,
-                item?.source_type,
-                item?.source_hint,
-                item?.source,
-                item?.source_url,
-                item?.source_url_masked,
-            ].filter(Boolean).join(" ").toLowerCase();
-            return item?.instant_import === true || raw.includes("cloud139") || raw.includes("139") || raw.includes("mobile") || raw.includes("移动");
+        function sourceIconKey(item) {
+            const source = sourceDescriptor(item);
+            if (source.providerKind === "mobile") return "cloud139";
+            if (source.providerKind === "tianyi") return "cloud189";
+            if (source.providerKind === "sixpan" || source.sourceForm === "magnet" || source.providerKind === "btbtla") return "bt";
+            if (source.providerKind === "quark") return "quark";
+            return "other";
         }
 
         function publicPosterUrl(item = {}) {
@@ -196,60 +185,25 @@
 
         function isSixpanCandidate(item) {
             if (isBtbtlaCandidate(item)) return false;
-            const raw = [
-                item?.source_type,
-                item?.source_hint,
-                item?.source,
-                item?.route,
-                item?.source_url,
-                item?.source_url_masked,
-            ].filter(Boolean).join(" ").toLowerCase();
-            return raw.includes("magnet") || raw.includes("torrent") || raw.includes("bt") || raw.includes("种子") || raw.includes("磁链") || raw.includes("sixpan");
+            const source = sourceDescriptor(item);
+            return source.providerKind === "sixpan" && source.sourceForm === "magnet";
         }
 
         function isBtbtlaCandidate(item) {
-            const sourceType = String(item?.source_type || "").toLowerCase();
-            const route = String(item?.route || "").toLowerCase();
-            return sourceType === "bt_detail" || route === "btbtla_resolve";
+            const source = sourceDescriptor(item);
+            return source.providerKind === "btbtla" || source.searchSourceId === "btbtla";
         }
 
         function isQuarkCandidate(item) {
-            const raw = [
-                item?.source_type,
-                item?.source_hint,
-                item?.source,
-                item?.route,
-                item?.source_url,
-                item?.source_url_masked,
-                item?.provider,
-            ].filter(Boolean).join(" ").toLowerCase();
-            return raw.includes("quark") || raw.includes("夸克") || raw.includes("uc") || raw.includes("quark_to_mobile");
+            return sourceDescriptor(item).providerKind === "quark";
         }
 
         function isCloud139Candidate(item) {
-            const raw = [
-                item?.source_type,
-                item?.source_hint,
-                item?.source,
-                item?.route,
-                item?.source_url,
-                item?.source_url_masked,
-                item?.provider,
-            ].filter(Boolean).join(" ").toLowerCase();
-            return raw.includes("cloud139") || raw.includes("139") || raw.includes("mobile") || raw.includes("移动") || raw.includes("cloud139_direct");
+            return sourceDescriptor(item).providerKind === "mobile";
         }
 
         function isTianyiCandidate(item) {
-            const raw = [
-                item?.source_type,
-                item?.source_hint,
-                item?.source,
-                item?.route,
-                item?.source_url,
-                item?.source_url_masked,
-                item?.provider,
-            ].filter(Boolean).join(" ").toLowerCase();
-            return raw.includes("cloud189") || raw.includes("189") || raw.includes("tianyi") || raw.includes("天翼") || raw.includes("cloud189_direct");
+            return sourceDescriptor(item).providerKind === "tianyi";
         }
 
         function sortPublicResources(items) {
@@ -341,12 +295,11 @@
                     updatePublicResourceState(
                         publicId,
                         {
-                            source_type: detail.source_type || item.source_type,
-                            route: detail.route || item.route,
+                            provider_kind: detail.provider_kind || detail.link?.provider_kind || item.provider_kind,
+                            source_form: detail.source_form || detail.link?.source_form || item.source_form,
+                            search_source_id: detail.search_source_id || detail.link?.search_source_id || item.search_source_id,
                             supported: detail.supported ?? item.supported,
                             category_suggestion: detail.category_suggestion || item.category_suggestion,
-                            instant_import: detail.instant_import ?? item.instant_import,
-                            speed_tag: detail.speed_tag || item.speed_tag,
                             size_text: knownSizeText(detail.size_text, item.size_text, item.size),
                         },
                         { render: false },
@@ -467,9 +420,6 @@
             }
             if (isBtbtlaCandidate(item)) {
                 return { label: "选择资源", className: "secondary", disabled: false, title: "先选择下载资源并解析磁链" };
-            }
-            if (isInstantImportResource(item)) {
-                return { label: "快速入库", className: "submit-instant", disabled: false, title: "该资源支持快速入库" };
             }
             if (isSixpanCandidate(item)) {
                 const speed = sixpanSubmitSpeed(item.public_id);
@@ -725,13 +675,12 @@
             const selected = publicState.selectedPublicId === item.public_id;
             const sourceIcon = sourceIconKey(item);
             const quality = item.quality || inferQuality(item.title);
-            const source = sourceLabel(item.source_type || item.source_hint || item.source);
+            const descriptor = sourceDescriptor(item);
+            const source = sourceLabel(descriptor.providerKind || descriptor.searchSourceId);
             const updatedAt = formatDate(item.datetime || item.created_at);
             const size = knownSizeText(item.size_text, item.size);
             const detailState = publicState.details[item.public_id];
             const sixpanCandidate = isSixpanCandidate(item);
-            const instantImport = isInstantImportResource(item);
-            const instantLabel = item.speed_tag || "快速入库";
             const sixpanSpeed = sixpanSubmitSpeed(item.public_id);
             const slowImport = sixpanCandidate && sixpanSpeed === "slow";
             const fastImport = sixpanCandidate && !slowImport;
@@ -750,9 +699,9 @@
                 posterAlt: item.title || "资源封面",
                 iconClass: `tile-source-${escapeHtml(sourceIcon)}`,
                 iconHtml: icon(sourceIcon),
-                classes: [poster ? "has-poster" : "", selected ? "selected" : "", instantImport ? "is-instant-import" : "", fastImport ? "is-fast-import" : "", slowImport ? "is-slow-import" : "", invalid ? "is-invalid-resource" : ""],
-                badgesHtml: `${instantImport ? `<div class="instant-import-badge">${escapeHtml(instantLabel)}</div>` : ""}${fastImport ? '<div class="fast-import-badge">快速入库</div>' : ""}${slowImport ? '<div class="slow-import-badge">慢速入库</div>' : ""}`,
-                tagsHtml: `<span class="tag tag-blue">${escapeHtml(source)}</span>${instantImport ? '<span class="tag tag-fast">快速入库</span>' : ""}${fastImport ? '<span class="tag tag-fast">快速入库</span>' : ""}${sixpanCandidate ? '<span class="tag tag-cyan">云端搬运</span>' : ""}${quality ? `<span class="tag tag-gold">${escapeHtml(quality)}</span>` : ""}${stateTag}`,
+                classes: [poster ? "has-poster" : "", selected ? "selected" : "", fastImport ? "is-fast-import" : "", slowImport ? "is-slow-import" : "", invalid ? "is-invalid-resource" : ""],
+                badgesHtml: `${fastImport ? '<div class="fast-import-badge">内容可选</div>' : ""}${slowImport ? '<div class="slow-import-badge">完整资源</div>' : ""}`,
+                tagsHtml: `<span class="tag tag-blue">${escapeHtml(source)}</span>${quality ? `<span class="tag tag-gold">${escapeHtml(quality)}</span>` : ""}${stateTag}`,
                 metaHtml: `${size ? `<span>文件大小：${escapeHtml(size)}</span>` : ""}<span>更新时间：${escapeHtml(updatedAt)}</span>${invalid ? `<span class="resource-invalid-message">${escapeHtml(publicMessageForDisplay(item.availability_message || "详情检测未通过", item.availability_status || "详情检测未通过", "详情检测未通过"))}</span>` : ""}`,
                 actionsHtml: `<button class="secondary detail-trigger" type="button" data-detail-public-id="${escapeHtml(item.public_id)}">${publicDetailButtonLabel(selected, detailState)}</button><button type="button" class="${escapeHtml(submitMeta.className)}" data-submit-public-id="${escapeHtml(item.public_id)}" ${submitMeta.disabled ? "disabled" : ""} title="${escapeHtml(submitMeta.title)}">${escapeHtml(submitMeta.label)}</button>`,
                 detailHtml: renderPublicResourceDetail(detailState),
@@ -786,7 +735,6 @@
             syncSearchSourceOptions,
             updateSearchSourceActiveState,
             sourceIconKey,
-            isInstantImportResource,
             publicPosterUrl,
             normalizePublicPosterUrl,
             publicSourceOrigin,

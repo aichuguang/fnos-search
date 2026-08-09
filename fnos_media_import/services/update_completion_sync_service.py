@@ -31,7 +31,7 @@ class UpdateCompletionSyncService:
         self.mark_seen = mark_seen
 
     def sync(self, subscription_id: int) -> dict[str, Any]:
-        subscription = self.database.get_update_subscription(subscription_id, include_sources=True)
+        subscription = self.database.update.get_update_subscription(subscription_id, include_sources=True)
         if not subscription:
             return {"checked": 0, "completed_count": 0, "message": "订阅不存在"}
         candidates = self._list_all_candidates(subscription_id)
@@ -53,7 +53,7 @@ class UpdateCompletionSyncService:
             if decision not in {"submitted", "imported", "review"} or not candidate.get("job_id"):
                 continue
             checked += 1
-            job = self.database.get_job(int(candidate["job_id"]))
+            job = self.database.job_queries.get(int(candidate["job_id"]))
             if not job:
                 continue
             status = str(job.get("status") or "")
@@ -130,7 +130,7 @@ class UpdateCompletionSyncService:
                     review_keys.add(episode_key)
                 status_items.append(self.status_from_job(candidate_for_sync, job, status=status, decision="review"))
             else:
-                self.database.update_update_candidate(candidate_id, decision="submitted", raw_data=raw)
+                self.database.update.update_update_candidate(candidate_id, decision="submitted", raw_data=raw)
                 if episode:
                     pending.append(episode)
                 if episode_key:
@@ -218,7 +218,7 @@ class UpdateCompletionSyncService:
                         "next_episode": next_episode,
                     }
                 )
-            self.database.update_update_subscription(subscription_id, subscription_updates)
+            self.database.update.update_update_subscription(subscription_id, subscription_updates)
             subscription.update(subscription_updates)
 
             # 订阅进度/缺集先成功落库，再写入 completed/failed/review 终态。
@@ -226,7 +226,7 @@ class UpdateCompletionSyncService:
             # 造成进度或缺集永久遗漏。completed 分支的 mark_seen 也位于订阅更新之前，
             # 三步任意一步失败都可依赖幂等操作在下轮恢复。
             for candidate_id, decision, reason, candidate_raw_data in terminal_candidate_updates:
-                self.database.update_update_candidate(
+                self.database.update.update_update_candidate(
                     candidate_id,
                     decision=decision,
                     reason=reason,
@@ -234,7 +234,7 @@ class UpdateCompletionSyncService:
                 )
 
             if requeued_episode_keys:
-                self.database.add_update_event(
+                self.database.update.add_update_event(
                     subscription_id,
                     None,
                     "warn",
@@ -249,7 +249,7 @@ class UpdateCompletionSyncService:
                 )
 
         if completed:
-            self.database.add_update_event(
+            self.database.update.add_update_event(
                 subscription_id,
                 None,
                 "info",
@@ -271,21 +271,11 @@ class UpdateCompletionSyncService:
         offset = 0
         page_size = 500
         while True:
-            try:
-                page = self.database.list_update_candidates(
-                    subscription_id=subscription_id,
-                    limit=page_size,
-                    offset=offset,
-                )
-            except TypeError:
-                # 兼容只实现旧签名的轻量数据库适配器。正式 Database 支持 offset。
-                return list(
-                    self.database.list_update_candidates(
-                        subscription_id=subscription_id,
-                        limit=page_size,
-                    )
-                    or []
-                )
+            page = self.database.update.list_update_candidates(
+                subscription_id=subscription_id,
+                limit=page_size,
+                offset=offset,
+            )
             page = list(page or [])
             new_items: list[dict[str, Any]] = []
             for item in page:
@@ -306,13 +296,7 @@ class UpdateCompletionSyncService:
         return candidates
 
     def _known_episode_keys(self, subscription_id: int, *, default_season: int | None) -> set[EpisodeKey]:
-        list_seen = getattr(self.database, "list_update_seen_episodes", None)
-        if not callable(list_seen):
-            return set()
-        try:
-            rows = list_seen(subscription_id) or set()
-        except Exception:  # noqa: BLE001
-            return set()
+        rows = self.database.update.list_update_seen_episodes(subscription_id)
         result: set[EpisodeKey] = set()
         for item in rows:
             if not isinstance(item, (list, tuple)) or len(item) < 2:

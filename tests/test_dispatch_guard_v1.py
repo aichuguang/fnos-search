@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,7 +59,7 @@ def _plan(job_id: int, strategy: str) -> dict:
         },
         "transfer": {
             "strategy": strategy,
-            "executor": "mobile_relay" if strategy == "relay_upload_mobile" else "native",
+            "executor": "provider_relay" if strategy == "relay_upload_provider" else "native",
             "idempotency_key": "",
         },
         "paths": paths,
@@ -81,7 +83,7 @@ def _plan(job_id: int, strategy: str) -> dict:
     return attach_plan_integrity(plan)
 
 
-class _Database:
+class _Database(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.events: list[tuple] = []
 
@@ -94,13 +96,19 @@ class _Database:
     def get_job(self, _job_id: int):
         return None
 
+    @staticmethod
+    def update_job_if_status(*_args, **_kwargs) -> bool:
+        return True
+
 
 class DispatcherGuardTests(unittest.TestCase):
-    def test_hint_rejects_partial_v1_envelope(self) -> None:
-        plan = _plan(7, "relay_upload_mobile")
+    def test_dispatch_rejects_partial_v1_envelope_before_queueing(self) -> None:
+        plan = _plan(7, "relay_upload_provider")
         plan.pop("plan_schema_version")
+        queued: list[int] = []
         job = {
             "id": 7,
+            "status": "waiting_transfer",
             "category": "movie",
             "destination_id": "mobile-main",
             "plan_version": 1,
@@ -108,23 +116,21 @@ class DispatcherGuardTests(unittest.TestCase):
         }
         dispatcher = ImportCompletionDispatcher(
             database=_Database(),
-            rclone_service=object(),
-            category=lambda _key: {},
-            enqueue_organizer=lambda *_args: None,
+            enqueue_transfer=lambda job_id: queued.append(job_id),
         )
-        self.assertFalse(dispatcher.uses_rclone_staging(job))
+        result = dispatcher.dispatch({"success": True, "job": job}, "provider_done")
+
+        self.assertTrue(result["rejected"])
+        self.assertEqual(queued, [])
 
     def test_relay_waiting_job_uses_durable_transfer_callback(self) -> None:
         database = _Database()
         queued: list[int] = []
         dispatcher = ImportCompletionDispatcher(
             database=database,
-            rclone_service=object(),
-            category=lambda _key: {},
-            enqueue_organizer=lambda *_args: None,
             enqueue_transfer=lambda job_id: queued.append(job_id) or {"success": True, "queued": True},
         )
-        plan = _plan(7, "relay_upload_mobile")
+        plan = _plan(7, "relay_upload_provider")
         job = {
             "id": 7,
             "status": "waiting_transfer",
@@ -141,18 +147,14 @@ class DispatcherGuardTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertTrue(result["queued"])
 
-    def test_unowned_category_summary_cannot_invoke_finalizer(self) -> None:
+    def test_unowned_category_summary_is_rejected(self) -> None:
         database = _Database()
-        finalizer_calls: list[tuple] = []
         service = RcloneCallbackService(
             CallbackDependencies(
                 db=database,
-                rclone=SimpleNamespace(
-                    finalize_category_imports=lambda *args: finalizer_calls.append(args),
-                ),
+                rclone=SimpleNamespace(),
                 safe_int=lambda value, default, _minimum, _maximum: int(value or default),
                 callback_level=lambda _status: "info",
-                enqueue_organizer=lambda *_args: None,
                 cancelled_status="cancelled",
             )
         )
@@ -163,7 +165,6 @@ class DispatcherGuardTests(unittest.TestCase):
 
         self.assertEqual(status_code, 409)
         self.assertTrue(response["rejected"])
-        self.assertEqual(finalizer_calls, [])
 
     def test_unowned_resolve_callback_cannot_invoke_path_helper(self) -> None:
         database = _Database()
@@ -178,7 +179,6 @@ class DispatcherGuardTests(unittest.TestCase):
                 ),
                 safe_int=lambda value, default, _minimum, _maximum: int(value or default),
                 callback_level=lambda _status: "info",
-                enqueue_organizer=lambda *_args: None,
                 cancelled_status="cancelled",
             )
         )
@@ -198,23 +198,16 @@ class DispatcherGuardTests(unittest.TestCase):
         self.assertEqual(response["error_code"], "rclone_job_required")
         self.assertEqual(resolve_calls, [])
 
-    def test_worker_resolve_and_naming_requests_carry_job_id(self) -> None:
+    def test_worker_callbacks_are_strictly_job_bound(self) -> None:
         content = (
             Path(__file__).resolve().parents[1] / "scripts" / "fnos_rclone_worker.sh"
         ).read_text(encoding="utf-8")
-        resolve_block = content[
-            content.index('"status": "resolve_folder"') : content.index(
-                "FALLBACK_ROOT=", content.index('"status": "resolve_folder"')
-            )
-        ]
-        naming_block = content[
-            content.index('"status": "naming_plan"') : content.index(
-                "target_dir =", content.index('"status": "naming_plan"')
-            )
-        ]
 
-        self.assertIn('payload["job_id"] = int(job_dir_match.group(1))', resolve_block)
-        self.assertIn('payload["job_id"] = int(job_dir_match.group(1))', naming_block)
+        self.assertIn('payload["job_id"] = int(job_dir_match.group(1))', content)
+        self.assertIn('payload["require_job_match"] = True', content)
+        self.assertIn("if not job_dir_match:", content)
+        self.assertNotIn('"status": "resolve_folder"', content)
+        self.assertNotIn('"status": "naming_plan"', content)
 
 
 if __name__ == "__main__":

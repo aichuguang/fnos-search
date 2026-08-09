@@ -498,23 +498,13 @@ def _sync_job_with_connection(
     terminal status remains authoritative for the next cancellation step.
     """
 
-    commands = getattr(database, "job_commands", None)
-    previous = None
-    transition_row = getattr(commands, "_transition_row", None)
-    if callable(transition_row):
-        previous = transition_row(connection, int(job_id))
-    cursor = connection.execute(
-        "UPDATE import_jobs SET status=?, error_message=?, updated_at=? "
-        "WHERE id=? AND LOWER(COALESCE(status,'')) NOT IN "
-        "('cancelled','canceled','rejected')",
-        (status, error_message, updated_at, int(job_id)),
-    )
-    emitter = getattr(commands, "_emit_status_transition", None)
-    if callable(emitter):
-        emitter(
+    return bool(
+        database.job_commands.update_unless_status_with_connection(
             connection,
-            previous,
-            {"status": status, "error_message": error_message, "updated_at": updated_at},
-            cursor.rowcount,
+            int(job_id),
+            {"cancelled", "canceled", "rejected"},
+            status=status,
+            error_message=error_message,
+            updated_at=updated_at,
         )
-    return cursor.rowcount == 1
+    )

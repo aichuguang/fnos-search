@@ -313,30 +313,16 @@ class DurableWorkerRuntime:
         delay = self.retry_delay_seconds if retry_delay_seconds is None else retry_delay_seconds
 
         def fail() -> bool:
-            try:
-                return bool(
-                    self.repository.fail(
-                        task_id,
-                        self.owner_id,
-                        error,
-                        retry_delay_seconds=max(0, int(delay)),
-                        terminal=terminal,
-                        result=result,
-                    )
+            return bool(
+                self.repository.fail(
+                    task_id,
+                    self.owner_id,
+                    error,
+                    retry_delay_seconds=max(0, int(delay)),
+                    terminal=terminal,
+                    result=result,
                 )
-            except TypeError as exc:
-                # Preserve compatibility with repository doubles and older
-                # integrations that have not added the terminal/result options.
-                if "unexpected keyword" not in str(exc):
-                    raise
-                return bool(
-                    self.repository.fail(
-                        task_id,
-                        self.owner_id,
-                        error,
-                        retry_delay_seconds=0 if terminal else max(0, int(delay)),
-                    )
-                )
+            )
 
         return self._repository_transition("fail", task_id, fail)
 

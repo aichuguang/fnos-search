@@ -302,7 +302,7 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
         "native_save": "native",
         "native_offline": "native_offline",
         "rclone_copy": "rclone",
-        "relay_upload_mobile": "mobile_relay",
+        "relay_upload_provider": "provider_relay",
     }.get(strategy)
     if expected_executor is None:
         missing.append("transfer.strategy")
@@ -315,14 +315,15 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
 
     # Every V1 plan has an immutable final path. Data-plane strategies require
     # a task-scoped landing path.  rclone_copy also has a destination staging
-    # path; relay_upload_mobile deliberately does not because it uploads from
+    # path; Provider relay deliberately does not because it uploads from
     # the frozen local relay cache directly to the native destination.
+    relay_strategies = {"relay_upload_provider"}
     required = ["destination_final"]
-    if strategy in {"rclone_copy", "relay_upload_mobile"}:
+    if strategy == "rclone_copy" or strategy in relay_strategies:
         required.append("source_landing")
     if strategy == "rclone_copy":
         required.append("destination_staging")
-    if strategy == "relay_upload_mobile":
+    if strategy in relay_strategies:
         required.append("local_temp")
     for key in required:
         ref = _dict(paths.get(key))
@@ -333,7 +334,7 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
         if strict_paths and not str(ref.get("kind") or "").strip():
             missing.append(f"paths.{key}.kind")
         allowed = {
-            "destination_final": {"native"} if strategy in {"native_save", "native_offline", "relay_upload_mobile"} else {"openlist", "local"},
+            "destination_final": {"native"} if strategy in {"native_save", "native_offline", *relay_strategies} else {"openlist", "local"},
             "source_landing": {"openlist"},
             "destination_staging": {"openlist", "local"},
             "local_temp": {"relay"},
@@ -346,8 +347,8 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
             leaf = str(ref.get("path") or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
             if leaf != f"job-{job_id}":
                 missing.append(f"paths.{key}.job_scope")
-    if strategy == "relay_upload_mobile" and paths.get("destination_staging") not in (None, {}):
-        missing.append("paths.destination_staging must be empty for relay_upload_mobile")
+    if strategy in relay_strategies and paths.get("destination_staging") not in (None, {}):
+        missing.append(f"paths.destination_staging must be empty for {strategy}")
     if missing:
         raise JobPlanError("V1 execution_plan missing/invalid fields: " + ",".join(dict.fromkeys(missing)))
     return plan

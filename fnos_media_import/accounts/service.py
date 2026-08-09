@@ -817,10 +817,7 @@ class ProviderAccountService:
         probe_config = dict(config or {})
         if provider_kind == "tianyi" and cache_namespace:
             probe_config["_cache_namespace"] = cache_namespace
-        try:
-            return test_fn(provider_kind, credentials, probe_config)  # type: ignore[misc]
-        except TypeError:
-            return test_fn(credentials, probe_config)
+        return test_fn(provider_kind, credentials, probe_config)
 
     # ---- activation / disabling / deletion ----
 

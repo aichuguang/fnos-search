@@ -47,13 +47,13 @@ class PublicSixpanPreviewService:
             if cached else "BT 入库资源"
         )
         link = self.detect_link(source_url, self.routes(), password=password)
-        if str(link.source_type or "").lower() not in {"magnet", "torrent"}:
+        if link.provider_kind != "sixpan" or link.source_form != "magnet":
             return {"success": False, "message": "该资源暂不支持内容预览", "items": []}, 400
         try:
             data = importer.parse_resource(
                 title=resolved_title,
                 source_url=link.url,
-                source_type=link.source_type,
+                source_type=link.resource_kind,
             )
         except Exception as exc:  # noqa: BLE001
             return {

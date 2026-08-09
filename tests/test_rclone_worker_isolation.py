@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import json
 import subprocess
 import unittest
@@ -32,7 +34,7 @@ from fnos_media_import.services.rclone_worker_client import (
 )
 
 
-class _Response:
+class _Response(RepositoryFakeMixin):
     def __init__(self, payload: dict[str, Any], status_code: int = 200) -> None:
         self.payload = payload
         self.status_code = status_code
@@ -41,7 +43,7 @@ class _Response:
         return self.payload
 
 
-class _Session:
+class _Session(RepositoryFakeMixin):
     def __init__(self, response: _Response) -> None:
         self.response = response
         self.calls: list[dict[str, Any]] = []
@@ -340,17 +342,19 @@ class WorkerProxyContractTests(unittest.TestCase):
 
     def test_file_retry_preserves_worker_transport_status(self) -> None:
         database = SimpleNamespace(
-            get_rclone_file_event=lambda _event_id: {
+            rclone=SimpleNamespace(
+                get_rclone_file_event=lambda _event_id: {
                 "id": 7,
                 "status": "failed",
                 "filename": "episode.mkv",
-            },
-            add_rclone_file_event=lambda **_kwargs: self.fail(
+                },
+                add_rclone_file_event=lambda **_kwargs: self.fail(
                 "transport failure must not create a retry event"
+                ),
             ),
-            add_event=lambda *_args, **_kwargs: self.fail(
+            job_commands=SimpleNamespace(add_event=lambda *_args, **_kwargs: self.fail(
                 "transport failure must not create a business event"
-            ),
+            )),
         )
         runner = SimpleNamespace(
             start_file_retry=lambda _event: {

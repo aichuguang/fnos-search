@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import json
 import logging
+import math
+import os
 import re
 import secrets
 import threading
@@ -13,10 +15,11 @@ import uuid
 import xml.etree.ElementTree as ET
 from email.utils import formatdate
 from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
-from Crypto.Cipher import PKCS1_v1_5
+from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
+from Crypto.Util.Padding import pad
 
 from ..constants import JOB_DONE, JOB_FAILED, JOB_SUBMITTED
 from ..http_client import HttpClient
@@ -31,6 +34,26 @@ TIANYI_SESSION_IP_MISMATCH_MESSAGE = (
     "\u7cfb\u7edf\u5df2\u6309\u5929\u7ffc\u4e91\u76d8\u5ba2\u6237\u7aef\u534f\u8bae\u5237\u65b0\u4f1a\u8bdd\uff0c\u4f46\u4e1a\u52a1\u8bf7\u6c42\u4ecd\u88ab\u62d2\u7edd\u3002"
     "\u8bf7\u5728\u8d26\u53f7\u9875\u91cd\u65b0\u767b\u5f55\u3002"
 )
+
+
+class _LimitedFileReader:
+    """Expose exactly one file slice to ``requests`` without buffering it."""
+
+    def __init__(self, handle: Any, length: int) -> None:
+        self.handle = handle
+        self.length = max(0, int(length))
+        self.remaining = self.length
+
+    def __len__(self) -> int:
+        return self.length
+
+    def read(self, size: int = -1) -> bytes:
+        if self.remaining <= 0:
+            return b""
+        wanted = self.remaining if size is None or int(size) < 0 else min(self.remaining, int(size))
+        chunk = self.handle.read(wanted)
+        self.remaining -= len(chunk)
+        return chunk
 
 
 class TianyiApiError(RuntimeError):
@@ -61,6 +84,7 @@ class TianyiImporter:
 
     WEB_URL = "https://cloud.189.cn"
     API_URL = "https://api.cloud.189.cn"
+    UPLOAD_URL = "https://upload.cloud.189.cn"
     AUTH_URL = "https://open.e.189.cn"
     APP_ID = "8025431004"
     ACCOUNT_TYPE = "02"
@@ -598,7 +622,12 @@ class TianyiImporter:
         except Exception as exc:  # noqa: BLE001
             return {"status": "unknown", "message": f"Cloud189 task check failed: {exc}"}
 
-    def verify_native_result(self, receipt: Any) -> dict[str, Any]:
+    def verify_native_result(self, request: Any) -> dict[str, Any]:
+        from ..transfer.verifier import VerifyRequest
+
+        if not isinstance(request, VerifyRequest):
+            raise TypeError("verify_native_result requires VerifyRequest")
+        receipt = request.operation
         raw = self._receipt_raw(receipt)
         if not raw.get("empty_share"):
             status = self.poll_operation(receipt)
@@ -754,6 +783,532 @@ class TianyiImporter:
                 return str(item.get("file_id") or "")
         return ""
 
+    def list_drive_folders(self, parent_folder_id: str = "-11") -> list[dict[str, Any]]:
+        """List native Tianyi folders for the storage-location picker."""
+
+        return [
+            {
+                "folder_id": str(item.get("file_id") or ""),
+                "name": str(item.get("name") or ""),
+                "parent_folder_id": str(parent_folder_id or "-11"),
+            }
+            for item in self._list_drive_items(str(parent_folder_id or "-11"))
+            if bool(item.get("is_folder")) and str(item.get("file_id") or "")
+        ]
+
+    def resolve_folder_locator(
+        self,
+        locator_kind: str,
+        locator_value: str,
+        *,
+        create: bool,
+    ) -> str:
+        """Resolve a frozen ``folder_id``/``folder_path`` locator."""
+
+        kind = str(locator_kind or "folder_id").strip().lower()
+        value = str(locator_value or "").strip()
+        if kind == "folder_id":
+            if not value:
+                raise TianyiApiError(
+                    "Cloud189 target folder_id cannot be empty",
+                    code="TARGET_FOLDER_REQUIRED",
+                )
+            return value
+        if kind != "folder_path":
+            raise TianyiApiError(
+                f"Unsupported Cloud189 target locator: {kind}",
+                code="TARGET_LOCATOR_INVALID",
+            )
+        root_folder_id, separator, relative_path = value.partition("::")
+        if not separator or not root_folder_id or not relative_path:
+            raise TianyiApiError(
+                "Cloud189 folder_path locator is invalid",
+                code="TARGET_LOCATOR_INVALID",
+            )
+        if create:
+            return self._ensure_folder_path(root_folder_id, relative_path)
+        current = root_folder_id
+        for raw_name in relative_path.replace("\\", "/").split("/"):
+            name = self._safe_folder_name(raw_name)
+            if not name:
+                continue
+            current = self._find_folder(current, name)
+            if not current:
+                return ""
+        return current
+
+    def upload_file(
+        self,
+        *,
+        local_file: str,
+        parent_folder_id: str,
+        target_name: str = "",
+        overwrite: bool = True,
+        progress: Callable[[float], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Upload one local file with the 189CloudPC multipart protocol."""
+
+        path = os.path.realpath(str(local_file or ""))
+        if not path or not os.path.isfile(path):
+            raise TianyiApiError(
+                f"Cloud189 upload file does not exist: {local_file}",
+                code="LOCAL_FILE_MISSING",
+            )
+        folder_id = str(parent_folder_id or "").strip()
+        if not folder_id:
+            raise TianyiApiError(
+                "Cloud189 upload parent folder_id is required",
+                code="TARGET_FOLDER_REQUIRED",
+            )
+        file_name = str(target_name or os.path.basename(path)).strip()
+        if not file_name or file_name in {".", ".."} or "/" in file_name or "\\" in file_name:
+            raise TianyiApiError(
+                "Cloud189 upload file name is invalid",
+                code="FILE_NAME_INVALID",
+            )
+        file_size = int(os.path.getsize(path))
+        if file_size <= 0:
+            raise TianyiApiError(
+                "Cloud189 189CloudPC upload does not support empty files",
+                code="EMPTY_FILE_UNSUPPORTED",
+            )
+        slice_size = self._upload_part_size(file_size)
+        file_md5, slice_md5, parts = self._upload_hashes(path, file_size, slice_size)
+        params = {
+            "parentFolderId": folder_id,
+            "fileName": quote_plus(file_name, safe=""),
+            "fileSize": str(file_size),
+            "fileMd5": file_md5,
+            "sliceSize": str(slice_size),
+            "sliceMd5": slice_md5,
+        }
+        initialized = self._upload_request(
+            "GET",
+            "/person/initMultiUpload",
+            params=params,
+        )
+        upload_data = self._upload_response_data(initialized)
+        upload_file_id = str(
+            upload_data.get("uploadFileId")
+            or initialized.get("uploadFileId")
+            or ""
+        ).strip()
+        if not upload_file_id:
+            raise TianyiApiError(
+                "Cloud189 initMultiUpload returned no uploadFileId",
+                code="UPLOAD_SESSION_MISSING",
+                stage="upload_init",
+            )
+        file_data_exists = self._as_int(
+            upload_data.get("fileDataExists", initialized.get("fileDataExists")),
+            default=0,
+        )
+        callback = progress if callable(progress) else None
+        if file_data_exists != 1:
+            for index, part in enumerate(parts, start=1):
+                urls_response = self._upload_request(
+                    "GET",
+                    "/person/getMultiUploadUrls",
+                    params={
+                        "uploadFileId": upload_file_id,
+                        "partInfo": part["part_info"],
+                    },
+                )
+                upload_urls = urls_response.get("uploadUrls")
+                if not isinstance(upload_urls, dict):
+                    nested = self._upload_response_data(urls_response)
+                    upload_urls = nested.get("uploadUrls") if isinstance(nested, dict) else None
+                if not isinstance(upload_urls, dict) or not upload_urls:
+                    raise TianyiApiError(
+                        "Cloud189 getMultiUploadUrls returned no URL",
+                        code="UPLOAD_URL_MISSING",
+                        stage="upload_part_url",
+                    )
+                preferred = upload_urls.get(f"partNumber_{index}")
+                raw_url = preferred if isinstance(preferred, dict) else next(
+                    (item for item in upload_urls.values() if isinstance(item, dict)),
+                    None,
+                )
+                if not isinstance(raw_url, dict):
+                    raise TianyiApiError(
+                        "Cloud189 upload URL payload is invalid",
+                        code="UPLOAD_URL_INVALID",
+                        stage="upload_part_url",
+                    )
+                request_url = str(raw_url.get("requestURL") or "").strip()
+                if not request_url:
+                    raise TianyiApiError(
+                        "Cloud189 upload URL is empty",
+                        code="UPLOAD_URL_INVALID",
+                        stage="upload_part_url",
+                    )
+                self._put_upload_part(
+                    request_url,
+                    self._parse_upload_headers(raw_url.get("requestHeader")),
+                    path,
+                    int(part["offset"]),
+                    int(part["size"]),
+                )
+                if callback is not None:
+                    callback(index * 100.0 / (len(parts) + 1))
+
+        committed = self._upload_request(
+            "GET",
+            "/person/commitMultiUploadFile",
+            params={
+                "uploadFileId": upload_file_id,
+                "isLog": "0",
+                "opertype": "3" if overwrite else "1",
+            },
+        )
+        if callback is not None:
+            callback(100.0)
+        file_info = committed.get("file") if isinstance(committed.get("file"), dict) else {}
+        return {
+            "success": True,
+            "file_id": str(file_info.get("userFileId") or file_info.get("fileId") or ""),
+            "file_name": str(file_info.get("fileName") or file_name),
+            "file_size": self._as_int(file_info.get("fileSize"), default=file_size),
+            "file_md5": str(file_info.get("fileMd5") or file_md5),
+            "upload_file_id": upload_file_id,
+            "rapid_upload": file_data_exists == 1,
+            "raw": committed,
+        }
+
+    def delete_drive_item(
+        self,
+        *,
+        file_id: str,
+        file_name: str,
+        is_folder: bool = False,
+    ) -> bool:
+        """Delete one known item through the signed PC batch-task API."""
+
+        item_id = str(file_id or "").strip()
+        if not item_id:
+            return False
+        task_info = {
+            "fileId": item_id,
+            "fileName": str(file_name or ""),
+            "isFolder": 1 if is_folder else 0,
+        }
+        try:
+            created = self._post(
+                "/batch/createBatchTask.action",
+                form={
+                    "type": "DELETE",
+                    "taskInfos": json.dumps(
+                        [task_info],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            )
+        except TianyiApiError as exc:
+            if exc.code in {"FileNotFound", "FileDoesNotExist", "NotFound"}:
+                return True
+            raise
+        task_id = str(created.get("taskId") or "").strip()
+        if not task_id:
+            raise TianyiApiError(
+                "Cloud189 delete task returned no taskId",
+                code="TASK_ID_MISSING",
+            )
+        return self._wait_batch_task(task_id, "DELETE")
+
+    def _wait_batch_task(
+        self,
+        task_id: str,
+        task_type: str,
+        *,
+        attempts: int = 20,
+        interval: float = 0.25,
+    ) -> bool:
+        for _attempt in range(max(1, int(attempts))):
+            value = self._post(
+                "/batch/checkBatchTask.action",
+                form={"taskId": str(task_id), "type": str(task_type)},
+            )
+            state = self._as_int(value.get("taskStatus"), default=-999)
+            if state == 4:
+                return True
+            if state in {-1, 5, 6}:
+                raise TianyiApiError(
+                    self._message(value, f"Cloud189 {task_type} task failed"),
+                    code=self._response_code(value) or "BATCH_TASK_FAILED",
+                )
+            time.sleep(max(0.0, float(interval)))
+        raise TianyiApiError(
+            f"Cloud189 {task_type} task did not finish in time",
+            code="BATCH_TASK_TIMEOUT",
+        )
+
+    @staticmethod
+    def _upload_part_size(file_size: int) -> int:
+        default = 10 * 1024 * 1024
+        size = max(0, int(file_size))
+        if size > default * 2 * 999:
+            multiplier = max(math.ceil((size / 1999) / default), 5)
+            return int(multiplier * default)
+        if size > default * 999:
+            return default * 2
+        return default
+
+    @staticmethod
+    def _upload_hashes(
+        local_file: str,
+        file_size: int,
+        slice_size: int,
+    ) -> tuple[str, str, list[dict[str, Any]]]:
+        file_hash = hashlib.md5()  # noqa: S324 - Provider protocol requires MD5
+        parts: list[dict[str, Any]] = []
+        offset = 0
+        with open(local_file, "rb") as handle:
+            while offset < file_size:
+                remaining = min(slice_size, file_size - offset)
+                part_hash = hashlib.md5()  # noqa: S324 - Provider protocol requires MD5
+                consumed = 0
+                while consumed < remaining:
+                    chunk = handle.read(min(1024 * 1024, remaining - consumed))
+                    if not chunk:
+                        raise TianyiApiError(
+                            "Cloud189 upload source changed while hashing",
+                            code="LOCAL_FILE_CHANGED",
+                            stage="upload_hash",
+                        )
+                    file_hash.update(chunk)
+                    part_hash.update(chunk)
+                    consumed += len(chunk)
+                digest = part_hash.digest()
+                parts.append(
+                    {
+                        "offset": offset,
+                        "size": remaining,
+                        "md5": digest.hex().upper(),
+                        "part_info": f"{len(parts) + 1}-{base64.b64encode(digest).decode('ascii')}",
+                    }
+                )
+                offset += remaining
+        if offset != file_size:
+            raise TianyiApiError(
+                "Cloud189 upload source size changed while hashing",
+                code="LOCAL_FILE_CHANGED",
+                stage="upload_hash",
+            )
+        file_md5 = file_hash.hexdigest().upper()
+        if file_size <= slice_size:
+            slice_md5 = file_md5
+        else:
+            joined = "\n".join(str(item["md5"]) for item in parts)
+            slice_md5 = hashlib.md5(joined.encode("utf-8")).hexdigest().upper()  # noqa: S324
+        return file_md5, slice_md5, parts
+
+    @staticmethod
+    def _aes_ecb_encrypt(value: str, key: str) -> str:
+        key_bytes = str(key or "").encode("utf-8")[:16]
+        if len(key_bytes) != 16:
+            raise TianyiApiError(
+                "Cloud189 sessionSecret is too short for upload parameter encryption",
+                code="SESSION_CREDENTIALS_MISSING",
+                stage="upload_request",
+            )
+        encrypted = AES.new(key_bytes, AES.MODE_ECB).encrypt(
+            pad(str(value or "").encode("utf-8"), AES.block_size)
+        )
+        return encrypted.hex().upper()
+
+    @staticmethod
+    def _parse_upload_headers(value: Any) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for item in str(value or "").split("&"):
+            key, separator, raw_value = item.partition("=")
+            if separator and key:
+                headers[str(key)] = str(raw_value)
+        return headers
+
+    @staticmethod
+    def _upload_response_data(value: dict[str, Any]) -> dict[str, Any]:
+        data = value.get("data") if isinstance(value.get("data"), dict) else {}
+        return dict(data)
+
+    def _upload_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any],
+        retried: bool = False,
+    ) -> dict[str, Any]:
+        session = self._pc_session_data()
+        session_key = str(session.get("sessionKey") or "").strip()
+        session_secret = str(session.get("sessionSecret") or "").strip()
+        if not session_key or not session_secret:
+            raise TianyiApiError(
+                "Cloud189 PC session is missing sessionKey/sessionSecret",
+                code="SESSION_CREDENTIALS_MISSING",
+                stage="upload_request",
+            )
+        normalized_path = "/" + str(path or "").lstrip("/")
+        url = f"{self.UPLOAD_URL}{normalized_path}"
+        encoded_params = "&".join(
+            f"{key}={self._scalar(value)}"
+            for key, value in sorted((params or {}).items())
+            if value is not None
+        )
+        encrypted_params = self._aes_ecb_encrypt(encoded_params, session_secret)
+        headers = self._pc_signature_headers(
+            url,
+            method,
+            session_key=session_key,
+            session_secret=session_secret,
+            params_data=encrypted_params,
+        )
+        query = {**self._pc_client_suffix(), "params": encrypted_params}
+        try:
+            response = self.http.session.request(
+                str(method or "GET").upper(),
+                url,
+                params=query,
+                headers=headers,
+                timeout=self.timeout,
+                verify=self.http.verify_tls,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise self._network_error(
+                "upload_request",
+                "Cloud189 upload API request failed",
+                exc,
+            ) from exc
+        value = self._response_payload(
+            response,
+            "Cloud189 upload API",
+            stage="upload_request",
+        )
+        code = self._response_code(value)
+        message = self._message(value, f"Cloud189 upload API error: {code}")
+        invalid_session = code in {
+            "InvalidSessionKey",
+            "InvalidAccessToken",
+            "UserInvalidOpenToken",
+        } or "usersessionboisnull" in message.lower().replace(" ", "")
+        ip_mismatch = self._is_session_ip_mismatch(message)
+        if invalid_session or ip_mismatch:
+            logger.warning(
+                "event=tianyi_upload_session_rejected stage=upload_request path=%s code=%s "
+                "has_access_token=%s has_refresh_token=%s has_session_key=%s retried=%s",
+                normalized_path,
+                code,
+                bool(self.access_token),
+                bool(self.refresh_token),
+                bool(self._auth_data.get("sessionKey")),
+                retried,
+            )
+            if not retried and self._rebind_session_for_ip_mismatch():
+                return self._upload_request(
+                    method,
+                    path,
+                    params=params,
+                    retried=True,
+                )
+            if ip_mismatch:
+                raise TianyiApiError(
+                    TIANYI_SESSION_IP_MISMATCH_MESSAGE,
+                    code="SESSION_IP_MISMATCH",
+                    stage="upload_request",
+                    http_status=response.status_code,
+                )
+            raise TianyiApiError(
+                "Cloud189 PC session expired; please re-login",
+                code=code or "AUTH_EXPIRED",
+                stage="upload_request",
+                http_status=response.status_code,
+            )
+        if response.status_code in {401, 403}:
+            raise TianyiApiError(
+                "Cloud189 authentication expired",
+                code=code or "AUTH_EXPIRED",
+                stage="upload_request",
+                http_status=response.status_code,
+            )
+        if response.status_code >= 400:
+            raise TianyiApiError(
+                message,
+                code=code or f"HTTP_{response.status_code}",
+                stage="upload_request",
+                http_status=response.status_code,
+            )
+        if code not in {"", "0", "success", "SUCCESS"}:
+            raise TianyiApiError(
+                message,
+                code=code,
+                stage="upload_request",
+                http_status=response.status_code,
+            )
+        self._last_keep_alive_at = time.monotonic()
+        return value
+
+    def _put_upload_part(
+        self,
+        request_url: str,
+        request_headers: dict[str, str],
+        local_file: str,
+        offset: int,
+        size: int,
+    ) -> None:
+        last_error: BaseException | None = None
+        for attempt in range(3):
+            try:
+                with open(local_file, "rb") as handle:
+                    handle.seek(int(offset))
+                    reader = _LimitedFileReader(handle, int(size))
+                    headers = {str(key): str(value) for key, value in request_headers.items()}
+                    headers.setdefault("Content-Length", str(int(size)))
+                    response = self.http.session.put(
+                        str(request_url),
+                        params=self._pc_client_suffix(),
+                        data=reader,
+                        headers=headers,
+                        timeout=max(self.timeout, 120),
+                        verify=self.http.verify_tls,
+                    )
+                if int(response.status_code or 0) == 200:
+                    return
+                try:
+                    value = self._response_payload(
+                        response,
+                        "Cloud189 upload part",
+                        stage="upload_part",
+                    )
+                except TianyiApiError:
+                    value = {}
+                raise TianyiApiError(
+                    self._message(
+                        value,
+                        f"Cloud189 upload part HTTP {response.status_code}",
+                    ),
+                    code=self._response_code(value) or f"HTTP_{response.status_code}",
+                    stage="upload_part",
+                    http_status=response.status_code,
+                )
+            except TianyiApiError as exc:
+                last_error = exc
+                if exc.http_status in {401, 403} or exc.code in {
+                    "AUTH_EXPIRED",
+                    "InvalidSessionKey",
+                }:
+                    raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+            if attempt < 2:
+                time.sleep(0.5 * (2**attempt))
+        if isinstance(last_error, TianyiApiError):
+            raise last_error
+        raise self._network_error(
+            "upload_part",
+            "Cloud189 upload part failed",
+            last_error or RuntimeError("unknown upload error"),
+        )
+
     def _get(self, path: str, **params: Any) -> dict[str, Any]:
         return self._request("GET", path, params=params)
 
@@ -786,6 +1341,7 @@ class TianyiImporter:
         *,
         session_key: str,
         session_secret: str,
+        params_data: str = "",
         date: str | None = None,
         request_id: str | None = None,
     ) -> dict[str, str]:
@@ -796,6 +1352,8 @@ class TianyiImporter:
             f"SessionKey={session_key}&Operate={operate}"
             f"&RequestURI={request_path}&Date={http_date}"
         )
+        if params_data:
+            source += f"&params={params_data}"
         signature = hmac.new(
             str(session_secret).encode("utf-8"),
             source.encode("utf-8"),

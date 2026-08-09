@@ -13,41 +13,37 @@ from fnos_media_import.services.runtime_reload_service import (
 
 
 class RcloneStartupRecoveryActivationTests(unittest.TestCase):
-    def test_handler_registration_does_not_start_recovery_and_activation_is_idempotent(self) -> None:
+    def test_scoped_v1_recovery_activation_is_idempotent(self) -> None:
         service = RcloneService.__new__(RcloneService)
+        service.db = None
         service.lock = threading.Lock()
-        service._run_ready_handler = None
-        service._direct_ready_handler = None
-        service._pending_run_ready_results = []
         service._startup_recovery_activated = False
         calls: list[str] = []
-        service.recover_waiting_organizer_dispatches = lambda: calls.append("organizer") or {"success": True}
-        service.recover_unstarted_staging_jobs = lambda: calls.append("transfer") or {"success": True}
+        service.recover_scoped_runs = lambda: calls.append("scoped") or {"success": True}
 
-        service.set_run_ready_handler(lambda _result, _context: None)
-
-        self.assertEqual(calls, [])
         first = service.activate_startup_recovery()
         second = service.activate_startup_recovery()
         self.assertTrue(first["success"])
         self.assertTrue(second["skipped"])
-        self.assertEqual(calls, ["organizer", "transfer"])
+        self.assertEqual(calls, ["scoped"])
+        self.assertNotIn("waiting_organizer", first)
+        self.assertNotIn("waiting_transfer", first)
 
     def test_failed_activation_can_be_retried_explicitly(self) -> None:
         service = RcloneService.__new__(RcloneService)
+        service.db = None
         service.lock = threading.Lock()
         service._startup_recovery_activated = False
         attempts = 0
 
-        def recover_organizer():
+        def recover_scoped():
             nonlocal attempts
             attempts += 1
             if attempts == 1:
                 raise RuntimeError("database unavailable")
             return {"success": True}
 
-        service.recover_waiting_organizer_dispatches = recover_organizer
-        service.recover_unstarted_staging_jobs = lambda: {"success": True}
+        service.recover_scoped_runs = recover_scoped
 
         with self.assertRaisesRegex(RuntimeError, "database unavailable"):
             service.activate_startup_recovery()
@@ -68,13 +64,6 @@ class RuntimeCompositionSourceTests(unittest.TestCase):
         start = self.source.index("locator_config = rclone_runtime_config(app_config)")
         end = self.source.index("transfer_recovery_scanner =", start)
         startup = self.source[start:end]
-        reload_start = self.source.index(
-            "locator_runtime_config = rclone_runtime_config(app_config)", end
-        )
-        reload_end = self.source.index(
-            "v1_transfer_dispatch.set_organizer_service", reload_start
-        )
-        reload_block = self.source[reload_start:reload_end]
 
         self.assertIn(
             "v1_rclone_locator = RcloneLocatorResolver(locator_config)", startup
@@ -82,10 +71,25 @@ class RuntimeCompositionSourceTests(unittest.TestCase):
         self.assertIn("v1_rclone_locator.bind_revision_services(", startup)
         self.assertIn("rclone_service.set_v1_locator_resolver(", startup)
         self.assertIn("locator_resolver=v1_rclone_locator", startup)
+        self.assertIn("runtime_installer = RuntimeInstaller(", startup)
+        self.assertNotIn("_wire_v1_runtime_build", self.source)
+
+    def test_runtime_installer_never_reassigns_transfer_dispatch_fields(self) -> None:
+        installer_source = (
+            Path(__file__).resolve().parents[1]
+            / "fnos_media_import"
+            / "runtime_builder.py"
+        ).read_text(encoding="utf-8")
+        start = installer_source.index("class RuntimeInstaller:")
+        installer_source = installer_source[start:]
+
+        self.assertIn("self.locator_resolver.update_config(locator_config)", installer_source)
         self.assertIn(
-            "v1_rclone_locator.update_config(locator_runtime_config)", reload_block
+            "self.transfer_dispatch.set_organizer_service(build.organizer_service)",
+            installer_source,
         )
-        self.assertNotIn("RcloneLocatorResolver(locator_runtime_config)", reload_block)
+        self.assertNotIn("self.transfer_dispatch.locator_resolver =", installer_source)
+        self.assertNotIn("self.transfer_dispatch.rclone_config =", installer_source)
 
     def test_v1_master_key_fails_closed_without_empty_key_fallback(self) -> None:
         startup_start = self.source.index("root_key = master_key_from_env()")
@@ -103,7 +107,7 @@ class RuntimeCompositionSourceTests(unittest.TestCase):
 
 
 class RuntimeOrganizerTransitionTests(unittest.TestCase):
-    def test_finalize_transition_switches_before_suspend_and_activation(self) -> None:
+    def test_finalize_transition_runs_lifecycle_after_installer_publication(self) -> None:
         events: list[str] = []
 
         class Organizer:
@@ -118,13 +122,9 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
 
         old_build = SimpleNamespace(organizer_service=Organizer("old"))
         new_build = SimpleNamespace(organizer_service=Organizer("new"))
-        dispatcher = SimpleNamespace(
-            set_organizer=lambda organizer: events.append(f"dispatch:{organizer.name}")
-        )
         retirement = SimpleNamespace(retire=lambda build: events.append("retire:old" if build is old_build else "retire:other"))
 
         finalize_organizer_runtime_transition(
-            dispatcher=dispatcher,
             previous_build=old_build,
             candidate_build=new_build,
             retirement=retirement,
@@ -132,7 +132,7 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
 
         self.assertEqual(
             events,
-            ["dispatch:new", "suspend:old", "activate:new:False", "retire:old"],
+            ["suspend:old", "activate:new:False", "retire:old"],
         )
 
     def test_finalize_transition_keeps_web_only_organizer_background_suspended(self) -> None:
@@ -150,20 +150,16 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
 
         old_build = SimpleNamespace(organizer_service=Organizer("old"))
         new_build = SimpleNamespace(organizer_service=Organizer("new"))
-        dispatcher = SimpleNamespace(
-            set_organizer=lambda organizer: events.append(f"dispatch:{organizer.name}")
-        )
         retirement = SimpleNamespace(retire=lambda _build: events.append("retire:old"))
 
         finalize_organizer_runtime_transition(
-            dispatcher=dispatcher,
             previous_build=old_build,
             candidate_build=new_build,
             retirement=retirement,
             activate_background=False,
         )
 
-        self.assertEqual(events, ["dispatch:new", "suspend:old", "retire:old"])
+        self.assertEqual(events, ["suspend:old", "retire:old"])
 
     def test_reload_service_does_not_publish_or_retire_organizer_early(self) -> None:
         events: list[str] = []
@@ -224,7 +220,6 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
                 self.config = config
                 return candidate
 
-        dispatcher = SimpleNamespace(set_organizer=lambda _organizer: events.append("dispatch"))
         retirement = SimpleNamespace(retire=lambda _build: events.append("retire"))
         runtime_services = SimpleNamespace(swap=lambda _snapshot: events.append("swap") or 2)
         update_service = SimpleNamespace(set_runtime=lambda **_kwargs: None)
@@ -250,7 +245,6 @@ class RuntimeOrganizerTransitionTests(unittest.TestCase):
             config_int=lambda config, key, default: int(config.get(key, default)),
             rollback_logger=lambda: None,
             advanced_config_key="advanced",
-            organizer_dispatcher=dispatcher,
         )
 
         result = service.reload(old_config, old_build)

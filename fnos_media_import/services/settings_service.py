@@ -49,12 +49,12 @@ class SettingsService:
         return {"success": True, "config": self.deps.redact_config(self.deps.raw_config())}, 200
 
     def history_summary(self) -> tuple[dict[str, Any], int]:
-        return {"success": True, "summary": self.deps.db.history_cleanup_summary()}, 200
+        return {"success": True, "summary": self.deps.db.update.history_cleanup_summary()}, 200
 
     def cleanup_history(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         if not self.deps.payload_bool(payload, "confirm", False):
             return {"success": False, "message": "请先确认清理历史记录"}, 400
-        result = self.deps.db.cleanup_history_records(backup=self.deps.payload_bool(payload, "backup", True), vacuum=self.deps.payload_bool(payload, "vacuum", True), backup_prefix="app_before_history_cleanup")
+        result = self.deps.db.update.cleanup_history_records(backup=self.deps.payload_bool(payload, "backup", True), vacuum=self.deps.payload_bool(payload, "vacuum", True), backup_prefix="app_before_history_cleanup")
         cleared_total = int(result.get("cleared_total") or 0)
         message = f"历史记录清理完成，已删除 {cleared_total} 条历史记录；定时追更订阅与来源已保留。"
         if result.get("backup", {}).get("path"):
@@ -65,7 +65,7 @@ class SettingsService:
 
     def advanced(self) -> tuple[dict[str, Any], int]:
         try:
-            body = self.deps.advanced_response(self.deps.raw_config(), self.deps.db.get_app_settings())
+            body = self.deps.advanced_response(self.deps.raw_config(), self.deps.db.app_settings.get_all())
         except ValueError as exc:
             logger.error("advanced config is not a valid V1 stored document: %s", exc)
             return {
@@ -78,7 +78,7 @@ class SettingsService:
     def export_advanced(self) -> tuple[dict[str, Any], int]:
         """Build a versioned, sensitive backup document for an authenticated admin."""
 
-        settings = self.deps.db.get_app_settings()
+        settings = self.deps.db.app_settings.get_all()
         try:
             stored = persisted_config_from_settings(settings)
         except ValueError as exc:
@@ -148,29 +148,19 @@ class SettingsService:
                 "message": message,
                 "mode": mode,
                 "reload": reload_result,
-                **self.deps.advanced_response(self.deps.raw_config(), self.deps.db.get_app_settings()),
+                **self.deps.advanced_response(self.deps.raw_config(), self.deps.db.app_settings.get_all()),
             }, 200
 
     def _persist_advanced_config(self, payload: dict[str, Any]) -> tuple[bool, Any, dict[str, Any]]:
-        atomic_update = getattr(self.deps.db, "update_app_setting_atomic", None)
-        if callable(atomic_update):
-            def updater(previous: Any, _existed: bool) -> dict[str, Any]:
-                current = previous if isinstance(previous, dict) else {}
-                return self.deps.normalize_advanced(payload, current_stored=current)
+        def updater(previous: Any, _existed: bool) -> dict[str, Any]:
+            current = previous if isinstance(previous, dict) else {}
+            return self.deps.normalize_advanced(payload, current_stored=current)
 
-            existed, previous, normalized = atomic_update(self.deps.advanced_key, updater)
-            return bool(existed), copy.deepcopy(previous), normalized
-
-        # Compatibility fallback for lightweight test doubles and older DB
-        # adapters.  The process-local lock still prevents in-process lost
-        # updates, while the production Database uses the atomic path above.
-        settings = self.deps.db.get_app_settings()
-        existed = self.deps.advanced_key in settings
-        previous = copy.deepcopy(settings.get(self.deps.advanced_key))
-        current = previous if isinstance(previous, dict) else {}
-        normalized = self.deps.normalize_advanced(payload, current_stored=current)
-        self.deps.db.set_app_settings({self.deps.advanced_key: normalized})
-        return existed, previous, normalized
+        existed, previous, normalized = self.deps.db.app_settings.update_atomic(
+            self.deps.advanced_key,
+            updater,
+        )
+        return bool(existed), copy.deepcopy(previous), normalized
 
     def _rollback_advanced_config(
         self,
@@ -179,32 +169,23 @@ class SettingsService:
         previous: Any,
         previous_exists: bool,
     ) -> dict[str, Any]:
-        compare_and_set = getattr(self.deps.db, "compare_and_set_app_setting", None)
         superseded = False
         rolled_back = False
         try:
-            if callable(compare_and_set):
-                rolled_back = bool(
-                    compare_and_set(
-                        self.deps.advanced_key,
-                        expected,
-                        previous,
-                        expected_exists=True,
-                        replacement_exists=previous_exists,
-                    )
+            rolled_back = bool(
+                self.deps.db.app_settings.compare_and_set(
+                    self.deps.advanced_key,
+                    expected,
+                    previous,
+                    expected_exists=True,
+                    replacement_exists=previous_exists,
                 )
-                if not rolled_back:
-                    # Provider tokens live in immutable account revisions, not
-                    # in advanced_config.  Any mismatch therefore represents
-                    # a genuine newer writer and must not be merged or masked.
-                    superseded = True
-            else:
-                # This path is only used by process-local compatibility doubles,
-                # so no concurrent writer can pass the enclosing lock.
-                self.deps.db.set_app_settings(
-                    {self.deps.advanced_key: previous if previous_exists else {}}
-                )
-                rolled_back = True
+            )
+            if not rolled_back:
+                # Provider tokens live in immutable account revisions, not
+                # in advanced_config. Any mismatch therefore represents a
+                # genuine newer writer and must not be merged or masked.
+                superseded = True
         except Exception:  # noqa: BLE001
             logger.exception("advanced config database rollback failed")
             return {
@@ -247,7 +228,7 @@ class SettingsService:
             return {"success": False, "message": str(exc)}, 400
         if not updates:
             return {"success": False, "message": "没有可保存的设置"}, 400
-        self.deps.db.set_app_settings(updates)
+        self.deps.db.app_settings.set_many(updates)
         return {"success": True, "message": "系统设置已保存", "settings": self.deps.effective_settings()}, 200
 
     def update_all(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
@@ -297,10 +278,7 @@ class SettingsService:
                     written = copy.deepcopy(updates)
                     return updates, set()
 
-                atomic_mutate = getattr(self.deps.db, "mutate_app_settings_atomic", None)
-                if not callable(atomic_mutate):
-                    raise RuntimeError("数据库不支持统一配置事务")
-                previous, _current = atomic_mutate(persist)
+                previous, _current = self.deps.db.app_settings.mutate_all_atomic(persist)
             except ValueError as exc:
                 return {"success": False, "message": str(exc)}, 400
             except Exception as exc:  # noqa: BLE001
@@ -328,7 +306,7 @@ class SettingsService:
             "settings": self.deps.effective_settings(),
             "search_providers": self.deps.search_providers(),
             "reload": reload_result,
-            **self.deps.advanced_response(self.deps.raw_config(), self.deps.db.get_app_settings()),
+            **self.deps.advanced_response(self.deps.raw_config(), self.deps.db.app_settings.get_all()),
         }
         return response, 200
 
@@ -389,15 +367,6 @@ class SettingsService:
         expected: dict[str, Any],
         previous: dict[str, Any],
     ) -> dict[str, Any]:
-        atomic_mutate = getattr(self.deps.db, "mutate_app_settings_atomic", None)
-        if not callable(atomic_mutate):
-            return {
-                "message": "设置重载失败，数据库不支持事务回滚；请检查服务日志。",
-                "rolled_back": False,
-                "superseded": False,
-                "runtime_restored": False,
-            }
-
         try:
             def restore(current: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
                 for key, expected_value in expected.items():
@@ -413,7 +382,7 @@ class SettingsService:
                         delete_keys.add(key)
                 return replacements, delete_keys
 
-            atomic_mutate(restore)
+            self.deps.db.app_settings.mutate_all_atomic(restore)
             rolled_back = True
             superseded = False
         except _AdvancedConfigSuperseded:

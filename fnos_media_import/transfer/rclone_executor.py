@@ -53,6 +53,8 @@ _CATEGORY_SUFFIX = {
     "other": "OTHER",
 }
 
+_RELAY_UPLOAD_STRATEGIES = frozenset({"relay_upload_provider"})
+
 
 def _category_suffix(category_key: str) -> str:
     key = str(category_key or "").strip().lower()
@@ -79,7 +81,7 @@ def build_managed_copy_run(plan: Any, locator_resolver: Any) -> dict[str, Any]:
     raw = _raw_plan(plan)
     transfer = _mapping(raw.get("transfer"))
     strategy = str(transfer.get("strategy") or "").strip().lower()
-    if strategy not in {"rclone_copy", "relay_upload_mobile"}:
+    if strategy != "rclone_copy" and strategy not in _RELAY_UPLOAD_STRATEGIES:
         return {}
     job_id = _positive_int(raw.get("job_id"))
     if job_id <= 0:
@@ -139,7 +141,7 @@ def build_managed_copy_run(plan: Any, locator_resolver: Any) -> dict[str, Any]:
             locator_resolver,
             target,
             target_root,
-            relay=strategy == "relay_upload_mobile",
+            relay=strategy in _RELAY_UPLOAD_STRATEGIES,
         )
         target_root = local_target
     else:
@@ -155,7 +157,7 @@ def build_managed_copy_run(plan: Any, locator_resolver: Any) -> dict[str, Any]:
     destination = _mapping(raw.get("destination"))
     return {
         "copy_mode": True,
-        "relay_mode": strategy == "relay_upload_mobile",
+        "relay_mode": strategy in _RELAY_UPLOAD_STRATEGIES,
         "job_id": job_id,
         "category": category,
         "category_suffix": suffix,

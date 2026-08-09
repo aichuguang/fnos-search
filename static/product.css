@@ -7111,6 +7111,43 @@ body[data-page="admin"] .storage-record-main small {
     line-height: 1.5;
 }
 
+body[data-page="admin"] .storage-capability-list {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 7px;
+}
+
+body[data-page="admin"] .storage-capability-list span {
+    display: inline-flex;
+    align-items: center;
+    min-height: 22px;
+    padding: 2px 8px;
+    border: 1px solid rgba(126, 164, 230, .20);
+    border-radius: 999px;
+    color: rgba(218, 231, 255, .72);
+    background: rgba(40, 67, 108, .28);
+    font-size: 10px;
+    font-weight: 800;
+}
+
+body[data-page="admin"] .storage-capability-list .is-success {
+    color: #8ce7ca;
+    border-color: rgba(84, 214, 177, .30);
+    background: rgba(36, 126, 100, .20);
+}
+
+body[data-page="admin"] .storage-capability-list .is-warning {
+    color: #ffd38a;
+    border-color: rgba(255, 190, 84, .28);
+    background: rgba(109, 68, 13, .20);
+}
+
+body[data-page="admin"] .storage-capability-list .is-neutral {
+    color: #c8d3e5;
+}
+
 body[data-page="admin"] .text-success { color: #76e0bf; }
 body[data-page="admin"] .text-error { color: #ff9bab; }
 
@@ -7269,6 +7306,104 @@ body[data-page="admin"] .storage-route-overrides label {
 
 body[data-page="admin"] .storage-form-grid > label.span-2 {
     grid-column: 1 / -1;
+}
+
+body[data-page="admin"] .storage-native-browser {
+    display: grid;
+    grid-column: 1 / -1;
+    gap: 10px;
+    min-width: 0;
+    padding: 13px;
+    border: 1px solid rgba(89, 151, 255, .24);
+    border-radius: 10px;
+    background: rgba(7, 18, 42, .46);
+}
+
+body[data-page="admin"] .storage-native-browser > header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+body[data-page="admin"] .storage-native-browser > header strong,
+body[data-page="admin"] .storage-native-browser > header small {
+    display: block;
+}
+
+body[data-page="admin"] .storage-native-browser > header strong {
+    color: #edf4ff;
+    font-size: 12px;
+}
+
+body[data-page="admin"] .storage-native-browser > header small {
+    margin-top: 4px;
+    color: rgba(218, 231, 255, .58);
+    font-size: 11px;
+}
+
+body[data-page="admin"] .storage-native-breadcrumbs {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 5px;
+    min-width: 0;
+}
+
+body[data-page="admin"] .storage-native-breadcrumbs > span {
+    color: rgba(218, 231, 255, .36);
+}
+
+body[data-page="admin"] .storage-native-folder-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    min-height: 54px;
+}
+
+body[data-page="admin"] .storage-native-folder {
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 9px 10px;
+    color: #eaf2ff;
+    border: 1px solid rgba(126, 164, 230, .18);
+    border-radius: 7px;
+    background: #10213f;
+    text-align: left;
+}
+
+body[data-page="admin"] .storage-native-folder:hover {
+    border-color: rgba(84, 214, 177, .42);
+    background: #153055;
+}
+
+body[data-page="admin"] .storage-native-folder > span:nth-child(2) {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+body[data-page="admin"] .storage-native-folder small {
+    color: rgba(218, 231, 255, .48);
+    font-size: 10px;
+}
+
+body[data-page="admin"] .storage-native-selection {
+    display: grid;
+    gap: 6px;
+}
+
+body[data-page="admin"] .storage-native-selection > span {
+    color: rgba(218, 231, 255, .68);
+    font-size: 11px;
+    font-weight: 700;
+}
+
+body[data-page="admin"] .storage-native-selection input {
+    width: 100%;
 }
 
 body[data-page="admin"] .storage-form-grid label > span,
@@ -7589,6 +7724,10 @@ body[data-page="admin"] .storage-preflight-list p {
     body[data-page="admin"] .storage-form-grid,
     body[data-page="admin"] .storage-category-fields { grid-template-columns: 1fr; }
     body[data-page="admin"] .storage-form-grid > label.span-2 { grid-column: auto; }
+    body[data-page="admin"] .storage-native-browser { grid-column: auto; }
+    body[data-page="admin"] .storage-native-browser > header { align-items: stretch; flex-direction: column; }
+    body[data-page="admin"] .storage-native-browser > header > button { width: 100%; }
+    body[data-page="admin"] .storage-native-folder-list { grid-template-columns: 1fr; }
     body[data-page="admin"] .storage-editor-header { align-items: flex-start; flex-direction: column; }
     body[data-page="admin"] .storage-form-actions { display: grid; grid-template-columns: 1fr; }
     body[data-page="admin"] .storage-route-row { grid-template-columns: 1fr; }

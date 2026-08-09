@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import Mock
 
 from fnos_media_import.importers.cloud139 import Cloud139Importer
 from fnos_media_import.importers.generic import GenericWebhookImporter
@@ -12,26 +10,9 @@ from fnos_media_import.services.import_service import ImportService
 
 class RuntimeV1CutoverTests(unittest.TestCase):
     def test_import_service_does_not_derive_target_from_removed_category_paths(self) -> None:
-        config = SimpleNamespace(
-            raw={
-                "cloud139": {"target_root_path": "/legacy"},
-                "cmcc_upload": {"access_token": "legacy"},
-            },
-            category=lambda key: {"label": key},
-        )
-        service = ImportService(Mock(), config, Mock(), Mock())
-        self.assertEqual(
-            service._target_path(
-                "cloud139_direct",
-                {
-                    "label": "电影",
-                    "quark_save_path": "/legacy/quark",
-                    "cloud139_target_path": "/legacy/139",
-                    "mobile_target_path": "/legacy/mobile",
-                },
-            ),
-            "",
-        )
+        method_names = set(vars(ImportService))
+        self.assertNotIn("_target_path", method_names)
+        self.assertFalse(any(name.startswith("_submit_") for name in method_names))
 
     def test_provider_importers_require_v1_locator_or_explicit_path(self) -> None:
         cloud139 = Cloud139Importer(

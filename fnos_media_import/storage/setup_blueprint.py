@@ -168,6 +168,17 @@ def create_storage_setup_blueprint(context: StorageSetupBlueprintContext) -> Blu
         return guarded(lambda: jsonify(service.save_account(json_payload())))
 
     @protected
+    def list_account_folders(account_id: str) -> Any:
+        return guarded(
+            lambda: jsonify(
+                service.list_account_folders(
+                    account_id,
+                    request.args.get("parent_id", ""),
+                )
+            )
+        )
+
+    @protected
     def save_openlist() -> Any:
         return guarded(lambda: jsonify(service.save_openlist(json_payload())))
 
@@ -211,6 +222,12 @@ def create_storage_setup_blueprint(context: StorageSetupBlueprintContext) -> Blu
 
     blueprint.add_url_rule("/api/admin/storage-setup", "snapshot", snapshot, methods=["GET"])
     blueprint.add_url_rule("/api/admin/storage-setup/accounts", "save_account", save_account, methods=["POST"])
+    blueprint.add_url_rule(
+        "/api/admin/storage-setup/accounts/<account_id>/folders",
+        "list_account_folders",
+        list_account_folders,
+        methods=["GET"],
+    )
     blueprint.add_url_rule("/api/admin/storage-setup/openlist", "save_openlist", save_openlist, methods=["PUT"])
     blueprint.add_url_rule(
         "/api/admin/storage-setup/openlist/<connection_id>",

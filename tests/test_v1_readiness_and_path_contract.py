@@ -12,7 +12,7 @@ from fnos_media_import.planning.job_plan import (
 from fnos_media_import.planning.plan_validator import PlanValidator
 from fnos_media_import.planning.planner import ImportPlanner
 from fnos_media_import.transfer import TransferError, TransferPlan
-from fnos_media_import.transfer.mobile_relay_executor import MobileRelayExecutor
+from fnos_media_import.transfer.provider_relay_executor import ProviderRelayExecutor
 
 
 class _Mounts:
@@ -34,6 +34,15 @@ class _Mounts:
                 "storage_identity_id": "provider:quark:account:src",
                 "identity_root": "/",
             }
+        if mount_id == "destination":
+            return {
+                "mount_id": "destination",
+                "namespace_id": "openlist:ol:destination",
+                "readable": True,
+                "writable": False,
+                "storage_identity_id": "provider:mobile:account:dst",
+                "identity_root": "/",
+            }
         return None
 
     @staticmethod
@@ -52,6 +61,26 @@ class _Mounts:
                 "enabled": True,
                 "identity_status": "declared",
                 "native_locator": {"kind": "path", "value": "/FNOS"},
+            }
+        if mount_id == "destination" and revision == 1:
+            return {
+                "connection_id": "ol",
+                "connection_revision": 1,
+                "namespace_id": "openlist:ol:destination",
+                "provider_kind": "mobile",
+                "account_id": "dst",
+                "storage_identity_id": "provider:mobile:account:dst",
+                "identity_root": "/",
+                "readable": True,
+                "writable": False,
+                "enabled": True,
+                "identity_status": "verified",
+                "native_locator": {
+                    "kind": "folder_id",
+                    "value": "root-folder-id",
+                    "upload_verified": True,
+                    "organizer_mutation_verified": True,
+                },
             }
         return None
 
@@ -72,7 +101,7 @@ class V1PathContractTests(unittest.TestCase):
             category=category,
             category_key="movie",
             job_id=7,
-            strategy="relay_upload_mobile",
+            strategy="relay_upload_provider",
             source_mount={
                 "namespace_id": "openlist:ol:source",
                 "readable": True,
@@ -94,7 +123,7 @@ class V1PathContractTests(unittest.TestCase):
         validator._validate_paths(
             plan={"job_id": 7},
             source={},
-            destination={},
+            destination={"provider_kind": "mobile", "account_id": "dst"},
             target=None,
             paths={
                 "source_landing": {
@@ -128,8 +157,15 @@ class V1PathContractTests(unittest.TestCase):
                 "source_connection_id": "ol",
                 "source_connection_revision": 1,
                 "source_native_locator": {"kind": "path", "value": "/FNOS"},
+                "destination_mount_id": "destination",
+                "destination_mount_revision": 1,
+                "destination_mount_namespace_id": "openlist:ol:destination",
+                "destination_mount_storage_identity_id": "provider:mobile:account:dst",
+                "destination_mount_identity_root": "/",
+                "destination_connection_id": "ol",
+                "destination_connection_revision": 1,
             },
-            strategy="relay_upload_mobile",
+            strategy="relay_upload_provider",
             errors=errors,
         )
         self.assertEqual(errors, [])
@@ -140,7 +176,7 @@ class V1PathContractTests(unittest.TestCase):
             "job_id": 7,
             "source": {"provider_kind": "quark", "source_form": "share", "canonical_source_id": "q:1"},
             "destination": {"id": "mobile_main", "provider_kind": "mobile"},
-            "transfer": {"strategy": "relay_upload_mobile", "executor": "mobile_relay"},
+            "transfer": {"strategy": "relay_upload_provider", "executor": "provider_relay"},
             "paths": {
                 "source_landing": {"namespace_id": "openlist:ol:source", "path": "/_fnos_ingress/job-7"},
                 "destination_final": {"namespace_id": "native:mobile:mobile_main", "path": "/影视"},
@@ -177,8 +213,8 @@ class V1PathContractTests(unittest.TestCase):
             },
             "destination": {"id": "mobile_main", "provider_kind": "mobile"},
             "transfer": {
-                "strategy": "relay_upload_mobile",
-                "executor": "mobile_relay",
+                "strategy": "relay_upload_provider",
+                "executor": "provider_relay",
                 "idempotency_key": "import:sha256:invalid-for-test",
             },
             "paths": {
@@ -240,7 +276,7 @@ class V1PathContractTests(unittest.TestCase):
                 "job_id": 7,
                 "source": {"provider_kind": "quark"},
                 "destination": {"id": "mobile_main", "provider_kind": "mobile"},
-                "transfer": {"strategy": "relay_upload_mobile"},
+                "transfer": {"strategy": "relay_upload_provider"},
                 "paths": {
                     "source_landing": {
                         "kind": "openlist",
@@ -260,7 +296,7 @@ class V1PathContractTests(unittest.TestCase):
                 },
             }
         )
-        executor = MobileRelayExecutor(object(), object(), relay_root="/data/relay").bind(plan)
+        executor = ProviderRelayExecutor(object(), object(), relay_root="/data/relay").bind(plan)
         self.assertEqual(executor._relay_dir(), "/data/relay/job-7")
 
 

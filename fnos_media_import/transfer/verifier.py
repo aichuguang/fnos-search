@@ -21,6 +21,7 @@ from fnos_media_import.domain.models import (
 )
 from fnos_media_import.transfer import (
     ErrorCode,
+    OperationReceipt,
     TransferVerifyResult,
 )
 
@@ -49,6 +50,7 @@ class VerifyRequest:
     expected_file_count: int = 0
     expected_total_size: int = 0
     checksum: str = ""
+    operation: OperationReceipt | None = None
 
 
 def _normalize_listed(value: Any) -> ListedFiles:
@@ -151,7 +153,3 @@ class TransferVerifier:
             expected_file_count=int(expected_file_count or 0),
             expected_total_size=int(expected_total_size or 0),
         )
-
-    # 兼容裸调用（orchestrator 对无 .verify 属性的可调用对象直接调用）。
-    def __call__(self, plan: Any = None) -> TransferVerifyResult:
-        return self.verify(plan)

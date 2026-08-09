@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import os
-import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fnos_media_import.process_role import resolve_process_role
-from fnos_media_import.services.rclone_service import RcloneService
+from fnos_media_import.services.rclone_worker_runtime import RcloneWorkerRuntime
 from fnos_media_import.services.readiness_service import ReadinessService
 from fnos_media_import.services.security_status_service import SecurityStatusService
 from fnos_media_import.services.trending_discovery_scheduler import TrendingDiscoveryScheduler
@@ -253,42 +252,22 @@ class WebRoleSchedulerBoundaryTests(unittest.TestCase):
         self.assertIsNone(update_scheduler.thread)
         self.assertIsNone(trending_scheduler.thread)
 
-    def test_rclone_scheduler_stays_stopped_after_web_runtime_reload(self) -> None:
-        restart_calls: list[int] = []
-        service = object.__new__(RcloneService)
-        service.config = {"auto_interval_minutes": 0}
-        service.fnos_config = {}
-        service.categories = {}
-        service.cmcc_upload_config = {}
-        service.cloud139_config = {}
-        service.enabled = True
-        service.scheduler_allowed = False
-        service.environment_checker = SimpleNamespace(apply_config=lambda _config: None)
-        service.worker_command = SimpleNamespace(apply_config=lambda _config: None)
-        service.log_sink = SimpleNamespace(resize=lambda _limit: None)
-        service.scheduler = SimpleNamespace(restart=restart_calls.append)
-
-        service.apply_runtime_config(
-            {"auto_interval_minutes": 15, "enabled": True},
-            {},
-            {},
-            {},
-            {},
+    def test_rclone_worker_runtime_has_no_periodic_scheduler(self) -> None:
+        shutdown_calls: list[bool] = []
+        runtime = RcloneWorkerRuntime(
+            rclone_service=SimpleNamespace(
+                shutdown=lambda: shutdown_calls.append(True)
+            )
         )
 
-        self.assertEqual(restart_calls, [])
+        runtime.start()
+        runtime.start()
+        self.assertTrue(runtime.started)
+        self.assertEqual([], shutdown_calls)
 
-    def test_rclone_cold_start_guard_blocks_web_scheduler(self) -> None:
-        start_calls: list[int] = []
-        service = object.__new__(RcloneService)
-        service.scheduler_allowed = False
-        service.lock = threading.Lock()
-        service.config = {"auto_interval_minutes": 15}
-        service.scheduler = SimpleNamespace(start=start_calls.append)
-
-        service.start_scheduler()
-
-        self.assertEqual(start_calls, [])
+        runtime.shutdown()
+        self.assertFalse(runtime.started)
+        self.assertEqual([True], shutdown_calls)
 
 
 if __name__ == "__main__":

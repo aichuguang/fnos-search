@@ -185,16 +185,16 @@ class TrendingRepository:
         source_id = str(payload.get("source_id") or payload.get("series_id") or payload.get("id") or "")
         canonical_key = str(payload.get("canonical_key") or (f"{source}:{source_id}" if source_id else payload.get("title") or ""))
         with self._connection_factory() as connection:
-            legacy_canonical_key = str(payload.get("legacy_canonical_key") or "").strip()
-            if legacy_canonical_key:
-                canonical_key, migrated_year = self._migrate_legacy_candidate_key(
+            base_canonical_key = str(payload.get("base_canonical_key") or "").strip()
+            if base_canonical_key:
+                canonical_key, reconciled_year = self._reconcile_candidate_key(
                     connection,
-                    legacy_canonical_key=legacy_canonical_key,
+                    base_canonical_key=base_canonical_key,
                     canonical_key=canonical_key,
                     year=payload.get("year"),
                 )
-                if migrated_year and not _candidate_year(payload.get("year")):
-                    payload["year"] = int(migrated_year)
+                if reconciled_year and not _candidate_year(payload.get("year")):
+                    payload["year"] = int(reconciled_year)
             connection.execute(
                 """
                 INSERT INTO trending_candidates
@@ -233,16 +233,16 @@ class TrendingRepository:
             return int(row["id"])
 
     @staticmethod
-    def _migrate_legacy_candidate_key(
+    def _reconcile_candidate_key(
         connection: sqlite3.Connection,
         *,
-        legacy_canonical_key: str,
+        base_canonical_key: str,
         canonical_key: str,
         year: Any,
     ) -> tuple[str, str]:
-        """Move a pre-year identity to the year-aware key without duplicating it."""
+        """Reconcile an unknown-year identity with year-aware candidates."""
 
-        prefix = f"{legacy_canonical_key}|"
+        prefix = f"{base_canonical_key}|"
         year_aware = connection.execute(
             """
             SELECT canonical_key, year
@@ -258,61 +258,79 @@ class TrendingRepository:
             for row in year_aware
             if _candidate_year(row["year"])
         }
-        legacy = connection.execute(
+        base_row = connection.execute(
             """
             SELECT id, year, status, subscription_id, initial_import_job_id,
                    ignore_until, ignore_reason, first_seen_at, last_seen_at
             FROM trending_candidates
             WHERE canonical_key = ?
             """,
-            (legacy_canonical_key,),
+            (base_canonical_key,),
         ).fetchone()
         current_year = _candidate_year(year)
-        canonical_key = f"{legacy_canonical_key}|{current_year}" if current_year else legacy_canonical_key
-        if not legacy:
+        canonical_key = (
+            f"{base_canonical_key}|{current_year}"
+            if current_year
+            else base_canonical_key
+        )
+        if not base_row:
             if current_year:
                 return canonical_key, current_year
             if len(identities) == 1:
                 return next(iter(identities))
-            return legacy_canonical_key, ""
+            return base_canonical_key, ""
 
-        legacy_year = _candidate_year(legacy["year"])
+        base_year = _candidate_year(base_row["year"])
         known_years = {identity_year for _identity_key, identity_year in identities}
 
         if current_year:
-            if legacy_year and legacy_year != current_year:
-                TrendingRepository._move_legacy_candidate_row(
+            if base_year and base_year != current_year:
+                TrendingRepository._move_candidate_row(
                     connection,
-                    legacy=legacy,
-                    canonical_key=f"{legacy_canonical_key}|{legacy_year}",
+                    source_row=base_row,
+                    canonical_key=f"{base_canonical_key}|{base_year}",
                 )
                 return canonical_key, current_year
-            if not legacy_year and any(known_year != current_year for known_year in known_years):
+            if not base_year and any(
+                known_year != current_year for known_year in known_years
+            ):
                 return canonical_key, current_year
-            TrendingRepository._move_legacy_candidate_row(connection, legacy=legacy, canonical_key=canonical_key)
+            TrendingRepository._move_candidate_row(
+                connection,
+                source_row=base_row,
+                canonical_key=canonical_key,
+            )
             return canonical_key, current_year
 
-        if legacy_year:
-            canonical_key = f"{legacy_canonical_key}|{legacy_year}"
-            TrendingRepository._move_legacy_candidate_row(connection, legacy=legacy, canonical_key=canonical_key)
-            if len(known_years | {legacy_year}) > 1:
-                return legacy_canonical_key, ""
-            return canonical_key, legacy_year
+        if base_year:
+            canonical_key = f"{base_canonical_key}|{base_year}"
+            TrendingRepository._move_candidate_row(
+                connection,
+                source_row=base_row,
+                canonical_key=canonical_key,
+            )
+            if len(known_years | {base_year}) > 1:
+                return base_canonical_key, ""
+            return canonical_key, base_year
 
         if len(identities) == 1:
             canonical_key, current_year = next(iter(identities))
-            TrendingRepository._move_legacy_candidate_row(connection, legacy=legacy, canonical_key=canonical_key)
+            TrendingRepository._move_candidate_row(
+                connection,
+                source_row=base_row,
+                canonical_key=canonical_key,
+            )
             return canonical_key, current_year
-        return legacy_canonical_key, ""
+        return base_canonical_key, ""
 
     @staticmethod
-    def _move_legacy_candidate_row(
+    def _move_candidate_row(
         connection: sqlite3.Connection,
         *,
-        legacy: sqlite3.Row,
+        source_row: sqlite3.Row,
         canonical_key: str,
     ) -> None:
-        """Preserve the legacy row id while folding in an existing year-aware row."""
+        """Preserve the source row id while folding in a year-aware row."""
 
         current = connection.execute(
             """
@@ -323,16 +341,16 @@ class TrendingRepository:
             """,
             (canonical_key,),
         ).fetchone()
-        if current and int(current["id"]) != int(legacy["id"]):
+        if current and int(current["id"]) != int(source_row["id"]):
             protected_statuses = {"ignored", "importing", "imported", "import_failed"}
-            legacy_status = str(legacy["status"] or "")
+            source_status = str(source_row["status"] or "")
             current_status = str(current["status"] or "")
             merged_status = (
-                legacy_status
-                if legacy_status in protected_statuses
+                source_status
+                if source_status in protected_statuses
                 else current_status
                 if current_status in protected_statuses
-                else legacy_status or current_status or "discovered"
+                else source_status or current_status or "discovered"
             )
             connection.execute(
                 """
@@ -354,13 +372,13 @@ class TrendingRepository:
                     current["ignore_reason"],
                     current["first_seen_at"],
                     current["last_seen_at"],
-                    int(legacy["id"]),
+                    int(source_row["id"]),
                 ),
             )
             connection.execute("DELETE FROM trending_candidates WHERE id = ?", (int(current["id"]),))
         connection.execute(
             "UPDATE trending_candidates SET canonical_key = ? WHERE id = ?",
-            (canonical_key, int(legacy["id"])),
+            (canonical_key, int(source_row["id"])),
         )
 
     def get_candidate(self, candidate_id: int) -> dict[str, Any] | None:

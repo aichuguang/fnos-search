@@ -23,6 +23,7 @@ from .webdav_client import OpenListWebDAVClient
 WebDAVFactory = Callable[[dict[str, Any]], Any]
 DEFAULT_PROBE_ROOT = "/_fnos_probe"
 _MESSAGE_LIMIT = 300
+_OPTIONAL_WEBDAV_FILE_WRITE_PROVIDERS = frozenset({"mobile", "tianyi"})
 
 
 def _short(message: Any) -> str:
@@ -77,11 +78,19 @@ class OpenListMountService:
         connection_service: OpenListConnectionService | None = None,
         webdav_factory: WebDAVFactory | None = None,
         probe_root: str = DEFAULT_PROBE_ROOT,
+        relay_upload_capability_resolver: Callable[[str], bool] | None = None,
     ) -> None:
         self.database = database
         self.connection_service = connection_service
         self.webdav_factory = webdav_factory or self._default_webdav_factory
         self.probe_root = probe_root
+        self.relay_upload_capability_resolver = relay_upload_capability_resolver
+
+    def set_relay_upload_capability_resolver(
+        self,
+        resolver: Callable[[str], bool] | None,
+    ) -> None:
+        self.relay_upload_capability_resolver = resolver
 
     @staticmethod
     def _default_webdav_factory(credentials: dict[str, Any]) -> OpenListWebDAVClient:
@@ -90,6 +99,28 @@ class OpenListMountService:
             username=credentials["username"],
             password=credentials["password"],
         )
+
+    def requires_webdav_file_write_for_provider(self, provider_kind: Any) -> bool:
+        """Return whether a healthy mount must support WebDAV file uploads.
+
+        The OpenList ``189CloudPC`` driver does implement upload. However,
+        OpenList's WebDAV layer currently maps any underlying ``PutDirectly``
+        error to HTTP 405, so a failed probe does not prove that the driver or
+        WebDAV protocol lacks upload support. Relay-capable Providers in this
+        product write bytes through their frozen native uploader and use
+        OpenList only for visibility plus Organizer MOVE/DELETE operations.
+        Such a mount may therefore remain valid while staying
+        ``writable=False`` so ordinary rclone destination planning still fails
+        closed.
+        """
+
+        normalized = str(provider_kind or "").strip().lower()
+        if callable(self.relay_upload_capability_resolver):
+            try:
+                return not bool(self.relay_upload_capability_resolver(normalized))
+            except Exception:  # noqa: BLE001 - capability lookup fails closed
+                return True
+        return normalized not in _OPTIONAL_WEBDAV_FILE_WRITE_PROVIDERS
 
     # ---- 查询 / 序列化 ----
 
@@ -602,6 +633,7 @@ class OpenListMountService:
         expected_revision: int | None = None,
         expected_connection_revision: int | None = None,
         persist_result: bool = True,
+        require_webdav_file_write: bool | None = None,
     ) -> dict[str, Any]:
         with self.database.connect() as conn:
             row = self._get_mount_row(conn, mount_id)
@@ -635,15 +667,15 @@ class OpenListMountService:
             conflict.code = "OPENLIST_CONNECTION_CONFLICT"
             conflict.status = 409
             raise conflict
-        try:
-            credentials = self.connection_service.resolve_credentials(
-                row["connection_id"], connection_revision
-            )
-        except TypeError as exc:  # pragma: no cover - stale composition root
-            raise OpenListValidationError(
-                "OpenList connection service 不支持冻结 revision 凭证解析"
-            ) from exc
+        credentials = self.connection_service.resolve_credentials(
+            row["connection_id"], connection_revision
+        )
         client = self.webdav_factory(credentials)
+        write_required = (
+            self.requires_webdav_file_write_for_provider(row["provider_kind"])
+            if require_webdav_file_write is None
+            else bool(require_webdav_file_write)
+        )
         relative_probe = normalize_openlist_path(probe_root or row["probe_root"] or self.probe_root)
         root = normalize_openlist_path(posixpath.join(row["webdav_root"], relative_probe.lstrip("/")))
         task_dir = posixpath.join(root, f"fnos-probe-{uuid.uuid4().hex}")
@@ -666,6 +698,7 @@ class OpenListMountService:
                 writable=False,
                 connection_revision=connection_revision,
                 persist_result=persist_result,
+                write_required=write_required,
             )
 
         # 2) mount 根目录列举
@@ -686,7 +719,12 @@ class OpenListMountService:
                 client.mkcol(root)
             except Exception as exc:  # noqa: BLE001
                 probe_root_ok = False
-                checks.append({"name": "探测根目录", "ok": False, "required": True, "message": f"探测根目录创建/确认失败：{_short(exc)}"})
+                checks.append({
+                    "name": "探测根目录",
+                    "ok": False,
+                    "required": write_required,
+                    "message": f"探测根目录创建/确认失败：{_short(exc)}",
+                })
         else:
             probe_root_ok = False
 
@@ -698,13 +736,13 @@ class OpenListMountService:
                 probe_started = True
                 client.put_bytes(probe_file, probe_content)
                 created = True
-                checks.append({"name": "临时目录与文件创建", "ok": True, "required": True, "message": f"探测目录创建成功：{probe_file}"})
+                checks.append({"name": "临时目录与文件创建", "ok": True, "required": write_required, "message": f"探测目录创建成功：{probe_file}"})
             except Exception as exc:  # noqa: BLE001
                 # mkcol 成功但写文件失败时，目录仍在服务器上，交给清理步骤处理。
                 probe_started = True
-                checks.append({"name": "临时目录与文件创建", "ok": False, "required": True, "message": _short(exc)})
+                checks.append({"name": "临时目录与文件创建", "ok": False, "required": write_required, "message": _short(exc)})
         else:
-            checks.append({"name": "临时目录与文件创建", "ok": False, "required": True, "message": "根目录列举或探测根目录确认失败，未执行写入探测"})
+            checks.append({"name": "临时目录与文件创建", "ok": False, "required": write_required, "message": "根目录列举或探测根目录确认失败，未执行写入探测"})
 
         # 4) 读取文件大小与内容摘要
         read_ok = False
@@ -718,7 +756,7 @@ class OpenListMountService:
                 message = _short(exc)
         else:
             message = "临时文件未创建，跳过读取"
-        checks.append({"name": "文件读取（大小与内容）", "ok": read_ok, "required": True, "message": message})
+        checks.append({"name": "文件读取（大小与内容）", "ok": read_ok, "required": write_required, "message": message})
 
         # 5) rename / move 能力探测
         moved_path = posixpath.join(task_dir, "probe-moved.txt")
@@ -753,11 +791,20 @@ class OpenListMountService:
                 message = _short(exc)
                 residue.extend([probe_file, moved_path, task_dir])
         else:
-            message = "探测目录未创建，跳过清理"
-        checks.append({"name": "临时清理删除", "ok": delete_ok, "required": True, "message": message})
+            delete_ok = not write_required
+            message = "未创建临时对象，无需清理" if delete_ok else "探测目录未创建，跳过清理"
+        checks.append({
+            "name": "临时清理删除",
+            "ok": delete_ok,
+            # Once an object was created, cleanup is mandatory even when file
+            # upload itself is optional; otherwise a successful native-only
+            # probe could silently leave residue behind.
+            "required": bool(probe_started or write_required),
+            "message": message,
+        })
 
-        readable = bool(list_ok and read_ok)
-        writable = bool(created and delete_ok)
+        readable = bool(list_ok and (read_ok or not write_required))
+        writable = bool(created and read_ok and delete_ok)
         return self._finish(
             row,
             checks,
@@ -766,6 +813,7 @@ class OpenListMountService:
             writable=writable,
             connection_revision=connection_revision,
             persist_result=persist_result,
+            write_required=write_required,
         )
 
     def _finish(
@@ -778,6 +826,7 @@ class OpenListMountService:
         writable: bool,
         connection_revision: int,
         persist_result: bool = True,
+        write_required: bool = True,
     ) -> dict[str, Any]:
         mount_id = row["mount_id"]
         now = utc_now_iso()
@@ -842,6 +891,17 @@ class OpenListMountService:
                 updated = current
         errors = [str(item.get("message") or item.get("name") or "检测失败") for item in checks if item.get("required") and not item.get("ok")]
         ok = not errors
+        if ok and writable:
+            message = "mount 读写检测通过"
+        elif ok and readable and not write_required:
+            message = (
+                "mount \u8bfb\u53d6\u68c0\u6d4b\u901a\u8fc7\uff1bWebDAV "
+                "\u6587\u4ef6\u5199\u5165\u4e0d\u53ef\u7528\uff0c\u53ef\u7528\u4e8e Provider "
+                "\u539f\u751f\u94fe\u8def\uff0c\u4f46\u4e0d\u80fd\u4f5c\u4e3a\u8de8\u76d8 rclone "
+                "\u5199\u5165\u76ee\u6807"
+            )
+        else:
+            message = "mount 读写检测未通过"
         return {
             "success": ok,
             "ok": ok,
@@ -851,11 +911,12 @@ class OpenListMountService:
             "revision": int(updated["revision"] or 0),
             "readable": readable,
             "writable": writable,
+            "webdav_file_write_required": bool(write_required),
             "identity_status": identity_status,
             "checks": checks,
             "errors": errors,
             "residue_warnings": residue,
-            "message": "mount 读写检测通过" if ok else "mount 读写检测未通过",
+            "message": message,
         }
 
     def confirm_identity(
@@ -947,14 +1008,9 @@ class OpenListMountService:
         if self.connection_service is None:
             raise OpenListValidationError("缺少 connection_service")
         connection_revision = int(mount.get("connection_revision") or 0)
-        try:
-            credentials = self.connection_service.resolve_credentials(
-                mount["connection_id"], connection_revision or None
-            )
-        except TypeError as exc:  # pragma: no cover - stale composition root
-            raise OpenListValidationError(
-                "OpenList connection service 不支持冻结 revision 凭证解析"
-            ) from exc
+        credentials = self.connection_service.resolve_credentials(
+            mount["connection_id"], connection_revision or None
+        )
         if connection_revision and int(credentials.get("revision") or 0) != connection_revision:
             raise OpenListValidationError("OpenList connection 凭证 revision 不一致")
         return self.webdav_factory(credentials), mount
@@ -985,12 +1041,7 @@ class OpenListMountService:
             if current in visited:
                 continue
             visited.add(current)
-            try:
-                entries = client.list_dir(current)
-            except TypeError:
-                # Test doubles and older clients may not accept optional
-                # WebDAV depth arguments; the default remains depth=1.
-                entries = client.list_dir(current)
+            entries = client.list_dir(current)
             for item in entries or []:
                 if not isinstance(item, dict):
                     continue
@@ -1053,7 +1104,7 @@ def _mount_revision_json(row: Any, connection_revision: int) -> str:
     )
 
 
-def _native_locator(value: Any) -> dict[str, str]:
+def _native_locator(value: Any) -> dict[str, Any]:
     if value in (None, "", {}):
         return {}
     if not isinstance(value, dict):
@@ -1062,7 +1113,21 @@ def _native_locator(value: Any) -> dict[str, str]:
     locator_value = str(value.get("value") or "").strip()
     if not kind or not locator_value:
         raise OpenListValidationError("native_locator 必须包含 kind 和 value")
-    return {"kind": kind, "value": locator_value}
+    result: dict[str, Any] = {"kind": kind, "value": locator_value}
+    for key in ("upload_verified", "organizer_mutation_verified"):
+        if key in value:
+            result[key] = _to_bool(value.get(key), False)
+    for key in (
+        "upload_tested_at",
+        "organizer_tested_at",
+        "display_name",
+        "probe_message",
+        "probe_fingerprint",
+    ):
+        text = str(value.get(key) or "").strip()
+        if text:
+            result[key] = text[:500]
+    return result
 
 
 def _json_contains_mount_id(raw: Any, mount_id: str) -> bool:

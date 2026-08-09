@@ -1,23 +1,19 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import copy
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from fnos_media_import.app import _video_file_paths
+from fnos_media_import.web_input import _video_file_paths
 from fnos_media_import.services.callback_service import (
     CallbackDependencies,
     RcloneCallbackService,
 )
-from fnos_media_import.services.rclone_category_finalizer import (
-    RcloneCategoryFinalizer,
-)
 from fnos_media_import.services.rclone_job_feasibility import (
     RcloneJobFeasibilityEvaluator,
-)
-from fnos_media_import.services.rclone_run_import_finalizer import (
-    RcloneRunImportFinalizer,
 )
 from tests._rclone_v1_fixtures import (
     rclone_v1_job,
@@ -58,7 +54,7 @@ def _manifest_job(*names: str) -> dict:
     )
 
 
-class _CallbackDatabase:
+class _CallbackDatabase(RepositoryFakeMixin):
     def __init__(self, job: dict) -> None:
         self.job = copy.deepcopy(job)
         self.file_events: list[tuple] = []
@@ -96,7 +92,6 @@ def _callback_service(database: _CallbackDatabase) -> RcloneCallbackService:
             rclone=SimpleNamespace(),
             safe_int=_safe_int,
             callback_level=lambda _status: "info",
-            enqueue_organizer=lambda *_args: None,
             cancelled_status="cancelled",
         )
     )
@@ -190,95 +185,7 @@ class RcloneStagingManifestCallbackTests(unittest.TestCase):
                 self.assertEqual(database.file_events, [])
 
 
-class RcloneCrossRunManifestCompletionTests(unittest.TestCase):
-    @staticmethod
-    def _events() -> list[dict]:
-        return [
-            {
-                "id": 1,
-                "run_id": 10,
-                "job_id": JOB_ID,
-                "status": "done",
-                "category": "tv",
-                "source_path": f"{SOURCE_JOB_ROOT}/E01.mkv",
-                "target_path": f"{TARGET_JOB_ROOT}/E01.mkv",
-            },
-            {
-                "id": 2,
-                "run_id": 10,
-                "job_id": JOB_ID,
-                "status": "failed",
-                "category": "tv",
-                "source_path": f"{SOURCE_JOB_ROOT}/E02.mkv",
-                "target_path": f"{TARGET_JOB_ROOT}/E02.mkv",
-            },
-            {
-                "id": 3,
-                "run_id": 11,
-                "job_id": JOB_ID,
-                "status": "done",
-                "category": "tv",
-                "source_path": f"{SOURCE_JOB_ROOT}/E02.mkv",
-                "target_path": f"{TARGET_JOB_ROOT}/E02.mkv",
-            },
-        ]
-
-    @staticmethod
-    def _database(events: list[dict]):
-        class FakeDatabase:
-            @staticmethod
-            def list_all_rclone_file_events(**filters) -> list[dict]:
-                if filters.get("run_id"):
-                    return [
-                        item for item in events if item["run_id"] == filters["run_id"]
-                    ]
-                if filters.get("job_id"):
-                    return [
-                        item for item in events if item["job_id"] == filters["job_id"]
-                    ]
-                return list(events)
-
-            @staticmethod
-            def get_jobs_by_ids(_job_ids) -> dict[int, dict]:
-                return {JOB_ID: _manifest_job("E01.mkv", "E02.mkv")}
-
-            @staticmethod
-            def add_event(*_args, **_kwargs) -> None:
-                return None
-
-            @staticmethod
-            def add_rclone_event(*_args, **_kwargs) -> None:
-                return None
-
-            @staticmethod
-            def update_job(*_args, **_kwargs) -> None:
-                return None
-
-        return FakeDatabase()
-
-    def test_category_finalizer_uses_latest_terminal_events_across_runs(self) -> None:
-        completed: list = []
-        finalizer = RcloneCategoryFinalizer(
-            database=self._database(self._events()),
-            categories=lambda: {"tv": {}},
-            category_key=lambda *_args: "tv",
-            event_matches=lambda event, **_kwargs: event.get("job_id") == JOB_ID,
-            feasibility=RcloneJobFeasibilityEvaluator.evaluate,
-            finish_ready=lambda _run, _key, _category, items, _events, **_kwargs: (
-                completed.extend(items) or {"success": True, "completed_items": items}
-            ),
-        )
-
-        finalizer.finalize(
-            11,
-            "tv",
-            {"status": "category_done", "moved_count": 1, "failed_count": 0},
-        )
-
-        self.assertEqual(len(completed), 1)
-        self.assertEqual(len(completed[0][1]), 2)
-        self.assertTrue(completed[0][2]["ready"])
-
+class RcloneManifestFeasibilityTests(unittest.TestCase):
     def test_transport_manifest_keeps_sidecars_for_completion(self) -> None:
         names = ("E01.mp4", "E01.srt", "tvshow.nfo")
         source_paths = [f"{SOURCE_JOB_ROOT}/{name}" for name in names]
@@ -294,24 +201,6 @@ class RcloneCrossRunManifestCompletionTests(unittest.TestCase):
         self.assertEqual(verdict["expected_file_count"], 3)
         self.assertEqual(_video_file_paths(source_paths), [source_paths[0]])
 
-    def test_run_finalizer_uses_latest_terminal_events_across_runs(self) -> None:
-        completed: list = []
-        finalizer = RcloneRunImportFinalizer(
-            database=self._database(self._events()),
-            categories=lambda: {"tv": {}},
-            log=lambda _message: None,
-            feasibility=RcloneJobFeasibilityEvaluator.evaluate,
-            finish_ready=lambda _run, _key, _category, items, _events, **_kwargs: (
-                completed.extend(items) or {"success": True, "completed_items": items}
-            ),
-            dispatch_ready=lambda *_args: None,
-        )
-
-        finalizer.finalize(11, 0)
-
-        self.assertEqual(len(completed), 1)
-        self.assertEqual(len(completed[0][1]), 2)
-        self.assertTrue(completed[0][2]["ready"])
 
 
 class RcloneWorkerManifestOrderingTests(unittest.TestCase):
@@ -327,7 +216,9 @@ class RcloneWorkerManifestOrderingTests(unittest.TestCase):
         self.assertIn('--include "/${RCLONE_ONLY_JOB_DIR}/**"', self.content)
 
     def test_manifest_ack_happens_before_first_file_processing(self) -> None:
-        manifest_ack = self.content.index('if ! persist_staging_manifest "$file_list"')
+        manifest_ack = self.content.index(
+            'if ! persist_staging_manifest "$copy_file_list"'
+        )
         file_loop = self.content.index("while IFS= read -r file; do", manifest_ack)
         self.assertLess(manifest_ack, file_loop)
 
@@ -336,8 +227,12 @@ class RcloneWorkerManifestOrderingTests(unittest.TestCase):
         self.assertIn('payload["job_id"] = int(job_dir_match.group(1))', self.content)
 
     def test_unstable_listing_is_rejected_before_manifest(self) -> None:
-        failed_assignment = self.content.index('if ! file_list="$(stable_file_list')
-        manifest_ack = self.content.index('if ! persist_staging_manifest "$file_list"')
+        failed_assignment = self.content.index(
+            'if copy_file_list="$(stable_file_list'
+        )
+        manifest_ack = self.content.index(
+            'if ! persist_staging_manifest "$copy_file_list"'
+        )
         self.assertLess(failed_assignment, manifest_ack)
 
 

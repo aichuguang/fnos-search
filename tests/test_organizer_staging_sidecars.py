@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from types import SimpleNamespace
 
-from fnos_media_import.constants import JOB_REVIEW, ROUTE_QUARK_TO_MOBILE
+from fnos_media_import.constants import JOB_REVIEW
 from fnos_media_import.organizer.openlist_client import OpenListError, OpenListItem, OpenListTransientError
 from fnos_media_import.organizer.parser import (
     V1_DESTINATION_FINAL_FIELD,
@@ -31,7 +33,7 @@ PLAN = organizer_v1_plan(
 JOB = organizer_v1_job(PLAN, status="waiting_organizer")
 
 
-class _PlanDatabase:
+class _PlanDatabase(RepositoryFakeMixin):
     @staticmethod
     def get_job(_job_id: int) -> dict:
         return JOB
@@ -71,7 +73,7 @@ def _video_mapping() -> dict:
     }
 
 
-class _ApplyBoundaryDatabase:
+class _ApplyBoundaryDatabase(RepositoryFakeMixin):
     def __init__(self, mapping: dict) -> None:
         self.task = {
             **_task(),
@@ -80,7 +82,7 @@ class _ApplyBoundaryDatabase:
             "operations": [],
             "evidence": {},
         }
-        self.job = {**JOB, "target_route": ROUTE_QUARK_TO_MOBILE}
+        self.job = {**JOB, "source_provider_kind": "quark", "source_form": "share"}
         self.run_updates: list[tuple[int, str, dict]] = []
         self.events: list[tuple] = []
 
@@ -105,8 +107,23 @@ class _ApplyBoundaryDatabase:
     def update_job(self, _job_id: int, **values) -> None:
         self.job.update(values)
 
+    def update_job_if_status(
+        self,
+        _job_id: int,
+        expected_statuses: set[str],
+        **values,
+    ) -> bool:
+        if str(self.job.get("status") or "") not in expected_statuses:
+            return False
+        self.job.update(values)
+        return True
+
     def add_event(self, *args) -> None:
         self.events.append(args)
+
+    @staticmethod
+    def list_guest_requests_by_job(_job_id: int) -> list[dict]:
+        return []
 
     @staticmethod
     def release_organizer_locks(**_values) -> None:

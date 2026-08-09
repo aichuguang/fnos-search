@@ -47,17 +47,12 @@ class PublicSubmissionService:
     ) -> dict[str, Any] | None:
         if not enabled or scoped_selection:
             return None
-        try:
-            duplicate = self._deps.queries.find_recent_by_url(
-                source_url=source_url,
-                category=category,
-                within_minutes=within_minutes,
-                destination_id=str(destination_id or "").strip() or None,
-            )
-        except TypeError:
-            duplicate = self._deps.queries.find_recent_by_url(
-                source_url=source_url, category=category, within_minutes=within_minutes
-            )
+        duplicate = self._deps.queries.find_recent_by_url(
+            source_url=source_url,
+            category=category,
+            within_minutes=within_minutes,
+            destination_id=str(destination_id or "").strip() or None,
+        )
         if not duplicate:
             return None
         duplicate = self._deps.sync_request(duplicate)

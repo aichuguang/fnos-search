@@ -29,7 +29,7 @@ from ..constants import (
     JOB_WAITING_OPENLIST,
     JOB_WAITING_ORGANIZER,
 )
-from ..database import Database
+from ..repositories.repository_set import OrganizerRepositories
 from ..media.fnos import FnosMediaRefresher
 from ..media_path_rules import sanitize_resource_dir_name, split_title_year
 from ..planning.job_plan import (
@@ -405,13 +405,15 @@ def build_frozen_openlist_client_resolver(
 class OrganizerService:
     def __init__(
         self,
-        db: Database,
+        db: OrganizerRepositories,
         config: dict[str, Any],
         categories: dict[str, dict[str, Any]],
         fnos: FnosMediaRefresher | None = None,
         *,
         recover_on_startup: bool = True,
         owner_id: str = "",
+        openlist_client_resolver: OpenListClientResolver | None = None,
+        execution_repository: Any = None,
     ) -> None:
         self.db = db
         self.config = config or {}
@@ -422,8 +424,12 @@ class OrganizerService:
         # enqueue/status checks only.  Task execution always installs a
         # resolver-produced client in the thread-local scope below.
         self.openlist = OpenListClient(self.config.get("openlist", {}))
-        self._openlist_client_resolver: OpenListClientResolver | None = None
-        self._execution_repository: Any = None
+        self._openlist_client_resolver = (
+            openlist_client_resolver
+            if callable(openlist_client_resolver)
+            else None
+        )
+        self._execution_repository = execution_repository
         self._openlist_context = threading.local()
         self.tmdb = TmdbClient(self.config.get("tmdb", {}))
         self.ai = AiCalibrator(self.config.get("ai", {}))
@@ -691,12 +697,9 @@ class OrganizerService:
 
     def _recover_stale_runs_on_startup(self) -> None:
         try:
-            try:
-                result = self.db.recover_stale_organizer_runs(
-                    owner_id=self.owner_id,
-                )
-            except TypeError:
-                result = self.db.recover_stale_organizer_runs()
+            result = self.db.organizer.recover_stale_organizer_runs(
+                owner_id=self.owner_id,
+            )
             count = int(result.get("count") or 0) if isinstance(result, dict) else int(result or 0)
             if count:
                 logger.warning("recovered stale organizer runs on startup: %s", count)
@@ -706,10 +709,10 @@ class OrganizerService:
                 job_id = _safe_positive_int(item.get("job_id"))
                 if not task_id or not job_id:
                     continue
-                job = self.db.get_job(job_id) or {}
+                job = self.db.job_queries.get(job_id) or {}
                 if str(job.get("status") or "") in {JOB_DONE, JOB_REVIEW, JOB_CANCELLED}:
                     continue
-                task = self.db.get_organizer_task(task_id, include_children=False) or {}
+                task = self.db.organizer.get_organizer_task(task_id, include_children=False) or {}
                 _job, _plan, rejection = self._task_v1_plan(
                     task,
                     context="Organizer stale-run recovery",
@@ -736,17 +739,21 @@ class OrganizerService:
             for organizer_status in ("done", "skipped"):
                 offset = 0
                 while True:
-                    page = self.db.list_organizer_tasks(limit=200, status=organizer_status, offset=offset)
+                    page = self.db.organizer.list_organizer_tasks(limit=200, status=organizer_status, offset=offset)
                     if not page:
                         break
                     for task in page:
-                        if organizer_status == "skipped" and not self._skipped_task_has_completion_evidence(task):
-                            continue
                         task_id = _safe_positive_int(task.get("id"))
                         job_id = _safe_positive_int(task.get("job_id"))
                         if not task_id or not job_id:
                             continue
-                        job = self.db.get_job(job_id) or {}
+                        job = self.db.job_queries.get(job_id) or {}
+                        if (
+                            organizer_status == "skipped"
+                            and not self._skipped_task_has_completion_evidence(task)
+                            and str(job.get("status") or "").strip().lower() != JOB_DONE
+                        ):
+                            continue
                         _validated_job, _validated_plan, rejection = self._task_v1_plan(
                             task,
                             context="Organizer startup completion recovery",
@@ -831,20 +838,20 @@ class OrganizerService:
         confirmation = evidence.get("completion_confirmation")
         if isinstance(confirmation, dict) and confirmation:
             return confirmation.get("success") is True
-        return True
+        return False
 
     def _recover_transient_scan_tasks_on_startup(self, *, include_scanning: bool = True) -> None:
         if not self.enabled or not callable(getattr(self, "_openlist_client_resolver", None)):
             return
         try:
             tasks: list[dict[str, Any]] = []
-            statuses = ["failed", "waiting_openlist", "stabilizing", "pending", "strm_pending"]
+            statuses = ["failed", "waiting_openlist", "stabilizing", "pending"]
             if include_scanning:
                 statuses.append("scanning")
             for status in statuses:
                 offset = 0
                 while True:
-                    page = self.db.list_organizer_tasks(limit=100, status=status, offset=offset)
+                    page = self.db.organizer.list_organizer_tasks(limit=100, status=status, offset=offset)
                     tasks.extend(page)
                     if len(page) < 100:
                         break
@@ -860,19 +867,7 @@ class OrganizerService:
                 if abort_reason and "关联入库任务已取消" in abort_reason:
                     self._cancel_task_for_cancelled_job(task, abort_reason)
                     continue
-                # Startup recovery is V1-only. Unlinked/legacy tasks are kept
-                # as read-only migration evidence and are never rescheduled.
                 status = str(task.get("status") or "").strip().lower()
-                if status == "strm_pending":
-                    raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-                    strm_state = raw_data.get("strm_completion") if isinstance(raw_data.get("strm_completion"), dict) else {}
-                    if str(strm_state.get("status") or "") != "pending":
-                        continue
-                    task_id = _safe_positive_int(task.get("id"))
-                    if task_id:
-                        delay = _remaining_retry_delay_seconds(strm_state.get("next_retry_at"), fallback=5)
-                        self._schedule_task_after(task_id, delay)
-                    continue
                 if status == "failed":
                     error = str(task.get("error_message") or "").lower()
                     if not self._task_retries_openlist_visibility(task):
@@ -911,10 +906,10 @@ class OrganizerService:
                             "clear_scan_lease": True,
                         }
                     )
-                try:
-                    recovered = self.db.update_organizer_task(task_id, **update_values)
-                except TypeError:
-                    recovered = self.db.update_organizer_task(task_id, status="waiting_openlist", error_message="")
+                recovered = self.db.organizer.update_organizer_task(
+                    task_id,
+                    **update_values,
+                )
                 if recovered is False:
                     continue
                 self._sync_linked_job(
@@ -966,7 +961,7 @@ class OrganizerService:
         job_id = _safe_positive_int((task or {}).get("job_id"))
         if not job_id:
             return False
-        job = self.db.get_job(job_id)
+        job = self.db.job_queries.get(job_id)
         current_status = str((job or {}).get("status") or "").strip()
         if not isinstance(job, dict) or not current_status:
             return False
@@ -1005,18 +1000,15 @@ class OrganizerService:
             "error_message": error_message,
             "raw_data": _merge_raw_data(raw_data, {"completion": payload}),
         }
-        updater = getattr(self.db, "update_job_if_status", None)
-        if callable(updater):
-            updated = bool(updater(job_id, {current_status}, **updates))
-        else:
-            latest = self.db.get_job(job_id) or {}
-            if str(latest.get("status") or "").strip() != current_status:
-                updated = False
-            else:
-                self.db.update_job(job_id, **updates)
-                updated = True
+        updated = bool(
+            self.db.job_commands.update_if_status(
+                job_id,
+                {current_status},
+                **updates,
+            )
+        )
         if not updated:
-            latest = self.db.get_job(job_id) or job
+            latest = self.db.job_queries.get(job_id) or job
             logger.info(
                 "organizer_linked_job_cas_conflict task_id=%s job_id=%s expected_status=%s current_status=%s requested_status=%s",
                 (task or {}).get("id"),
@@ -1026,7 +1018,7 @@ class OrganizerService:
                 status,
             )
             return False
-        self.db.add_event(job_id, level, message, {"completion": payload})
+        self.db.job_commands.add_event(job_id, level, message, {"completion": payload})
         self._sync_linked_guest_requests(
             job_id,
             status=status,
@@ -1041,13 +1033,9 @@ class OrganizerService:
         status: str,
         organizer_task_id: int | None,
     ) -> int:
-        list_requests = getattr(self.db, "list_guest_requests_by_job", None)
-        transition_request = getattr(self.db, "transition_guest_request_with_event", None)
-        if not callable(list_requests) or not callable(transition_request):
-            return 0
         public_status = JOB_STATUS_LABELS.get(status, status)
         changed = 0
-        for item in list_requests(job_id):
+        for item in self.db.guest_request_queries.list_by_job(job_id):
             request_id = _safe_positive_int(item.get("id"))
             current_status = str(item.get("status") or "").strip().lower()
             if not request_id or current_status in {"rejected", "cancelled", "unsupported"}:
@@ -1059,7 +1047,7 @@ class OrganizerService:
                 "job_status": status,
                 "organizer_task_id": organizer_task_id,
             }
-            transitioned = transition_request(
+            transitioned = self.db.guest_request_commands.transition_with_event(
                 request_id,
                 expected_statuses={current_status},
                 status=status,
@@ -1088,14 +1076,9 @@ class OrganizerService:
             return f"Organizer 任务状态已变化：{task_status or '未知'}"
         job_id = _safe_positive_int(task.get("job_id"))
         if job_id:
-            get_job = getattr(self.db, "get_job", None)
-            if callable(get_job):
-                try:
-                    job = get_job(job_id) or {}
-                except Exception:  # noqa: BLE001
-                    job = {}
-                if str(job.get("status") or "").strip().lower() == JOB_CANCELLED:
-                    return "关联入库任务已取消"
+            job = self.db.job_queries.get(job_id) or {}
+            if str(job.get("status") or "").strip().lower() == JOB_CANCELLED:
+                return "关联入库任务已取消"
         return ""
 
     def _ensure_task_active(
@@ -1106,7 +1089,7 @@ class OrganizerService:
         expected_revision: int | None = None,
         scan_owner: str = "",
     ) -> dict[str, Any]:
-        task = self.db.get_organizer_task(task_id)
+        task = self.db.organizer.get_organizer_task(task_id)
         reason = self._task_abort_reason(task, allowed_statuses=allowed_statuses)
         if not reason and expected_revision is not None:
             current_revision = _safe_positive_int((task or {}).get("revision")) or 1
@@ -1132,29 +1115,14 @@ class OrganizerService:
         expected_revision = _safe_positive_int(task.get("revision"))
         if not task_id or expected_status.lower() in ORGANIZER_CANCELLATION_TERMINAL_STATUSES:
             return False
-        if not expected_status:
-            # Lightweight/legacy adapters sometimes expose partial task rows
-            # without status/revision.  Production Database rows always carry
-            # both fields and therefore always use the CAS branch below.
-            result = self.db.update_organizer_task(task_id, **updates)
-            return result is not False
+        if not expected_status or not expected_revision:
+            return False
         guarded = {
             **updates,
             "expected_statuses": {expected_status},
         }
-        if expected_revision:
-            guarded["expected_revision"] = expected_revision
-        try:
-            result = self.db.update_organizer_task(task_id, **guarded)
-        except TypeError:
-            latest = self.db.get_organizer_task(task_id, include_children=False) or {}
-            latest_status = str(latest.get("status") or "").strip()
-            latest_revision = _safe_positive_int(latest.get("revision"))
-            if latest_status != expected_status or (
-                expected_revision and latest_revision and latest_revision != expected_revision
-            ):
-                return False
-            result = self.db.update_organizer_task(task_id, **updates)
+        guarded["expected_revision"] = expected_revision
+        result = self.db.organizer.update_organizer_task(task_id, **guarded)
         return result is not False
 
     def _cancel_organizer_task(
@@ -1162,49 +1130,37 @@ class OrganizerService:
         task: dict[str, Any],
         reason: str,
     ) -> tuple[str, dict[str, Any]]:
-        """Cancel one task without allowing a stale snapshot to replace ``done``.
-
-        The production database exposes a dedicated atomic cancellation update.
-        The guarded CAS fallback keeps lightweight test/adaptor databases
-        compatible and retries after re-reading a concurrently changed task.
-        """
+        """Cancel one task without allowing a stale snapshot to replace ``done``."""
 
         task_id = _safe_positive_int(task.get("id"))
         if not task_id:
             return "missing", {}
         latest = task
-        atomic_cancel = getattr(self.db, "cancel_organizer_task", None)
-        getter = getattr(self.db, "get_organizer_task", None)
         for attempt in range(ORGANIZER_CANCELLATION_MAX_ATTEMPTS):
-            if attempt and callable(getter):
-                latest = getter(task_id, include_children=False) or {}
+            if attempt:
+                latest = self.db.organizer.get_organizer_task(
+                    task_id,
+                    include_children=False,
+                ) or {}
             status = str(latest.get("status") or "").strip().lower()
             if not latest:
                 return "missing", {}
             if status in ORGANIZER_CANCELLATION_TERMINAL_STATUSES:
                 return status, latest
-            if callable(atomic_cancel):
-                updated = atomic_cancel(task_id, reason=reason)
-            else:
-                updated = self.db.update_organizer_task(
-                    task_id,
-                    status="cancelled",
-                    error_message=reason,
-                    expected_revision=_safe_positive_int(latest.get("revision")) or 1,
-                    expected_statuses={status},
-                    bump_revision=True,
-                    clear_scan_lease=True,
-                )
+            updated = self.db.organizer.cancel_organizer_task(task_id, reason=reason)
             if updated:
-                current = getter(task_id, include_children=False) if callable(getter) else None
+                current = self.db.organizer.get_organizer_task(
+                    task_id,
+                    include_children=False,
+                )
                 return "cancelled", current or {**latest, "status": "cancelled", "error_message": reason}
-            if callable(getter):
-                latest = getter(task_id, include_children=False) or {}
-                current_status = str(latest.get("status") or "").strip().lower()
-                if current_status in ORGANIZER_CANCELLATION_TERMINAL_STATUSES:
-                    return current_status, latest
-            else:
-                break
+            latest = self.db.organizer.get_organizer_task(
+                task_id,
+                include_children=False,
+            ) or {}
+            current_status = str(latest.get("status") or "").strip().lower()
+            if current_status in ORGANIZER_CANCELLATION_TERMINAL_STATUSES:
+                return current_status, latest
         return "conflict", latest
 
     def _cancel_task_for_cancelled_job(self, task: dict[str, Any], reason: str) -> bool:
@@ -1217,7 +1173,7 @@ class OrganizerService:
         normalized_job_id = _safe_positive_int(job_id)
         if not normalized_job_id:
             return {"success": False, "message": "缺少有效任务 ID", "task_ids": []}
-        tasks = self.db.list_organizer_tasks_by_job(normalized_job_id, limit=1000)
+        tasks = self.db.organizer.list_organizer_tasks_by_job(normalized_job_id, limit=1000)
         task_ids: list[int] = []
         cancelled_ids: list[int] = []
         conflicts: list[int] = []
@@ -1254,7 +1210,7 @@ class OrganizerService:
         }
 
     def _mark_linked_job_waiting(self, task_id: int) -> None:
-        task = self.db.get_organizer_task(task_id, include_children=False) or {}
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False) or {}
         self._sync_linked_job(
             task,
             status=JOB_WAITING_ORGANIZER,
@@ -1276,13 +1232,13 @@ class OrganizerService:
         return self.ai.test()
 
     def list_tasks(self, *, limit: int = 100, status: str | None = None, offset: int = 0) -> list[dict[str, Any]]:
-        return self.db.list_organizer_tasks(limit=limit, status=status, offset=offset)
+        return self.db.organizer.list_organizer_tasks(limit=limit, status=status, offset=offset)
 
     def get_task(self, task_id: int) -> dict[str, Any] | None:
-        return self.db.get_organizer_task(task_id)
+        return self.db.organizer.get_organizer_task(task_id)
 
     def list_runs(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-        return self.db.list_organizer_runs(limit=limit, offset=offset)
+        return self.db.organizer.list_organizer_runs(limit=limit, offset=offset)
 
     def create_manual_task(self, payload: dict[str, Any], *, defer_process: bool = False) -> dict[str, Any]:
         _ = payload, defer_process
@@ -1341,7 +1297,7 @@ class OrganizerService:
         # 关联 Job 必须拥有自己的 Organizer task。复用同根目录下另一个 Job
         # 的任务会导致后者完成时只同步原 Job，当前 Job 永久停在 waiting。
         # 真正执行阶段已有 root/category 锁负责串行化。
-        guest_requests = self.db.list_guest_requests_by_job(job_id) if job_id else []
+        guest_requests = self.db.guest_request_queries.list_by_job(job_id) if job_id else []
         request_id = int(guest_requests[0]["id"]) if guest_requests else None
         title = str((job or {}).get("title") or payload.get("title") or filename or "").strip()
         task_id, created = self._get_or_create_organizer_task(
@@ -1359,7 +1315,12 @@ class OrganizerService:
                 "filename": filename,
                 "source_path": source_path,
                 "target_path": target_path,
-                "job": {"id": (job or {}).get("id"), "title": (job or {}).get("title"), "source_type": (job or {}).get("source_type")},
+                "job": {
+                    "id": (job or {}).get("id"),
+                    "title": (job or {}).get("title"),
+                    "source_provider_kind": (job or {}).get("source_provider_kind"),
+                    "source_form": (job or {}).get("source_form"),
+                },
                 "naming_plan": payload.get("naming_plan"),
             },
             raw_data={**payload, "execution_plan_ref": self._execution_plan_ref(job, v1_plan)},
@@ -1387,7 +1348,12 @@ class OrganizerService:
         guarded_job, v1_plan, rejection = self._guard_enqueue_job(
             job,
             context='Organizer completed-directory enqueue',
-            allowed_strategies={"native_save", "native_offline", "rclone_copy", "relay_upload_mobile"},
+            allowed_strategies={
+                "native_save",
+                "native_offline",
+                "rclone_copy",
+                "relay_upload_provider",
+            },
         )
         if rejection:
             return rejection
@@ -1416,8 +1382,7 @@ class OrganizerService:
             return reject_non_v1_job(self.db, job, context="Organizer completed-directory enqueue", error=error)
         job_id = int((job or {}).get("id") or 0) or None
         if job_id:
-            get_job = getattr(self.db, "get_job", None)
-            latest_job = (get_job(job_id) if callable(get_job) else None) or job or {}
+            latest_job = self.db.job_queries.get(job_id) or job or {}
             if str(latest_job.get("status") or "").strip().lower() == JOB_CANCELLED:
                 return {
                     "success": False,
@@ -1433,7 +1398,7 @@ class OrganizerService:
                 job=job,
                 requested_root=normalized_root,
             )
-        guest_requests = self.db.list_guest_requests_by_job(job_id) if job_id else []
+        guest_requests = self.db.guest_request_queries.list_by_job(job_id) if job_id else []
         request_id = int(guest_requests[0]["id"]) if guest_requests else None
         title = _title_from_update_payload(payload, job or {}, normalized_root)
         task_id, created = self._get_or_create_organizer_task(
@@ -1446,7 +1411,15 @@ class OrganizerService:
             job_id=job_id,
             request_id=request_id,
             status="stabilizing",
-            evidence={"root_path": normalized_root, "job": {"id": job_id, "title": title, "source_type": (job or {}).get("source_type")}},
+            evidence={
+                "root_path": normalized_root,
+                "job": {
+                    "id": job_id,
+                    "title": title,
+                    "source_provider_kind": (job or {}).get("source_provider_kind"),
+                    "source_form": (job or {}).get("source_form"),
+                },
+            },
             raw_data={**payload, "execution_plan_ref": self._execution_plan_ref(job, v1_plan)},
         )
         if not created:
@@ -1457,10 +1430,9 @@ class OrganizerService:
                 requested_root=normalized_root,
             )
         if job_id:
-            get_job = getattr(self.db, "get_job", None)
-            latest_job = (get_job(job_id) if callable(get_job) else None) or job or {}
+            latest_job = self.db.job_queries.get(job_id) or job or {}
             if str(latest_job.get("status") or "").strip().lower() == JOB_CANCELLED:
-                cancelled_task = self.db.get_organizer_task(task_id, include_children=False) or {
+                cancelled_task = self.db.organizer.get_organizer_task(task_id, include_children=False) or {
                     "id": task_id,
                     "job_id": job_id,
                     "status": "stabilizing",
@@ -1485,16 +1457,16 @@ class OrganizerService:
     def _get_or_create_organizer_task(self, *, job_id: int | None, **task_values: Any) -> tuple[int, bool]:
         if not _safe_positive_int(job_id):
             raise JobPlanError("Organizer task creation requires a linked V1 import job")
-        atomic_creator = getattr(self.db, "get_or_create_organizer_task_for_job", None)
-        if callable(atomic_creator):
-            return atomic_creator(job_id=int(job_id), **task_values)
-        return self.db.create_organizer_task(job_id=job_id, **task_values), True
+        return self.db.organizer.get_or_create_organizer_task_for_job(
+            job_id=int(job_id),
+            **task_values,
+        )
 
     def _existing_task_for_job(self, job_id: int | None) -> dict[str, Any] | None:
         if not job_id:
             return None
         try:
-            rows = self.db.list_organizer_tasks_by_job(int(job_id), limit=1)
+            rows = self.db.organizer.list_organizer_tasks_by_job(int(job_id), limit=1)
         except Exception:  # noqa: BLE001
             return None
         return rows[0] if rows else None
@@ -1520,7 +1492,7 @@ class OrganizerService:
                         "success": False,
                         "queued": False,
                         "task_id": task_id,
-                        "status": str((self.db.get_organizer_task(task_id, include_children=False) or task).get("status") or ""),
+                        "status": str((self.db.organizer.get_organizer_task(task_id, include_children=False) or task).get("status") or ""),
                         "message": "Organizer 任务状态已变化，未用复用校验结果覆盖当前状态",
                     }
             except Exception:  # noqa: BLE001
@@ -1631,7 +1603,7 @@ class OrganizerService:
                 logger.debug("close Organizer diagnostic OpenList client failed", exc_info=True)
 
     def _schedule_initial_openlist_visibility_wait(self, task_id: int) -> bool:
-        task = self.db.get_organizer_task(task_id, include_children=False) or {}
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False) or {}
         if not self._task_waits_for_openlist_visibility(task):
             return False
         delays = self._openlist_visibility_retry_delays()
@@ -1668,20 +1640,20 @@ class OrganizerService:
         return True
 
     def _process_task_safely(self, task_id: int) -> None:
-        task = self.db.get_organizer_task(task_id, include_children=False) or {}
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False) or {}
         abort_reason = self._task_abort_reason(task)
         if abort_reason:
             if "关联入库任务已取消" in abort_reason:
                 self._cancel_task_for_cancelled_job(task, abort_reason)
             return
-        if str(task.get("status") or "") not in {"pending", "stabilizing", "waiting_openlist", "strm_pending"}:
+        if str(task.get("status") or "") not in {"pending", "stabilizing", "waiting_openlist"}:
             # 延时 Timer 在运行时配置重载后可能存在旧实例回调。任务已失败、
             # 已完成或正在扫描时直接忽略过期回调，避免同一错误被重复写入。
             return
         try:
             self.process_task(task_id, auto_apply=True)
         except Exception as exc:  # noqa: BLE001
-            latest = self.db.get_organizer_task(task_id, include_children=False) or task
+            latest = self.db.organizer.get_organizer_task(task_id, include_children=False) or task
             self._update_organizer_task_from_snapshot(
                 latest,
                 status="failed",
@@ -1708,11 +1680,10 @@ class OrganizerService:
 
     def _linked_job(self, task: dict[str, Any] | None) -> dict[str, Any] | None:
         job_id = _safe_positive_int((task or {}).get("job_id"))
-        getter = getattr(self.db, "get_job", None)
-        if not job_id or not callable(getter):
+        if not job_id:
             return None
         try:
-            value = getter(job_id)
+            value = self.db.job_queries.get(job_id)
         except Exception:  # noqa: BLE001
             logger.debug("organizer linked job lookup failed job_id=%s", job_id, exc_info=True)
             return None
@@ -1846,10 +1817,9 @@ class OrganizerService:
 
         candidate = job if isinstance(job, dict) else {}
         job_id = _safe_positive_int(candidate.get("id"))
-        getter = getattr(self.db, "get_job", None)
-        if job_id and callable(getter):
+        if job_id:
             try:
-                candidate = getter(job_id) or candidate
+                candidate = self.db.job_queries.get(job_id) or candidate
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -2109,15 +2079,12 @@ class OrganizerService:
                 "error_message": failure_message,
                 "raw_data": raw_data,
             }
-            try:
-                updated = self.db.update_organizer_task(
-                    task_id,
-                    expected_statuses={"waiting_openlist"},
-                    expected_revision=expected_revision,
-                    **update_values,
-                )
-            except TypeError:
-                updated = self.db.update_organizer_task(task_id, **update_values)
+            updated = self.db.organizer.update_organizer_task(
+                task_id,
+                expected_statuses={"waiting_openlist"},
+                expected_revision=expected_revision,
+                **update_values,
+            )
             if updated is False:
                 raise OrganizerScanLeaseLost("Organizer 任务状态已变化，拒绝覆盖后台调度结果")
             self._sync_linked_job(
@@ -2174,7 +2141,7 @@ class OrganizerService:
                 return self.process_task(task_id, auto_apply=auto_apply)
             finally:
                 worker_context.active = False
-        task = self.db.get_organizer_task(task_id, include_children=False)
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer worker")
@@ -2221,12 +2188,6 @@ class OrganizerService:
             if deadline:
                 return _remaining_retry_delay_seconds(deadline, fallback=0), deadline
             return 0, ""
-        if status == "strm_pending":
-            state = raw_data.get("strm_completion") if isinstance(raw_data.get("strm_completion"), dict) else {}
-            deadline = str(state.get("next_retry_at") or "").strip()
-            if deadline:
-                return _remaining_retry_delay_seconds(deadline, fallback=0), deadline
-            return 0, ""
         if status not in {"stabilizing", "pending"}:
             return 0, ""
         try:
@@ -2266,7 +2227,7 @@ class OrganizerService:
         **updates: Any,
     ) -> bool:
         if scan_revision is None:
-            result = self.db.update_organizer_task(task_id, **updates)
+            result = self.db.organizer.update_organizer_task(task_id, **updates)
             return result is not False
         guarded = {
             **updates,
@@ -2274,18 +2235,13 @@ class OrganizerService:
             "expected_revision": scan_revision,
             "clear_scan_lease": clear_scan_lease,
         }
-        try:
-            result = self.db.update_organizer_task(task_id, **guarded)
-        except TypeError:
-            # Lightweight integrations predating scan revisions remain usable;
-            # the production Database always enforces the guarded branch.
-            result = self.db.update_organizer_task(task_id, **updates)
+        result = self.db.organizer.update_organizer_task(task_id, **guarded)
         return result is not False
 
     def process_task(self, task_id: int, *, auto_apply: bool = True) -> dict[str, Any]:
         """Scan one task using the OpenList connection frozen in its V1 plan."""
 
-        task = self.db.get_organizer_task(task_id, include_children=False)
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
         _job, plan, rejection = self._task_v1_plan(task, context="Organizer scan")
@@ -2298,7 +2254,6 @@ class OrganizerService:
         if (
             self._task_abort_reason(task)
             or status == "done"
-            or (status == "strm_pending" and not auto_apply)
         ):
             return self._process_task_v1(task_id, auto_apply=auto_apply)
         try:
@@ -2312,7 +2267,7 @@ class OrganizerService:
             )
 
     def _process_task_v1(self, task_id: int, *, auto_apply: bool = True) -> dict[str, Any]:
-        task = self.db.get_organizer_task(task_id, include_children=False)
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer scan")
@@ -2332,16 +2287,6 @@ class OrganizerService:
             }
         if str(task.get("status") or "") == "done":
             return {"success": True, "task_id": task_id, "status": "done", "message": "标准化任务已完成，无需重复扫描"}
-        if str(task.get("status") or "") == "strm_pending":
-            if auto_apply:
-                return self.apply_task(task_id)
-            return {
-                "success": True,
-                "deferred": True,
-                "task_id": task_id,
-                "status": "strm_pending",
-                "message": "历史任务已完成真实媒体整理，下一次执行将按新规则直接收尾，不再等待 STRM",
-            }
         claimable_statuses = {
             "pending",
             "stabilizing",
@@ -2351,55 +2296,35 @@ class OrganizerService:
             "auto_approved",
             "manual_confirmed",
         }
-        claimer = getattr(self.db, "claim_organizer_task_for_scan", None)
         scan_revision: int | None = None
         scan_lease: OrganizerScanLease | None = None
-        if callable(claimer):
-            try:
-                claimed = claimer(
-                    task_id,
-                    allowed_statuses=claimable_statuses,
-                    owner_id=getattr(self, "owner_id", "organizer"),
-                    lease_seconds=self._organizer_scan_lease_seconds(),
-                )
-            except TypeError:
-                claimed = claimer(task_id, allowed_statuses=claimable_statuses)
-            if not claimed:
-                current = self.db.get_organizer_task(task_id, include_children=False) or task
-                status = str(current.get("status") or "")
-                return {
-                    "success": True,
-                    "skipped": True,
-                    "task_id": task_id,
-                    "status": status,
-                    "message": "标准化任务已由另一执行器接管，本次跳过重复扫描",
-                }
-            task = self.db.get_organizer_task(task_id, include_children=False) or {**task, "status": "scanning"}
-            scan_revision = _safe_positive_int(task.get("revision")) or 1
-            scan_lease = OrganizerScanLease(
-                database=self.db,
-                task_id=task_id,
-                owner_id=getattr(self, "owner_id", "organizer"),
-                revision=scan_revision,
-                lease_seconds=self._organizer_scan_lease_seconds(),
-                heartbeat_interval_seconds=self._organizer_scan_heartbeat_interval(),
-                log=lambda message: logger.warning("%s", message),
-            )
-        else:
-            if not self._update_organizer_task_from_snapshot(
-                task,
-                status="scanning",
-                error_message="",
-            ):
-                current = self.db.get_organizer_task(task_id, include_children=False) or task
-                return {
-                    "success": True,
-                    "skipped": True,
-                    "task_id": task_id,
-                    "status": str(current.get("status") or ""),
-                    "message": "标准化任务状态已变化，本次跳过重复扫描",
-                }
-            task = {**task, "status": "scanning"}
+        claimed = self.db.organizer.claim_organizer_task_for_scan(
+            task_id,
+            allowed_statuses=claimable_statuses,
+            owner_id=getattr(self, "owner_id", "organizer"),
+            lease_seconds=self._organizer_scan_lease_seconds(),
+        )
+        if not claimed:
+            current = self.db.organizer.get_organizer_task(task_id, include_children=False) or task
+            status = str(current.get("status") or "")
+            return {
+                "success": True,
+                "skipped": True,
+                "task_id": task_id,
+                "status": status,
+                "message": "标准化任务已由另一执行器接管，本次跳过重复扫描",
+            }
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False) or {**task, "status": "scanning"}
+        scan_revision = _safe_positive_int(task.get("revision")) or 1
+        scan_lease = OrganizerScanLease(
+            repository=self.db.organizer,
+            task_id=task_id,
+            owner_id=getattr(self, "owner_id", "organizer"),
+            revision=scan_revision,
+            lease_seconds=self._organizer_scan_lease_seconds(),
+            heartbeat_interval_seconds=self._organizer_scan_heartbeat_interval(),
+            log=lambda message: logger.warning("%s", message),
+        )
         try:
             if scan_lease is not None:
                 scan_lease.start()
@@ -2498,17 +2423,14 @@ class OrganizerService:
                 expected_revision=scan_revision,
                 scan_owner=getattr(self, "owner_id", "organizer") if scan_revision is not None else "",
             )
-            try:
-                replaced = self.db.replace_organizer_plan(
-                    task_id,
-                    files=files,
-                    mappings=mappings,
-                    operations=operations,
-                    expected_revision=scan_revision,
-                    owner_id=getattr(self, "owner_id", "organizer") if scan_revision is not None else "",
-                )
-            except TypeError:
-                replaced = self.db.replace_organizer_plan(task_id, files=files, mappings=mappings, operations=operations)
+            replaced = self.db.organizer.replace_organizer_plan(
+                task_id,
+                files=files,
+                mappings=mappings,
+                operations=operations,
+                expected_revision=scan_revision,
+                owner_id=getattr(self, "owner_id", "organizer") if scan_revision is not None else "",
+            )
             if replaced is False:
                 raise OrganizerScanLeaseLost("Organizer 扫描状态已变化，拒绝写入旧计划")
             # 计划生成阶段必须保持只读。广告删除也作为持久化 operation 留到
@@ -2523,7 +2445,7 @@ class OrganizerService:
                 expected_revision=scan_revision,
                 scan_owner=getattr(self, "owner_id", "organizer") if scan_revision is not None else "",
             )
-            latest_task = self.db.get_organizer_task(task_id, include_children=False) or task
+            latest_task = self.db.organizer.get_organizer_task(task_id, include_children=False) or task
             latest_raw = latest_task.get("raw_data") if isinstance(latest_task.get("raw_data"), dict) else {}
             if "openlist_visibility_retry" in latest_raw:
                 latest_raw = dict(latest_raw)
@@ -2559,7 +2481,7 @@ class OrganizerService:
                 )
             return {"success": True, "task_id": task_id, "status": status, "summary": summary}
         except OrganizerScanLeaseLost as exc:
-            latest = self.db.get_organizer_task(task_id, include_children=False) or task
+            latest = self.db.organizer.get_organizer_task(task_id, include_children=False) or task
             return {
                 "success": False,
                 "skipped": True,
@@ -2570,7 +2492,7 @@ class OrganizerService:
                 "message": str(exc),
             }
         except OrganizerTaskCancelled as exc:
-            latest = self.db.get_organizer_task(task_id, include_children=False) or task
+            latest = self.db.organizer.get_organizer_task(task_id, include_children=False) or task
             reason = str(exc)
             if "关联入库任务已取消" in reason:
                 self._cancel_task_for_cancelled_job(latest, reason)
@@ -2583,7 +2505,7 @@ class OrganizerService:
                 "message": reason,
             }
         except Exception as exc:  # noqa: BLE001
-            latest = self.db.get_organizer_task(task_id, include_children=False) or task
+            latest = self.db.organizer.get_organizer_task(task_id, include_children=False) or task
             if str(latest.get("status") or "").strip().lower() in {"skipped", "cancelled"}:
                 return {"success": False, "skipped": True, "cancelled": True, "task_id": task_id, "message": str(latest.get("error_message") or "任务已停止")}
             message = f"扫描或生成标准化计划失败：root={normalize_path(task.get('openlist_root_path'))}；{exc}"
@@ -2751,7 +2673,7 @@ class OrganizerService:
         return self.process_task(task_id, auto_apply=True)
 
     def approve_task(self, task_id: int) -> dict[str, Any]:
-        task = self.db.get_organizer_task(task_id)
+        task = self.db.organizer.get_organizer_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer approve")
@@ -2787,51 +2709,37 @@ class OrganizerService:
             return {"success": False, "conflict": True, "message": str(exc)}
         mapping_updates: list[dict[str, Any]] = []
 
-        atomic_updater = getattr(self.db, "update_organizer_mappings_and_plan", None)
         expected_revision = _safe_positive_int(task.get("revision"))
-        if callable(atomic_updater) and expected_revision:
-            try:
-                category = self.categories.get(str(task.get("category") or ""), {})
-                target_category = self._target_category_for_task(task, category)
-                operations = self._operations_for_mappings(
-                    approved_mappings,
-                    target_category,
-                    include_auto_delete=True,
-                )
-                evidence = dict(task.get("evidence") or {}) if isinstance(task.get("evidence"), dict) else {}
-                updated = atomic_updater(
-                    task_id,
-                    mapping_updates=mapping_updates,
-                    operations=operations,
-                    evidence=evidence,
-                    expected_status=str(task.get("status") or ""),
-                    expected_revision=expected_revision,
-                    task_updates={
-                        "status": "manual_confirmed",
-                        "confidence": max(float(task.get("confidence") or 0), 88),
-                    },
-                    clear_scan_lease=True,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("organizer_approve_atomic_write_failed task_id=%s", task_id)
-                return {"success": False, "message": f"任务放行失败且已回滚：{exc}"}
-        else:
-            # Compatibility fallback for lightweight adapters. Production
-            # Database always uses the transaction above.
-            for item in mapping_updates:
-                self.db.update_organizer_mapping(int(item["id"]), **item["updates"])
-            updated = self.db.update_organizer_task(
+        if not expected_revision:
+            return {"success": False, "conflict": True, "message": "Organizer 任务版本缺失"}
+        try:
+            category = self.categories.get(str(task.get("category") or ""), {})
+            target_category = self._target_category_for_task(task, category)
+            operations = self._operations_for_mappings(
+                approved_mappings,
+                target_category,
+                include_auto_delete=True,
+            )
+            evidence = dict(task.get("evidence") or {}) if isinstance(task.get("evidence"), dict) else {}
+            updated = self.db.organizer.update_organizer_mappings_and_plan(
                 task_id,
-                status="manual_confirmed",
-                confidence=max(float(task.get("confidence") or 0), 88),
+                mapping_updates=mapping_updates,
+                operations=operations,
+                evidence=evidence,
+                expected_status=str(task.get("status") or ""),
                 expected_revision=expected_revision,
-                expected_statuses={status},
-                bump_revision=True,
+                task_updates={
+                    "status": "manual_confirmed",
+                    "confidence": max(float(task.get("confidence") or 0), 88),
+                },
                 clear_scan_lease=True,
             )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("organizer_approve_atomic_write_failed task_id=%s", task_id)
+            return {"success": False, "message": f"任务放行失败且已回滚：{exc}"}
         if updated is False:
             return {"success": False, "conflict": True, "message": "任务状态已变化，请刷新后重试"}
-        return {"success": True, "task": self.db.get_organizer_task(task_id)}
+        return {"success": True, "task": self.db.organizer.get_organizer_task(task_id)}
 
     def _validate_approval_mappings(
         self,
@@ -2866,7 +2774,7 @@ class OrganizerService:
             raise OpenListError(f"存在 {len(duplicates)} 个重复目标路径，不能批准")
 
     def skip_task(self, task_id: int) -> dict[str, Any]:
-        task = self.db.get_organizer_task(task_id, include_children=False)
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer skip")
@@ -2911,7 +2819,7 @@ class OrganizerService:
                     "message": f"生成原名直通入库计划失败：{exc}",
                 }
         raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        updated = self.db.update_organizer_task(
+        updated = self.db.organizer.update_organizer_task(
             task_id,
             status="skipped",
             error_message="",
@@ -2934,11 +2842,11 @@ class OrganizerService:
             "success": True,
             "skipped": True,
             "message": "资源已位于正式分类目录，已跳过命名整理",
-            "task": self.db.get_organizer_task(task_id),
+            "task": self.db.organizer.get_organizer_task(task_id),
         }
 
     def delete_task(self, task_id: int) -> dict[str, Any]:
-        task = self.db.get_organizer_task(task_id, include_children=False)
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False)
         if not task:
             return {"success": False, "not_found": True, "message": "记录不存在"}
         if _safe_positive_int(task.get("job_id")):
@@ -2953,7 +2861,7 @@ class OrganizerService:
                 "conflict": True,
                 "message": "只能删除已完成或已取消的记录",
             }
-        deleted = self.db.delete_organizer_task_if_status(task_id, deletable_statuses)
+        deleted = self.db.organizer.delete_organizer_task_if_status(task_id, deletable_statuses)
         if not deleted:
             return {
                 "success": False,
@@ -3084,7 +2992,7 @@ class OrganizerService:
             "skip_openlist_strm_refresh": True,
         }
         evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
-        replaced = self.db.replace_organizer_plan(
+        replaced = self.db.organizer.replace_organizer_plan(
             task_id,
             files=files,
             mappings=mappings,
@@ -3129,13 +3037,13 @@ class OrganizerService:
             "file_count": len(files),
             "target_root": final_root,
             "message": f"已生成原名直通入库计划，共 {len(files)} 个文件，正在移入正式分类目录",
-            "task": self.db.get_organizer_task(task_id),
+            "task": self.db.organizer.get_organizer_task(task_id),
         }
 
     def start_apply_task(self, task_id: int) -> dict[str, Any]:
         """提交真实 OpenList 整理到后台线程执行，接口只负责快速确认已接收。"""
 
-        task = self.db.get_organizer_task(task_id)
+        task = self.db.organizer.get_organizer_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer start apply")
@@ -3164,7 +3072,6 @@ class OrganizerService:
             # 必须把 run 持久化与任务进入 executing 放在同一个数据库 claim 中。
             # 否则进程若在后台线程真正开始前退出，启动恢复只能看到一个没有 run
             # 的 executing 任务，无法安全回收，会永久停留在“整理中”。
-            atomic_run_claim = callable(getattr(self.db, "claim_organizer_run", None))
             run_id, active_run = self._claim_organizer_run(task_id)
             if not run_id:
                 with self._background_apply_lock:
@@ -3198,20 +3105,11 @@ class OrganizerService:
                 }
             if run_id <= 0:
                 raise RuntimeError("Organizer 运行记录创建失败")
-            if atomic_run_claim:
-                task = {
-                    **task,
-                    "status": "executing",
-                    "revision": _safe_positive_int(task.get("revision")) or 1,
-                }
-            else:
-                if not self._update_organizer_task_from_snapshot(
-                    task,
-                    status="executing",
-                    error_message="",
-                ):
-                    raise OrganizerTaskCancelled("Organizer 任务状态已变化，拒绝启动后台执行")
-                task = {**task, "status": "executing"}
+            task = {
+                **task,
+                "status": "executing",
+                "revision": _safe_positive_int(task.get("revision")) or 1,
+            }
             self._sync_linked_job(task, status=JOB_ORGANIZING, stage="organizing", message="Organizer 已提交后台执行，正在执行标准化移动/重命名")
             thread = threading.Thread(
                 target=self._apply_task_safely,
@@ -3225,7 +3123,7 @@ class OrganizerService:
             self._finish_organizer_run_failure(run_id, task_id, message)
             with self._background_apply_lock:
                 self._background_apply_tasks.discard(task_id)
-            current = self.db.get_organizer_task(task_id, include_children=False) or task
+            current = self.db.organizer.get_organizer_task(task_id, include_children=False) or task
             return {
                 "success": False,
                 "cancelled": str(current.get("status") or "") == "cancelled",
@@ -3238,7 +3136,7 @@ class OrganizerService:
         except Exception as exc:  # noqa: BLE001
             message = f"Organizer 后台执行启动失败：{exc}"
             try:
-                latest = self.db.get_organizer_task(task_id, include_children=False) or task
+                latest = self.db.organizer.get_organizer_task(task_id, include_children=False) or task
                 updated = self._update_organizer_task_from_snapshot(
                     latest,
                     status="failed",
@@ -3281,7 +3179,7 @@ class OrganizerService:
             self.apply_task(task_id, run_id=run_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("organizer_background_apply_failed task_id=%s", task_id)
-            latest = self.db.get_organizer_task(task_id, include_children=False) or {}
+            latest = self.db.organizer.get_organizer_task(task_id, include_children=False) or {}
             self._update_organizer_task_from_snapshot(
                 latest,
                 status="failed",
@@ -3307,7 +3205,7 @@ class OrganizerService:
         task_before: dict[str, Any] | None = None
         mapping_before: dict[str, Any] | None = None
         if task_id:
-            task_before = self.db.get_organizer_task(task_id)
+            task_before = self.db.organizer.get_organizer_task(task_id)
             if task_before:
                 _job, _plan, rejection = self._task_v1_plan(task_before, context="Organizer mapping update")
                 if rejection:
@@ -3336,9 +3234,8 @@ class OrganizerService:
                 else:
                     return {"success": False, "message": "映射记录不属于当前任务"}
 
-        atomic_updater = getattr(self.db, "update_organizer_mappings_and_plan", None)
         expected_revision = _safe_positive_int((task_before or {}).get("revision"))
-        if task_id and task_before and mapping_before and callable(atomic_updater) and expected_revision:
+        if task_id and task_before and mapping_before and expected_revision:
             updated_mappings = [
                 ({**item, **updates} if int(item.get("id") or 0) == int(mapping_id) else dict(item))
                 for item in task_before.get("mappings") or []
@@ -3360,7 +3257,7 @@ class OrganizerService:
                     evidence["episode_completeness"] = episode_completeness
                 else:
                     evidence.pop("episode_completeness", None)
-                updated = atomic_updater(
+                updated = self.db.organizer.update_organizer_mappings_and_plan(
                     task_id,
                     mapping_updates=[{"id": int(mapping_id), "updates": updates}],
                     operations=operations,
@@ -3386,38 +3283,16 @@ class OrganizerService:
                 "mapping_id": mapping_id,
                 "target_path": recalculated_target or updates.get("target_path") or "",
             }
-
-        # Compatibility fallback for lightweight/legacy adapters without the
-        # atomic plan writer. Production Database never takes this path.
-        self.db.update_organizer_mapping(mapping_id, **updates)
-        if task_id:
-            task = self.db.get_organizer_task(task_id)
-            if task:
-                category = self.categories.get(str(task.get("category") or ""), {})
-                target_category = self._target_category_for_task(task, category)
-                operations = self._operations_for_mappings(task.get("mappings") or [], target_category, include_auto_delete=False)
-                self.db.replace_organizer_operations(task_id, operations)
-                evidence = dict(task.get("evidence") or {}) if isinstance(task.get("evidence"), dict) else {}
-                episode_completeness = _episode_completeness_report(
-                    str(task.get("category") or ""),
-                    task.get("mappings") or [],
-                )
-                if episode_completeness:
-                    evidence["episode_completeness"] = episode_completeness
-                else:
-                    evidence.pop("episode_completeness", None)
-                if not self._update_organizer_task_from_snapshot(task, evidence=evidence):
-                    return {
-                        "success": False,
-                        "conflict": True,
-                        "message": "Organizer 任务状态已变化，未覆盖当前完整性报告",
-                    }
-        return {"success": True, "mapping_id": mapping_id, "target_path": recalculated_target or updates.get("target_path") or ""}
+        return {
+            "success": False,
+            "conflict": True,
+            "message": "Organizer 任务或映射版本缺失，未写入修改",
+        }
 
     def batch_update_mappings(self, task_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         """Precompute and atomically persist a task-wide title/season edit."""
 
-        task = self.db.get_organizer_task(task_id)
+        task = self.db.organizer.get_organizer_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer batch mapping update")
@@ -3508,11 +3383,8 @@ class OrganizerService:
             logger.exception("organizer_batch_mapping_preflight_failed task_id=%s", task_id)
             return {"success": False, "message": f"批量修改预检失败，未写入任何映射：{exc}"}
 
-        updater = getattr(self.db, "update_organizer_mappings_and_plan", None)
-        if not callable(updater):
-            return {"success": False, "message": "当前数据库适配器不支持原子批量修改，未写入任何映射"}
         try:
-            updated = updater(
+            updated = self.db.organizer.update_organizer_mappings_and_plan(
                 task_id,
                 mapping_updates=mapping_updates,
                 operations=operations,
@@ -3533,7 +3405,7 @@ class OrganizerService:
             "success": True,
             "message": f"已批量更新 {len(mapping_updates)} 条映射",
             "changed": len(mapping_updates),
-            "task": self.db.get_organizer_task(task_id),
+            "task": self.db.organizer.get_organizer_task(task_id),
         }
 
     def _recalculate_mapping_target_if_needed(self, mapping: dict[str, Any], updates: dict[str, Any], task: dict[str, Any], target_category: dict[str, Any]) -> str:
@@ -3582,7 +3454,7 @@ class OrganizerService:
     def apply_task(self, task_id: int, *, run_id: int | None = None) -> dict[str, Any]:
         """Apply a task using only its frozen V1 OpenList connection."""
 
-        task = self.db.get_organizer_task(task_id)
+        task = self.db.organizer.get_organizer_task(task_id)
         if not task:
             self._finish_organizer_run_failure(
                 _safe_positive_int(run_id),
@@ -3620,7 +3492,7 @@ class OrganizerService:
 
     def _apply_task_v1(self, task_id: int, *, run_id: int | None = None) -> dict[str, Any]:
         run_id = _safe_positive_int(run_id)
-        task = self.db.get_organizer_task(task_id)
+        task = self.db.organizer.get_organizer_task(task_id)
         if not task:
             self._finish_organizer_run_failure(run_id, task_id, "标准化任务不存在")
             return {"success": False, "message": "标准化任务不存在"}
@@ -3655,7 +3527,7 @@ class OrganizerService:
                     "status": current_status,
                     "message": "标准化任务不存在" if current_status == "missing" else "Organizer 已由其他进程执行",
                 }
-            task = self.db.get_organizer_task(task_id) or task
+            task = self.db.organizer.get_organizer_task(task_id) or task
         # Cancellation always wins.  After that, validate the persisted staging
         # boundaries before reporting a generic state conflict so a tampered
         # manual plan is recorded as the actual security failure.  The normal
@@ -3717,7 +3589,7 @@ class OrganizerService:
                 "message": abort_reason,
             }
         lease = OrganizerRunLease(
-            database=self.db,
+            repository=self.db.organizer,
             run_id=run_id,
             owner_id=getattr(self, "owner_id", "organizer"),
             lease_seconds=self._organizer_run_lease_seconds(),
@@ -3773,26 +3645,21 @@ class OrganizerService:
         lease: OrganizerRunLease,
     ) -> dict[str, Any]:
         logger.info("organizer_apply_start task_id=%s root=%s title=%s", task_id, task.get("openlist_root_path"), task.get("title"))
-        # 兼容旧版本已经进入 strm_pending 的任务：按当前规则直接收尾，
-        # 不再等待或检查 STRM 文件是否生成。
-        pending_strm = self._pending_strm_completion(task)
-        if pending_strm:
-            return self._resume_strm_completion(task_id, run_id, task, pending_strm, lease)
         category = self.categories.get(str(task.get("category") or ""), {})
         target_category = self._target_category_for_task(task, category)
         self._ensure_task_active(task_id, allowed_statuses={"executing"})
-        # Scan/mapping edits already persist the exact operation plan.  Reuse it
-        # after a crash so completed steps stay completed; only legacy tasks
-        # without any operation rows need a one-time reconstruction.
+        # Scan/mapping edits persist the exact operation plan. Rebuild it only
+        # when a V1 crash occurred between mapping persistence and operation
+        # persistence, while still deriving exclusively from the frozen task.
         if not (task.get("operations") or []):
             operations = self._operations_for_mappings(
                 task.get("mappings") or [],
                 target_category,
                 include_auto_delete=True,
             )
-            self.db.replace_organizer_operations(task_id, operations)
+            self.db.organizer.replace_organizer_operations(task_id, operations)
             lease.ensure_owned()
-            task = self.db.get_organizer_task(task_id) or task
+            task = self.db.organizer.get_organizer_task(task_id) or task
         blocked = [m for m in task.get("mappings") or [] if str(m.get("status")) in {"conflict", "need_edit"}]
         if blocked:
             message = f"仍有 {len(blocked)} 项需要审核"
@@ -3847,15 +3714,15 @@ class OrganizerService:
                     lease.ensure_owned()
                     for batch_op, verdict, message, inverse in batch_verdicts:
                         if verdict == "done":
-                            self.db.update_organizer_operation(int(batch_op["id"]), run_id=run_id, status="done", undo_data=inverse)
+                            self.db.organizer.update_organizer_operation(int(batch_op["id"]), run_id=run_id, status="done", undo_data=inverse)
                             if inverse:
                                 undo.insert(0, inverse)
                             done += 1
                         elif verdict == "skipped":
-                            self.db.update_organizer_operation(int(batch_op["id"]), run_id=run_id, status="skipped", error_message=message)
+                            self.db.organizer.update_organizer_operation(int(batch_op["id"]), run_id=run_id, status="skipped", error_message=message)
                             skipped += 1
                         else:
-                            self.db.update_organizer_operation(int(batch_op["id"]), run_id=run_id, status="failed", error_message=message)
+                            self.db.organizer.update_organizer_operation(int(batch_op["id"]), run_id=run_id, status="failed", error_message=message)
                             failures.append(
                                 {
                                     "operation_id": int(batch_op.get("id") or 0),
@@ -3879,7 +3746,7 @@ class OrganizerService:
                     lease.ensure_owned()
                     inverse = self._execute_operation(op)
                     lease.ensure_owned()
-                    self.db.update_organizer_operation(int(op["id"]), run_id=run_id, status="done", undo_data=inverse)
+                    self.db.organizer.update_organizer_operation(int(op["id"]), run_id=run_id, status="done", undo_data=inverse)
                     if inverse:
                         undo.insert(0, inverse)
                     done += 1
@@ -3887,11 +3754,11 @@ class OrganizerService:
                     raise
                 except SkipOperation as exc:
                     lease.ensure_owned()
-                    self.db.update_organizer_operation(int(op["id"]), run_id=run_id, status="skipped", error_message=str(exc))
+                    self.db.organizer.update_organizer_operation(int(op["id"]), run_id=run_id, status="skipped", error_message=str(exc))
                     skipped += 1
                 except Exception as exc:  # noqa: BLE001
                     lease.ensure_owned()
-                    self.db.update_organizer_operation(int(op["id"]), run_id=run_id, status="failed", error_message=str(exc))
+                    self.db.organizer.update_organizer_operation(int(op["id"]), run_id=run_id, status="failed", error_message=str(exc))
                     failures.append(
                         {
                             "operation_id": int(op.get("id") or 0),
@@ -4034,41 +3901,14 @@ class OrganizerService:
             logger.exception("organizer_apply_failed task_id=%s", task_id)
             return {"success": False, "task_id": task_id, "run_id": run_id, "message": str(exc)}
         finally:
-            self.db.release_organizer_locks(run_id=run_id, lock_keys=acquired)
-
-    def _create_organizer_run(self, task_id: int) -> int:
-        creator = self.db.create_organizer_run
-        try:
-            return int(
-                creator(
-                    task_id,
-                    owner_id=getattr(self, "owner_id", "organizer"),
-                    lease_seconds=self._organizer_run_lease_seconds(),
-                )
-            )
-        except TypeError:
-            try:
-                return int(creator(task_id, owner_id=getattr(self, "owner_id", "organizer")))
-            except TypeError:
-                # 保持轻量测试桩和旧扩展实现兼容；正式 Database 支持租约参数。
-                return int(creator(task_id))
+            self.db.organizer.release_organizer_locks(run_id=run_id, lock_keys=acquired)
 
     def _claim_organizer_run(self, task_id: int) -> tuple[int | None, dict[str, Any] | None]:
-        claimant = getattr(self.db, "claim_organizer_run", None)
-        if not callable(claimant):
-            # 保持轻量测试桩和旧扩展实现兼容；正式 Database 使用跨进程原子 claim。
-            return self._create_organizer_run(task_id), None
-        try:
-            run_id, active_run = claimant(
-                task_id,
-                owner_id=getattr(self, "owner_id", "organizer"),
-                lease_seconds=self._organizer_run_lease_seconds(),
-            )
-        except TypeError:
-            try:
-                run_id, active_run = claimant(task_id, owner_id=getattr(self, "owner_id", "organizer"))
-            except TypeError:
-                run_id, active_run = claimant(task_id)
+        run_id, active_run = self.db.organizer.claim_organizer_run(
+            task_id,
+            owner_id=getattr(self, "owner_id", "organizer"),
+            lease_seconds=self._organizer_run_lease_seconds(),
+        )
         return _safe_positive_int(run_id), active_run if isinstance(active_run, dict) else None
 
     def _organizer_run_lease_seconds(self) -> int:
@@ -4090,16 +3930,12 @@ class OrganizerService:
             return None
 
     def _update_organizer_run(self, run_id: int, status: str, **values: Any) -> None:
-        updater = self.db.update_organizer_run
-        try:
-            updated = updater(
-                run_id,
-                status,
-                owner_id=getattr(self, "owner_id", "organizer"),
-                **values,
-            )
-        except TypeError:
-            updated = updater(run_id, status, **values)
+        updated = self.db.organizer.update_organizer_run(
+            run_id,
+            status,
+            owner_id=getattr(self, "owner_id", "organizer"),
+            **values,
+        )
         if updated is False:
             raise OrganizerRunLeaseLost("Organizer 运行租约已失效，拒绝写入终态")
 
@@ -4116,41 +3952,22 @@ class OrganizerService:
         evidence: Any = None,
         raw_data: Any = None,
     ) -> None:
-        finalizer = getattr(self.db, "finalize_organizer_run_and_task", None)
-        if callable(finalizer):
-            values = {
-                "owner_id": getattr(self, "owner_id", "organizer"),
-                "run_status": run_status,
-                "task_status": task_status,
-                "summary": summary,
-                "undo_data": undo_data,
-                "error_message": error_message,
-                "evidence": evidence,
-                "raw_data": raw_data,
-            }
-            try:
-                updated = finalizer(run_id, task_id, **values)
-            except TypeError:
-                values.pop("raw_data", None)
-                updated = finalizer(run_id, task_id, **values)
-            if updated is False:
-                raise OrganizerRunLeaseLost("Organizer 运行租约已失效，拒绝写入任务终态")
-            return
-        self._update_organizer_run(
+        updated = self.db.organizer.finalize_organizer_run_and_task(
             run_id,
-            run_status,
+            task_id,
+            owner_id=getattr(self, "owner_id", "organizer"),
+            run_status=run_status,
+            task_status=task_status,
             summary=summary,
             undo_data=undo_data,
             error_message=error_message,
+            evidence=evidence,
+            raw_data=raw_data,
         )
-        task_values: dict[str, Any] = {"status": task_status, "error_message": error_message}
-        if evidence is not None:
-            task_values["evidence"] = evidence
-        if raw_data is not None:
-            task_values["raw_data"] = raw_data
-        latest = self.db.get_organizer_task(task_id, include_children=False) or {}
-        if not self._update_organizer_task_from_snapshot(latest, **task_values):
-            raise OrganizerRunLeaseLost("Organizer 任务状态已变化，拒绝写入任务终态")
+        if updated is False:
+            raise OrganizerRunLeaseLost(
+                "Organizer 运行租约已失效，拒绝写入任务终态"
+            )
 
     def _finish_organizer_run_failure(self, run_id: int | None, task_id: int, message: str) -> None:
         run_id = _safe_positive_int(run_id)
@@ -4200,7 +4017,7 @@ class OrganizerService:
             acquired: list[str] = []
             waiting_key = ""
             for key in lock_keys:
-                if self.db.acquire_organizer_lock(
+                if self.db.organizer.acquire_organizer_lock(
                     key,
                     task_id=task_id,
                     run_id=run_id,
@@ -4216,7 +4033,7 @@ class OrganizerService:
                 return acquired
 
             if acquired:
-                self.db.release_organizer_locks(run_id=run_id, lock_keys=acquired)
+                self.db.organizer.release_organizer_locks(run_id=run_id, lock_keys=acquired)
             if lease is not None:
                 lease.ensure_owned()
             if time.monotonic() >= deadline:
@@ -4276,26 +4093,15 @@ class OrganizerService:
 
     def rollback_run(self, run_id: int) -> dict[str, Any]:
         wanted_run_id = _safe_positive_int(run_id)
-        matched_run: dict[str, Any] | None = None
-        offset = 0
-        while wanted_run_id:
-            legacy_pagination = False
-            try:
-                page = self.db.list_organizer_runs(limit=500, offset=offset)
-            except TypeError:
-                page = self.db.list_organizer_runs(limit=500)
-                legacy_pagination = True
-            matched_run = next(
-                (run for run in page if _safe_positive_int(run.get("id")) == wanted_run_id),
-                None,
-            )
-            if matched_run or len(page) < 500 or legacy_pagination:
-                break
-            offset += len(page)
+        matched_run = (
+            self.db.organizer.get_organizer_run(wanted_run_id)
+            if wanted_run_id
+            else None
+        )
         if not matched_run:
             return {"success": False, "message": "运行记录不存在"}
         task_id = _safe_positive_int(matched_run.get("task_id"))
-        task = self.db.get_organizer_task(task_id) if task_id else None
+        task = self.db.organizer.get_organizer_task(task_id) if task_id else None
         if not task:
             return {"success": False, "message": "运行记录关联的 Organizer 任务不存在"}
         _job, _plan, rejection = self._task_v1_plan(
@@ -4396,11 +4202,11 @@ class OrganizerService:
                 ai_suggestion = self.ai.calibrate(evidence)
                 ai_trace["used"] = bool(ai_suggestion)
                 ai_trace["reason"] = "规则/TMDB 置信度不足，已调用 AI 校准"
-                self.db.add_organizer_ai_suggestion(int(task["id"]), "openai-compatible", self.ai.model, evidence, {}, ai_suggestion)
+                self.db.organizer.add_organizer_ai_suggestion(int(task["id"]), "openai-compatible", self.ai.model, evidence, {}, ai_suggestion)
             except Exception as exc:  # noqa: BLE001
                 ai_suggestion = {"error": str(exc)}
                 ai_trace["reason"] = f"AI 校准失败：{exc}"
-                self.db.add_organizer_ai_suggestion(int(task["id"]), "openai-compatible", self.ai.model, evidence, {}, ai_suggestion)
+                self.db.organizer.add_organizer_ai_suggestion(int(task["id"]), "openai-compatible", self.ai.model, evidence, {}, ai_suggestion)
         elif not self.ai.configured:
             ai_trace["reason"] = "AI 未启用或配置不完整，未调用"
         else:
@@ -4752,7 +4558,7 @@ class OrganizerService:
         return target_dir, related
 
     def _apply_auto_delete_operations(self, task_id: int, *, expected_status: str = "") -> dict[str, Any]:
-        task = self.db.get_organizer_task(task_id) or {}
+        task = self.db.organizer.get_organizer_task(task_id) or {}
         operations = [op for op in task.get("operations") or [] if str(op.get("type") or "") == "delete_file" and str(op.get("status") or "pending") == "pending"]
         if not operations:
             return {}
@@ -4769,15 +4575,15 @@ class OrganizerService:
                 )
                 self._execute_operation(op)
                 if op_id:
-                    self.db.update_organizer_operation(op_id, status="done")
+                    self.db.organizer.update_organizer_operation(op_id, status="done")
                 done += 1
             except SkipOperation as exc:
                 if op_id:
-                    self.db.update_organizer_operation(op_id, status="skipped", error_message=str(exc))
+                    self.db.organizer.update_organizer_operation(op_id, status="skipped", error_message=str(exc))
                 skipped += 1
             except Exception as exc:  # noqa: BLE001
                 if op_id:
-                    self.db.update_organizer_operation(op_id, status="failed", error_message=str(exc))
+                    self.db.organizer.update_organizer_operation(op_id, status="failed", error_message=str(exc))
                 failed += 1
                 errors.append(str(exc))
         return {"done": done, "skipped": skipped, "failed": failed, "errors": errors[:5]}
@@ -4849,25 +4655,7 @@ class OrganizerService:
                     continue
         return {"success": False, "failed": True, "path": normalized, "message": last_error or "删除失败"}
 
-    @staticmethod
-    def _pending_strm_completion(task: dict[str, Any]) -> dict[str, Any]:
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        state = raw_data.get("strm_completion") if isinstance(raw_data.get("strm_completion"), dict) else {}
-        return dict(state) if str(state.get("status") or "") == "pending" else {}
 
-    def _strm_confirmation_delays(self) -> list[int]:
-        configured = self.organizer_config.get("strm_confirm_retry_delays_seconds")
-        if not isinstance(configured, (list, tuple)):
-            configured = [5, 15, 30, 60, 120, 300]
-        result: list[int] = []
-        for value in configured:
-            try:
-                delay = max(1, min(3600, int(value)))
-            except (TypeError, ValueError):
-                continue
-            if delay not in result:
-                result.append(delay)
-        return result or [5, 15, 30, 60, 120, 300]
 
     def _start_strm_completion(
         self,
@@ -4957,123 +4745,7 @@ class OrganizerService:
             cleanup_enabled=False,
         )
 
-    def _resume_strm_completion(
-        self,
-        task_id: int,
-        run_id: int,
-        task: dict[str, Any],
-        state: dict[str, Any],
-        lease: OrganizerRunLease,
-    ) -> dict[str, Any]:
-        lease.ensure_owned()
-        self._ensure_task_active(task_id, allowed_statuses={"executing"})
-        summary = state.get("summary") if isinstance(state.get("summary"), dict) else {"task_id": task_id}
-        undo = state.get("undo") if isinstance(state.get("undo"), list) else []
-        confirmation = state.get("confirmation") if isinstance(state.get("confirmation"), dict) else {}
-        task_evidence = state.get("task_evidence") if isinstance(state.get("task_evidence"), dict) else {}
-        accepted_state = {
-            **state,
-            "version": 2,
-            "status": "refresh_accepted",
-            "confirmation_required": False,
-            "handled_by": "openlist",
-            "legacy_pending_reconciled": True,
-        }
-        return self._finish_strm_completion(
-            task_id,
-            run_id,
-            task,
-            lease,
-            state=accepted_state,
-            summary=summary,
-            undo=undo,
-            task_evidence=task_evidence,
-            confirmation=confirmation,
-            cleanup_enabled=False,
-        )
 
-    def _defer_strm_completion(
-        self,
-        task_id: int,
-        run_id: int,
-        task: dict[str, Any],
-        lease: OrganizerRunLease,
-        state: dict[str, Any],
-        *,
-        delay_override: int | None = None,
-        increment_attempt: bool = True,
-    ) -> dict[str, Any]:
-        lease.ensure_owned()
-        delays = state.get("delays_seconds") if isinstance(state.get("delays_seconds"), list) else self._strm_confirmation_delays()
-        attempts = max(0, int(state.get("attempts") or 0))
-        delay_index = min(attempts, max(0, len(delays) - 1))
-        delay = max(1, int(delay_override or delays[delay_index]))
-        next_attempts = attempts + 1 if increment_attempt else attempts
-        next_retry_at = _utc_after_seconds(delay)
-        pending = {
-            **state,
-            "status": "pending",
-            "attempts": next_attempts,
-            "max_attempts": max(1, int(state.get("max_attempts") or len(delays))),
-            "delays_seconds": delays,
-            "next_retry_at": next_retry_at,
-            "last_check_at": str(state.get("last_check_at") or _utc_now_text()),
-        }
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        raw_data = {**raw_data, "strm_completion": pending}
-        task_evidence = pending.get("task_evidence") if isinstance(pending.get("task_evidence"), dict) else {}
-        evidence = {**task_evidence, "strm_completion": pending}
-        summary = pending.get("summary") if isinstance(pending.get("summary"), dict) else {"task_id": task_id}
-        undo = pending.get("undo") if isinstance(pending.get("undo"), list) else []
-        self._finalize_organizer_run_and_task(
-            run_id,
-            task_id,
-            run_status="deferred",
-            task_status="strm_pending",
-            summary=summary,
-            undo_data=undo,
-            evidence=evidence,
-            raw_data=raw_data,
-        )
-        message = f"真实媒体已整理，等待 OpenList 生成并同步 STRM；{delay} 秒后复查"
-        self._sync_linked_job(
-            task,
-            status=JOB_CONFIRMING,
-            stage="strm_pending",
-            message=message,
-            extra={"strm_completion": {"attempts": next_attempts, "next_retry_at": next_retry_at}},
-        )
-        worker_context = getattr(self, "_worker_context", None)
-        if not bool(getattr(worker_context, "active", False)):
-            if self._schedule_task_after(task_id, delay) is False:
-                failure_message = "新 STRM 尚未可见，且当前进程无法安排后续复查；旧 STRM 已保留，请手动重试"
-                self.db.update_organizer_task(
-                    task_id,
-                    status="waiting_review",
-                    error_message=failure_message,
-                    expected_statuses={"strm_pending"},
-                )
-                self._sync_linked_job(
-                    task,
-                    status=JOB_REVIEW,
-                    stage="review",
-                    message=failure_message,
-                    level=EVENT_WARN,
-                    error_message=failure_message,
-                )
-                return {"success": False, "task_id": task_id, "run_id": run_id, "message": failure_message}
-        return {
-            "success": True,
-            "deferred": True,
-            "queued": True,
-            "retry_after_seconds": delay,
-            "delay_seconds": delay,
-            "task_id": task_id,
-            "run_id": run_id,
-            "status": "strm_pending",
-            "next_retry_at": next_retry_at,
-            "message": message,
-        }
 
     def _finish_strm_completion(
         self,
@@ -5432,14 +5104,11 @@ class OrganizerService:
         if old_name in set(final_names):
             return {"enabled": True, "skipped": True, "old_name": old_name, "message": "\u65e7\u540d\u4e0e\u6700\u7ec8\u540d\u4e00\u81f4\uff0c\u65e0\u9700\u6e05\u7406\u65e7 STRM \u76ee\u5f55"}
 
-        try:
-            openlist_cleanup = self._cleanup_old_openlist_strm_dir(
-                old_name,
-                normalized_category,
-                prefix=refresh_prefix,
-            )
-        except TypeError:
-            openlist_cleanup = self._cleanup_old_openlist_strm_dir(old_name, normalized_category)
+        openlist_cleanup = self._cleanup_old_openlist_strm_dir(
+            old_name,
+            normalized_category,
+            prefix=refresh_prefix,
+        )
         local_cleanup = self._cleanup_old_local_strm_dir(old_name, normalized_category)
         failed = bool(openlist_cleanup.get("failed") or local_cleanup.get("failed"))
         success = bool(openlist_cleanup.get("success") or local_cleanup.get("success")) and not failed
@@ -5806,7 +5475,7 @@ class OrganizerService:
                     score_tmdb_result(title, year, category_key, item, has_episodes),
                     score_tmdb_result(query_title or title, query_year or year, category_key, item, has_episodes),
                 )
-                self.db.add_organizer_tmdb_match(int(task["id"]), tmdb_query, media_type, item, score)
+                self.db.organizer.add_organizer_tmdb_match(int(task["id"]), tmdb_query, media_type, item, score)
                 if score > best[0]:
                     best = (score, item)
             if best[0] >= 85:
@@ -5817,43 +5486,6 @@ class OrganizerService:
             return None
         return best[1]
 
-    def _configured_category_root_for_path(self, path: str) -> str:
-        """Read legacy category paths for diagnostics only.
-
-        Execution planning no longer calls this helper; V1 paths are supplied
-        by ``_target_category_for_task``.
-        """
-
-        normalized = normalize_path(path)
-        explicit_candidates: list[str] = []
-        inferred_candidates: list[str] = []
-        for item in getattr(self, "categories", {}).values():
-            roots = [
-                item.get("openlist_root_path"),
-                item.get("cloud139_fnos_target_path"),
-                item.get("mobile_openlist_root_path"),
-                item.get("mobile_target_path"),
-                item.get("sixpan_fnos_target_path"),
-            ]
-            explicit = [value for value in roots if str(value or "").strip()]
-            if not explicit:
-                try:
-                    explicit = [
-                        category_target_root(item, allow_legacy_diagnostic=True)
-                    ]
-                except ValueError:
-                    explicit = []
-            for value in explicit:
-                root = normalize_path(value)
-                if root == "/" or not _path_is_same_or_child(normalized, root):
-                    continue
-                if root not in explicit_candidates:
-                    explicit_candidates.append(root)
-            inferred = _source_category_root_for_path(normalized, item)
-            if inferred != "/" and _path_is_same_or_child(normalized, inferred) and inferred not in inferred_candidates:
-                inferred_candidates.append(inferred)
-        candidates = explicit_candidates or inferred_candidates
-        return max(candidates, key=lambda value: (value.count("/"), len(value)), default="")
 
     def _target_create_stop_root(self, target_path: str, category_root: str, resource_root: str) -> str:
         target_dir = dirname(target_path)
@@ -6281,7 +5913,7 @@ class OrganizerService:
                 )
         for old_name, new_name in pairs:
             self.openlist.rename(join_path(source_dir, old_name), new_name, overwrite=False)
-        return ("legacy_rename", bulk_attempts + len(pairs))
+        return ("single_rename", bulk_attempts + len(pairs))
 
     def _perform_regex_batch_rename(
         self,
@@ -7559,7 +7191,7 @@ class OrganizerService:
         fnos = getattr(self, "fnos", None)
         if not fnos or not organizer_config.get("refresh_fnos_after_apply"):
             return False
-        task = self.db.get_organizer_task(task_id, include_children=False) or {}
+        task = self.db.organizer.get_organizer_task(task_id, include_children=False) or {}
         category = (getattr(self, "categories", {}) or {}).get(str(task.get("category") or ""), {})
         dir_list = category.get("strm_fnos_dir_list") or []
         if not dir_list:
@@ -7598,40 +7230,7 @@ class OrganizerService:
         )
         return True
 
-    def _root_path_from_target(self, category_key: str, target_path: str) -> str:
-        path = normalize_path(target_path)
-        parent = dirname(path)
-        if category_key in EPISODIC_CATEGORIES and basename(parent).lower().startswith("season "):
-            return dirname(parent)
-        return parent
 
-    def _category_from_label_or_path(self, label: str, target_path: str) -> str:
-        """Best-effort legacy category classification for read-only diagnostics."""
-
-        wanted = str(label or "").strip()
-        for key, item in self.categories.items():
-            if wanted and wanted in {str(item.get("label") or ""), str(item.get("fnos_lib") or "")}:
-                return key
-        normalized = normalize_path(target_path)
-        matches: list[tuple[int, int, str]] = []
-        for key, item in self.categories.items():
-            for field in ("openlist_root_path", "mobile_openlist_root_path", "mobile_target_path", "cloud139_fnos_target_path", "sixpan_fnos_target_path", "cmcc_parent_path"):
-                root = normalize_path(item.get(field) or "")
-                if root != "/" and _path_is_same_or_child(normalized, root):
-                    matches.append((root.count("/"), len(root), key))
-        if matches:
-            return max(matches)[2]
-        parts = [part for part in normalized.strip("/").split("/") if part]
-        anchor_matches: list[tuple[int, int, str]] = []
-        for key, item in self.categories.items():
-            anchors = _category_path_anchors(item)
-            for index, part in enumerate(parts):
-                if part.casefold() in anchors:
-                    anchor_matches.append((-index, len(part), key))
-                    break
-        if anchor_matches:
-            return max(anchor_matches)[2]
-        return "movie"
 
     def _lock_keys(self, task: dict[str, Any]) -> list[str]:
         keys = {f"category:{task.get('category')}", f"root:{normalize_path(task.get('openlist_root_path'))}"}
@@ -8429,51 +8028,8 @@ def _companion_is_safely_related(name: str, matched_video: dict[str, Any] | None
     return bool(re.fullmatch(r"season[ ._-]*\d{1,2}(?:[ ._-]*(?:poster|banner|fanart|thumb))?", stem))
 
 
-def _category_path_anchors(category: dict[str, Any]) -> set[str]:
-    values: list[Any] = [category.get("label"), category.get("fnos_lib")]
-    for field in (
-        "openlist_root_path",
-        "cloud139_fnos_target_path",
-        "mobile_openlist_root_path",
-        "mobile_target_path",
-        "sixpan_fnos_target_path",
-        "cmcc_parent_path",
-    ):
-        value = str(category.get(field) or "").replace("\\", "/").strip().strip("/")
-        if value:
-            values.append(value.split("/")[-1])
-    return {str(value or "").strip().casefold() for value in values if str(value or "").strip()}
 
 
-def _source_category_root_for_path(path: Any, category: dict[str, Any]) -> str:
-    normalized = normalize_path(path)
-    explicit_roots: list[str] = []
-    for field in (
-        "openlist_root_path",
-        "cloud139_fnos_target_path",
-        "mobile_openlist_root_path",
-        "mobile_target_path",
-        "sixpan_fnos_target_path",
-    ):
-        value = str(category.get(field) or "").strip()
-        if not value:
-            continue
-        root = normalize_path(value)
-        if root != "/" and _path_is_same_or_child(normalized, root):
-            explicit_roots.append(root)
-    if explicit_roots:
-        return max(explicit_roots, key=lambda value: (value.count("/"), len(value)))
-    anchors = _category_path_anchors(category)
-    parts = [part for part in normalized.strip("/").split("/") if part]
-    for index, part in enumerate(parts):
-        if part.casefold() in anchors:
-            return normalize_path("/" + "/".join(parts[: index + 1]))
-    try:
-        return normalize_path(
-            category_target_root(category, allow_legacy_diagnostic=True)
-        )
-    except ValueError:
-        return "/"
 
 
 def _flag_enabled(value: Any) -> bool:

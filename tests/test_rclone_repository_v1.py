@@ -34,10 +34,10 @@ def _v1_job(job_id: int = 12, strategy: str = "rclone_copy") -> dict:
             "selection": selection.to_dict(),
         },
         "destination": {
-            "id": "mobile_main" if strategy == "relay_upload_mobile" else "tianyi_main",
-            "provider_kind": "mobile" if strategy == "relay_upload_mobile" else "tianyi",
+            "id": "mobile_main" if strategy == "relay_upload_provider" else "tianyi_main",
+            "provider_kind": "mobile" if strategy == "relay_upload_provider" else "tianyi",
             "target_revision": 1,
-            "binding_id": "binding_mobile" if strategy == "relay_upload_mobile" else "binding_tianyi",
+            "binding_id": "binding_mobile" if strategy == "relay_upload_provider" else "binding_tianyi",
             "binding_revision": 1,
         },
         "routing": {
@@ -45,7 +45,7 @@ def _v1_job(job_id: int = 12, strategy: str = "rclone_copy") -> dict:
             "assignment_revision": 1,
             "search_source_id": "quark",
             "category_key": "movie",
-            "destination_id": "mobile_main" if strategy == "relay_upload_mobile" else "tianyi_main",
+            "destination_id": "mobile_main" if strategy == "relay_upload_provider" else "tianyi_main",
             "enabled": True,
         },
         "target_category": {"category_key": "movie", "public_label": "电影"},
@@ -57,7 +57,7 @@ def _v1_job(job_id: int = 12, strategy: str = "rclone_copy") -> dict:
         },
         "transfer": {
             "strategy": strategy,
-            "executor": "rclone" if strategy == "rclone_copy" else "mobile_relay",
+            "executor": "rclone" if strategy == "rclone_copy" else "provider_relay",
             "idempotency_key": "",
         },
         "paths": {
@@ -66,21 +66,21 @@ def _v1_job(job_id: int = 12, strategy: str = "rclone_copy") -> dict:
                 "namespace_id": "openlist:ol:quark",
                 "path": f"/_fnos_ingress/job-{job_id}",
             },
-            "destination_staging": None if strategy == "relay_upload_mobile" else {
+            "destination_staging": None if strategy == "relay_upload_provider" else {
                 "kind": "openlist",
                 "namespace_id": "openlist:ol:tianyi",
                 "path": f"/_fnos_staging/movie/job-{job_id}",
             },
             "destination_final": {
-                "kind": "native" if strategy == "relay_upload_mobile" else "openlist",
-                "namespace_id": "native:mobile:mobile_lib" if strategy == "relay_upload_mobile" else "openlist:ol:tianyi",
+                "kind": "native" if strategy == "relay_upload_provider" else "openlist",
+                "namespace_id": "native:mobile:mobile_lib" if strategy == "relay_upload_provider" else "openlist:ol:tianyi",
                 "path": f"/电影/job-{job_id}",
             },
             "local_temp": {
                 "kind": "relay",
                 "namespace_id": "local:relay",
                 "path": f"/data/relay/job-{job_id}",
-            } if strategy == "relay_upload_mobile" else None,
+            } if strategy == "relay_upload_provider" else None,
         },
     }
     plan["transfer"]["idempotency_key"] = compute_operation_key(plan)
@@ -89,7 +89,7 @@ def _v1_job(job_id: int = 12, strategy: str = "rclone_copy") -> dict:
         "id": job_id,
         "plan_version": 1,
         "category": "movie",
-        "destination_id": "mobile_main" if strategy == "relay_upload_mobile" else "tianyi_main",
+        "destination_id": "mobile_main" if strategy == "relay_upload_provider" else "tianyi_main",
         "raw_data": {},
         "_canonical_execution_plan": plan,
     }
@@ -139,7 +139,7 @@ class RcloneRepositoryV1Tests(unittest.TestCase):
         self.assertFalse(matched)
 
     def test_relay_callback_ownership_uses_source_and_local_temp_roots(self) -> None:
-        job = _v1_job(strategy="relay_upload_mobile")
+        job = _v1_job(strategy="relay_upload_provider")
         self.assertTrue(_job_owns_staging_directory(job, 12))
         matched, has_roots = _job_matches_staging_callback_paths(
             job,

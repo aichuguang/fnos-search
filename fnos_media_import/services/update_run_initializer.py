@@ -37,27 +37,19 @@ class UpdateRunInitializer:
 
     def initialize(self, subscription_id: int, *, trigger_type: str) -> UpdateRunContext:
         sync_result = self.sync_completion(subscription_id)
-        subscription = self.database.get_update_subscription(subscription_id, include_sources=True)
+        subscription = self.database.update.get_update_subscription(subscription_id, include_sources=True)
         if not subscription:
             raise ValueError("追更订阅不存在")
         if sync_result.get("completed_count"):
-            subscription = self.database.get_update_subscription(subscription_id, include_sources=True) or subscription
+            subscription = self.database.update.get_update_subscription(subscription_id, include_sources=True) or subscription
         lease_seconds = max(30, int(self.lease_seconds()))
-        claim = getattr(self.database, "claim_update_run", None)
-        if callable(claim):
-            run_id, active_run = claim(
-                subscription_id,
-                trigger_type,
-                scheduled_at=str(subscription.get("next_run_at") or ""),
-                owner_id=self.owner_id,
-                lease_seconds=lease_seconds,
-            )
-        else:
-            run_id, active_run = self.database.create_update_run(
-                subscription_id,
-                trigger_type,
-                scheduled_at=str(subscription.get("next_run_at") or ""),
-            ), None
+        run_id, active_run = self.database.update.claim_update_run(
+            subscription_id,
+            trigger_type,
+            scheduled_at=str(subscription.get("next_run_at") or ""),
+            owner_id=self.owner_id,
+            lease_seconds=lease_seconds,
+        )
         if run_id is None:
             raise UpdateRunAlreadyActive(active_run)
         self.record_stage(run_id, "start", "开始执行定时追更", {"trigger_type": trigger_type})
@@ -68,7 +60,7 @@ class UpdateRunInitializer:
                 "同步已提交入库任务的整理完成状态",
                 sync_result,
             )
-        self.database.add_update_event(
+        self.database.update.add_update_event(
             subscription_id,
             run_id,
             "info",

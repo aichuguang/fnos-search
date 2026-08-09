@@ -17,6 +17,7 @@ from tests._organizer_v1_fixtures import (
     organizer_v1_job,
     organizer_v1_plan,
 )
+from tests._repository_v1_fakes import RepositoryFakeMixin
 
 
 def _mapping(
@@ -164,7 +165,7 @@ class EpisodeCompletenessReportTests(unittest.TestCase):
             plan,
         )
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def get_job(self, _job_id: int) -> dict:
                 return job
 
@@ -179,6 +180,27 @@ class EpisodeCompletenessReportTests(unittest.TestCase):
 
             def update_organizer_task(self, _task_id: int, **updates) -> None:
                 task.update(updates)
+
+            def update_organizer_mappings_and_plan(
+                self,
+                _task_id: int,
+                *,
+                mapping_updates: list[dict],
+                operations: list[dict],
+                evidence: dict,
+                expected_status: str,
+                expected_revision: int,
+                **_kwargs,
+            ) -> bool:
+                if task["status"] != expected_status or task["revision"] != expected_revision:
+                    return False
+                for item in mapping_updates:
+                    if int(item["id"]) == int(mapping["id"]):
+                        mapping.update(item["updates"])
+                task["operations"] = operations
+                task["evidence"] = evidence
+                task["revision"] += 1
+                return True
 
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
@@ -228,11 +250,20 @@ class EpisodeCompletenessReportTests(unittest.TestCase):
         service.openlist = SimpleNamespace(exists=lambda _path: False)
         service.tmdb = SimpleNamespace(configured=False, search=lambda *_args, **_kwargs: [])
         service.ai = SimpleNamespace(configured=False)
-        service.db = SimpleNamespace(
-            get_job=lambda _job_id: job,
-            add_organizer_tmdb_match=lambda *_args, **_kwargs: None,
-            add_organizer_ai_suggestion=lambda *_args, **_kwargs: None,
-        )
+        class FakeDatabase(RepositoryFakeMixin):
+            @staticmethod
+            def get_job(_job_id: int) -> dict:
+                return job
+
+            @staticmethod
+            def add_organizer_tmdb_match(*_args, **_kwargs) -> None:
+                return None
+
+            @staticmethod
+            def add_organizer_ai_suggestion(*_args, **_kwargs) -> None:
+                return None
+
+        service.db = FakeDatabase()
         bind_organizer_v1_execution_repository(service, plan)
         videos = [
             OpenListItem(

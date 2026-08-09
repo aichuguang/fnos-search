@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +34,7 @@ class _Cloud139Stub:
     check_before_save = False
 
 
-class _TianyiStub:
+class _TianyiStub(RepositoryFakeMixin):
     def __init__(
         self,
         *,
@@ -97,7 +99,7 @@ class _TianyiStub:
         }
 
 
-class _ManualCache:
+class _ManualCache(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.records: dict[str, dict[str, Any]] = {}
 
@@ -125,7 +127,7 @@ class _ManualCache:
         return self.records.get(public_id)
 
 
-class _CachedDatabase:
+class _CachedDatabase(RepositoryFakeMixin):
     def __init__(self, record: dict[str, Any]) -> None:
         self.record = record
 
@@ -137,9 +139,10 @@ class TianyiPublicFlowTests(unittest.TestCase):
     def test_cloud189_link_is_supported_without_legacy_routes(self) -> None:
         link = detect_link("https://cloud.189.cn/t/AbC123", {})
 
-        self.assertEqual(link.source_type, "cloud189")
+        self.assertEqual(link.provider_kind, "tianyi")
+        self.assertEqual(link.source_form, "share")
+        self.assertEqual(link.search_source_id, "tianyi")
         self.assertTrue(link.supported)
-        self.assertEqual(link.route, "cloud189_direct")
 
     def test_pansou_tianyi_result_is_available_to_guest_search(self) -> None:
         client = PanSouClient({}, {})
@@ -212,10 +215,12 @@ class TianyiPublicFlowTests(unittest.TestCase):
             tianyi_importer=importer,
         )
 
-        self.assertEqual(detail["source_type"], "cloud189")
+        self.assertEqual(detail["provider_kind"], "tianyi")
+        self.assertEqual(detail["source_form"], "share")
+        self.assertEqual(detail["search_source_id"], "tianyi")
         self.assertTrue(detail["supported"])
         self.assertTrue(detail["detail_capability"]["available"])
-        self.assertEqual(detail["inspection"]["provider"], "cloud189")
+        self.assertEqual(detail["inspection"]["provider"], "tianyi")
         self.assertTrue(detail["inspection"]["success"])
         self.assertEqual(
             [(item["fid"], item["is_dir"], item["can_expand"]) for item in detail["inspection"]["items"]],
@@ -280,7 +285,7 @@ class TianyiPublicFlowTests(unittest.TestCase):
         self.assertEqual(result["public_id"], "MANUAL-189")
         self.assertEqual(result["item"]["source_type"], "cloud189")
         self.assertTrue(result["item"]["supported"])
-        self.assertEqual(result["detail"]["inspection"]["provider"], "cloud189")
+        self.assertEqual(result["detail"]["inspection"]["provider"], "tianyi")
         self.assertTrue(result["detail"]["inspection"]["success"])
         self.assertEqual(cache.records["MANUAL-189"]["password"], "4321")
 
@@ -316,11 +321,11 @@ class TianyiPublicFlowTests(unittest.TestCase):
 
         self.assertTrue(allowed["allowed"])
         self.assertTrue(allowed["checked"])
-        self.assertEqual(allowed["provider"], "cloud189")
+        self.assertEqual(allowed["provider"], "tianyi")
         self.assertFalse(invalid["allowed"])
         self.assertEqual(invalid["inspection"]["status"], "failed")
         self.assertFalse(non_dict_failure["allowed"])
-        self.assertEqual(non_dict_failure["inspection"]["provider"], "cloud189")
+        self.assertEqual(non_dict_failure["inspection"]["provider"], "tianyi")
         self.assertFalse(unconfigured["allowed"])
         self.assertFalse(unconfigured["checked"])
         self.assertEqual(unconfigured["inspection"]["status"], "unconfigured")
@@ -361,7 +366,9 @@ class TianyiPublicFlowTests(unittest.TestCase):
         )
 
         self.assertTrue(prepared.scoped_selection)
-        self.assertEqual(prepared.link.source_type, "cloud189")
+        self.assertEqual(prepared.link.provider_kind, "tianyi")
+        self.assertEqual(prepared.link.source_form, "share")
+        self.assertEqual(prepared.link.search_source_id, "tianyi")
         self.assertEqual(
             prepared.payload["tianyi_selection"]["selected_files"],
             [
@@ -415,6 +422,10 @@ class TianyiPublicFlowTests(unittest.TestCase):
         service = ImportJobCreationService(
             database=database,
             config=SimpleNamespace(raw={}),
+            source_resolver=object(),
+            destination_resolver=object(),
+            plan_import=lambda **_kwargs: {},
+            validate_plan=lambda *_args, **_kwargs: None,
         )
         selection = {
             "mode": "items",
@@ -497,10 +508,10 @@ class TianyiPublicFlowTests(unittest.TestCase):
         self.assertIn("...tianyiPayload", submit)
         self.assertIn("handleTianyiSelectionChange", search)
         self.assertIn("tianyi_selection", workbench)
-        self.assertEqual(template.count("20260809-tianyi-public-v001"), 4)
-        self.assertEqual(request_template.count("20260809-tianyi-public-v001"), 4)
+        self.assertEqual(template.count("20260809-v1-cutover-v001"), 4)
+        self.assertEqual(request_template.count("20260809-v1-cutover-v001"), 4)
         self.assertIn(
-            "/static/resource-search-workbench.js?v=20260809-tianyi-public-v001",
+            "/static/resource-search-workbench.js?v=20260809-v1-cutover-v001",
             admin_template,
         )
 

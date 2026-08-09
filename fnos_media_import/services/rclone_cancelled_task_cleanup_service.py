@@ -66,11 +66,8 @@ class RcloneCancelledTaskCleanupService:
             result["warnings"].append("缺少任务 ID，为避免误停其他搬运，未执行全局 rclone 停止")
         events = list(file_events or [])
         if not events and self.database and job and job.get("id"):
-            events = self.database.list_rclone_file_events(job_id=int(job["id"]), limit=200)
-        try:
-            specs = self.specs_from_events(events, job=job)
-        except TypeError:
-            specs = self.specs_from_events(events)
+            events = self.database.rclone.list_rclone_file_events(job_id=int(job["id"]), limit=200)
+        specs = self.specs_from_events(events, job=job)
         if include_title_matches:
             specs.extend(self.specs_from_title(job=job, request_item=request_item, known_specs=specs))
         specs = self.dedupe_specs(specs)
@@ -91,12 +88,7 @@ class RcloneCancelledTaskCleanupService:
                 filename = str(spec.get("filename") or "").strip()
                 if not filename:
                     continue
-                try:
-                    item = self.delete_temp_file(filename, job=job, spec=spec)
-                except TypeError:
-                    # 兼容旧的嵌入式清理适配器；生产 RcloneService 使用带任务
-                    # 边界的新签名，绝不会再按文件名扫描整个共享 temp 根目录。
-                    item = self.delete_temp_file(filename)
+                item = self.delete_temp_file(filename, job=job, spec=spec)
                 result["items"].append(item)
                 if not item["ok"]:
                     result["warnings"].append(item["message"])

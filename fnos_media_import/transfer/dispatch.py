@@ -36,9 +36,9 @@ from . import (
 from .cleanup import CompositeFilesystemOps, LocalFilesystemOps, TransferCleanupService
 from .execution_repository import ExecutionConflictError, TransferExecutionRepository
 from .finalizer import TransferFinalizer
-from .mobile_relay_executor import MobileRelayExecutor
 from .native_executor import NativeSourceMaterializer, NativeTransferExecutor
 from .orchestrator import TransferOrchestrator
+from .provider_relay_executor import ProviderRelayExecutor
 from .rclone_adapter import RcloneOperationAdapter
 from .rclone_executor import RcloneTransferExecutor
 from .verifier import TransferVerifier
@@ -63,7 +63,6 @@ class TransferDispatchService:
         assignment_service: Any = None,
         execution_repository: TransferExecutionRepository | None = None,
         organizer_service: Any = None,
-        rclone_config: dict[str, Any] | None = None,
         relay_root: str = "/data/relay",
         local_target_root: str = "/storage-targets",
         execution_lease_seconds: int = 600,
@@ -79,14 +78,13 @@ class TransferDispatchService:
         self.assignment_service = assignment_service
         self.executions = execution_repository or TransferExecutionRepository(database)
         self.organizer_service = organizer_service
-        self.rclone_config = rclone_config or {}
         self.relay_root = os.path.realpath(relay_root)
         self.local_target_root = os.path.realpath(local_target_root)
         self.execution_lease_seconds = max(60, int(execution_lease_seconds))
         # Shared only by executors created by this dispatch composition root;
         # a fresh app/test composition must not inherit another process'
         # circuit-breaker state.
-        self._halted_mobile_account_ids: set[str] = set()
+        self._halted_relay_account_ids: set[str] = set()
         local_ops = LocalFilesystemOps((self.relay_root, self.local_target_root))
         self.cleanup = TransferCleanupService(
             CompositeFilesystemOps(local_ops=local_ops),
@@ -135,24 +133,41 @@ class TransferDispatchService:
                     verifier=self.verifier,
                 )
             }
-        if strategy == "relay_upload_mobile":
+        if strategy == "relay_upload_provider":
             destination = plan.get("destination") or {}
-            mobile = adapters.get("mobile") or self.registry.get("mobile")
-            uploader_factory = getattr(mobile, "relay_uploader_for", None)
+            provider_kind = str(destination.get("provider_kind") or "").strip().lower()
+            destination_adapter = adapters.get(provider_kind) or self.registry.get(provider_kind)
+            capabilities = destination_adapter.capabilities()
+            supports_relay = (
+                bool(capabilities.get("supports_relay_upload"))
+                if isinstance(capabilities, dict)
+                else bool(getattr(capabilities, "supports_relay_upload", False))
+            )
+            if not supports_relay:
+                raise TransferDispatchError(
+                    f"{provider_kind or '目标 Provider'} Adapter 不支持中继上传"
+                )
+            uploader_factory = getattr(destination_adapter, "relay_uploader_for", None)
             if not callable(uploader_factory):
-                raise TransferDispatchError("移动 Adapter 未提供冻结账号中继上传器")
+                raise TransferDispatchError(
+                    f"{provider_kind or '目标 Provider'} Adapter 未提供冻结账号中继上传器"
+                )
             uploader = uploader_factory(
                 str(destination.get("account_id") or ""),
                 int(destination.get("account_revision") or 0),
             )
+            if uploader is None:
+                raise TransferDispatchError(
+                    f"{provider_kind or '目标 Provider'} 冻结账号中继上传器不可用"
+                )
             return {
-                strategy: MobileRelayExecutor(
+                strategy: ProviderRelayExecutor(
                     rclone_adapter,
                     uploader,
                     source_materializer=materializer,
                     visibility_poller=lambda receipt: self._source_visible(plan, receipt),
                     relay_root=self.relay_root,
-                    halted_account_ids=self._halted_mobile_account_ids,
+                    halted_account_ids=self._halted_relay_account_ids,
                 )
             }
         raise TransferDispatchError(f"未知传输策略：{strategy}")
@@ -161,7 +176,7 @@ class TransferDispatchService:
         job_id = int(payload.get("job_id") or 0)
         if job_id <= 0:
             raise TransferDispatchError("Worker 缺少 job_id")
-        job = self.database.get_job(job_id)
+        job = self.database.job_queries.get(job_id)
         execution = self.executions.get(job_id)
         if not isinstance(job, dict) or execution is None:
             return {"worker_outcome": "business_failed", "message": "V1 任务、计划或执行状态缺失"}
@@ -206,7 +221,7 @@ class TransferDispatchService:
             # being claimed.  Re-read the business row after the claim fence;
             # never submit a Provider operation from a stale pre-cancel
             # snapshot.
-            job = self.database.get_job(job_id) or job
+            job = self.database.job_queries.get(job_id) or job
 
         cancellation_result = self._stop_if_job_cancelled(job, execution, claim_owner)
         if cancellation_result is not None:
@@ -1100,7 +1115,7 @@ class TransferDispatchService:
             return ""
         if phase == PHASE_SOURCE_MATERIALIZING:
             return f"landing:{base}"
-        if phase == PHASE_TRANSFERRING and strategy == "relay_upload_mobile":
+        if phase == PHASE_TRANSFERRING and strategy == "relay_upload_provider":
             return f"relay-dl:{base}"
         return base
 
@@ -1111,7 +1126,7 @@ class _JobAckService:
         self.executions = executions
 
     def ack(self, plan: Any) -> AckResult:
-        job = self.database.get_job(plan.job_id)
+        job = self.database.job_queries.get(plan.job_id)
         if not job:
             return AckResult(False, "ACK 时任务不存在")
         if str(job.get("status") or "").lower() in {"cancelled", "canceled", "rejected"}:
@@ -1155,7 +1170,7 @@ class _OrganizerAdapter:
                     (plan.job_id,),
                 ).fetchone()
         if row is None:
-            job = self.database.get_job(plan.job_id) or {}
+            job = self.database.job_queries.get(plan.job_id) or {}
             result = self.service.enqueue_from_completed_directory(
                 job=job,
                 category_label=str(job.get("category_label") or ""),

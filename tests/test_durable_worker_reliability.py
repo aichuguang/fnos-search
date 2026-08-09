@@ -8,11 +8,12 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
-from fnos_media_import.app import (
+from fnos_media_import.web_input import (
     _public_import_compensation_retry_job_id,
     _public_import_worker_result,
 )
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.services.durable_worker_runtime import DurableWorkerRuntime
 from fnos_media_import.services.worker_task_dispatcher import WorkerTaskDispatcher
 from fnos_media_import.services.worker_queue_diagnostics_service import (
@@ -24,8 +25,9 @@ class WorkerRepositoryReliabilityTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"worker-reliability-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -172,8 +174,9 @@ class WorkerOutcomeTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"worker-outcomes-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):

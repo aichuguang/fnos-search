@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from typing import Any
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 from fnos_media_import.services.trending_initial_import_service import (
     TrendingInitialImportError,
     TrendingInitialImportService,
@@ -74,7 +76,7 @@ class UpdateCandidateInternalImportTests(unittest.TestCase):
     def test_update_candidate_uses_internal_command_without_old_routing_fields(self) -> None:
         captured: dict[str, Any] = {}
 
-        class _Database:
+        class _Database(RepositoryFakeMixin):
             @staticmethod
             def get_update_candidate(_candidate_id: int) -> dict[str, Any]:
                 return {

@@ -5,14 +5,18 @@ import os
 import threading
 from typing import Any, Callable
 
-from .importers.cloud139 import Cloud139Importer
-from .importers.quark import ActiveQuarkImporter, QuarkImporter
-from .importers.sixpan import SixPanOfflineImporter
-from .importers.tianyi import TianyiImporter
+from .config import AppConfig
+from .providers.active import ActiveProviderImporter, ActiveProviderUnavailable
+from .classifiers.link_classifier import detect_link
 from .media.fnos import FnosMediaRefresher
 from .organizer.service import OrganizerService
+from .planning.destination_resolver import DestinationResolver
+from .planning.plan_validator import PlanValidationDeps, validate_plan
+from .planning.planner import ImportPlanner
+from .planning.source_resolver import SourceResolver
 from .providers.btbtla import BtbtlaClient
 from .providers.pansou import PanSouClient
+from .repositories.repository_set import OrganizerRepositories
 from .search import BtbtlaProvider, PanSouProvider, SearchAggregator, SearchProviderConfig
 from .services.import_service import ImportService
 from .services.search_service import SearchService
@@ -22,8 +26,8 @@ from .services.search_service import SearchService
 class RuntimeBuild:
     pansou: PanSouClient
     btbtla: BtbtlaClient
-    quark_importer: QuarkImporter
-    cloud139_importer: Cloud139Importer
+    quark_importer: Any
+    cloud139_importer: Any
     generic_importers: dict[str, Any]
     fnos: FnosMediaRefresher
     search_service: SearchService
@@ -58,36 +62,26 @@ class RuntimeBuild:
         return errors
 
 
-def organizer_defer_media_refresh(
-    config: Any,
-    openlist_config_provider: Callable[[], dict[str, Any]] | None = None,
-) -> bool:
+def organizer_defer_media_refresh(config: Any) -> bool:
     organizer = config.raw.get("organizer", {}) if isinstance(config.raw.get("organizer"), dict) else {}
     # V1 planning validates the concrete OpenList mount/connection before a
     # transfer can start.  Runtime refresh deferral therefore follows the
     # Organizer feature flag, not a removed process-wide OpenList URL.  The
-    # optional provider is retained only for API compatibility.
-    _ = openlist_config_provider
     return bool(
         organizer.get("enabled", False)
         and organizer.get("staging_enabled", True)
     )
 
 
-def rclone_runtime_config(
-    config: Any,
-    openlist_config_provider: Callable[[], dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+def rclone_runtime_config(config: Any) -> dict[str, Any]:
     runtime = dict(config.raw.get("rclone", {}) or {})
-    for legacy_key in ("execution_mode", "container_name", "exec_user"):
-        runtime.pop(legacy_key, None)
     runtime["config_path"] = str(
         os.getenv("RCLONE_CONFIG_PATH") or runtime.get("config_path") or "/config/rclone/rclone.conf"
     ).strip()
     runtime["cache_dir"] = str(
         os.getenv("RCLONE_CACHE_DIR") or runtime.get("cache_dir") or "/cache"
     ).strip()
-    defer_refresh = organizer_defer_media_refresh(config, openlist_config_provider)
+    defer_refresh = organizer_defer_media_refresh(config)
     runtime["defer_media_refresh_to_organizer"] = defer_refresh
     if defer_refresh:
         # 新流程由 OpenList 生成并同步 STRM，飞牛监听本地目录变化即可。
@@ -99,10 +93,6 @@ def rclone_runtime_config(
         and organizer.get("staging_enabled", True)
     )
     runtime["staging_enabled"] = staging_enabled
-    if staging_enabled:
-        # V1 任务级搬运只能由固化 execution_plan 触发。即使旧数据库还保留
-        # 了分类级定时分钟，也应在运行时关闭，避免周期性空跑和告警。
-        runtime["auto_interval_minutes"] = 0
     runtime["staging_dir_name"] = str(organizer.get("staging_dir_name") or "_入库暂存").strip()
     return runtime
 
@@ -111,63 +101,49 @@ class RuntimeBuilder:
     def __init__(
         self,
         database: Any,
-        token_update_callback: Callable[[dict[str, Any]], bool],
+        *,
+        organizer_repositories: OrganizerRepositories,
         owner_id: str = "",
-        quark_resolver: Callable[[], Any] | None = None,
-        openlist_config_provider: Callable[[], dict[str, Any]] | None = None,
         organizer_openlist_client_resolver: Callable[[dict[str, Any], dict[str, Any]], Any]
         | None = None,
+        provider_importer_resolver: Callable[[str], Any] | None = None,
+        accounts_service: Any = None,
+        target_service: Any = None,
+        mount_service: Any = None,
+        rules_service: Any = None,
+        provider_registry: Any = None,
+        source_record_service: Any = None,
+        execution_repository: Any = None,
+        enqueue_transfer: Callable[[int], Any] | None = None,
+        enqueue_transfer_with_connection: Callable[[Any, int], Any] | None = None,
+        config_revision_provider: Callable[[], int] | None = None,
     ) -> None:
         self._database = database
-        self._token_update_callback = token_update_callback
+        self._organizer_repositories = organizer_repositories
         self._owner_id = str(owner_id or "").strip()
-        self._quark_resolver = quark_resolver if callable(quark_resolver) else None
-        self._openlist_config_provider = (
-            openlist_config_provider if callable(openlist_config_provider) else None
-        )
         self._organizer_openlist_client_resolver = (
             organizer_openlist_client_resolver
             if callable(organizer_openlist_client_resolver)
             else None
         )
-
-    def set_quark_resolver(self, resolver: Callable[[], Any] | None) -> None:
-        """Bind the account-aware Quark resolver for every future runtime build.
-
-        ``RuntimeBuilder`` is also used by the hot-reload path.  A resolver set
-        only on the first ``ActiveQuarkImporter`` instance would be lost when a
-        new runtime is built, causing the wrapper to silently fall back to the
-        legacy global ``quark`` configuration.  Keeping the callback on the
-        builder makes initial and replacement builds use the same account
-        selection logic.
-        """
-
-        self._quark_resolver = resolver if callable(resolver) else None
-
-    def set_openlist_config_provider(
-        self, provider: Callable[[], dict[str, Any]] | None
-    ) -> None:
-        self._openlist_config_provider = provider if callable(provider) else None
-
-    def set_organizer_openlist_client_resolver(
-        self,
-        resolver: Callable[[dict[str, Any], dict[str, Any]], Any] | None,
-    ) -> None:
-        """Bind the task-scoped frozen OpenList resolver for future builds."""
-
-        self._organizer_openlist_client_resolver = resolver if callable(resolver) else None
-
-    def _openlist_config(self) -> dict[str, Any]:
-        if not callable(self._openlist_config_provider):
-            return {}
-        try:
-            value = self._openlist_config_provider()
-        except Exception:  # noqa: BLE001
-            return {}
-        return dict(value or {}) if isinstance(value, dict) else {}
+        self._provider_importer_resolver = (
+            provider_importer_resolver
+            if callable(provider_importer_resolver)
+            else None
+        )
+        self._accounts_service = accounts_service
+        self._target_service = target_service
+        self._mount_service = mount_service
+        self._rules_service = rules_service
+        self._provider_registry = provider_registry
+        self._source_record_service = source_record_service
+        self._execution_repository = execution_repository
+        self._enqueue_transfer = enqueue_transfer
+        self._enqueue_transfer_with_connection = enqueue_transfer_with_connection
+        self._config_revision_provider = config_revision_provider
 
     @staticmethod
-    def _runtime_config(config: Any, openlist: dict[str, Any]) -> Any:
+    def _runtime_config(config: Any) -> Any:
         """Return a config view containing only non-identity OpenList tuning."""
 
         raw = dict(getattr(config, "raw", {}) or {})
@@ -181,54 +157,71 @@ class RuntimeBuilder:
             "retry_backoff_seconds",
         }
         configured = raw.get("openlist") if isinstance(raw.get("openlist"), dict) else {}
-        supplied = openlist if isinstance(openlist, dict) else {}
         raw["openlist"] = {
             key: value
-            for source in (configured, supplied)
-            for key, value in source.items()
+            for key, value in configured.items()
             if key in allowed_openlist_keys
         }
-        config_type = type(config)
-        try:
-            return config_type(raw=raw, base_dir=getattr(config, "base_dir", None))
-        except TypeError:
-            return config_type(raw)
+        return AppConfig(raw=raw, base_dir=config.base_dir)
 
-    def _build_quark_importer(self, config: Any) -> ActiveQuarkImporter:
-        # Quark credentials are resolved exclusively from the active Provider
-        # account.  The fallback is intentionally empty and can never use a
-        # removed global auto-save URL/token section.
-        importer = ActiveQuarkImporter(QuarkImporter({}))
-        if self._quark_resolver is not None:
-            importer.set_resolver(self._quark_resolver)
-        return importer
+    def _active_importer(
+        self, provider_kind: str, display_name: str
+    ) -> ActiveProviderImporter:
+        def resolve() -> Any:
+            if self._provider_importer_resolver is not None:
+                return self._provider_importer_resolver(provider_kind)
+            raise ActiveProviderUnavailable(
+                f"当前{display_name}账号未配置或未激活"
+            )
+
+        return ActiveProviderImporter(display_name, resolve)
+
+    def _build_quark_importer(self) -> ActiveProviderImporter:
+        return self._active_importer("quark", "夸克")
+
+    def _require_v1_dependencies(self) -> None:
+        missing = [
+            name
+            for name, value in (
+                ("accounts_service", self._accounts_service),
+                ("target_service", self._target_service),
+                ("mount_service", self._mount_service),
+                ("rules_service", self._rules_service),
+                ("provider_registry", self._provider_registry),
+                ("provider_importer_resolver", self._provider_importer_resolver),
+                (
+                    "organizer_openlist_client_resolver",
+                    self._organizer_openlist_client_resolver,
+                ),
+                ("source_record_service", self._source_record_service),
+                ("execution_repository", self._execution_repository),
+                ("enqueue_transfer", self._enqueue_transfer),
+                (
+                    "enqueue_transfer_with_connection",
+                    self._enqueue_transfer_with_connection,
+                ),
+            )
+            if value is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "RuntimeBuilder V1 dependencies missing: " + ", ".join(missing)
+            )
 
     def build(self, config: Any, *, recover_background: bool = True) -> RuntimeBuild:
-        runtime_config = self._runtime_config(config, self._openlist_config())
+        self._require_v1_dependencies()
+        runtime_config = self._runtime_config(config)
         # Search source enablement and destination routing are V1 database
         # concerns.  The search adapters keep a route argument for their
         # low-level API shape, but must never receive the removed global
         # ``config.routes`` section.
         pansou = PanSouClient(runtime_config.raw["pansou"], {})
         btbtla = BtbtlaClient(runtime_config.raw.get("btbtla", {}), {})
-        quark = self._build_quark_importer(runtime_config)
-        # 139 credentials/target paths are resolved from Provider account and
-        # storage-target bindings.  Keep an empty shell for legacy service
-        # interfaces until their callers are fully migrated; it is always
-        # reported as unconfigured rather than reading global fields.
-        cloud139 = Cloud139Importer({}, cmcc_config={})
+        quark = self._build_quark_importer()
+        cloud139 = self._active_importer("mobile", "移动云")
         generic = {
-            # Cloud189 is the historical source name for Tianyi.  Do not
-            # construct a generic Webhook from global endpoint/token values;
-            # the active Tianyi Provider account is supplied by V1 planning.
-            "cloud189": TianyiImporter({}),
-            # ``sixpan`` contains only non-secret polling/parse defaults in
-            # V1.  Client identity and tokens are resolved from the active
-            # Provider account by the V1 execution adapter.
-            "sixpan": SixPanOfflineImporter(
-                runtime_config.raw.get("sixpan", {}),
-                token_update_callback=self._token_update_callback,
-            ),
+            "cloud189": self._active_importer("tianyi", "天翼云"),
+            "sixpan": self._active_importer("sixpan", "六盘"),
         }
         fnos = FnosMediaRefresher(runtime_config.raw["fnos"])
         search_config = runtime_config.raw.get("search", {})
@@ -243,26 +236,63 @@ class RuntimeBuilder:
             aliases=search_config.get("aliases", {}),
         )
         search = SearchService(self._database, aggregator)
+        source_resolver = SourceResolver(
+            detect_link=lambda url, password="", **_kwargs: detect_link(
+                url, {}, password=password
+            ),
+            config=runtime_config.raw,
+            source_catalog_provider=self._provider_registry.search_sources,
+        )
+        destination_resolver = DestinationResolver(
+            self._rules_service,
+            self._target_service,
+            self._accounts_service,
+        )
+        planner = ImportPlanner(
+            accounts_service=self._accounts_service,
+            target_service=self._target_service,
+            rules_service=self._rules_service,
+            mount_service=self._mount_service,
+            registry=self._provider_registry,
+            config=runtime_config.raw,
+            destination_resolver=destination_resolver,
+        )
+        plan_deps = PlanValidationDeps(
+            accounts_service=self._accounts_service,
+            target_service=self._target_service,
+            mount_service=self._mount_service,
+            registry=self._provider_registry,
+            source_record_service=self._source_record_service,
+            assignment_service=self._rules_service,
+            config=runtime_config.raw,
+        )
+
         importer = ImportService(
-            self._database,
-            runtime_config,
-            quark,
-            fnos,
-            cloud139_importer=cloud139,
-            generic_importers=generic,
+            database=self._database,
+            config=runtime_config,
+            fnos=fnos,
+            source_resolver=source_resolver,
+            destination_resolver=destination_resolver,
+            plan_import=planner.plan_import,
+            validate_plan=validate_plan,
+            plan_validation_deps=plan_deps,
+            execution_repository=self._execution_repository,
+            enqueue_transfer=self._enqueue_transfer,
+            enqueue_transfer_with_connection=self._enqueue_transfer_with_connection,
+            source_record_service=self._source_record_service,
+            config_revision_provider=self._config_revision_provider,
+            executor_id=self._owner_id,
         )
         organizer = OrganizerService(
-            self._database,
+            self._organizer_repositories,
             runtime_config.raw,
             runtime_config.categories,
             fnos,
             recover_on_startup=recover_background,
             owner_id=self._owner_id,
+            openlist_client_resolver=self._organizer_openlist_client_resolver,
+            execution_repository=self._execution_repository,
         )
-        if self._organizer_openlist_client_resolver is not None:
-            organizer.set_openlist_client_resolver(
-                self._organizer_openlist_client_resolver
-            )
         if not recover_background:
             # Web 进程仍可持久化 Organizer task，但不能在本进程启动
             # Timer 扫描；worker/all 进程会通过启动恢复或热重载激活它。
@@ -313,3 +343,21 @@ class RuntimeRetirementQueue:
             item = self._pending.pop(id(build), None)
         if item is not None:
             build.close()
+
+
+class RuntimeInstaller:
+    """Install lifecycle references owned outside an immutable RuntimeBuild.
+
+    It may update the current Organizer reference and shared locator runtime,
+    but never reaches into ImportService or mutates nested planning fields.
+    """
+
+    def __init__(self, *, locator_resolver: Any, transfer_dispatch: Any) -> None:
+        self.locator_resolver = locator_resolver
+        self.transfer_dispatch = transfer_dispatch
+
+    def install(self, build: RuntimeBuild, config: Any) -> None:
+        locator_config = rclone_runtime_config(config)
+        locator_config["relay_root"] = os.getenv("FNOS_RELAY_ROOT", "/data/relay")
+        self.locator_resolver.update_config(locator_config)
+        self.transfer_dispatch.set_organizer_service(build.organizer_service)

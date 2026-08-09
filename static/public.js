@@ -37,6 +37,9 @@ const CATEGORY_ICON = {
 };
 const SOURCE_LABEL = {
     quark: "夸克网盘",
+    mobile: "移动云",
+    tianyi: "天翼云盘",
+    sixpan: "六盘",
     uc: "UC 网盘",
     cloud139: "移动云",
     cloud189: "天翼云",
@@ -258,16 +261,6 @@ function sourceLabel(value) {
     return SOURCE_LABEL[value] || value || "公开资源";
 }
 
-function publicRouteLabel(route, sourceType = "") {
-    const normalizedRoute = String(route || "").toLowerCase();
-    const normalizedSource = String(sourceType || "").toLowerCase();
-    if (normalizedSource === "cloud139" || normalizedRoute === "cloud139_direct") return "快速入库";
-    if (["magnet", "torrent"].includes(normalizedSource) || normalizedRoute === "sixpan_offline") return "云端处理";
-    if (normalizedRoute === "quark_to_mobile") return "自动入库";
-    if (normalizedRoute === "unsupported") return "人工处理";
-    return normalizedRoute ? "自动处理" : "-";
-}
-
 let publicSearchModule = null;
 
 function getPublicSearchModule() {
@@ -282,7 +275,6 @@ function getPublicSearchModule() {
         formatDate,
         categoryLabel,
         sourceLabel,
-        publicRouteLabel,
         publicMessageForDisplay,
         showGlobalLoading,
         hideGlobalLoading,
@@ -342,10 +334,6 @@ function updateSearchSourceActiveState(...args) {
 
 function sourceIconKey(...args) {
     return getPublicSearchModule().sourceIconKey(...args);
-}
-
-function isInstantImportResource(...args) {
-    return getPublicSearchModule().isInstantImportResource(...args);
 }
 
 function publicPosterUrl(...args) {
@@ -534,7 +522,6 @@ function getPublicSubmitModule() {
         formatDate,
         categoryLabel,
         sourceLabel,
-        publicRouteLabel,
         publicStatusForDisplay,
         publicDefaultMessage,
         publicMessageForDisplay,

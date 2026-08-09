@@ -86,7 +86,7 @@ class UpdateEpisodeScanService:
             },
         )
         if not targets:
-            self.database.add_update_event(
+            self.database.update.add_update_event(
                 subscription_id,
                 run_id,
                 "info",

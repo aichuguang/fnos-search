@@ -112,7 +112,7 @@ class EventRetentionWorker:
         acquired = False
         try:
             acquired = bool(
-                self.database.acquire_scheduler_lease(
+                self.database.scheduler_leases.acquire(
                     self.lease_name,
                     self.owner_id,
                     self.lease_ttl_seconds,
@@ -167,14 +167,14 @@ class EventRetentionWorker:
         finally:
             if acquired:
                 try:
-                    self.database.release_scheduler_lease(self.lease_name, self.owner_id)
+                    self.database.scheduler_leases.release(self.lease_name, self.owner_id)
                 except Exception as exc:  # noqa: BLE001
                     self._safe_log(f"Event retention lease release failed: {exc}")
             self._run_lock.release()
 
     def _renew_lease(self) -> bool:
         return bool(
-            self.database.acquire_scheduler_lease(
+            self.database.scheduler_leases.acquire(
                 self.lease_name,
                 self.owner_id,
                 self.lease_ttl_seconds,
@@ -283,12 +283,7 @@ class EventRetentionWorker:
         return removed + self._prune_recoverable_unmatched_rclone_events(cutoff, remaining)
 
     def _prune_recoverable_unmatched_rclone_events(self, cutoff: str, limit: int) -> int:
-        matcher = getattr(self.database, "find_job_for_rclone_callback", None)
-        if not callable(matcher):
-            # Compatibility adapters without the production matcher cannot
-            # prove that a row is orphaned, so preserve it rather than risk a
-            # false cleanup during startup recovery.
-            return 0
+        matcher = self.database.rclone.find_job_for_rclone_callback
 
         scan_limit = max(100, min(2000, int(limit) * 4))
         rows = self._load_recoverable_unmatched_rows(cutoff, scan_limit, self._unmatched_scan_after_id)

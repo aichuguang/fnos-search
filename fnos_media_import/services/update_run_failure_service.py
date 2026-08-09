@@ -32,31 +32,18 @@ class UpdateRunFailureService:
         trigger_type: str = "schedule",
     ) -> None:
         message = str(error)
-        owns = getattr(self.database, "owns_update_run", None)
-        if callable(owns) and not owns(run_id, owner_id):
+        if not self.database.update.owns_update_run(run_id, owner_id):
             return
         self.record_stage(run_id, "failed", "定时追更执行失败", {"error": message})
-        finish = getattr(self.database, "finish_update_run", None)
-        if callable(finish):
-            finished = finish(
-                run_id,
-                owner_id,
-                status="failed",
-                candidate_count=candidate_count,
-                imported_count=submitted_count,
-                skipped_count=skipped_count,
-                error_message=message,
-            )
-        else:
-            self.database.update_update_run(
-                run_id,
-                status="failed",
-                candidate_count=candidate_count,
-                imported_count=submitted_count,
-                skipped_count=skipped_count,
-                error_message=message,
-            )
-            finished = True
+        finished = self.database.update.finish_update_run(
+            run_id,
+            owner_id,
+            status="failed",
+            candidate_count=candidate_count,
+            imported_count=submitted_count,
+            skipped_count=skipped_count,
+            error_message=message,
+        )
         if finished:
             retry_at = self._schedule_retry(
                 subscription_id=subscription_id,
@@ -64,7 +51,7 @@ class UpdateRunFailureService:
                 message=message,
                 trigger_type=trigger_type,
             )
-            self.database.add_update_event(
+            self.database.update.add_update_event(
                 subscription_id,
                 run_id,
                 "error",
@@ -79,11 +66,10 @@ class UpdateRunFailureService:
         message: str,
         trigger_type: str,
     ) -> str:
-        get_subscription = getattr(self.database, "get_update_subscription", None)
-        update_subscription = getattr(self.database, "update_update_subscription", None)
-        if not callable(get_subscription) or not callable(update_subscription):
-            return ""
-        subscription = get_subscription(subscription_id, include_sources=False)
+        subscription = self.database.update.get_update_subscription(
+            subscription_id,
+            include_sources=False,
+        )
         if not subscription:
             return ""
         retry_at = self.next_retry_at(subscription, trigger_type) if self.next_retry_at else ""
@@ -101,5 +87,5 @@ class UpdateRunFailureService:
         }
         if retry_at:
             updates["next_run_at"] = retry_at
-        update_subscription(subscription_id, updates)
+        self.database.update.update_update_subscription(subscription_id, updates)
         return retry_at

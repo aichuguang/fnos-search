@@ -856,8 +856,6 @@ def _normalize_dir_list(value: Any) -> list[str]:
 
 def _normalize_sign_mode(value: Any) -> str:
     mode = str(value or "").strip().lower()
-    if mode in {"legacy", "legacy_php", "old"}:
-        return SIGN_MODE_PHP
     if mode in {SIGN_MODE_AUTO, SIGN_MODE_PHP, SIGN_MODE_FNV}:
         return mode
     return SIGN_MODE_PHP

@@ -24,13 +24,14 @@ from ..storage.target_service import encode_categories
 from . import (
     DEFAULT_LOCAL_TARGET_ROOT,
     DEFAULT_RELAY_ROOT,
+    DATA_PLANE_STRATEGIES,
     EXECUTION_PLAN_VERSION,
     STAGING_DIR,
     STRATEGY_EXECUTOR,
     STRATEGY_NATIVE_OFFLINE,
     STRATEGY_NATIVE_SAVE,
     STRATEGY_RCLONE_COPY,
-    STRATEGY_RELAY_UPLOAD_MOBILE,
+    STRATEGY_RELAY_UPLOAD_PROVIDER,
     VALID_SOURCE_FORMS,
     VALID_STRATEGIES,
     AdapterRegistry,
@@ -46,11 +47,9 @@ from . import (
     path_leaf,
     paths_overlap,
     split_openlist_namespace,
+    is_relay_upload_strategy,
 )
 from .job_plan import canonical_plan_json, compute_operation_key, compute_plan_hash
-
-_DATA_PLANE_STRATEGIES = frozenset({STRATEGY_RCLONE_COPY, STRATEGY_RELAY_UPLOAD_MOBILE})
-
 
 @dataclass(frozen=True)
 class PlanValidationDeps:
@@ -669,11 +668,13 @@ class PlanValidator:
                 errors.append("native_offline requires a frozen sixpan account revision")
             if not destination_caps.supports_native_offline:
                 errors.append("destination Adapter does not advertise supports_native_offline")
-        elif strategy == STRATEGY_RELAY_UPLOAD_MOBILE:
-            if dest_provider != "mobile":
-                errors.append("relay_upload_mobile destination must be mobile")
-            if source_provider == "mobile":
-                errors.append("mobile to mobile must use native_save")
+        elif is_relay_upload_strategy(strategy):
+            if dest_provider in {"local", "generic", "openlist_generic"}:
+                errors.append("Provider relay requires a registered Provider destination")
+            if source_provider == dest_provider:
+                errors.append("same-provider transfers must use native_save")
+            if category is None or category.native_locator is None:
+                errors.append("Provider relay requires a native destination locator")
             if not destination_caps.supports_relay_upload:
                 errors.append("destination Adapter does not advertise supports_relay_upload")
             elif destination_adapter is None or not callable(getattr(destination_adapter, "relay_uploader", None)):
@@ -710,11 +711,6 @@ class PlanValidator:
         if callable(method):
             try:
                 value: Any = method()
-            except TypeError:
-                try:
-                    value = method(account=None)
-                except Exception:  # noqa: BLE001 - runtime capability failure is fail-closed
-                    return ProviderCapabilities()
             except Exception:  # noqa: BLE001 - runtime capability failure is fail-closed
                 return ProviderCapabilities()
             if isinstance(value, ProviderCapabilities):
@@ -792,14 +788,15 @@ class PlanValidator:
             valid_refs.append((label, namespace, path, kind))
 
         # Validate strategy-specific path kinds before mount checks.
+        relay_expected_kinds = {
+            "source_landing": {"openlist"},
+            "destination_final": {"native"},
+            "local_temp": {"relay"},
+        }
         expected_kinds = {
             STRATEGY_NATIVE_SAVE: {"destination_final": {"native"}},
             STRATEGY_NATIVE_OFFLINE: {"destination_final": {"native"}},
-            STRATEGY_RELAY_UPLOAD_MOBILE: {
-                "source_landing": {"openlist"},
-                "destination_final": {"native"},
-                "local_temp": {"relay"},
-            },
+            STRATEGY_RELAY_UPLOAD_PROVIDER: relay_expected_kinds,
             STRATEGY_RCLONE_COPY: {
                 "source_landing": {"openlist"},
                 "destination_staging": {"openlist", "local"},
@@ -833,12 +830,12 @@ class PlanValidator:
                 errors.append(f"paths.{label} 越出受控本地根目录")
 
         # Relay 缓存使用独立的本地根，不能借用存储目标根，也不能从
-        # 当前 rclone 配置推导。它只属于 relay_upload_mobile 策略。
+        # 当前 rclone 配置推导。它只属于 Provider relay 策略。
         if local_temp:
             local_temp_namespace = _str(local_temp.get("namespace_id"))
             local_temp_path = _str(local_temp.get("path"))
-            if strategy != STRATEGY_RELAY_UPLOAD_MOBILE:
-                errors.append("paths.local_temp 只允许 relay_upload_mobile 使用")
+            if not is_relay_upload_strategy(strategy):
+                errors.append("paths.local_temp 只允许 Provider relay 使用")
             if strict_v1_paths and _str(local_temp.get("kind")) != "relay":
                 errors.append("paths.local_temp must explicitly declare kind=relay")
             if not local_temp_namespace or namespace_kind(local_temp_namespace) != "local":
@@ -854,7 +851,7 @@ class PlanValidator:
                 errors.append("paths.local_temp 不是任务级目录")
 
         # 任务级 landing/staging 叶子必须与 job_id 一致（§12.4）。
-        if strategy in _DATA_PLANE_STRATEGIES:
+        if strategy in DATA_PLANE_STRATEGIES:
             if not source_landing:
                 errors.append("跨盘/中继策略缺少 source_landing")
             elif path_leaf(source_landing.get("path")) != job:
@@ -864,13 +861,13 @@ class PlanValidator:
                 errors.append("rclone_copy 缺少 destination_staging")
             elif path_leaf(staging.get("path")) != job:
                 errors.append("destination_staging 不是任务级目录")
-        elif strategy == STRATEGY_RELAY_UPLOAD_MOBILE:
+        elif is_relay_upload_strategy(strategy):
             if staging:
-                errors.append("relay_upload_mobile 不允许 destination_staging")
+                errors.append(f"{strategy} 不允许 destination_staging")
             if not local_temp or not _str(local_temp.get("path")):
-                errors.append("relay_upload_mobile 缺少 local_temp")
+                errors.append(f"{strategy} 缺少 local_temp")
             if not final:
-                errors.append("relay_upload_mobile 缺少 destination_final")
+                errors.append(f"{strategy} 缺少 destination_final")
         elif strategy in {STRATEGY_NATIVE_SAVE, STRATEGY_NATIVE_OFFLINE}:
             if staging or source_landing or local_temp:
                 errors.append(f"{strategy} 不允许数据面 landing/staging/local_temp")
@@ -887,7 +884,7 @@ class PlanValidator:
             if strategy in {
                 STRATEGY_NATIVE_SAVE,
                 STRATEGY_NATIVE_OFFLINE,
-                STRATEGY_RELAY_UPLOAD_MOBILE,
+                STRATEGY_RELAY_UPLOAD_PROVIDER,
             } and final_kind != "native":
                 errors.append(f"{strategy} 的 destination_final 必须位于 native 命名空间")
             if strategy == STRATEGY_RCLONE_COPY and final_kind == "native":
@@ -1038,6 +1035,65 @@ class PlanValidator:
             elif staging_kind == "native":
                 errors.append("rclone_copy staging cannot use native namespace")
 
+        # Provider-neutral relay plans freeze the destination mount even though
+        # the final write uses a native locator.  That immutable revision is the
+        # proof that the selected account/root passed native upload and OpenList
+        # organizer mutation checks.  V1 hard cutover does not accept an
+        # unbound historical relay plan.
+        if strategy == STRATEGY_RELAY_UPLOAD_PROVIDER:
+            if not destination_mount_id:
+                errors.append("Provider relay missing destination mount binding")
+            else:
+                revision = _int_or(bindings.get("destination_mount_revision"), 0)
+                frozen_mount = self._frozen_mount(destination_mount_id, revision)
+                if frozen_mount is None:
+                    errors.append(
+                        f"destination mount revision does not exist: "
+                        f"{destination_mount_id}@{revision}"
+                    )
+                else:
+                    native_locator = _mapping(frozen_mount.get("native_locator"))
+                    if _str(frozen_mount.get("provider_kind")) != dest_provider:
+                        errors.append("destination mount Provider does not match plan target")
+                    if _str(frozen_mount.get("account_id")) != dest_account_id:
+                        errors.append("destination mount account does not match plan target")
+                    if not bool(frozen_mount.get("readable")):
+                        errors.append("Provider relay destination mount is not readable")
+                    if not bool(native_locator.get("upload_verified")):
+                        errors.append("Provider relay destination mount has no native upload proof")
+                    if not bool(native_locator.get("organizer_mutation_verified")):
+                        errors.append("Provider relay destination mount has no organizer mutation proof")
+                    if _str(bindings.get("destination_mount_storage_identity_id")) != _str(
+                        frozen_mount.get("storage_identity_id")
+                    ):
+                        errors.append("destination mount storage identity does not match revision")
+                    if normalize_path(
+                        bindings.get("destination_mount_identity_root")
+                    ) != normalize_path(frozen_mount.get("identity_root")):
+                        errors.append("destination mount identity root does not match revision")
+                    if _str(bindings.get("destination_mount_namespace_id")) != _str(
+                        frozen_mount.get("namespace_id")
+                    ):
+                        errors.append("destination mount namespace does not match revision")
+                    connection_id = _str(bindings.get("destination_connection_id"))
+                    connection_revision = _int_or(
+                        bindings.get("destination_connection_revision"), 0
+                    )
+                    if connection_id != _str(frozen_mount.get("connection_id")):
+                        errors.append("destination connection id does not match mount revision")
+                    if connection_revision != _int_or(
+                        frozen_mount.get("connection_revision"), 0
+                    ):
+                        errors.append("destination connection revision does not match mount revision")
+                    service = getattr(self.mount_service, "connection_service", None)
+                    if (
+                        not connection_id
+                        or connection_revision <= 0
+                        or service is None
+                        or service.get_revision(connection_id, connection_revision) is None
+                    ):
+                        errors.append("destination OpenList connection revision does not exist")
+
         # For an OpenList rclone final path, the frozen destination mount is
         # the same one used by staging.  Requiring this explicitly prevents a
         # tampered plan from copying into a different mount after validation.
@@ -1103,7 +1159,11 @@ class PlanValidator:
         staging = _mapping(paths.get("destination_staging"))
         task_leaf = f"job-{int(job_id)}" if int(job_id or 0) > 0 else ""
 
-        if strategy in {STRATEGY_NATIVE_SAVE, STRATEGY_NATIVE_OFFLINE, STRATEGY_RELAY_UPLOAD_MOBILE}:
+        if strategy in {
+            STRATEGY_NATIVE_SAVE,
+            STRATEGY_NATIVE_OFFLINE,
+            STRATEGY_RELAY_UPLOAD_PROVIDER,
+        }:
             locator = getattr(category, "native_locator", None)
             if not isinstance(locator, NativeLocator) or not final:
                 return
@@ -1114,6 +1174,22 @@ class PlanValidator:
             expected_namespace = f"native:{_str(destination.get('provider_kind'))}:{_str(destination.get('id'))}"
             if _str(final.get("namespace_id")) != expected_namespace:
                 errors.append("destination_final native namespace does not match target")
+            if is_relay_upload_strategy(strategy):
+                openlist_locator = getattr(category, "organizer_locator", None)
+                if openlist_locator is None:
+                    openlist_locator = getattr(category, "rclone_locator", None)
+                locator_mount_id = _str(getattr(openlist_locator, "mount_id", ""))
+                locator_connection_id = _str(
+                    getattr(openlist_locator, "connection_id", "")
+                )
+                frozen_mount_id = _str(bindings.get("destination_mount_id"))
+                frozen_connection_id = _str(bindings.get("destination_connection_id"))
+                if strategy == STRATEGY_RELAY_UPLOAD_PROVIDER and not locator_mount_id:
+                    errors.append("Provider relay target category has no OpenList mount locator")
+                if locator_mount_id and frozen_mount_id != locator_mount_id:
+                    errors.append("destination mount does not match target category")
+                if locator_connection_id and frozen_connection_id != locator_connection_id:
+                    errors.append("destination connection does not match target category")
             return
 
         if strategy != STRATEGY_RCLONE_COPY:
@@ -1304,10 +1380,13 @@ class PlanValidator:
             if frozen_mount is None:
                 errors.append(f"Organizer mount revision 不存在：{mount_id}@{mount_revision}")
             else:
-                if not bool(frozen_mount.get("readable")) or not bool(
+                native_locator = _mapping(frozen_mount.get("native_locator"))
+                organizer_mutation_ready = bool(
                     frozen_mount.get("writable")
-                ):
-                    errors.append("Organizer mount revision 必须可读写")
+                    or native_locator.get("organizer_mutation_verified")
+                )
+                if not bool(frozen_mount.get("readable")) or not organizer_mutation_ready:
+                    errors.append("Organizer mount revision 未通过读取与整理能力探测")
                 if _str(bindings.get("organizer_mount_storage_identity_id")) != _str(
                     frozen_mount.get("storage_identity_id")
                 ):

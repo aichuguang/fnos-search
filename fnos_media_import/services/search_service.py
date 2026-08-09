@@ -41,7 +41,7 @@ class SearchService:
             return result
         save_started = time.perf_counter()
         items = result.get("items") or []
-        resource_ids = self.db.save_resources(items)
+        resource_ids = self.db.resources.save_many(items)
         for item, resource_id in zip(items, resource_ids):
             item["resource_id"] = resource_id
         saved = len(resource_ids)
@@ -61,7 +61,7 @@ class SearchService:
         return self.aggregator.describe_providers()
 
     def _apply_runtime_settings(self) -> None:
-        settings = self.db.get_app_settings()
+        settings = self.db.app_settings.get_all()
         provider_settings = settings.get("search.providers")
         if not isinstance(provider_settings, dict):
             provider_settings = {}

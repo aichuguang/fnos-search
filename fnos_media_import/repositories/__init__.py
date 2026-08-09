@@ -20,6 +20,14 @@ from .rclone_repository import RcloneRepository
 from .organizer_repository import OrganizerRepository
 from .notification_delivery_repository import NotificationDeliveryRepository
 from .update_repository import UpdateRepository
+from .repository_set import (
+    JobRepositories,
+    NotificationRepositories,
+    OrganizerRepositories,
+    RcloneRepositories,
+    RepositorySet,
+    UpdateRepositories,
+)
 
 __all__ = [
     "AppSettingsRepository",
@@ -42,4 +50,10 @@ __all__ = [
     "OrganizerRepository",
     "NotificationDeliveryRepository",
     "UpdateRepository",
+    "JobRepositories",
+    "NotificationRepositories",
+    "OrganizerRepositories",
+    "RcloneRepositories",
+    "RepositorySet",
+    "UpdateRepositories",
 ]

@@ -91,7 +91,7 @@ def get_openapi_spec() -> dict[str, Any]:
                     "tags": ["Public"],
                     "summary": "访客链接识别，只返回是否可提交",
                     "requestBody": _body_ref("DetectRequest"),
-                    "responses": {"200": {"description": "公开识别结果", "content": _json_schema({"type": "object"})}},
+                    "responses": {"200": {"description": "公开识别结果", "content": _json_ref("SourceDetectionResponse")}},
                 }
             },
             "/api/public/resources/{public_id}/detail": {
@@ -201,7 +201,7 @@ def get_openapi_spec() -> dict[str, Any]:
                     _query("limit", "integer", "返回数量"),
                     _query("status", "string", "状态过滤"),
                     _query("category", "string", "分类过滤"),
-                    _query("source_type", "string", "来源类型过滤"),
+                    _query("source_provider_kind", "string", "来源 Provider 过滤"),
                     _query("keyword", "string", "关键词搜索"),
                 ],
             ),
@@ -338,11 +338,6 @@ def get_openapi_spec() -> dict[str, Any]:
                 parameters=[_query("limit", "integer", "返回数量")],
             ),
             "/api/admin/sixpan/probe": _admin_post("管理员检测六盘账号授权状态"),
-            "/api/admin/sixpan/sync": _admin_post("管理员手动同步六盘离线任务状态"),
-            "/api/admin/sixpan/jobs/{job_id}/retry-media-refresh": _admin_post(
-                "管理员仅重试已完成六盘任务的飞牛媒体库刷新",
-                parameters=[_path("job_id", "integer", "入库任务 ID")],
-            ),
             "/api/callback/rclone": {
                 "post": {
                     "tags": ["Callback"],
@@ -394,6 +389,9 @@ def get_openapi_spec() -> dict[str, Any]:
                                     "title": {"type": "string"},
                                     "supported": {"type": "boolean"},
                                     "reason": {"type": "string"},
+                                    "provider_kind": {"type": "string"},
+                                    "source_form": {"type": "string"},
+                                    "search_source_id": {"type": "string"},
                                     "datetime": {"type": "string"},
                                     "size_text": {"type": "string"},
                                     "category_suggestion": {"type": "object"},
@@ -410,7 +408,9 @@ def get_openapi_spec() -> dict[str, Any]:
                             "properties": {
                                 "public_id": {"type": "string"},
                                 "title": {"type": "string"},
-                                "source_type": {"type": "string"},
+                                "provider_kind": {"type": "string"},
+                                "source_form": {"type": "string"},
+                                "search_source_id": {"type": "string"},
                                 "category_suggestion": {"type": "object"},
                                 "inspection": {"type": "object", "description": "Quark / 139 检测摘要或其他来源预留接口说明"},
                             },
@@ -420,6 +420,67 @@ def get_openapi_spec() -> dict[str, Any]:
                 "DetectRequest": _object(
                     {"url": {"type": "string"}, "password": {"type": "string"}},
                     required=["url"],
+                ),
+                "SourceDetectionResponse": _object(
+                    {
+                        "success": {"type": "boolean"},
+                        "link": _object(
+                            {
+                                "provider_kind": {"type": "string"},
+                                "source_form": {"type": "string"},
+                                "search_source_id": {"type": "string"},
+                                "supported": {"type": "boolean"},
+                                "reason": {"type": "string"},
+                                "detail_capability": {"type": "object"},
+                            },
+                            required=[
+                                "provider_kind",
+                                "source_form",
+                                "search_source_id",
+                                "supported",
+                            ],
+                        ),
+                    },
+                    required=["success", "link"],
+                ),
+                "ImportJob": _object(
+                    {
+                        "id": {"type": "integer"},
+                        "title": {"type": "string"},
+                        "category": {"type": "string"},
+                        "status": {"type": "string"},
+                        "source_provider_kind": {"type": "string"},
+                        "source_form": {"type": "string"},
+                        "search_source_id": {"type": "string"},
+                        "transfer_strategy": {"type": "string"},
+                        "destination_id": {"type": "string"},
+                        "destination_provider_kind": {"type": "string"},
+                    },
+                    required=[
+                        "id",
+                        "source_provider_kind",
+                        "source_form",
+                        "search_source_id",
+                        "transfer_strategy",
+                        "destination_id",
+                        "destination_provider_kind",
+                    ],
+                ),
+                "ImportJobListResponse": _object(
+                    {
+                        "success": {"type": "boolean"},
+                        "items": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/ImportJob"},
+                        },
+                        "pagination": {"type": "object"},
+                    }
+                ),
+                "ImportJobDetailResponse": _object(
+                    {
+                        "success": {"type": "boolean"},
+                        "job": {"$ref": "#/components/schemas/ImportJob"},
+                    }
                 ),
                 "PublicSubmitRequest": _object(
                     {
@@ -618,6 +679,12 @@ def get_openapi_spec() -> dict[str, Any]:
             }
         },
     }
+    spec["paths"]["/api/admin/jobs"]["get"]["responses"]["200"][
+        "content"
+    ] = _json_ref("ImportJobListResponse")
+    spec["paths"]["/api/admin/jobs/{job_id}"]["get"]["responses"]["200"][
+        "content"
+    ] = _json_ref("ImportJobDetailResponse")
     _complete_openapi_contract(spec)
     return spec
 

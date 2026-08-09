@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fnos_media_import.app import _install_file_log_handler
+from fnos_media_import.logging_setup import install_file_log_handler
 
 
 class FileLoggingFallbackTests(unittest.TestCase):
@@ -18,7 +18,7 @@ class FileLoggingFallbackTests(unittest.TestCase):
             logger.addHandler(fallback)
 
             with patch.dict(os.environ, {"LOG_FILE": temp_dir}):
-                _install_file_log_handler(logger, Path(temp_dir))
+                install_file_log_handler(logger, Path(temp_dir))
 
             self.assertEqual(logger.handlers, [fallback])
 
@@ -37,7 +37,7 @@ class FileLoggingFallbackTests(unittest.TestCase):
                 patch.dict(os.environ, {"LOG_FILE": str(Path(temp_dir) / "invalid.log")}),
                 patch("logging.handlers.RotatingFileHandler", side_effect=ValueError("invalid path")),
             ):
-                _install_file_log_handler(logger, Path(temp_dir))
+                install_file_log_handler(logger, Path(temp_dir))
 
             self.assertEqual(logger.handlers, [fallback])
             self.assertTrue(any("持久日志不可用" in record.getMessage() for record in records))
@@ -59,7 +59,7 @@ class FileLoggingFallbackTests(unittest.TestCase):
                         side_effect=PermissionError("read-only log file"),
                     ),
                 ):
-                    _install_file_log_handler(logger, Path(temp_dir))
+                    install_file_log_handler(logger, Path(temp_dir))
             finally:
                 log_path.chmod(0o666)
 
@@ -79,7 +79,7 @@ class FileLoggingFallbackTests(unittest.TestCase):
             log_path = Path(temp_dir) / "app.log"
 
             with patch.dict(os.environ, {"LOG_FILE": str(log_path)}):
-                _install_file_log_handler(logger, Path(temp_dir))
+                install_file_log_handler(logger, Path(temp_dir))
 
             self.assertEqual(logger.handlers, [fallback])
 
@@ -93,8 +93,8 @@ class FileLoggingFallbackTests(unittest.TestCase):
             log_path = Path(temp_dir) / "app.log"
 
             with patch.dict(os.environ, {"LOG_FILE": str(log_path)}):
-                _install_file_log_handler(logger, Path(temp_dir))
-                _install_file_log_handler(logger, Path(temp_dir))
+                install_file_log_handler(logger, Path(temp_dir))
+                install_file_log_handler(logger, Path(temp_dir))
 
             file_handlers = [item for item in logger.handlers if isinstance(item, RotatingFileHandler)]
             self.assertEqual(len(file_handlers), 1)

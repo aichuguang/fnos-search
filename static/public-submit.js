@@ -2,7 +2,7 @@
     function create(context) {
         const {
             state, getElement, api, toast, escapeHtml, icon, formatDate,
-            categoryLabel, sourceLabel, publicRouteLabel, publicStatusForDisplay, publicDefaultMessage, publicMessageForDisplay,
+            categoryLabel, sourceLabel, publicStatusForDisplay, publicDefaultMessage, publicMessageForDisplay,
             showGlobalLoading, hideGlobalLoading, showPublicModal, hidePublicModal,
             resetNoticeBox,
             syncCategorySelect, activatePublicTab, categoryIcons,
@@ -18,6 +18,12 @@
         const CATEGORY_ICON = categoryIcons;
         const RECENT_REQUESTS_STORAGE_KEY = "fnos.public.recentRequests.v1";
         const RECENT_REQUESTS_LIMIT = 5;
+
+        function sourceFormLabel(value) {
+            const labels = { share: "分享链接", magnet: "磁链/种子", local: "本地文件", http: "HTTP 资源" };
+            const key = String(value || "").toLowerCase();
+            return labels[key] || value || "-";
+        }
 
         function loadRecentRequests() {
             try {
@@ -109,14 +115,14 @@
             const btbtlaDetail = isBtbtlaCandidate(detail) || isBtbtlaCandidate(link) || inspection.provider === "btbtla";
             const sixpanDetail = !btbtlaDetail && (isSixpanCandidate(detail) || isSixpanCandidate(link));
             const quarkDetail = isQuarkCandidate(detail) || isQuarkCandidate(link) || inspection.provider === "quark";
-            const cloud139Detail = isCloud139Candidate(detail) || isCloud139Candidate(link) || inspection.provider === "cloud139";
-            const tianyiDetail = isTianyiCandidate(detail) || isTianyiCandidate(link) || inspection.provider === "cloud189";
+            const cloud139Detail = isCloud139Candidate(detail) || isCloud139Candidate(link) || inspection.provider === "mobile";
+            const tianyiDetail = isTianyiCandidate(detail) || isTianyiCandidate(link) || inspection.provider === "tianyi";
             const sixpanState = sixpanDetail ? sixpanParseState(sixpanPublicKey(previewPublicId)) : null;
             const statusClass = sixpanDetail
                 ? sixpanState?.success ? "ok" : "warn"
                 : inspection.success ? "ok" : inspection.status === "reserved" ? "warn" : "error";
             const statusText = sixpanDetail
-                ? sixpanState?.success ? "可快速入库" : (sixpanState?.slow || sixpanState?.error) ? "慢速入库" : "内容预览中"
+                ? sixpanState?.success ? "内容已就绪" : (sixpanState?.slow || sixpanState?.error) ? "完整资源提交" : "内容预览中"
                 : inspection.status === "reserved" ? "暂不支持预览" : inspection.success ? "检测通过" : "检测未通过";
             return `
                 <section class="resource-detail-panel glass-panel soft">
@@ -129,8 +135,8 @@
                     </div>
                     <div class="resource-detail-grid">
                         <div><span>标题</span><strong>${escapeHtml(detail.title || "-")}</strong></div>
-                        <div><span>来源</span><strong>${escapeHtml(sourceLabel(detail.source_type || link.source_type || ""))}</strong></div>
-                        <div><span>入库方式</span><strong>${escapeHtml(publicRouteLabel(detail.route || link.route || "", detail.source_type || link.source_type || ""))}</strong></div>
+                        <div><span>来源</span><strong>${escapeHtml(sourceLabel(detail.provider_kind || link.provider_kind || ""))}</strong></div>
+                        <div><span>来源形态</span><strong>${escapeHtml(sourceFormLabel(detail.source_form || link.source_form || ""))}</strong></div>
                         <div><span>资源大小</span><strong>${escapeHtml(detailSize || "未知")}</strong></div>
                         <div><span>文件数量</span><strong>${escapeHtml(summary.file_count || "-")}</strong></div>
                         <div><span>建议分类</span><strong>${escapeHtml(suggestion.label || categoryLabel(suggestion.key || publicState.selectedCategory || "movie"))}${suggestion.confidence ? ` · ${escapeHtml(categoryConfidenceText(suggestion.confidence))}` : ""}</strong></div>
@@ -1033,7 +1039,7 @@
         async function loadSixpanParseForManual(link = publicState.manualLink, force = false) {
             const url = $("manualPublicUrl")?.value.trim() || "";
             const title = $("manualPublicTitle")?.value.trim() || "";
-            if (!url || !isSixpanCandidate(link || { source_type: "magnet", source_url: url })) {
+            if (!url || !isSixpanCandidate(link || { provider_kind: "sixpan", source_form: "magnet" })) {
                 delete publicState.sixpanParses[SIXPAN_MANUAL_KEY];
                 renderManualPublicStatus(link);
                 return;
@@ -1126,7 +1132,7 @@
                 bindPreviewInteractions(box);
                 return;
             }
-            if (isTianyiCandidate(item || {}) || inspection.provider === "cloud189") {
+            if (isTianyiCandidate(item || {}) || inspection.provider === "tianyi") {
                 box.innerHTML = `
                     <div class="manual-preview-box">
                         <div class="sixpan-parse-head">
@@ -1164,7 +1170,7 @@
                     ${icon(link.supported ? "check" : "info")}
                     <span>
                         <strong>${link.supported ? "已识别链接类型" : "链接会进入审核或暂不支持"}</strong>
-                        <small>识别来源：${escapeHtml(sourceLabel(link.source_type || "unknown"))}；提交时会再次检测资源可用性。</small>
+                        <small>识别来源：${escapeHtml(sourceLabel(link.provider_kind || "unknown"))}；提交时会再次检测资源可用性。</small>
                     </span>
                 </div>
                 ${sixpanHtml}
@@ -1707,7 +1713,7 @@
                     <div>
                         <strong>${escapeHtml(message)}</strong>
                         <p>${escapeHtml(inspectionMessage)}</p>
-                        <p>来源：${escapeHtml(sourceLabel(data.link?.source_type || ""))}；文件数：${escapeHtml(summary.file_count || "-")}；大小：${escapeHtml(summary.total_size_text || "-")}</p>
+                        <p>来源：${escapeHtml(sourceLabel(data.link?.provider_kind || ""))}；文件数：${escapeHtml(summary.file_count || "-")}；大小：${escapeHtml(summary.total_size_text || "-")}</p>
                     </div>
                 </div>
             `;

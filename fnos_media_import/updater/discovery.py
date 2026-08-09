@@ -62,12 +62,12 @@ class UpdateDiscovery:
                 if not url:
                     continue
                 link = detect_link(url, self.routes, password=str(item.get("password") or ""))
-                if str(link.source_type or "").strip().lower() in {"quark", "uc"} and self.quark:
+                if link.provider_kind == "quark" and self.quark:
                     expanded = self._expand_search_cloud_candidate(subscription, source, item, {"type": "quark", "url": link.url or url, "password": link.password or item.get("password") or ""})
                     if expanded:
                         result.extend(expanded)
                     continue
-                if str(link.source_type or "").strip().lower() == "cloud139" and self.cloud139:
+                if link.provider_kind == "mobile" and self.cloud139:
                     expanded = self._expand_search_cloud_candidate(subscription, source, item, {"type": "cloud139", "url": link.url or url, "password": link.password or item.get("password") or ""})
                     if expanded:
                         result.extend(expanded)
@@ -75,7 +75,10 @@ class UpdateDiscovery:
                 season, episode = episode_from_text(item.get("title"), _to_season(subscription.get("season")))
                 normalized = {
                     "title": item.get("title") or query,
-                    "source_type": link.source_type or item.get("source_type") or "unknown",
+                    "source_type": link.resource_kind or item.get("source_type") or "unknown",
+                    "provider_kind": link.provider_kind,
+                    "source_form": link.source_form,
+                    "search_source_id": link.search_source_id,
                     "url": link.url or url,
                     "password": link.password or item.get("password") or "",
                     "size_text": item.get("size_text") or item.get("size") or "",
@@ -434,7 +437,7 @@ class UpdateDiscovery:
         if not self.db:
             return loader()
         try:
-            cached = None if force else self.db.get_update_preview_cache(source_type, url)
+            cached = None if force else self.db.update.get_update_preview_cache(source_type, url)
         except Exception:
             cached = None
         if cached:
@@ -446,7 +449,7 @@ class UpdateDiscovery:
         ok, data = loader()
         try:
             latest_season, latest_episode = _latest_episode_from_preview_items(_preview_items_for_cache(data))
-            self.db.upsert_update_preview_cache(
+            self.db.update.upsert_update_preview_cache(
                 source_type=source_type,
                 source_url=url,
                 ok=bool(ok),

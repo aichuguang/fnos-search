@@ -50,7 +50,12 @@ class PublicSubmissionDecisionService:
                 guest_request_id,
                 reason=reason,
                 event_message=reason,
-                event_data={"content_guard": guard, "source_type": link.source_type},
+                event_data={
+                    "content_guard": guard,
+                    "provider_kind": link.provider_kind,
+                    "source_form": link.source_form,
+                    "search_source_id": link.search_source_id,
+                },
                 raw_patch={"content_guard": guard},
             )
             return self._review_response(
@@ -63,7 +68,12 @@ class PublicSubmissionDecisionService:
             guest_request_id,
             "info",
             "内容审核通过，允许自动入库",
-            {"content_guard": guard, "source_type": link.source_type},
+            {
+                "content_guard": guard,
+                "provider_kind": link.provider_kind,
+                "source_form": link.source_form,
+                "search_source_id": link.search_source_id,
+            },
         )
         current = self.get_request(guest_request_id) or {}
         self.update_request(

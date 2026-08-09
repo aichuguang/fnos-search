@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import copy
 import shutil
 import unittest
@@ -11,27 +13,66 @@ from fnos_media_import.config_persistence import (
     ADVANCED_CONFIG_EXPORT_FORMAT,
     ADVANCED_CONFIG_EXPORT_VERSION,
     advanced_config_response,
-    migrate_persisted_advanced_config_setting,
     migrate_stored_advanced_config,
     normalize_advanced_config_payload,
     persisted_config_from_settings,
 )
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.services.settings_service import SettingsDependencies, SettingsService
 
 
 WORK_TEST_ROOT = Path.cwd() / "codex_tmp" / "config-export-tests"
 
 
-class _FakeDb:
+class _FakeAppSettings(RepositoryFakeMixin):
     def __init__(self, settings: dict[str, Any] | None = None) -> None:
         self._settings = copy.deepcopy(settings or {})
 
-    def get_app_settings(self) -> dict[str, Any]:
+    def get_all(self) -> dict[str, Any]:
         return copy.deepcopy(self._settings)
 
-    def set_app_settings(self, updates: dict[str, Any]) -> None:
+    def set_many(self, updates: dict[str, Any]) -> None:
         self._settings.update(copy.deepcopy(updates))
+
+    def update_atomic(self, key: str, updater: Any) -> tuple[bool, Any, Any]:
+        existed = key in self._settings
+        previous = copy.deepcopy(self._settings.get(key))
+        updated = updater(copy.deepcopy(previous), existed)
+        self._settings[key] = copy.deepcopy(updated)
+        return existed, previous, copy.deepcopy(updated)
+
+    def mutate_all_atomic(self, updater: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        previous = copy.deepcopy(self._settings)
+        updates, delete_keys = updater(copy.deepcopy(previous))
+        for key in delete_keys:
+            self._settings.pop(key, None)
+        self._settings.update(copy.deepcopy(updates))
+        return previous, copy.deepcopy(self._settings)
+
+    def compare_and_set(
+        self,
+        key: str,
+        expected: Any,
+        replacement: Any,
+        *,
+        expected_exists: bool = True,
+        replacement_exists: bool = True,
+    ) -> bool:
+        if (key in self._settings) != expected_exists:
+            return False
+        if self._settings.get(key) != expected:
+            return False
+        if replacement_exists:
+            self._settings[key] = copy.deepcopy(replacement)
+        else:
+            self._settings.pop(key, None)
+        return True
+
+
+class _FakeDb(RepositoryFakeMixin):
+    def __init__(self, settings: dict[str, Any] | None = None) -> None:
+        self.app_settings = _FakeAppSettings(settings)
 
 
 def _document(stored: dict[str, Any], *, effective: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -89,12 +130,12 @@ def _service(
 
 
 class _WorkspaceDatabase:
-    def __enter__(self) -> Database:
+    def __enter__(self) -> RepositorySet:
         WORK_TEST_ROOT.mkdir(parents=True, exist_ok=True)
         self.path = WORK_TEST_ROOT / f"settings-{uuid.uuid4().hex}.db"
         self.database = Database(self.path)
         self.database.init_schema()
-        return self.database
+        return RepositorySet.from_database(self.database)
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         try:
@@ -222,7 +263,7 @@ class ConfigExportImportV1Tests(unittest.TestCase):
         )
         self.assertEqual(normalized, stored)
 
-    def test_export_filters_legacy_database_fields(self) -> None:
+    def test_export_rejects_legacy_database_fields_after_cutover(self) -> None:
         service = _service(
             _FakeDb(
                 {
@@ -235,15 +276,19 @@ class ConfigExportImportV1Tests(unittest.TestCase):
             raw_config={},
         )
         result, status = service.export_advanced()
-        self.assertEqual(status, 200, result)
-        self.assertEqual(result["document"]["stored"], {"pansou": {"timeout": 20}})
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["code"], "ADVANCED_CONFIG_MIGRATION_REQUIRED")
 
-    def test_database_legacy_fields_are_migrated_but_new_imports_stay_strict(self) -> None:
+    def test_v29_cleanup_helper_filters_legacy_database_fields(self) -> None:
         raw = {
             "quark": {"token": "legacy"},
             "openlist": {"base_url": "http://legacy", "timeout": 30},
             "pansou": {"base_url": "http://pansou", "unknown_option": True},
             "routes": {"quark": {"enabled": True}},
+            "rclone": {
+                "auto_interval_minutes": 15,
+                "staging_retry_delay_seconds": 30,
+            },
         }
         cleaned, removed = migrate_stored_advanced_config(raw)
         self.assertEqual(
@@ -251,49 +296,30 @@ class ConfigExportImportV1Tests(unittest.TestCase):
             {
                 "openlist": {"timeout": 30},
                 "pansou": {"base_url": "http://pansou"},
+                "rclone": {"staging_retry_delay_seconds": 30},
             },
         )
-        self.assertEqual(persisted_config_from_settings({"advanced_config": raw}), cleaned)
+        with self.assertRaisesRegex(ValueError, "\u65e7\u7248\u5b57\u6bb5"):
+            persisted_config_from_settings({"advanced_config": raw})
         self.assertIn("quark", removed)
         self.assertIn("openlist.base_url", removed)
         self.assertIn("pansou.unknown_option", removed)
         self.assertIn("routes", removed)
+        self.assertIn("rclone.auto_interval_minutes", removed)
         with self.assertRaisesRegex(ValueError, "pansou.unknown_option"):
             normalize_advanced_config_payload(
                 _payload({"pansou": {"unknown_option": True}}, mode="replace")
             )
 
-    def test_replace_can_overwrite_a_legacy_current_database_value(self) -> None:
-        replaced = normalize_advanced_config_payload(
-            _payload({"pansou": {"timeout": 45}}, mode="replace"),
-            current_stored={
-                "quark": {"token": "legacy"},
-                "routes": {"quark": {"enabled": True}},
-            },
-        )
-        self.assertEqual(replaced, {"pansou": {"timeout": 45}})
-
-    def test_startup_migration_cas_persists_cleaned_database_value(self) -> None:
-        with _WorkspaceDatabase() as database:
-            database.set_app_settings(
-                {
-                    "advanced_config": {
-                        "quark": {"token": "legacy"},
-                        "openlist": {"base_url": "http://legacy", "timeout": 30},
-                        "pansou": {"base_url": "http://pansou", "unknown_option": True},
-                    }
-                }
+    def test_current_database_value_is_strict_even_for_replace(self) -> None:
+        with self.assertRaisesRegex(ValueError, "\u65e7\u7248\u5b57\u6bb5"):
+            normalize_advanced_config_payload(
+                _payload({"pansou": {"timeout": 45}}, mode="replace"),
+                current_stored={
+                    "quark": {"token": "legacy"},
+                    "routes": {"quark": {"enabled": True}},
+                },
             )
-            settings, removed = migrate_persisted_advanced_config_setting(database)
-
-            expected = {
-                "openlist": {"timeout": 30},
-                "pansou": {"base_url": "http://pansou"},
-            }
-            self.assertEqual(settings["advanced_config"], expected)
-            self.assertEqual(database.get_app_settings()["advanced_config"], expected)
-            self.assertIn("quark", removed)
-            self.assertIn("openlist.base_url", removed)
 
     def test_update_service_requires_envelope_and_persists_merge(self) -> None:
         db = _FakeDb({"advanced_config": {"tmdb": {"language": "zh-CN"}}})
@@ -301,7 +327,7 @@ class ConfigExportImportV1Tests(unittest.TestCase):
         result, status = service.update_advanced(_payload({"pansou": {"timeout": 20}}))
         self.assertEqual(status, 200, result)
         self.assertEqual(
-            db.get_app_settings()["advanced_config"],
+            db.app_settings.get_all()["advanced_config"],
             {"tmdb": {"language": "zh-CN"}, "pansou": {"timeout": 20}},
         )
         result, status = service.update_advanced({"config": {"pansou": {"timeout": 30}}})
@@ -321,7 +347,7 @@ class ConfigExportImportV1Tests(unittest.TestCase):
             }
             result, status = service.update_all(payload)
             self.assertEqual(status, 200, result)
-            settings = database.get_app_settings()
+            settings = database.app_settings.get_all()
             self.assertEqual(settings["advanced_config"], {"pansou": {"timeout": 20}})
             self.assertFalse(settings["public.allow_anonymous_search"])
             self.assertEqual(settings["submission.mode"], "review")
@@ -336,11 +362,11 @@ class ConfigExportImportV1Tests(unittest.TestCase):
                 }
             )
             self.assertEqual(status, 200, result)
-            self.assertNotIn("advanced_config", database.get_app_settings())
+            self.assertNotIn("advanced_config", database.app_settings.get_all())
 
     def test_reload_failure_rolls_back_v1_config(self) -> None:
         with _WorkspaceDatabase() as database:
-            database.set_app_settings({"advanced_config": {"tmdb": {"language": "zh-CN"}}})
+            database.app_settings.set_many({"advanced_config": {"tmdb": {"language": "zh-CN"}}})
             calls = 0
 
             def reload_runtime() -> dict[str, Any]:
@@ -362,7 +388,7 @@ class ConfigExportImportV1Tests(unittest.TestCase):
             self.assertTrue(result["rolled_back"])
             self.assertTrue(result["runtime_restored"])
             self.assertEqual(
-                database.get_app_settings()["advanced_config"],
+                database.app_settings.get_all()["advanced_config"],
                 {"tmdb": {"language": "zh-CN"}},
             )
 

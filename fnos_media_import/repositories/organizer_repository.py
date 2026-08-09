@@ -1050,6 +1050,14 @@ class OrganizerRepository:
             rows = conn.execute("SELECT * FROM organizer_runs ORDER BY id DESC LIMIT ? OFFSET ?", (max(1, int(limit or 100)), max(0, int(offset or 0)))).fetchall()
         return [_decode_json_fields(dict(row), ("summary", "undo_data")) for row in rows]
 
+    def get_organizer_run(self, run_id: int) -> dict[str, Any] | None:
+        with self._connection_factory() as conn:
+            row = conn.execute(
+                "SELECT * FROM organizer_runs WHERE id = ?",
+                (int(run_id),),
+            ).fetchone()
+        return _decode_json_fields(dict(row), ("summary", "undo_data")) if row else None
+
     def list_organizer_runs_by_task_ids(self, task_ids: list[int]) -> list[dict[str, Any]]:
         normalized_ids = sorted({int(task_id) for task_id in task_ids if int(task_id or 0) > 0})
         if not normalized_ids:

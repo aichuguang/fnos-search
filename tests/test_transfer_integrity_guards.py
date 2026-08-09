@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import os
 import ntpath
 import shutil
@@ -245,7 +247,7 @@ def _openlist_plan() -> dict:
     }
 
 
-class _ExecutionRepository:
+class _ExecutionRepository(RepositoryFakeMixin):
     def __init__(self, plan: dict) -> None:
         self._plan = plan
 
@@ -257,7 +259,7 @@ class _ExecutionRepository:
         return SimpleNamespace(strategy="rclone_copy")
 
 
-class _FrozenMountService:
+class _FrozenMountService(RepositoryFakeMixin):
     def __init__(
         self,
         revision: dict,

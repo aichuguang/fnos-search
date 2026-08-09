@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.services.event_retention_worker import EventRetentionWorker
 from fnos_media_import.transfer.execution_repository import TransferExecutionRepository
 
@@ -19,24 +20,36 @@ class EventRetentionWorkerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "events.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
     def _insert_job(self, status: str, suffix: str) -> int:
+        job_id, created = self.database.job_commands.create(
+            {
+                "title": f"job-{suffix}",
+                "category": "tv",
+                "category_label": "TV",
+                "source_provider_kind": "quark",
+                "source_form": "share",
+                "source_url": f"source-record:event-retention-{suffix}",
+                "target_path": f"/openlist/tv/{suffix}",
+                "status": status,
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": f"event-retention:{suffix}",
+            }
+        )
+        self.assertTrue(created)
         with self.database.connect() as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO import_jobs (
-                    title, category, category_label, source_type, source_url,
-                    target_route, status, created_at, updated_at
-                ) VALUES (?, 'tv', '电视剧', 'quark', ?, 'quark_to_mobile', ?, ?, ?)
-                """,
-                (f"任务-{suffix}", f"https://example.invalid/{suffix}", status, OLD_TIMESTAMP, OLD_TIMESTAMP),
+            connection.execute(
+                "UPDATE import_jobs SET created_at = ?, updated_at = ? WHERE id = ?",
+                (OLD_TIMESTAMP, OLD_TIMESTAMP, job_id),
             )
-            return int(cursor.lastrowid)
+        return job_id
 
     def _insert_guest_request(self, suffix: str) -> int:
         with self.database.connect() as connection:
@@ -176,7 +189,7 @@ class EventRetentionWorkerTests(unittest.TestCase):
                 (f"{job_root}/episode.mkv", f"{job_root}/episode.mkv", OLD_TIMESTAMP),
             )
 
-        before = self.database.find_job_for_rclone_callback(
+        before = self.database.rclone.find_job_for_rclone_callback(
             "tv",
             "episode.mkv",
             f"{job_root}/episode.mkv",
@@ -321,7 +334,7 @@ class EventRetentionWorkerTests(unittest.TestCase):
                 (guest_request_id, OLD_TIMESTAMP),
             )
 
-        original_acquire = self.database.acquire_scheduler_lease
+        original_acquire = self.database.scheduler_leases.acquire
         acquire_count = 0
 
         def acquire_once(name: str, owner_id: str, ttl_seconds: int) -> bool:
@@ -331,7 +344,7 @@ class EventRetentionWorkerTests(unittest.TestCase):
                 return False
             return original_acquire(name, owner_id, ttl_seconds)
 
-        self.database.acquire_scheduler_lease = acquire_once  # type: ignore[method-assign]
+        self.database.scheduler_leases.acquire = acquire_once  # type: ignore[method-assign]
         result = self._worker(batch_size=1, max_delete_per_run=2).run_once()
 
         self.assertFalse(result["success"])

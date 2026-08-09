@@ -36,6 +36,7 @@ from fnos_media_import.accounts.crypto import (
 from fnos_media_import.accounts.service import InvalidConfigError, ProviderAccountService
 from fnos_media_import.accounts.repository import AccountConflictError
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.domain.models import AccountTestResult
 
 
@@ -48,8 +49,9 @@ class AccountsV1Tests(unittest.TestCase):
     def setUp(self) -> None:
         WORK_TEST_ROOT.mkdir(parents=True, exist_ok=True)
         self.db_path = WORK_TEST_ROOT / f"accounts-{uuid.uuid4().hex}.db"
-        self.db = Database(self.db_path)
-        self.db.init_schema()
+        self._db_infrastructure = Database(self.db_path)
+        self._db_infrastructure.init_schema()
+        self.db = RepositorySet.from_database(self._db_infrastructure)
         self.service = ProviderAccountService(self.db, lambda: KEY)
 
     def tearDown(self) -> None:

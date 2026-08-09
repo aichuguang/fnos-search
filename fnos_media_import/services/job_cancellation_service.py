@@ -31,7 +31,6 @@ class JobCancellationDependencies:
     cancelled_status: str
     worker_tasks: Any | None = None
     organizer: Any | None = None
-    sixpan_importer: Callable[[], Any] | None = None
     execution_repository: Any | None = None
     enqueue_transfer: Callable[..., Any] | None = None
 
@@ -123,8 +122,6 @@ class JobCancellationService:
         propagation = self._cancel_related_execution(
             cancelled_job,
             reason=reason,
-            cancelled_from_status=str(claim.get("cancelled_from_status") or ""),
-            durable_transfer_owned=durable_transfer_owned,
         )
         transfer_wakeup = self._enqueue_transfer_cancellation(job_id, reactivate=True)
         if transfer_wakeup is not None:
@@ -374,8 +371,6 @@ class JobCancellationService:
         job: dict[str, Any],
         *,
         reason: str,
-        cancelled_from_status: str,
-        durable_transfer_owned: bool,
     ) -> dict[str, Any]:
         job_id = int(job.get("id") or 0)
         items: list[dict[str, Any]] = []
@@ -411,46 +406,7 @@ class JobCancellationService:
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"取消 Worker 任务异常：{exc}")
 
-        if (
-            not durable_transfer_owned
-            and self._should_cancel_sixpan(job, cancelled_from_status=cancelled_from_status)
-        ):
-            try:
-                importer = self._deps.sixpan_importer() if callable(self._deps.sixpan_importer) else None
-                delete_tasks = getattr(importer, "delete_offline_tasks", None)
-                if not callable(delete_tasks):
-                    delete_tasks = getattr(getattr(importer, "client", None), "delete_offline_tasks", None)
-                if not callable(delete_tasks):
-                    warnings.append("六盘适配器未提供离线任务取消接口")
-                else:
-                    external_task_id = str(job.get("external_task_id") or "").strip()
-                    response = delete_tasks([external_task_id], delete_files=False)
-                    explicit_failure = isinstance(response, dict) and response.get("success") is False
-                    items.append(
-                        {
-                            "type": "cancel_sixpan_task",
-                            "success": not explicit_failure,
-                            "external_task_id": external_task_id,
-                            "delete_files": False,
-                            "response": response,
-                        }
-                    )
-                    if explicit_failure:
-                        warnings.append("六盘离线任务取消接口返回失败")
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"取消六盘离线任务异常：{exc}")
-
         return {"items": items, "warnings": warnings}
-
-    @staticmethod
-    def _should_cancel_sixpan(job: dict[str, Any], *, cancelled_from_status: str) -> bool:
-        if _normalized_status(cancelled_from_status) != "submitted":
-            return False
-        if not str(job.get("external_task_id") or "").strip():
-            return False
-        source_type = str(job.get("source_type") or "").strip().lower()
-        route = str(job.get("target_route") or "").strip().lower()
-        return source_type in {"magnet", "torrent", "bt"} or route == "sixpan_offline"
 
     def _cancel_execution(self, job_id: int, *, stop_running: bool) -> dict[str, Any]:
         cancel_job = getattr(self._deps.cleaner, "cancel_job", None)

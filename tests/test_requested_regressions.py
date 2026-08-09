@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -104,7 +106,7 @@ class UpdateBatchIsolationTests(unittest.TestCase):
         self.assertTrue(any(stage[1] == "import_failed" for stage in stages))
 
 
-class _OutcomeDatabase:
+class _OutcomeDatabase(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.subscription_updates: list[tuple[int, dict]] = []
         self.run_updates: list[tuple[int, dict]] = []
@@ -115,6 +117,10 @@ class _OutcomeDatabase:
 
     def update_update_run(self, run_id: int, **values) -> None:
         self.run_updates.append((run_id, values))
+
+    def finish_update_run(self, run_id: int, _owner_id: str, *, status: str, **values) -> bool:
+        self.update_update_run(run_id, status=status, **values)
+        return True
 
     def add_update_event(self, *args) -> None:
         self.events.append(args)
@@ -240,7 +246,7 @@ class UpdatePartialFailureRetryTests(unittest.TestCase):
         self.assertEqual(raw_data["missing_episode_retry"]["episodes"], [151])
 
 
-class _CompletionDatabase:
+class _CompletionDatabase(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.subscription = {
             "id": 5,
@@ -287,7 +293,7 @@ class UpdateCompletionGapTests(unittest.TestCase):
         self.assertEqual(final_update["missing_episodes"], [151])
 
 
-class _FailureDatabase:
+class _FailureDatabase(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.run_updates: list[tuple[int, dict]] = []
         self.subscription_updates: list[tuple[int, dict]] = []
@@ -295,6 +301,14 @@ class _FailureDatabase:
 
     def update_update_run(self, run_id: int, **values) -> None:
         self.run_updates.append((run_id, values))
+
+    @staticmethod
+    def owns_update_run(_run_id: int, _owner_id: str) -> bool:
+        return True
+
+    def finish_update_run(self, run_id: int, _owner_id: str, *, status: str, **values) -> bool:
+        self.update_update_run(run_id, status=status, **values)
+        return True
 
     def get_update_subscription(self, subscription_id: int, *, include_sources: bool = False):
         if subscription_id != 5 or include_sources:

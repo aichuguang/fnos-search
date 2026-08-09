@@ -40,7 +40,7 @@ class UpdateRunLease:
 
         def heartbeat() -> None:
             while not self._stop.wait(interval):
-                if not self.database.renew_update_run(
+                if not self.database.update.renew_update_run(
                     self.run_id,
                     self.owner_id,
                     lease_seconds=self.lease_seconds,
@@ -63,6 +63,6 @@ class UpdateRunLease:
             self._thread.join(timeout=1.0)
 
     def ensure_owned(self) -> None:
-        if self._lost.is_set() or not self.database.owns_update_run(self.run_id, self.owner_id):
+        if self._lost.is_set() or not self.database.update.owns_update_run(self.run_id, self.owner_id):
             self._lost.set()
             raise UpdateRunLeaseLost("追更运行租约已失效，停止继续处理")

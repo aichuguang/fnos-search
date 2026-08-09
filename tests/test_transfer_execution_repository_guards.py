@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import sqlite3
 import unittest
 from contextlib import contextmanager
@@ -12,7 +14,7 @@ from fnos_media_import.transfer.execution_repository import (
 from fnos_media_import.services.job_admin_query_service import serialize_transfer_execution
 
 
-class _MemoryDatabase:
+class _MemoryDatabase(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.connection = sqlite3.connect(":memory:", check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
@@ -62,6 +64,25 @@ class _MemoryDatabase:
         except Exception:
             self.connection.rollback()
             raise
+
+    @staticmethod
+    def update_unless_status_with_connection(
+        connection,
+        job_id: int,
+        excluded_statuses,
+        updates=None,
+        **fields,
+    ) -> bool:
+        values = {**(updates or {}), **fields}
+        statuses = sorted(str(value).strip().lower() for value in excluded_statuses)
+        assignments = ", ".join(f"{name} = ?" for name in values)
+        placeholders = ", ".join("?" for _value in statuses)
+        cursor = connection.execute(
+            f"UPDATE import_jobs SET {assignments} "
+            f"WHERE id = ? AND LOWER(status) NOT IN ({placeholders})",
+            (*values.values(), int(job_id), *statuses),
+        )
+        return int(cursor.rowcount or 0) > 0
 
 
 def _plan(job_id: int = 1) -> dict:

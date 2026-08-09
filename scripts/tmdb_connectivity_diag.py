@@ -37,13 +37,15 @@ def load_tmdb_config():
         from fnos_media_import.config import load_config
         from fnos_media_import.config_persistence import apply_persisted_config
         from fnos_media_import.database import Database
+        from fnos_media_import.repositories import RepositorySet
     except Exception as exc:  # noqa: BLE001
         print(f"[config] 加载应用模块失败：{exc}")
         return None
     try:
         cfg = load_config(config_path)
-        db = Database(cfg.database_path)
-        merged = apply_persisted_config(cfg, db.get_app_settings())
+        database = Database(cfg.database_path)
+        repositories = RepositorySet.from_database(database)
+        merged = apply_persisted_config(cfg, repositories.app_settings.get_all())
         tmdb = merged.raw.get("tmdb", {})
     except Exception as exc:  # noqa: BLE001
         print(f"[config] 读取数据库配置失败：{exc}")

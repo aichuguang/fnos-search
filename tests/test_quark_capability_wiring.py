@@ -88,17 +88,14 @@ class QuarkCapabilityCompositionTests(unittest.TestCase):
             <= calls[0]
         )
 
-    def test_quark_adapter_wires_candidate_account_importer_factory(self) -> None:
+    def test_quark_adapter_is_registered_as_formal_provider_adapter(self) -> None:
         calls = []
         for node in ast.walk(self._function("create_app")):
             if not isinstance(node, ast.Call):
                 continue
-            if not isinstance(node.func, ast.Name) or node.func.id != "LegacyNativeAdapter":
+            if not isinstance(node.func, ast.Name) or node.func.id != "QuarkProviderAdapter":
                 continue
-            if len(node.args) < 2 or not isinstance(node.args[1], ast.Constant):
-                continue
-            if node.args[1].value == "quark":
-                calls.append(node)
+            calls.append(node)
 
         self.assertEqual(len(calls), 1)
         keywords = {item.arg: item.value for item in calls[0].keywords if item.arg}

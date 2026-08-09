@@ -21,17 +21,17 @@ class UpdateSubscriptionQueryService:
         safe_page = max(1, int(page or 1))
         safe_per_page = max(1, int(per_page or 50))
         offset = (safe_page - 1) * safe_per_page
-        items = self.database.list_update_subscriptions(
+        items = self.database.update.list_update_subscriptions(
             limit=safe_per_page,
             offset=offset,
             status=status,
             include_sources=True,
         )
-        total = self.database.count_update_subscriptions(status=status)
+        total = self.database.update.count_update_subscriptions(status=status)
         return {"items": [self.with_path_health(item) for item in items], "total": total}
 
     def get(self, subscription_id: int) -> dict[str, Any] | None:
-        item = self.database.get_update_subscription(subscription_id, include_sources=True)
+        item = self.database.update.get_update_subscription(subscription_id, include_sources=True)
         return self.with_path_health(item)
 
     def with_path_health(self, item: dict[str, Any] | None) -> dict[str, Any] | None:

@@ -40,6 +40,41 @@ def normalize_storage_path(value: Any) -> str:
     return text.strip("/")
 
 
+def resolve_local_target(root: str, relative: str) -> str:
+    """Resolve a V1 local destination below the controlled container mount."""
+
+    root_norm = str(root or "").strip().replace("\\", "/")
+    while "//" in root_norm:
+        root_norm = root_norm.replace("//", "/")
+    if not root_norm.startswith("/"):
+        raise ValueError("root \u5fc5\u987b\u662f\u5bb9\u5668\u5185\u7edd\u5bf9\u8def\u5f84")
+    root_norm = root_norm.rstrip("/")
+    if not root_norm:
+        raise ValueError("root \u4e0d\u80fd\u662f\u6587\u4ef6\u7cfb\u7edf\u6839\u76ee\u5f55")
+    if "\x00" in root_norm or any(ord(char) < 32 for char in root_norm):
+        raise ValueError("root \u5305\u542b\u975e\u6cd5\u63a7\u5236\u5b57\u7b26")
+    if any(part in {"", ".", ".."} for part in root_norm.split("/")[1:]):
+        raise ValueError("root \u5305\u542b .. \u6216\u975e\u6cd5\u8def\u5f84\u6bb5")
+    if root_norm != "/storage-targets" and not root_norm.startswith(
+        "/storage-targets/"
+    ):
+        raise ValueError("root \u5fc5\u987b\u4f4d\u4e8e /storage-targets \u6302\u8f7d\u76ee\u5f55\u5185")
+
+    relative_text = str(relative or "").strip()
+    if not relative_text:
+        raise ValueError("relative \u4e0d\u80fd\u4e3a\u7a7a")
+    if relative_text.startswith(("/", "\\")):
+        raise ValueError("relative \u5fc5\u987b\u662f\u76f8\u5bf9\u8def\u5f84")
+    if "\x00" in relative_text or any(ord(char) < 32 for char in relative_text):
+        raise ValueError("relative \u5305\u542b\u975e\u6cd5\u63a7\u5236\u5b57\u7b26")
+    relative_norm = normalize_storage_path(relative_text)
+    if relative_norm in {"", ".", ".."} or any(
+        part in {"", ".", ".."} for part in relative_norm.split("/")
+    ):
+        raise ValueError("relative \u5305\u542b .. \u6216\u975e\u6cd5\u8def\u5f84\u6bb5")
+    return f"{root_norm}/{relative_norm}"
+
+
 def _reject_legacy_category_fields(category: Any) -> dict[str, Any]:
     value = category if isinstance(category, dict) else {}
     invalid = sorted(_LEGACY_CATEGORY_PATH_FIELDS.intersection(value))
@@ -181,6 +216,7 @@ __all__ = [
     "map_upload_path_to_openlist",
     "normalize_sixpan_path_sources",
     "normalize_storage_path",
+    "resolve_local_target",
     "openlist_root_for_upload",
     "rclone_upload_root",
     "upload_backend",

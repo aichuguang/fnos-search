@@ -4,9 +4,9 @@ import unittest
 import uuid
 from pathlib import Path
 
-from fnos_media_import.app import _worker_dispatch_enabled_for_role
-from fnos_media_import.constants import JOB_DONE, JOB_REVIEW
+from fnos_media_import.web_input import _worker_dispatch_enabled_for_role
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.domain.models import SelectionSnapshot
 from fnos_media_import.organizer.service import OrganizerService, _utc_after_seconds, _utc_now_text
 from fnos_media_import.planning.job_plan import attach_plan_integrity, compute_operation_key
@@ -14,13 +14,13 @@ from fnos_media_import.services.organizer_admin_service import (
     OrganizerAdminCommandDependencies,
     OrganizerAdminCommandService,
 )
-from fnos_media_import.services.organizer_dispatch_service import OrganizerDispatchService
 from fnos_media_import.services.worker_task_dispatcher import WorkerTaskDispatcher
 from tests._organizer_v1_fixtures import (
     attach_organizer_v1_task,
     bind_organizer_v1_execution_repository,
     organizer_v1_job,
 )
+from tests._repository_v1_fakes import RepositoryFakeMixin
 
 
 def _worker_schedule_plan(job_id: int) -> dict:
@@ -105,114 +105,6 @@ def _worker_schedule_plan(job_id: int) -> dict:
     return attach_plan_integrity(plan)
 
 
-class OrganizerDurableDispatchTests(unittest.TestCase):
-    @staticmethod
-    def _build_service(*, dispatch_process, task_id: int = 81):
-        jobs = {
-            11: {
-                "id": 11,
-                "title": "测试剧",
-                "category": "tv",
-                "category_label": "电视剧",
-                "status": JOB_DONE,
-                "raw_data": {},
-            }
-        }
-        stage_updates: list[tuple[str, str, str]] = []
-
-        class FakeDatabase:
-            @staticmethod
-            def get_job(job_id: int) -> dict:
-                return dict(jobs.get(job_id) or {})
-
-            @staticmethod
-            def add_event(*_args, **_kwargs) -> None:
-                return None
-
-        class FakeOrganizer:
-            enabled = True
-            openlist = type("OpenListState", (), {"configured": True})()
-
-            @staticmethod
-            def enqueue_from_completed_directory(**_kwargs) -> dict:
-                return {
-                    "success": True,
-                    "queued": True,
-                    "task_id": task_id,
-                    "message": "已创建 OpenList 标准化任务",
-                }
-
-        def set_completion_stage(job, status, stage, message, *_args, **_kwargs):
-            updated = {**job, "status": status}
-            if job.get("id"):
-                jobs[int(job["id"])] = updated
-            stage_updates.append((status, stage, message))
-            return updated
-
-        service = OrganizerDispatchService(
-            database=FakeDatabase(),
-            organizer=FakeOrganizer(),
-            resolve_plan=lambda _job: {"root_path": "/移动云/_入库暂存/电视剧/job-11"},
-            resolve_rclone_plan=lambda _item: {"root_path": "/移动云/_入库暂存/电视剧/job-11"},
-            set_completion_stage=set_completion_stage,
-            invalid_virtual_path=lambda _path: False,
-            dispatch_process=dispatch_process,
-        )
-        return service, jobs, stage_updates
-
-    def test_direct_auto_task_is_handed_to_durable_worker(self) -> None:
-        dispatches: list[tuple[int, bool]] = []
-
-        def dispatch_process(task_id: int, *, auto_apply: bool) -> dict:
-            dispatches.append((task_id, auto_apply))
-            return {"success": True, "queued": True, "worker_task_id": 501}
-
-        service, jobs, _updates = self._build_service(dispatch_process=dispatch_process)
-        result = {"success": True, "job": jobs[11]}
-
-        organizer = service.enqueue_completed_import(result, "sixpan_poll")
-
-        self.assertEqual(dispatches, [(81, True)])
-        self.assertTrue(organizer["success"])
-        self.assertEqual(organizer["worker_dispatch"]["worker_task_id"], 501)
-
-    def test_rclone_auto_task_is_handed_to_durable_worker(self) -> None:
-        dispatches: list[tuple[int, bool]] = []
-
-        def dispatch_process(task_id: int, *, auto_apply: bool) -> dict:
-            dispatches.append((task_id, auto_apply))
-            return {"success": True, "queued": True, "worker_task_id": 502}
-
-        service, jobs, _updates = self._build_service(dispatch_process=dispatch_process, task_id=82)
-
-        organizer = service.enqueue_rclone_completed_items(
-            {
-                "completed_items": [
-                    {
-                        "job_id": 11,
-                        "job": jobs[11],
-                        "category": "tv",
-                        "category_label": "电视剧",
-                    }
-                ]
-            },
-            {"run_id": 7},
-        )
-
-        self.assertEqual(dispatches, [(82, True)])
-        self.assertTrue(organizer["success"])
-        self.assertEqual(organizer["items"][0]["worker_dispatch"]["worker_task_id"], 502)
-
-    def test_required_queue_failure_moves_job_to_review(self) -> None:
-        service, jobs, updates = self._build_service(dispatch_process=lambda *_args, **_kwargs: None)
-        result = {"success": True, "job": jobs[11]}
-
-        organizer = service.enqueue_completed_import(result, "cloud139_reconcile")
-
-        self.assertFalse(organizer["success"])
-        self.assertEqual(updates[-1][0:2], (JOB_REVIEW, "review"))
-        self.assertIn("持久化 Worker 投递失败", updates[-1][2])
-        self.assertEqual(result["job"]["status"], JOB_REVIEW)
 
 
 class WorkerDispatchRoleTests(unittest.TestCase):
@@ -220,7 +112,7 @@ class WorkerDispatchRoleTests(unittest.TestCase):
         self.assertTrue(_worker_dispatch_enabled_for_role({}, "web"))
         self.assertTrue(_worker_dispatch_enabled_for_role({}, "scheduler"))
 
-    def test_worker_and_legacy_all_roles_keep_configuration_switch(self) -> None:
+    def test_worker_and_combined_roles_keep_configuration_switch(self) -> None:
         self.assertFalse(_worker_dispatch_enabled_for_role({}, "worker"))
         self.assertFalse(_worker_dispatch_enabled_for_role({}, "all"))
         self.assertTrue(_worker_dispatch_enabled_for_role({"durable_dispatch_enabled": True}, "all"))
@@ -230,8 +122,9 @@ class OrganizerWorkerRedispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"organizer-worker-redispatch-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -270,7 +163,7 @@ class OrganizerWorkerScheduleTests(unittest.TestCase):
         attach_organizer_v1_task(task, plan)
         job = organizer_v1_job(plan)
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             @staticmethod
             def get_organizer_task(_task_id: int, include_children: bool = False) -> dict:
                 return task

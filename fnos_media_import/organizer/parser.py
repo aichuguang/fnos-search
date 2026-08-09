@@ -12,12 +12,6 @@ from .openlist_client import basename, dirname, join_path
 EPISODIC_CATEGORIES = {"tv", "anime", "variety"}
 V1_DESTINATION_FINAL_FIELD = "_v1_destination_final"
 V1_DESTINATION_IS_RESOURCE_FIELD = "_v1_destination_is_resource"
-LEGACY_CATEGORY_TARGET_FIELDS = (
-    "openlist_root_path",
-    "cloud139_fnos_target_path",
-    "mobile_target_path",
-    "sixpan_fnos_target_path",
-)
 TECH_VERSION_PATTERN = re.compile(
     r"(?i)(2160p|1080p|720p|4k|8k|hdr10?|dv|dolby\s*vision|sdr|60fps|120fps|高码率|臻彩|remux|bluray|web-?dl|h\.?265|hevc|x265|h\.?264|x264)"
 )
@@ -502,18 +496,12 @@ def extract_version_tags(value: Any) -> str:
     return " ".join(tags[:4])
 
 
-def category_target_root(
-    category: dict[str, Any],
-    *,
-    allow_legacy_diagnostic: bool = False,
-) -> str:
+def category_target_root(category: dict[str, Any]) -> str:
     """Return a target root only when it came from a frozen V1 plan.
 
     Provider-specific category path fields predate the immutable execution
-    plan. They may still be displayed by migration diagnostics, but accepting
-    them in the normal code path would let an edited runtime config redirect an
-    already-created job. Callers that are *strictly read-only diagnostics* must
-    opt in explicitly.
+    plan. Accepting them anywhere in production would let an edited runtime
+    config redirect an already-created job.
     """
 
     value = str(category.get(V1_DESTINATION_FINAL_FIELD) or "").strip()
@@ -522,14 +510,6 @@ def category_target_root(
         if root in {"", ".", "/"} or root.startswith("/../") or root == "/..":
             raise ValueError("V1 paths.destination_final must be a non-root path")
         return root
-    if allow_legacy_diagnostic:
-        for key in LEGACY_CATEGORY_TARGET_FIELDS:
-            value = str(category.get(key) or "").strip()
-            if value and value.lower() not in {"none", "null", "undefined"}:
-                return "/" + value.strip("/")
-        label = str(category.get("label") or "").strip()
-        if label and label.lower() not in {"none", "null", "undefined"}:
-            return "/" + label.strip("/")
     raise ValueError("Organizer target root must come from V1 paths.destination_final")
 
 

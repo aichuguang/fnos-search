@@ -1,6 +1,6 @@
 """Fail-closed guard for the canonical V1 import execution plan.
 
-Legacy task metadata may still exist in databases created by older releases,
+Retired task metadata may still exist in databases created by older releases,
 but it is never interpreted here.  Callers either receive a validated V1
 plan or atomically move the job to manual review and stop the old execution
 path.
@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..constants import COMPLETION_STAGE_REVIEW, EVENT_ERROR, EVENT_WARN, JOB_REVIEW
+from ..planning import is_data_plane_strategy, is_relay_upload_strategy
 from ..planning.job_plan import (
     JobPlanError,
     plan_path,
@@ -20,8 +21,8 @@ from ..planning.job_plan import (
 )
 
 
-LEGACY_PLAN_FIELD = "staging_" + "plan"
-LEGACY_SIXPAN_REFRESH_FIELD = "sixpan_" + "legacy_" + "refresh"
+RETIRED_PLAN_FIELD = "staging_" + "plan"
+RETIRED_SIXPAN_REFRESH_FIELD = "sixpan_" + "legacy_" + "refresh"
 
 
 def require_v1_execution_plan(
@@ -50,7 +51,7 @@ def reject_non_v1_job(
 ) -> dict[str, Any]:
     """Stop an old/invalid task and durably record manual-review state.
 
-    The legacy fields are detected only to improve the audit message; their
+    Retired fields are detected only to improve the audit message; their
     contents are never parsed or used to derive paths, accounts, or commands.
     """
 
@@ -58,9 +59,9 @@ def reject_non_v1_job(
     job_id = _positive_int(current.get("id"))
     raw_data = current.get("raw_data") if isinstance(current.get("raw_data"), dict) else {}
     reason = str(error or "任务缺少可执行的 V1 execution_plan").strip()
-    legacy_fields = [
+    retired_fields = [
         field
-        for field in (LEGACY_PLAN_FIELD, LEGACY_SIXPAN_REFRESH_FIELD)
+        for field in (RETIRED_PLAN_FIELD, RETIRED_SIXPAN_REFRESH_FIELD)
         if field in raw_data
     ]
     message = f"{context}已拒绝旧版或无效任务并转人工审核：{reason}"
@@ -68,12 +69,12 @@ def reject_non_v1_job(
         "state": "manual_review",
         "reason": "unsupported_execution_plan",
         "message": message,
-        "legacy_fields": legacy_fields,
+        "retired_fields": retired_fields,
         "recorded_at": _utc_now(),
     }
     updated = False
     if database is not None and job_id > 0:
-        latest = _get_job(database, job_id) or current
+        latest = database.job_queries.get(job_id) or current
         latest_raw = latest.get("raw_data") if isinstance(latest.get("raw_data"), dict) else {}
         completion = (
             latest_raw.get("completion")
@@ -93,10 +94,9 @@ def reject_non_v1_job(
         }
         current_status = str(latest.get("status") or "").strip()
         if current_status not in {"cancelled", "done", "success", "skipped_existing", "rejected"}:
-            updater = getattr(database, "update_job_if_status", None)
-            if callable(updater) and current_status:
+            if current_status:
                 updated = bool(
-                    updater(
+                    database.job_commands.update_if_status(
                         job_id,
                         {current_status},
                         status=JOB_REVIEW,
@@ -105,37 +105,33 @@ def reject_non_v1_job(
                     )
                 )
             else:
-                latest_check = _get_job(database, job_id) or latest
+                latest_check = database.job_queries.get(job_id) or latest
                 latest_status = str(latest_check.get("status") or "").strip()
                 if not current_status or latest_status == current_status:
-                    update_job = getattr(database, "update_job", None)
-                    if callable(update_job):
-                        update_job(
-                            job_id,
-                            status=JOB_REVIEW,
-                            error_message=message,
-                            raw_data=next_raw,
-                        )
-                        updated = True
+                    database.job_commands.update(
+                        job_id,
+                        status=JOB_REVIEW,
+                        error_message=message,
+                        raw_data=next_raw,
+                    )
+                    updated = True
         _mark_execution_manual_review(execution_repository, job_id, message)
-        add_event = getattr(database, "add_event", None)
-        if callable(add_event):
-            add_event(
-                job_id,
-                EVENT_ERROR if level == EVENT_ERROR else EVENT_WARN,
-                message,
-                {
-                    "execution_plan_guard": marker,
-                    "status_updated": updated,
-                },
-            )
+        database.job_commands.add_event(
+            job_id,
+            EVENT_ERROR if level == EVENT_ERROR else EVENT_WARN,
+            message,
+            {
+                "execution_plan_guard": marker,
+                "status_updated": updated,
+            },
+        )
     return {
         "success": False,
         "rejected": True,
         "manual_review": True,
         "job_id": job_id,
         "message": message,
-        "legacy_fields": legacy_fields,
+        "retired_fields": retired_fields,
         "status_updated": updated,
     }
 
@@ -176,12 +172,12 @@ def v1_rclone_copy_run(
 
     plan = plan or require_v1_execution_plan(job, execution_repository=execution_repository)
     strategy = plan_strategy(plan)
-    if strategy not in {"rclone_copy", "relay_upload_mobile"}:
+    if not is_data_plane_strategy(strategy):
         return {}
     source = plan_path(plan, "source_landing")
     target = plan_path(
         plan,
-        "destination_staging" if strategy == "rclone_copy" else "local_temp",
+        "destination_staging" if not is_relay_upload_strategy(strategy) else "local_temp",
     )
     source_root, source_leaf = _split_job_path(source.get("path"))
     target_root, target_leaf = _split_job_path(target.get("path"))
@@ -309,14 +305,6 @@ def _mark_execution_manual_review(repository: Any, job_id: int, message: str) ->
         return
 
 
-def _get_job(database: Any, job_id: int) -> dict[str, Any] | None:
-    getter = getattr(database, "get_job", None)
-    if not callable(getter):
-        return None
-    value = getter(job_id)
-    return value if isinstance(value, dict) else None
-
-
 def _positive_int(value: Any) -> int:
     try:
         parsed = int(value or 0)
@@ -345,8 +333,8 @@ def _utc_now() -> str:
 
 
 __all__ = [
-    "LEGACY_PLAN_FIELD",
-    "LEGACY_SIXPAN_REFRESH_FIELD",
+    "RETIRED_PLAN_FIELD",
+    "RETIRED_SIXPAN_REFRESH_FIELD",
     "plan_allows_media_refresh",
     "plan_requires_organizer",
     "reject_non_v1_job",

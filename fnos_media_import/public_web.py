@@ -315,7 +315,9 @@ def _adapter_placeholders(
             "key": "quark",
             "name": "Quark 自动转存",
             "source_types": ["quark", "uc"],
-            "route": "quark_to_mobile",
+            "provider_kind": "quark",
+            "source_form": "share",
+            "search_source_id": "quark",
             "adapter_type": "quark_provider",
             "enabled": quark_configured,
             "configured": quark_configured,
@@ -332,7 +334,7 @@ def _adapter_placeholders(
             if isinstance(description.get("capabilities"), dict)
             else {}
         )
-        route_enabled = bool(
+        submit_enabled = bool(
             description.get("configured") and cloud139_capabilities.get("submit")
         )
         items.append(
@@ -340,9 +342,11 @@ def _adapter_placeholders(
                 "key": "cloud139",
                 "name": "139 移动云官方直转",
                 "source_types": ["cloud139"],
-                "route": "cloud139_direct",
+                "provider_kind": "mobile",
+                "source_form": "share",
+                "search_source_id": "mobile",
                 "adapter_type": "cloud139_cmcc_native",
-                "enabled": route_enabled,
+                "enabled": submit_enabled,
                 "configured": bool(description.get("configured")),
                 "status": "implemented" if description.get("configured") else "unconfigured",
                 "message": "已接入 139 移动云官方直转，复用移动云官方上传 CMCC 认证" if description.get("configured") else "139 官方直转未配置，请在“移动云官方上传”中维护 CMCC Basic 认证",
@@ -352,10 +356,10 @@ def _adapter_placeholders(
         )
 
     placeholder_specs = [
-        ("cloud189", "天翼云", ["cloud189"], "cloud189_direct", "请在 Provider 账号中激活天翼云账号"),
-        ("sixpan", "磁链 / 种子离线", ["magnet", "torrent"], "sixpan_offline", "请在 Provider 账号中激活六盘账号"),
+        ("cloud189", "天翼云", ["cloud189"], "tianyi", "share", "tianyi", "请在 Provider 账号中激活天翼云账号"),
+        ("sixpan", "磁链 / 种子离线", ["magnet", "torrent"], "sixpan", "magnet", "sixpan_magnet", "请在 Provider 账号中激活六盘账号"),
     ]
-    for key, name, source_types, route, message in placeholder_specs:
+    for key, name, source_types, provider_kind, source_form, search_source_id, message in placeholder_specs:
         importer = generic_importers.get(key)
         description = importer.describe() if importer and hasattr(importer, "describe") else {}
         if importer and not description:
@@ -373,7 +377,7 @@ def _adapter_placeholders(
                     description = {"adapter_type": f"{key}_provider", "configured": False}
         adapter_type = str(description.get("adapter_type") or "placeholder_webhook")
         configured = bool(description.get("configured"))
-        implemented = adapter_type in {"sixpan_offline", f"{key}_provider"} or (
+        implemented = adapter_type == f"{key}_provider" or (
             adapter_type == "generic_webhook" and configured
         )
         capabilities = (
@@ -381,8 +385,8 @@ def _adapter_placeholders(
             if isinstance(description.get("capabilities"), dict)
             else {}
         )
-        route_enabled = bool(implemented and configured and capabilities.get("submit"))
-        if adapter_type == "sixpan_offline":
+        submit_enabled = bool(implemented and configured and capabilities.get("submit"))
+        if adapter_type == "sixpan_provider":
             item_message = "已接入六盘 OpenAPI 离线任务适配器"
         elif adapter_type == f"{key}_provider" and configured:
             item_message = str(description.get("message") or f"{name} Provider 账号已配置")
@@ -395,9 +399,11 @@ def _adapter_placeholders(
                 "key": key,
                 "name": name,
                 "source_types": source_types,
-                "route": route,
+                "provider_kind": provider_kind,
+                "source_form": source_form,
+                "search_source_id": search_source_id,
                 "adapter_type": adapter_type,
-                "enabled": route_enabled,
+                "enabled": submit_enabled,
                 "configured": configured,
                 "status": "implemented" if implemented and configured else ("unconfigured" if importer else "placeholder"),
                 "message": item_message,
@@ -443,8 +449,10 @@ def _public_adapter_capabilities(
                 "key": item["key"],
                 "name": public_names.get(str(item["key"] or ""), item["name"]),
                 "source_types": item["source_types"],
+                "provider_kind": item["provider_kind"],
+                "source_form": item["source_form"],
+                "search_source_id": item["search_source_id"],
                 "enabled": usable,
-                "route_enabled": bool(item.get("enabled")),
                 "configured": bool(item.get("configured")),
                 "status": item["status"] if usable else "unavailable",
                 "capabilities": capabilities,
@@ -489,15 +497,6 @@ def _verify_public_captcha(payload: dict[str, Any], security_config: dict[str, A
     return True, ""
 
 
-def _public_routes(routes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {
-        key: {
-            "enabled": _config_bool(value, "enabled", False),
-        }
-        for key, value in routes.items()
-    }
-
-
 def _public_resource_item(
     item: dict[str, Any],
     public_id: str,
@@ -507,7 +506,7 @@ def _public_resource_item(
     raw = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
     poster = str(item.get("poster") or item.get("cover") or item.get("image_url") or raw.get("poster") or raw.get("cover") or raw.get("image_url") or "").strip()
     source_origin = str(item.get("source_origin") or raw.get("source_origin") or "").strip()
-    instant_import = _is_cloud139_public_item(item)
+    classification = detect_link(source_url) if source_url else None
     result = {
         "public_id": public_id,
         "title": item.get("title") or "未命名资源",
@@ -515,7 +514,21 @@ def _public_resource_item(
         "reason": "已识别资源类型，提交时会检测可用性" if item.get("supported") else "当前资源暂不支持自动入库",
         "source_type": item.get("source_type") or item.get("source") or "",
         "source_hint": item.get("source_hint") or item.get("source") or item.get("provider") or "",
-        "route": item.get("route") or "",
+        "provider_kind": str(
+            item.get("provider_kind")
+            or getattr(classification, "provider_kind", "")
+            or ""
+        ),
+        "source_form": str(
+            item.get("source_form")
+            or getattr(classification, "source_form", "")
+            or ""
+        ),
+        "search_source_id": str(
+            item.get("search_source_id")
+            or getattr(classification, "search_source_id", "")
+            or ""
+        ),
         "availability_status": item.get("availability_status") or "",
         "availability_message": item.get("availability_message") or "",
         "datetime": item.get("datetime") or item.get("created_at") or "",
@@ -528,8 +541,6 @@ def _public_resource_item(
         "ranking_score": int(item.get("ranking_score") or 0),
         "category_suggestion": _category_suggestion(item),
         "result_key": _public_result_key(item),
-        "instant_import": instant_import,
-        "speed_tag": "快速入库" if instant_import else "",
     }
     if poster:
         result["poster"] = poster
@@ -552,17 +563,6 @@ def _public_result_key(item: dict[str, Any]) -> str:
     title = str(item.get("title") or item.get("name") or item.get("note") or "").strip()
     raw_key = f"{source_type}|{source_url or title}"
     return hashlib.sha256(raw_key.encode("utf-8", "ignore")).hexdigest()[:20]
-
-
-def _is_cloud139_public_item(item: dict[str, Any]) -> bool:
-    source_type = str(item.get("source_type") or "").strip().lower()
-    if source_type == "cloud139":
-        return True
-    text = " ".join(
-        str(item.get(key) or "")
-        for key in ("url", "source_url", "source_hint", "source", "provider")
-    ).lower()
-    return "yun.139.com" in text or "caiyun.139.com" in text or "mobile" in text or "移动" in text
 
 
 def _public_resource_detail(
@@ -610,8 +610,8 @@ def _public_resource_child_files(
     password = str(cached.get("password") or raw.get("password") or raw.get("pwd") or "")
     title = str(cached.get("title") or raw.get("title") or raw.get("note") or "temp_check")
     link = detect_link(source_url, routes, password=password)
-    source = str(link.source_type or "").strip().lower()
-    if source == "cloud139":
+    provider_kind = str(link.provider_kind or "").strip().lower()
+    if provider_kind == "mobile":
         data = cloud139_importer.list_files(link.url, fid=fid, password=link.password, title=title)
         success = bool(isinstance(data, dict) and data.get("success", True) is not False)
         summary = _cloud139_inspection_summary(success, data)
@@ -622,7 +622,7 @@ def _public_resource_child_files(
             "summary": summary.get("summary") or {},
         }
 
-    if source == "cloud189":
+    if provider_kind == "tianyi":
         if not _importer_configured(tianyi_importer):
             return {
                 "success": False,
@@ -674,7 +674,7 @@ def _public_resource_child_files(
             "summary": summary.get("summary") or {},
         }
 
-    if source not in {"quark", "uc"}:
+    if provider_kind != "quark":
         return {"success": False, "message": "该来源暂不支持目录预览", "items": []}
 
     ok, check_data = quark_importer.check_share(link.url, title)
@@ -700,27 +700,27 @@ def _public_resource_child_files(
 
 
 def _detail_capability_for_source(
-    source_type: str,
+    provider_kind: str,
     cloud139_importer: Cloud139Importer | None = None,
     sixpan_importer: Any | None = None,
     tianyi_importer: Any | None = None,
 ) -> dict[str, Any]:
-    source = str(source_type or "").strip().lower()
-    if source in {"quark", "uc"}:
+    source = str(provider_kind or "").strip().lower()
+    if source == "quark":
         return {"available": True, "provider": "quark", "message": "正在检测资源是否可用"}
-    if source == "cloud139":
+    if source == "mobile":
         configured = bool(cloud139_importer and cloud139_importer.configured)
         return {
             "available": configured,
-            "provider": "cloud139",
+            "provider": "mobile",
             "reserved": not configured,
             "message": "正在检测资源是否支持快速入库" if configured else "快速入库服务未配置，请联系管理员",
         }
-    if source == "cloud189":
+    if source == "tianyi":
         configured = _importer_configured(tianyi_importer)
         return {
             "available": configured,
-            "provider": "cloud189",
+            "provider": "tianyi",
             "reserved": not configured,
             "message": (
                 "\u6b63\u5728\u8bfb\u53d6\u5929\u7ffc\u4e91\u5206\u4eab\u5185\u5bb9"
@@ -728,7 +728,7 @@ def _detail_capability_for_source(
                 else "\u5929\u7ffc\u4e91\u8d26\u53f7\u672a\u914d\u7f6e\u6216\u672a\u6fc0\u6d3b\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458"
             ),
         }
-    if source in {"magnet", "torrent"}:
+    if source == "sixpan":
         configured = bool(sixpan_importer and getattr(sixpan_importer, "configured", False))
         return {
             "available": configured,
@@ -748,14 +748,14 @@ def _inspect_public_resource(
     sixpan_importer: Any | None = None,
     tianyi_importer: Any | None = None,
 ) -> dict[str, Any]:
-    source = str(getattr(link, "source_type", "") or "").strip().lower()
-    if source in {"quark", "uc"}:
+    source = str(getattr(link, "provider_kind", "") or "").strip().lower()
+    if source == "quark":
         ok, data = quark_importer.check_share(getattr(link, "url", ""), title)
         return _quark_inspection_summary(ok, data, fallback_size=raw.get("size") or raw.get("size_text") or "")
-    if source == "cloud139" and cloud139_importer.configured:
+    if source == "mobile" and cloud139_importer.configured:
         ok, data = cloud139_importer.check_share(getattr(link, "url", ""), title=title, password=str(getattr(link, "password", "") or ""))
         return _cloud139_inspection_summary(ok, data, fallback_size=raw.get("size") or raw.get("size_text") or "")
-    if source == "cloud189" and _importer_configured(tianyi_importer):
+    if source == "tianyi" and _importer_configured(tianyi_importer):
         try:
             ok, data = tianyi_importer.check_share(
                 getattr(link, "url", ""),
@@ -909,7 +909,7 @@ def _cloud139_inspection_summary(ok: bool, data: Any, fallback_size: Any = "") -
     if not message:
         message = "资源有效，可快速入库" if ok else "资源可能已失效，请换一个资源"
     return {
-        "provider": "cloud139",
+        "provider": "mobile",
         "status": "ok" if ok else "failed",
         "success": bool(ok),
         "message": message,
@@ -951,7 +951,7 @@ def _tianyi_inspection_summary(ok: bool, data: Any, fallback_size: Any = "") -> 
             else "\u5929\u7ffc\u4e91\u8d44\u6e90\u53ef\u80fd\u5df2\u5931\u6548\uff0c\u8bf7\u68c0\u67e5\u5206\u4eab\u94fe\u63a5\u548c\u63d0\u53d6\u7801"
         )
     return {
-        "provider": "cloud189",
+        "provider": "tianyi",
         "status": "ok" if ok else "failed",
         "success": bool(ok),
         "message": message,

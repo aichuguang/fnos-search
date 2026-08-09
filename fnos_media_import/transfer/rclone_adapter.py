@@ -10,7 +10,6 @@ fails closed instead of accidentally observing or stopping another job.
 
 from __future__ import annotations
 
-import inspect
 import os
 from typing import Any
 
@@ -28,12 +27,12 @@ from . import (
 class RcloneOperationAdapter:
     """Single rclone data-plane adapter for remote and local copies.
 
-    Supported service contract (in preference order):
+    Required service contract:
 
     * ``start_copy(source, destination, operation_key, copy_run=...)``;
-    * ``poll_run(run_id, ...)`` or ``poll(receipt)`` or ``get_run(run_id)``;
-    * ``cancel_run(run_id, ...)``, ``cancel_operation(...)`` or
-      ``cancel(receipt)``.
+    * ``find_run_by_operation_key(operation_key)``;
+    * ``poll_run(run_id, operation_key=..., receipt=...)``;
+    * ``cancel_run(run_id, operation_key=..., receipt=...)``.
 
     A process-wide ``status()`` or ``cancel_job()`` is never a valid V1
     fallback.
@@ -79,14 +78,13 @@ class RcloneOperationAdapter:
                 copy_run=run,
             )
 
-        starter = getattr(self.service, "start_copy", None)
-        if not callable(starter):
-            raise TransferError(
-                ErrorCode.OPENLIST_UNAVAILABLE,
-                "rclone service does not expose the V1 scoped copy contract",
-            )
         try:
-            result = self._call_start_copy(starter, source, destination, key, run)
+            result = self.service.start_copy(
+                source,
+                destination,
+                key,
+                copy_run=run,
+            )
         except TransferError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -273,55 +271,22 @@ class RcloneOperationAdapter:
         return text
 
     def _find_existing_run(self, operation_key: str) -> dict[str, Any] | OperationReceipt | None:
-        for name in ("find_run_by_operation_key", "get_run_by_operation_key", "lookup_operation"):
-            method = getattr(self.service, name, None)
-            if not callable(method):
-                continue
-            try:
-                value = self._call_operation_lookup(method, operation_key)
-            except Exception as exc:  # noqa: BLE001
-                raise TransferError(
-                    ErrorCode.NETWORK_TRANSIENT,
-                    f"rclone reconcile lookup failed ({name}): {exc}",
-                    retryable=True,
-                ) from exc
-            if value:
-                if isinstance(value, dict):
-                    run_job = value.get("job_id") or value.get("jobId")
-                    if run_job not in (None, "") and int(run_job) != int(self.plan.job_id):
-                        raise TransferError(
-                            ErrorCode.RESULT_UNKNOWN,
-                            "rclone operation lookup returned another job",
-                        )
-                return value
-            # The first advertised lookup method is the canonical reconcile
-            # surface.  Only its explicit empty result permits submission.
-            return None
-        return None
-
-    @staticmethod
-    def _call_operation_lookup(method: Any, operation_key: str) -> Any:
         try:
-            params = inspect.signature(method).parameters
-        except (TypeError, ValueError):
-            return method(operation_key)
-        if any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in params.values()
-        ) or "operation_key" in params:
-            return method(operation_key=operation_key)
-        positional = [
-            parameter
-            for parameter in params.values()
-            if parameter.kind
-            in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            )
-        ]
-        if positional:
-            return method(operation_key)
-        raise TypeError("lookup method does not accept an operation key")
+            value = self.service.find_run_by_operation_key(operation_key)
+        except Exception as exc:  # noqa: BLE001
+            raise TransferError(
+                ErrorCode.NETWORK_TRANSIENT,
+                f"rclone reconcile lookup failed: {exc}",
+                retryable=True,
+            ) from exc
+        if isinstance(value, dict):
+            run_job = value.get("job_id") or value.get("jobId")
+            if run_job not in (None, "") and int(run_job) != int(self.plan.job_id):
+                raise TransferError(
+                    ErrorCode.RESULT_UNKNOWN,
+                    "rclone operation lookup returned another job",
+                )
+        return value or None
 
     def _coerce_submission_receipt(
         self,
@@ -394,107 +359,15 @@ class RcloneOperationAdapter:
             raise TransferError(ErrorCode.RESULT_UNKNOWN, "rclone receipt has no operation_id")
 
     def _poll_scoped(self, run_id: int | str, receipt: OperationReceipt, operation_key: str) -> Any:
-        for name in ("poll_run", "poll"):
-            method = getattr(self.service, name, None)
-            if not callable(method):
-                continue
-            try:
-                if name == "poll_run":
-                    return self._call_scoped(method, run_id, operation_key=operation_key, receipt=receipt)
-                return method(receipt)
-            except TypeError:
-                # A method with the wrong (usually legacy/global) signature
-                # must not cause a fallback to global status().
-                continue
-        getter = getattr(self.service, "get_run", None)
-        if callable(getter):
-            return getter(run_id)
-        status = getattr(self.service, "status", None)
-        if callable(status) and self._accepts_scoped_argument(status):
-            return self._call_scoped(status, run_id, operation_key=operation_key, receipt=receipt)
-        return None
-
-    @staticmethod
-    def _call_start_copy(method: Any, source: dict[str, str], destination: dict[str, str], key: str, run: dict[str, Any]) -> Any:
-        return RcloneOperationAdapter._call_supported(
-            method,
-            {
-                "source": source,
-                "destination": destination,
-                "operation_key": key,
-                "copy_run": run,
-            },
+        return self.service.poll_run(
+            run_id,
+            operation_key=operation_key,
+            receipt=receipt,
         )
-
-    @staticmethod
-    def _call_supported(method: Any, kwargs: dict[str, Any]) -> Any:
-        try:
-            params = inspect.signature(method).parameters
-        except (TypeError, ValueError):
-            return method(**kwargs)
-        accepts_kwargs = any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in params.values()
-        )
-        if accepts_kwargs:
-            return method(**kwargs)
-        # Keep positional parameters in declaration order for services whose
-        # public method predates the V1 keyword contract.
-        positional = [
-            parameter
-            for parameter in params.values()
-            if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        args: list[Any] = []
-        for parameter in positional:
-            if parameter.name in kwargs:
-                args.append(kwargs[parameter.name])
-            elif parameter.default is inspect.Parameter.empty:
-                break
-        if len(args) == len([p for p in positional if p.default is inspect.Parameter.empty]):
-            remaining = {key: value for key, value in kwargs.items() if key in params and key not in {p.name for p in positional[:len(args)]}}
-            return method(*args, **remaining)
-        filtered = {key: value for key, value in kwargs.items() if key in params}
-        return method(**filtered)
 
     def _cancel_scoped(self, run_id: int | str, receipt: OperationReceipt, operation_key: str) -> Any:
-        for name in ("cancel_run", "cancel_operation", "cancel"):
-            method = getattr(self.service, name, None)
-            if not callable(method):
-                continue
-            try:
-                if name == "cancel":
-                    return method(receipt)
-                return self._call_scoped(method, run_id, operation_key=operation_key, receipt=receipt)
-            except TypeError:
-                continue
-        # Deliberately do not call cancel_job(job_id): it is a global/legacy
-        # control surface and can terminate an unrelated operation.
-        return None
-
-    @staticmethod
-    def _accepts_scoped_argument(method: Any) -> bool:
-        try:
-            params = inspect.signature(method).parameters
-        except (TypeError, ValueError):
-            return False
-        return any(name in params for name in ("run_id", "operation_id", "receipt"))
-
-    @staticmethod
-    def _call_scoped(method: Any, run_id: int | str, *, operation_key: str, receipt: OperationReceipt) -> Any:
-        try:
-            params = inspect.signature(method).parameters
-        except (TypeError, ValueError):
-            return method(run_id)
-        kwargs: dict[str, Any] = {}
-        if "run_id" in params:
-            kwargs["run_id"] = run_id
-        elif "operation_id" in params:
-            kwargs["operation_id"] = receipt.operation_id
-        elif "receipt" in params:
-            kwargs["receipt"] = receipt
-        if "operation_key" in params:
-            kwargs["operation_key"] = operation_key
-        if kwargs:
-            return method(**kwargs)
-        return method(run_id)
+        return self.service.cancel_run(
+            run_id,
+            operation_key=operation_key,
+            receipt=receipt,
+        )

@@ -55,6 +55,9 @@ __all__ = [
 ]
 
 
+_RELAY_UPLOAD_STRATEGIES = frozenset({"relay_upload_provider"})
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     max_attempts: int = 3
@@ -322,9 +325,9 @@ class TransferOrchestrator:
                     "native_save 要求来源与目标同 Provider，失败不降级为跨盘",
                 )
             return None
-        if strategy == "relay_upload_mobile":
-            if dest_kind != "mobile":
-                return TransferError(ErrorCode.INVALID_PLAN, "relay_upload_mobile 只允许目标为移动云")
+        if strategy in _RELAY_UPLOAD_STRATEGIES:
+            if source_kind == dest_kind:
+                return TransferError(ErrorCode.INVALID_PLAN, "同 Provider 传输必须使用 native_save")
             return None
         if strategy == "rclone_copy":
             if dest_kind == "mobile":
@@ -541,8 +544,8 @@ class TransferOrchestrator:
 
         Provider 原生校验统一接收 ``VerifyRequest``；路径 descriptor 仍由
         编排器冻结计划决定，不能再以 ``plan + 一组散落关键字`` 调用原生
-        executor。Native executor 会使用 plan 的 native locator，并把
-        receipt 作为可选的旧 importer 适配信息传入。
+        executor。Native executor 使用 plan 的 native locator，并把冻结
+        operation receipt 作为正式校验请求的一部分传入。
         """
 
         from fnos_media_import.transfer.verifier import VerifyRequest
@@ -555,14 +558,14 @@ class TransferOrchestrator:
             expected_file_count=int(expected["file_count"]),
             expected_total_size=int(expected["total_size"]),
             checksum=str(expected["checksum"]),
+            operation=self.state.receipt,
         )
 
     def _invoke_verifier(self, verifier: Any, *, descriptor: dict[str, Any], native_target: bool) -> Any:
         """按统一协议调用目标校验器。
 
         通用文件系统校验器保留现有 ``verify(plan, **kwargs)`` 契约；原生
-        校验器严格收到 VerifyRequest，且只在其方法声明了 receipt 参数时
-        才传递旧 importer 所需的 receipt，避免再次触发关键字 TypeError。
+        校验器严格且仅收到包含冻结 operation 的 VerifyRequest。
         """
 
         object_verify = getattr(verifier, "verify", None)
@@ -574,25 +577,6 @@ class TransferOrchestrator:
 
         if native_target:
             request = self._verify_request(descriptor)
-            receipt = self.state.receipt
-            if receipt is None:
-                return verify_call(request)
-            try:
-                signature = inspect.signature(verify_call)
-            except (TypeError, ValueError):
-                signature = None
-            accepts_receipt = bool(
-                signature
-                and (
-                    "receipt" in signature.parameters
-                    or any(
-                        parameter.kind == inspect.Parameter.VAR_KEYWORD
-                        for parameter in signature.parameters.values()
-                    )
-                )
-            )
-            if accepts_receipt:
-                return verify_call(request, receipt=receipt)
             return verify_call(request)
 
         expected = self.plan.verification_expected()
@@ -616,7 +600,7 @@ class TransferOrchestrator:
         # alias; never let that alias select the wrong verification target.
         descriptor = (
             self.plan.destination_final
-            if self.plan.strategy == "relay_upload_mobile"
+            if self.plan.strategy in _RELAY_UPLOAD_STRATEGIES
             else self.plan.destination_staging or self.plan.destination_final
         )
         native_target = self._is_native_descriptor(descriptor)
@@ -641,7 +625,7 @@ class TransferOrchestrator:
                 if self.organizer_service is None:
                     return self._to_manual_review("Organizer 已启用但未装配，禁止跳过整理")
                 self.state.phase = PHASE_ORGANIZING
-            elif self.plan.strategy == "relay_upload_mobile" or self.plan.destination_staging is None:
+            elif self.plan.strategy in _RELAY_UPLOAD_STRATEGIES or self.plan.destination_staging is None:
                 self.state.phase = PHASE_FINAL_VERIFYING
             else:
                 self.state.phase = PHASE_FINALIZING
@@ -686,7 +670,7 @@ class TransferOrchestrator:
         )
 
     def _step_finalizing(self) -> TransferStepResult:
-        if self.plan.strategy == "relay_upload_mobile":
+        if self.plan.strategy in _RELAY_UPLOAD_STRATEGIES:
             # Relay has no staging -> final archive operation.  This guard also
             # repairs a restored snapshot produced by an older planner without
             # invoking TransferFinalizer against a native namespace.

@@ -10,6 +10,7 @@ from ..notifications import smtp as smtp_channel
 from ..notifications import webhook as webhook_channel
 from ..notifications.smtp import SmtpPermanentError, SmtpTransientError
 from ..notifications.webhook import WebhookPermanentError, WebhookTransientError
+from ..repositories.repository_set import NotificationRepositories
 from ..repositories.notification_delivery_repository import (
     DELIVERY_FAILED,
     DELIVERY_RETRYABLE,
@@ -18,7 +19,12 @@ from ..repositories.notification_delivery_repository import (
 
 
 class NotificationSettingsService:
-    def __init__(self, *, db: Any, public_base_url: Callable[[], str] = lambda: "") -> None:
+    def __init__(
+        self,
+        *,
+        db: NotificationRepositories,
+        public_base_url: Callable[[], str] = lambda: "",
+    ) -> None:
         self._db = db
         self._public_base_url = public_base_url
 
@@ -27,7 +33,7 @@ class NotificationSettingsService:
             "success": True,
             "config": notify_config.redact(notify_config.read_config(self._db)),
             "events": {key: event_defs.EVENT_LABELS.get(key, key) for key in event_defs.ALL_EVENTS},
-            "summary": self._db.notification_delivery_summary(),
+            "summary": self._db.notification_deliveries.summary(),
         }, 200
 
     def update(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
@@ -79,7 +85,7 @@ class NotificationSettingsService:
             return {"success": False, "message": "limit 和 offset 必须是整数"}, 400
         if limit < 1 or limit > 500 or offset < 0:
             return {"success": False, "message": "limit 必须在 1-500 之间，offset 不能小于 0"}, 400
-        rows = self._db.list_notification_deliveries(
+        rows = self._db.notification_deliveries.list_deliveries(
             event_type=str(payload.get("event_type") or "").strip() or None,
             channel=str(payload.get("channel") or "").strip() or None,
             limit=limit,
@@ -88,7 +94,7 @@ class NotificationSettingsService:
         return {
             "success": True,
             "deliveries": rows,
-            "summary": self._db.notification_delivery_summary(),
+            "summary": self._db.notification_deliveries.summary(),
         }, 200
 
     def retry(self, task_id: int) -> tuple[dict[str, Any], int]:
@@ -205,7 +211,7 @@ class NotificationSettingsService:
         status_code: int | None = None,
         error: str = "",
     ) -> None:
-        self._db.record_notification_delivery(
+        self._db.notification_deliveries.record(
             task_id=None,
             event_type="test",
             channel=channel,

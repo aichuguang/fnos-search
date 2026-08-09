@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import threading
 import sqlite3
 import time
@@ -9,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.organizer.service import OrganizerService
 from fnos_media_import.organizer.run_lease import OrganizerRunLease
 from tests._organizer_v1_fixtures import (
@@ -20,7 +23,7 @@ from tests._organizer_v1_fixtures import (
 )
 
 
-class _StartApplyDatabase:
+class _StartApplyDatabase(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.plan = organizer_v1_plan(1, category="tv")
         self.job = organizer_v1_job(self.plan, status="organizing")
@@ -45,6 +48,18 @@ class _StartApplyDatabase:
     def create_organizer_run(self, task_id: int, *, owner_id: str = "") -> int:
         self.events.append(("create_run", task_id, owner_id))
         return 71
+
+    def claim_organizer_run(
+        self,
+        task_id: int,
+        *,
+        owner_id: str,
+        lease_seconds: int,
+    ) -> tuple[int, None]:
+        del lease_seconds
+        run_id = self.create_organizer_run(task_id, owner_id=owner_id)
+        self.update_organizer_task(task_id, status="executing")
+        return run_id, None
 
     def update_organizer_task(self, task_id: int, **values) -> None:
         self.events.append(("update_task", task_id, values))
@@ -124,7 +139,7 @@ class OrganizerApplyRunReuseTests(unittest.TestCase):
         )
         job = organizer_v1_job(plan, status="organizing")
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.task = attach_organizer_v1_task(
                     {
@@ -162,6 +177,33 @@ class OrganizerApplyRunReuseTests(unittest.TestCase):
                 self.run_updates.append((run_id, status, values))
 
             @staticmethod
+            def renew_organizer_run(_run_id: int, _owner_id: str, **_kwargs) -> bool:
+                return True
+
+            @staticmethod
+            def owns_organizer_run(_run_id: int, _owner_id: str) -> bool:
+                return True
+
+            def finalize_organizer_run_and_task(
+                self,
+                run_id: int,
+                _task_id: int,
+                **values,
+            ) -> bool:
+                self.update_organizer_run(
+                    run_id,
+                    values["run_status"],
+                    summary=values.get("summary"),
+                    undo_data=values.get("undo_data"),
+                    error_message=values.get("error_message") or "",
+                )
+                self.task.update(
+                    status=values["task_status"],
+                    error_message=values.get("error_message") or "",
+                )
+                return True
+
+            @staticmethod
             def release_organizer_locks(**_values) -> None:
                 return None
 
@@ -190,7 +232,7 @@ class OrganizerApplyRunReuseTests(unittest.TestCase):
         self.assertEqual(database.run_updates[-1][0:2], (71, "done"))
 
     def test_missing_task_finishes_precreated_run(self) -> None:
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.run_updates: list[tuple[int, str, dict]] = []
 
@@ -200,6 +242,14 @@ class OrganizerApplyRunReuseTests(unittest.TestCase):
 
             def update_organizer_run(self, run_id: int, status: str, **values) -> None:
                 self.run_updates.append((run_id, status, values))
+
+            @staticmethod
+            def renew_organizer_run(_run_id: int, _owner_id: str, **_kwargs) -> bool:
+                return True
+
+            @staticmethod
+            def owns_organizer_run(_run_id: int, _owner_id: str) -> bool:
+                return True
 
         database = FakeDatabase()
         service = OrganizerService.__new__(OrganizerService)
@@ -219,7 +269,7 @@ class OrganizerApplyRunReuseTests(unittest.TestCase):
         )
         job = organizer_v1_job(plan, status="organizing")
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.task = attach_organizer_v1_task(
                     {
@@ -250,6 +300,33 @@ class OrganizerApplyRunReuseTests(unittest.TestCase):
             def update_organizer_run(self, run_id: int, status: str, **values) -> None:
                 self.run_updates.append((run_id, status, values))
 
+            @staticmethod
+            def renew_organizer_run(_run_id: int, _owner_id: str, **_kwargs) -> bool:
+                return True
+
+            @staticmethod
+            def owns_organizer_run(_run_id: int, _owner_id: str) -> bool:
+                return True
+
+            def finalize_organizer_run_and_task(
+                self,
+                run_id: int,
+                _task_id: int,
+                **values,
+            ) -> bool:
+                self.update_organizer_run(
+                    run_id,
+                    values["run_status"],
+                    summary=values.get("summary"),
+                    undo_data=values.get("undo_data"),
+                    error_message=values.get("error_message") or "",
+                )
+                self.task.update(
+                    status=values["task_status"],
+                    error_message=values.get("error_message") or "",
+                )
+                return True
+
         database = FakeDatabase()
         service = OrganizerService.__new__(OrganizerService)
         service.db = database
@@ -269,8 +346,9 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"organizer-claim-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -279,14 +357,14 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
                 candidate.unlink()
 
     def test_two_service_instances_submit_only_one_background_apply(self) -> None:
-        job_id, created = self.database.create_job(
+        job_id, created = self.database.job_commands.create(
             {
                 "title": "并发应用",
                 "category": "tv",
                 "category_label": "电视剧",
-                "source_type": "quark",
+                "source_provider_kind": "quark",
+                "source_form": "share",
                 "source_url": "source-record:test-apply-claim",
-                "target_route": "native_save",
                 "target_path": "/移动云/电视剧",
                 "status": "waiting_organizer",
                 "destination_id": "native-main",
@@ -303,7 +381,7 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
         )
         job = organizer_v1_job(plan, status="waiting_organizer")
         task_payload = attach_organizer_v1_task({}, plan)
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             category="tv",
             openlist_root_path=plan["paths"]["organizer"]["path"],
             job_id=job_id,
@@ -317,7 +395,7 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
                 self.database = database
 
             def get_organizer_task(self, requested_task_id: int, include_children: bool = True):
-                task = self.database.get_organizer_task(requested_task_id, include_children=include_children)
+                task = self.database.organizer.get_organizer_task(requested_task_id, include_children=include_children)
                 initial_read_barrier.wait(timeout=5)
                 return task
 
@@ -334,7 +412,9 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
         release_background = threading.Event()
         background_finished = threading.Event()
         for owner in ("process-a", "process-b"):
-            coordinated = CoordinatedDatabase(Database(self.db_path))
+            coordinated = CoordinatedDatabase(
+                RepositorySet.from_database(Database(self.db_path))
+            )
             coordinated.plan = plan
             service = _start_apply_service(coordinated)
             service.owner_id = owner
@@ -368,63 +448,67 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
             self.assertEqual(len(results), 2)
             self.assertTrue(all(result.get("success") for result in results))
             self.assertEqual(len(background_started), 1)
-            runs = self.database.list_organizer_runs(limit=10)
+            runs = self.database.organizer.list_organizer_runs(limit=10)
             self.assertEqual(len(runs), 1)
             self.assertEqual(runs[0]["status"], "running")
             self.assertEqual({result.get("run_id") for result in results}, {runs[0]["id"]})
-            task = self.database.get_organizer_task(task_id, include_children=False)
+            task = self.database.organizer.get_organizer_task(task_id, include_children=False)
             self.assertEqual(task["status"], "executing")
         finally:
             release_background.set()
             background_finished.wait(timeout=5)
 
     def test_finished_run_does_not_open_duplicate_completion_window(self) -> None:
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             category="tv",
             openlist_root_path="/移动云/_入库暂存/电视剧/job-89",
             status="manual_confirmed",
         )
-        run_id, active = self.database.claim_organizer_run(task_id, owner_id="process-a")
+        run_id, active = self.database.organizer.claim_organizer_run(task_id, owner_id="process-a")
         self.assertIsNone(active)
-        self.database.update_organizer_run(int(run_id or 0), "done")
+        self.database.organizer.update_organizer_run(int(run_id or 0), "done")
 
-        duplicate_run_id, claim_info = Database(self.db_path).claim_organizer_run(task_id, owner_id="process-b")
+        duplicate_run_id, claim_info = RepositorySet.from_database(
+            Database(self.db_path)
+        ).organizer.claim_organizer_run(task_id, owner_id="process-b")
 
         self.assertIsNone(duplicate_run_id)
         self.assertEqual(claim_info["task_status"], "executing")
-        self.assertEqual(len(self.database.list_organizer_runs(limit=10)), 1)
+        self.assertEqual(len(self.database.organizer.list_organizer_runs(limit=10)), 1)
 
     def test_cancelled_and_skipped_tasks_cannot_be_claimed(self) -> None:
         for status in ("cancelled", "skipped"):
             with self.subTest(status=status):
-                task_id = self.database.create_organizer_task(
+                task_id = self.database.organizer.create_organizer_task(
                     category="tv",
                     openlist_root_path=f"/移动云/_入库暂存/电视剧/job-{status}",
                     status="manual_confirmed",
                 )
-                self.database.update_organizer_task(task_id, status=status)
+                self.database.organizer.update_organizer_task(task_id, status=status)
 
-                run_id, claim_info = Database(self.db_path).claim_organizer_run(
+                run_id, claim_info = RepositorySet.from_database(
+                    Database(self.db_path)
+                ).organizer.claim_organizer_run(
                     task_id,
                     owner_id="late-worker",
                 )
 
                 self.assertIsNone(run_id)
                 self.assertEqual(claim_info["task_status"], status)
-                task = self.database.get_organizer_task(task_id, include_children=False)
+                task = self.database.organizer.get_organizer_task(task_id, include_children=False)
                 self.assertEqual(task["status"], status)
                 self.assertEqual(
-                    [run for run in self.database.list_organizer_runs(limit=20) if run["task_id"] == task_id],
+                    [run for run in self.database.organizer.list_organizer_runs(limit=20) if run["task_id"] == task_id],
                     [],
                 )
 
     def test_expired_run_is_atomically_replaced_by_only_one_concurrent_claim(self) -> None:
-        task_id = self.database.create_organizer_task(
+        task_id = self.database.organizer.create_organizer_task(
             category="tv",
             openlist_root_path="/移动云/_入库暂存/电视剧/job-90",
             status="manual_confirmed",
         )
-        old_run_id, _active = self.database.claim_organizer_run(task_id, owner_id="old-process")
+        old_run_id, _active = self.database.organizer.claim_organizer_run(task_id, owner_id="old-process")
         with self.database.connect() as connection:
             connection.execute(
                 "UPDATE organizer_runs SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
@@ -436,7 +520,9 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
 
         def claim(owner: str) -> None:
             barrier.wait(timeout=5)
-            result = Database(self.db_path).claim_organizer_run(task_id, owner_id=owner)
+            result = RepositorySet.from_database(
+                Database(self.db_path)
+            ).organizer.claim_organizer_run(task_id, owner_id=owner)
             with claim_lock:
                 claims.append(result)
 
@@ -448,30 +534,30 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
 
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(sum(1 for run_id, _active in claims if run_id), 1)
-        runs = self.database.list_organizer_runs(limit=10)
+        runs = self.database.organizer.list_organizer_runs(limit=10)
         self.assertEqual(sum(1 for run in runs if run["status"] == "running"), 1)
         self.assertEqual(next(run for run in runs if run["id"] == old_run_id)["status"], "failed")
 
     def test_expired_lock_from_other_task_is_recovered_before_acquire(self) -> None:
-        old_task_id = self.database.create_organizer_task(category="tv", openlist_root_path="/job-91", status="manual_confirmed")
-        old_run_id, _active = self.database.claim_organizer_run(old_task_id, owner_id="old-process")
+        old_task_id = self.database.organizer.create_organizer_task(category="tv", openlist_root_path="/job-91", status="manual_confirmed")
+        old_run_id, _active = self.database.organizer.claim_organizer_run(old_task_id, owner_id="old-process")
         self.assertTrue(
-            self.database.acquire_organizer_lock(
+            self.database.organizer.acquire_organizer_lock(
                 "/移动云/电视剧",
                 task_id=old_task_id,
                 run_id=old_run_id,
                 owner="old-process",
             )
         )
-        new_task_id = self.database.create_organizer_task(category="tv", openlist_root_path="/job-92", status="manual_confirmed")
-        new_run_id, _active = self.database.claim_organizer_run(new_task_id, owner_id="new-process")
+        new_task_id = self.database.organizer.create_organizer_task(category="tv", openlist_root_path="/job-92", status="manual_confirmed")
+        new_run_id, _active = self.database.organizer.claim_organizer_run(new_task_id, owner_id="new-process")
         with self.database.connect() as connection:
             connection.execute(
                 "UPDATE organizer_runs SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
                 (old_run_id,),
             )
 
-        acquired = self.database.acquire_organizer_lock(
+        acquired = self.database.organizer.acquire_organizer_lock(
             "/移动云/电视剧",
             task_id=new_task_id,
             run_id=new_run_id,
@@ -479,13 +565,13 @@ class OrganizerApplyCrossProcessClaimTests(unittest.TestCase):
         )
 
         self.assertTrue(acquired)
-        runs = self.database.list_organizer_runs(limit=10)
+        runs = self.database.organizer.list_organizer_runs(limit=10)
         self.assertEqual(next(run for run in runs if run["id"] == old_run_id)["status"], "failed")
 
 
 class OrganizerRunLeaseTests(unittest.TestCase):
     def test_heartbeat_runs_during_work_and_stops_on_exit(self) -> None:
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.renewals = 0
 
@@ -499,7 +585,7 @@ class OrganizerRunLeaseTests(unittest.TestCase):
 
         database = FakeDatabase()
         with OrganizerRunLease(
-            database=database,
+            repository=database,
             run_id=1,
             owner_id="owner",
             lease_seconds=30,
@@ -521,7 +607,7 @@ class OrganizerRunLeaseTests(unittest.TestCase):
         )
         job = organizer_v1_job(plan, status="organizing")
 
-        class FakeDatabase:
+        class FakeDatabase(RepositoryFakeMixin):
             def __init__(self) -> None:
                 self.owned = True
                 self.operation_updates: list[int] = []

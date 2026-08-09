@@ -25,7 +25,7 @@ class RcloneFileRetryService:
         self._deps = dependencies
 
     def retry(self, event_id: int, *, force: bool) -> tuple[dict[str, Any], int]:
-        file_event = self._deps.database.get_rclone_file_event(event_id)
+        file_event = self._deps.database.rclone.get_rclone_file_event(event_id)
         if not file_event:
             return {"success": False, "message": "文件搬运记录不存在"}, 404
         status = str(file_event.get("status") or "").strip().lower()
@@ -35,7 +35,7 @@ class RcloneFileRetryService:
         http_status = int(result.pop("_http_status", 200) or 200)
         if result.get("success"):
             message = f"已请求单文件重试：{file_event.get('filename') or ''}"
-            retry_event_id = self._deps.database.add_rclone_file_event(
+            retry_event_id = self._deps.database.rclone.add_rclone_file_event(
                 run_id=None,
                 job_id=file_event.get("job_id"),
                 status="retry_requested",
@@ -48,7 +48,7 @@ class RcloneFileRetryService:
                 raw_data={"source_event_id": event_id, "force": force},
             )
             if file_event.get("job_id"):
-                self._deps.database.add_event(int(file_event["job_id"]), "info", message, {"source_file_event_id": event_id, "retry_file_event_id": retry_event_id})
+                self._deps.database.job_commands.add_event(int(file_event["job_id"]), "info", message, {"source_file_event_id": event_id, "retry_file_event_id": retry_event_id})
             result["retry_file_event_id"] = retry_event_id
         return {
             "success": bool(result.get("success")),

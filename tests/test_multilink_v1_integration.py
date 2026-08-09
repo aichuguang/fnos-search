@@ -6,11 +6,15 @@ import uuid
 from pathlib import Path
 
 from fnos_media_import.accounts.service import ProviderAccountService
+from fnos_media_import.config import AppConfig
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import OrganizerRepositories, RepositorySet
 from fnos_media_import.domain.models import (
     AccountTestResult,
     LocalLocator,
     NativeLocator,
+    OpenListLocator,
+    RcloneLocator,
     SourceDescriptor,
     TargetCategory,
 )
@@ -21,16 +25,21 @@ from fnos_media_import.planning import PlanningError, SourceAccountUnavailable
 from fnos_media_import.planning.plan_validator import PlanValidationDeps, validate_plan
 from fnos_media_import.planning.planner import ImportPlanner
 from fnos_media_import.planning.source_resolver import SourceResolver
+from fnos_media_import.providers.adapters import (
+    QuarkProviderAdapter,
+    TianyiProviderAdapter,
+)
 from fnos_media_import.providers.registry import ProviderRegistry
+from fnos_media_import.runtime_builder import RuntimeBuilder
 from fnos_media_import.services.import_job_service import (
     ImportJobCreationService,
     V1PlanningError,
 )
 from fnos_media_import.services.source_record_service import SourceRecordService
+from fnos_media_import.services.worker_task_dispatcher import WorkerTaskDispatcher
 from fnos_media_import.storage.assignment_service import SourceAssignmentService
 from fnos_media_import.storage.target_service import StorageTargetService
 from fnos_media_import.transfer.execution_repository import TransferExecutionRepository
-from fnos_media_import.transfer.native_executor import LegacyNativeAdapter
 
 
 KEY = bytes.fromhex("00" * 32)
@@ -54,23 +63,30 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
         self.db_path = Path(__file__).with_name(
             f"_multilink_v1_{uuid.uuid4().hex}.db"
         )
-        self.db = Database(self.db_path)
-        self.db.init_schema()
+        self._db_infrastructure = Database(self.db_path)
+        self._db_infrastructure.init_schema()
+        self.db = RepositorySet.from_database(self._db_infrastructure)
         self.accounts = ProviderAccountService(self.db, lambda: KEY)
         self.connections = OpenListConnectionService(self.db, lambda: KEY)
         self.mounts = OpenListMountService(self.db, self.connections)
         self.targets = StorageTargetService(self.db)
         self.assignments = SourceAssignmentService(self.db, self.targets)
+        self.sources = SourceRecordService(self.db, lambda: KEY)
+        importer = _MaterializingImporter()
         self.registry = ProviderRegistry(
             [
-                LegacyNativeAdapter(
-                    _MaterializingImporter(),
-                    "quark",
-                    supports_native_save=True,
-                )
+                QuarkProviderAdapter(
+                    importer_factory=lambda _account_id, _revision: importer,
+                    account_importer_factory=lambda _values: importer,
+                    source_record_service=self.sources,
+                ),
+                TianyiProviderAdapter(
+                    importer_factory=lambda _account_id, _revision: importer,
+                    account_importer_factory=lambda _values: importer,
+                    source_record_service=self.sources,
+                ),
             ]
         )
-        self.sources = SourceRecordService(self.db, lambda: KEY)
 
     def tearDown(self) -> None:
         for candidate in (
@@ -93,6 +109,23 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
         self.accounts.test_account(
             account.account_id,
             tester=lambda *_args: AccountTestResult(True, "quark-user", "ok"),
+        )
+        self.accounts.activate_account("default", account.account_id, None)
+        return account.account_id
+
+    def _tianyi_account(self) -> str:
+        account = self.accounts.create_account(
+            provider_kind="tianyi",
+            name="\u5929\u7ffc\u4e3b\u8d26\u53f7",
+            config={"identity": "user"},
+            credentials={
+                "session_key": "session-key",
+                "session_secret": "0123456789abcdef",
+            },
+        )
+        self.accounts.test_account(
+            account.account_id,
+            tester=lambda *_args: AccountTestResult(True, "tianyi-user", "ok"),
         )
         self.accounts.activate_account("default", account.account_id, None)
         return account.account_id
@@ -245,6 +278,338 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
             "LOCAL_ORGANIZER_REQUIRES_OPENLIST_MOUNT",
         )
 
+    def test_tianyi_same_provider_plan_uses_native_save(self) -> None:
+        account_id = self._tianyi_account()
+        self.targets.create_target(
+            destination_id="tianyi_main",
+            name="\u5929\u7ffc\u4e3b\u76d8",
+            provider_kind="tianyi",
+            categories={
+                "movie": TargetCategory(
+                    category_key="movie",
+                    public_label="\u7535\u5f71",
+                    native_locator=NativeLocator("folder_id", "root-folder-id"),
+                )
+            },
+            account_id=account_id,
+        )
+        self.assignments.upsert("tianyi", "movie", "tianyi_main")
+        source = self.sources.capture(
+            SourceDescriptor(
+                "tianyi",
+                "share",
+                "tianyi:share:abc",
+                search_source_id="tianyi",
+            ),
+            {"url": "https://cloud.189.cn/t/example", "password": ""},
+        )
+        planner, _resolver, deps = self._planner()
+
+        plan = planner.plan_import(
+            source=source,
+            category_key="movie",
+            job_id=41,
+        )
+
+        self.assertEqual(plan["transfer"]["strategy"], "native_save")
+        self.assertEqual(plan["destination"]["account_id"], account_id)
+        self.assertEqual(
+            plan["paths"]["destination_final"]["path"],
+            "root-folder-id",
+        )
+        validate_plan(
+            plan,
+            {
+                "id": 41,
+                "category": "movie",
+                "destination_id": "tianyi_main",
+                "plan_version": 1,
+            },
+            deps=deps,
+        )
+
+    def test_runtime_builder_initial_build_can_create_execute_and_retry_without_rewire(self) -> None:
+        account_id = self._quark_account()
+        self.targets.create_target(
+            destination_id="quark_runtime",
+            name="Quark runtime target",
+            provider_kind="quark",
+            categories={
+                "movie": TargetCategory(
+                    category_key="movie",
+                    public_label="Movie",
+                    native_locator=NativeLocator("path", "/Movies"),
+                )
+            },
+            account_id=account_id,
+        )
+        self.assignments.upsert("quark", "movie", "quark_runtime")
+        self.accounts.set_catalog_provider(self.registry.manifests)
+        self.assignments.set_source_catalog_provider(self.registry.search_sources)
+        executions = TransferExecutionRepository(self.db)
+        worker_dispatcher = WorkerTaskDispatcher(
+            repository=self.db.worker_tasks,
+            enabled=lambda: True,
+            config_revision=lambda: 1,
+        )
+        active_importer = _MaterializingImporter()
+        config = AppConfig(
+            raw={
+                "pansou": {},
+                "btbtla": {"base_url": "https://example.invalid"},
+                "fnos": {
+                    "log_enabled": False,
+                    "token_cache_path": str(self.db_path.with_suffix(".fnos-token.json")),
+                },
+                "search": {"providers": {}},
+                "openlist": {},
+                "organizer": {"enabled": False, "staging_enabled": False},
+                "categories": {"movie": {"label": "Movie", "fnos_lib": "Movie"}},
+            },
+            base_dir=self.db_path.parent,
+        )
+        builder = RuntimeBuilder(
+            self.db,
+            organizer_repositories=OrganizerRepositories.from_set(self.db),
+            owner_id="runtime-builder-test",
+            organizer_openlist_client_resolver=lambda _job, _plan: None,
+            provider_importer_resolver=lambda _provider_kind: active_importer,
+            accounts_service=self.accounts,
+            target_service=self.targets,
+            mount_service=self.mounts,
+            rules_service=self.assignments,
+            provider_registry=self.registry,
+            source_record_service=self.sources,
+            execution_repository=executions,
+            enqueue_transfer=lambda job_id: worker_dispatcher.import_transfer_execute(
+                job_id,
+                reactivate=True,
+            ),
+            enqueue_transfer_with_connection=(
+                worker_dispatcher.import_transfer_execute_with_connection
+            ),
+            config_revision_provider=lambda: 1,
+        )
+
+        runtime = builder.build(config, recover_background=False)
+        try:
+            created = runtime.import_service.create_import_job(
+                {
+                    "title": "Runtime builder V1",
+                    "category": "movie",
+                    "url": "https://pan.quark.cn/s/runtime-builder-v1",
+                }
+            )
+            self.assertTrue(created["success"], created)
+            self.assertTrue(created["created"])
+            job_id = int(created["job"]["id"])
+            self.assertEqual(executions.plan(job_id)["version"], 1)
+
+            claimed = self.db.worker_tasks.claim(
+                "runtime-worker",
+                task_types=["import_transfer_execute"],
+            )
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed["payload"]["job_id"], job_id)
+            self.assertTrue(
+                self.db.worker_tasks.fail(
+                    int(claimed["id"]),
+                    "runtime-worker",
+                    "simulated worker restart",
+                    terminal=True,
+                )
+            )
+
+            replacement = builder.build(config, recover_background=False)
+            try:
+                retried = replacement.import_service.retry_job(job_id)
+                self.assertTrue(retried["success"])
+                reactivated = self.db.worker_tasks.get(int(claimed["id"]))
+                self.assertEqual(reactivated["status"], "pending")
+                self.assertEqual(reactivated["attempts"], 0)
+            finally:
+                replacement.close()
+        finally:
+            runtime.close()
+
+    def test_quark_to_tianyi_relay_freezes_and_requires_native_proofs(self) -> None:
+        quark_account = self._quark_account()
+        tianyi_account = self._tianyi_account()
+        self.connections.create_connection(
+            {
+                "connection_id": "ol_relay",
+                "name": "OpenList relay",
+                "base_url": "http://openlist:5244/dav",
+                "username": "admin",
+                "password": "secret",
+            }
+        )
+        source_mount = self.mounts.create_mount(
+            {
+                "mount_id": "quark_relay_source",
+                "connection_id": "ol_relay",
+                "name": "\u5938\u514b\u6765\u6e90",
+                "webdav_root": "/quark",
+                "account_id": quark_account,
+                "provider_kind": "quark",
+                "identity_root": "/",
+                "native_locator": {"kind": "path", "value": "/FNOS"},
+            }
+        )
+        destination_mount = self.mounts.create_mount(
+            {
+                "mount_id": "tianyi_relay_target",
+                "connection_id": "ol_relay",
+                "name": "\u5929\u7ffc\u76ee\u6807",
+                "webdav_root": "/tianyi",
+                "account_id": tianyi_account,
+                "provider_kind": "tianyi",
+                "identity_root": "/",
+                "native_locator": {
+                    "kind": "folder_id",
+                    "value": "root-folder-id",
+                    "upload_verified": True,
+                    "organizer_mutation_verified": True,
+                },
+            }
+        )
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE openlist_mounts SET readable=1, writable=1, "
+                "last_tested_at='2026-08-09T00:00:00Z' WHERE mount_id=?",
+                (source_mount["mount_id"],),
+            )
+            connection.execute(
+                "UPDATE openlist_mounts SET readable=1, writable=0, "
+                "last_tested_at='2026-08-09T00:00:00Z' WHERE mount_id=?",
+                (destination_mount["mount_id"],),
+            )
+        self.mounts.confirm_identity(source_mount["mount_id"])
+        self.mounts.confirm_identity(destination_mount["mount_id"])
+        self.targets.create_target(
+            destination_id="tianyi_relay",
+            name="\u5929\u7ffc\u8de8\u76d8\u76ee\u6807",
+            provider_kind="tianyi",
+            categories={
+                "movie": TargetCategory(
+                    category_key="movie",
+                    public_label="\u7535\u5f71",
+                    native_locator=NativeLocator("folder_id", "root-folder-id"),
+                    rclone_locator=RcloneLocator(
+                        "ol_relay",
+                        destination_mount["mount_id"],
+                        "/tianyi/电影",
+                    ),
+                    organizer_locator=OpenListLocator(
+                        "ol_relay",
+                        destination_mount["mount_id"],
+                        "/tianyi",
+                    ),
+                )
+            },
+            account_id=tianyi_account,
+        )
+        self.assignments.upsert("quark", "movie", "tianyi_relay")
+        source = self.sources.capture(
+            SourceDescriptor(
+                "quark",
+                "share",
+                "quark:share:relay",
+                search_source_id="quark",
+                expected_file_count=2,
+                expected_total_bytes=12,
+            ),
+            {"url": "https://pan.quark.cn/s/relay", "password": ""},
+        )
+        planner, _resolver, deps = self._planner()
+        plan = planner.plan_import(
+            source=source,
+            category_key="movie",
+            job_id=42,
+        )
+        job = {
+            "id": 42,
+            "category": "movie",
+            "destination_id": "tianyi_relay",
+            "plan_version": 1,
+        }
+
+        self.assertEqual(
+            plan["transfer"]["strategy"],
+            "relay_upload_provider",
+        )
+        self.assertEqual(plan["destination"]["account_id"], tianyi_account)
+        self.assertGreater(plan["destination"]["account_revision"], 0)
+        self.assertEqual(
+            plan["paths"]["destination_final"]["namespace_id"],
+            "native:tianyi:tianyi_relay",
+        )
+        self.assertEqual(
+            plan["paths"]["destination_final"]["path"],
+            "root-folder-id",
+        )
+        self.assertEqual(
+            plan["bindings"]["destination_mount_id"],
+            destination_mount["mount_id"],
+        )
+        validate_plan(plan, job, deps=deps)
+
+        destination_revision = int(
+            plan["bindings"]["destination_mount_revision"]
+        )
+        original_revision = self.mounts.get_revision(
+            destination_mount["mount_id"],
+            destination_revision,
+        )
+        self.assertIsNotNone(original_revision)
+        for index, proof_name in enumerate(
+            ("upload_verified", "organizer_mutation_verified"),
+            start=43,
+        ):
+            broken_revision = dict(original_revision)
+            broken_revision["native_locator"] = dict(
+                original_revision["native_locator"]
+            )
+            broken_revision["native_locator"][proof_name] = False
+            with self.db.connect() as connection:
+                connection.execute(
+                    "UPDATE openlist_mount_revisions SET config_json=? "
+                    "WHERE mount_id=? AND revision=?",
+                    (
+                        json.dumps(
+                            broken_revision,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        destination_mount["mount_id"],
+                        destination_revision,
+                    ),
+                )
+            with self.subTest(proof_name=proof_name):
+                with self.assertRaises(PlanningError):
+                    planner.plan_import(
+                        source=source,
+                        category_key="movie",
+                        job_id=index,
+                    )
+                with self.assertRaises(PlanningError):
+                    validate_plan(plan, job, deps=deps)
+            with self.db.connect() as connection:
+                connection.execute(
+                    "UPDATE openlist_mount_revisions SET config_json=? "
+                    "WHERE mount_id=? AND revision=?",
+                    (
+                        json.dumps(
+                            original_revision,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        destination_mount["mount_id"],
+                        destination_revision,
+                    ),
+                )
+        validate_plan(plan, job, deps=deps)
+
     def test_job_plan_execution_and_worker_task_are_atomic(self) -> None:
         account_id = self._quark_account()
         self.targets.create_target(
@@ -358,7 +723,11 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
 
     def test_new_provider_source_is_declared_without_core_mapping(self) -> None:
         resolver = SourceResolver(
-            lambda _url: {"source_type": "115_share"},
+            lambda _url: {
+                "provider_kind": "115",
+                "source_form": "share",
+                "search_source_id": "p115",
+            },
             source_catalog_provider=lambda: [
                 {
                     "search_source_id": "p115",

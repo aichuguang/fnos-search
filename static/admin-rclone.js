@@ -236,7 +236,7 @@
                         <div class="task-log-id">#${escapeHtml(item.id)}</div>
                         <div class="task-log-main">
                             <strong>${escapeHtml(item.title || "未命名任务")}</strong>
-                            <p>${statusPill(item.status)} · ${escapeHtml(item.category_label || item.category || "-")} · ${escapeHtml(String(item.source_type || "-").toUpperCase())}</p>
+                            <p>${statusPill(item.status)} · ${escapeHtml(item.category_label || item.category || "-")} · ${escapeHtml(String(item.source_provider_kind || "-").toUpperCase())}</p>
                             <p>创建：${escapeHtml(formatDate(item.created_at))} · ${item.finished_at ? `结束：${escapeHtml(formatDate(item.finished_at))}` : "尚未结束"}</p>
                         </div>
                         <div class="task-log-stats">

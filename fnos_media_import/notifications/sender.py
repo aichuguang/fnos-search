@@ -35,7 +35,7 @@ def deliver_task(db: Any, task: dict[str, Any]) -> dict[str, Any]:
     attempts = max(1, int(task.get("attempts") or 1))
 
     config = notify_config.read_config(db)
-    latest = db.latest_notification_delivery_status_by_task(task_id)
+    latest = db.notification_deliveries.latest_status_by_channel(task_id)
     retry_failed_channels = bool(payload.get("retry_failed_channels")) and attempts == 1
     pending = [
         channel
@@ -56,7 +56,7 @@ def deliver_task(db: Any, task: dict[str, Any]) -> dict[str, Any]:
     transient_failed: list[str] = []
     for channel in pending:
         if not bool(config.get("enabled")) or not notify_config.channel_enabled(config, channel):
-            db.record_notification_delivery(
+            db.notification_deliveries.record(
                 task_id=task_id, event_type=event_type, channel=channel,
                 status=DELIVERY_FAILED, attempts=attempts,
                 error_message="通知渠道已禁用，已停止投递",
@@ -67,7 +67,7 @@ def deliver_task(db: Any, task: dict[str, Any]) -> dict[str, Any]:
         expected_revision = str(expected_revisions.get(channel) or "")
         current_revision = notify_config.channel_revision(config, channel)
         if expected_revision and expected_revision != current_revision:
-            db.record_notification_delivery(
+            db.notification_deliveries.record(
                 task_id=task_id, event_type=event_type, channel=channel,
                 status=DELIVERY_FAILED, attempts=attempts,
                 error_message="渠道配置已变更，为避免把历史事件发送到新目标，已停止投递",
@@ -78,13 +78,13 @@ def deliver_task(db: Any, task: dict[str, Any]) -> dict[str, Any]:
             _send_one(db, config, channel, payload, task_id, attempts)
             latest[channel] = DELIVERY_SUCCESS
         except (SmtpPermanentError, WebhookPermanentError) as exc:
-            db.record_notification_delivery(
+            db.notification_deliveries.record(
                 task_id=task_id, event_type=event_type, channel=channel,
                 status=DELIVERY_FAILED, attempts=attempts, error_message=str(exc),
             )
             latest[channel] = DELIVERY_FAILED
         except (SmtpTransientError, WebhookTransientError) as exc:
-            db.record_notification_delivery(
+            db.notification_deliveries.record(
                 task_id=task_id, event_type=event_type, channel=channel,
                 status=DELIVERY_RETRYABLE, attempts=attempts, error_message=str(exc),
             )
@@ -129,7 +129,7 @@ def _send_one(
             html_body=str(email_payload.get("html") or ""),
             message_id=event_id,
         )
-        db.record_notification_delivery(
+        db.notification_deliveries.record(
             task_id=task_id, event_type=event_type, channel=channel,
             status=DELIVERY_SUCCESS, attempts=attempts,
             recipient=", ".join(_mask_email(item) for item in recipients),
@@ -142,7 +142,7 @@ def _send_one(
         result = webhook_channel.send_webhook(
             webhook_cfg, webhook_payload, notification_id=event_id
         )
-        db.record_notification_delivery(
+        db.notification_deliveries.record(
             task_id=task_id, event_type=event_type, channel=channel,
             status=DELIVERY_SUCCESS, attempts=attempts,
             recipient=_mask_webhook_url(str(webhook_cfg.get("url") or "")),
@@ -152,7 +152,7 @@ def _send_one(
     elif channel == event_defs.CHANNEL_GUEST_EMAIL:
         context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
         request_id = int(context.get("request_id") or 0)
-        subscription = db.get_guest_notification_subscription(request_id) if request_id else None
+        subscription = db.guest_notification_subscriptions.get_for_request(request_id) if request_id else None
         if not subscription or subscription.get("opted_out_at"):
             raise SmtpPermanentError("访客未订阅或已停止接收通知")
         if event_type != event_defs.EVENT_GUEST_EMAIL_VERIFY and not subscription.get("verified_at"):
@@ -192,7 +192,7 @@ def _send_one(
             html_body=html_body,
             message_id=event_id,
         )
-        db.record_notification_delivery(
+        db.notification_deliveries.record(
             task_id=task_id, event_type=event_type, channel=channel,
             status=DELIVERY_SUCCESS, attempts=attempts,
             recipient=_mask_email(recipient), status_code=result.get("status_code"),

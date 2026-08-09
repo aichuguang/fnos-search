@@ -63,6 +63,11 @@ class ResourceRepository:
                     ids_by_key[(str(row["source"] or ""), str(row["url"] or ""))] = int(row["id"])
         return [ids_by_key.get(key, 0) for key in lookup_keys]
 
+    def save(self, item: dict[str, Any]) -> int:
+        """Persist one resource without routing through a database façade."""
+
+        return self.save_many([item])[0]
+
     def get(self, resource_id: int) -> dict[str, Any] | None:
         with self._connection_factory() as connection:
             row = connection.execute("SELECT * FROM resources WHERE id = ?", (resource_id,)).fetchone()

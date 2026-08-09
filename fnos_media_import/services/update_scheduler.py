@@ -52,7 +52,7 @@ class UpdateScheduler:
     def shutdown(self) -> None:
         self.stop_event.set()
         try:
-            self.service.db.release_scheduler_lease(self.lease_name, self.owner_id)
+            self.service.db.scheduler_leases.release(self.lease_name, self.owner_id)
         except Exception:  # noqa: BLE001
             logger.exception("failed to release update scheduler lease")
 
@@ -83,7 +83,7 @@ class UpdateScheduler:
         running_run: dict[str, Any] | None = None
         scheduler = self.service._scheduler_config()
         try:
-            rows = self.service.db.list_update_subscriptions(limit=1, status="enabled", include_sources=False)
+            rows = self.service.db.update.list_update_subscriptions(limit=1, status="enabled", include_sources=False)
             if rows:
                 item = rows[0]
                 next_subscription = {
@@ -97,7 +97,7 @@ class UpdateScheduler:
         except Exception:  # noqa: BLE001
             pass
         try:
-            running_run = self.service.db.get_running_update_run()
+            running_run = self.service.db.update.get_running_update_run()
         except Exception:  # noqa: BLE001
             pass
         return {
@@ -138,7 +138,7 @@ class UpdateScheduler:
         while not self.stop_event.wait(self.interval_seconds):
             try:
                 lease_ttl = max(90, self.interval_seconds * 3)
-                if not self.service.db.acquire_scheduler_lease(self.lease_name, self.owner_id, lease_ttl):
+                if not self.service.db.scheduler_leases.acquire(self.lease_name, self.owner_id, lease_ttl):
                     continue
                 self.service.run_due(limit=self.max_subscriptions_per_tick, trigger_type="schedule")
                 self.last_run_at = utc_now()

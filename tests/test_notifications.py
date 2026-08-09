@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import copy
 import hashlib
 import hmac
@@ -12,6 +14,7 @@ from unittest import mock
 from zoneinfo import ZoneInfoNotFoundError
 
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.notifications import config as notify_config
 from fnos_media_import.notifications import events as notify_events
 from fnos_media_import.notifications import secrets as secret_store
@@ -54,7 +57,7 @@ def _enabled_config() -> dict:
     return config
 
 
-class _FakeSmtp:
+class _FakeSmtp(RepositoryFakeMixin):
     def __init__(self, code: int) -> None:
         self.code = code
 
@@ -79,7 +82,7 @@ class _FakeLoginRejectingSmtp(_FakeSmtp):
         )
 
 
-class _FakeSlowQuitSmtp:
+class _FakeSlowQuitSmtp(RepositoryFakeMixin):
     class Socket:
         def __init__(self) -> None:
             self.timeout: float | None = None
@@ -106,7 +109,7 @@ class _FakeSlowQuitSmtp:
         self.closed = True
 
 
-class _FakeHttpResponse:
+class _FakeHttpResponse(RepositoryFakeMixin):
     def __init__(self, status: int) -> None:
         self.status = status
 
@@ -114,7 +117,7 @@ class _FakeHttpResponse:
         return b"response body must not enter audit errors"
 
 
-class _FakePool:
+class _FakePool(RepositoryFakeMixin):
     status = 200
     captured: dict = {}
 
@@ -139,8 +142,9 @@ class NotificationTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"notify-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -165,15 +169,17 @@ class NotificationTests(unittest.TestCase):
         )
 
     def _create_job(self, status: str = "created") -> int:
-        job_id, created = self.database.create_job({
+        job_id, created = self.database.job_commands.create({
             "title": "测试任务",
             "category": "movie",
             "category_label": "电影",
-            "source_type": "quark",
+            "source_provider_kind": "quark",
+            "source_form": "share",
             "source_url": f"https://example.com/{uuid.uuid4().hex}",
-            "target_route": "quark_to_mobile",
             "target_path": "/电影",
             "status": status,
+            "destination_id": "native-main",
+            "plan_version": 1,
             "idempotency_key": f"test:{uuid.uuid4().hex}",
         })
         self.assertTrue(created)
@@ -612,7 +618,7 @@ class NotificationTests(unittest.TestCase):
         config = _enabled_config()
         notify_config.write_config(db, config)
         job_id = self._create_job(status="organizing")
-        task_id = db.create_organizer_task(
+        task_id = db.organizer.create_organizer_task(
             category="movie",
             openlist_root_path="/清云/_入库暂存/电影/job-review",
             title="测试影片",
@@ -753,11 +759,11 @@ class NotificationTests(unittest.TestCase):
             second = deliver_task(db, db.worker_tasks.get(task_id))
             self.assertEqual(second["worker_outcome"], "completed")
 
-        deliveries = db.list_notification_deliveries(event_type=notify_events.EVENT_GUEST_NEW)
+        deliveries = db.notification_deliveries.list_deliveries(event_type=notify_events.EVENT_GUEST_NEW)
         statuses = [row["status"] for row in deliveries]
         self.assertIn("retryable", statuses)
         self.assertIn("success", statuses)
-        summary = db.notification_delivery_summary()
+        summary = db.notification_deliveries.summary()
         self.assertGreaterEqual(summary["success"], 1)
 
     def test_deliver_task_permanent_failure_is_terminal(self) -> None:
@@ -778,7 +784,7 @@ class NotificationTests(unittest.TestCase):
         ):
             result = deliver_task(db, db.worker_tasks.get(task_id))
         self.assertEqual(result["worker_outcome"], "business_failed")
-        statuses = [row["status"] for row in db.list_notification_deliveries()]
+        statuses = [row["status"] for row in db.notification_deliveries.list_deliveries()]
         self.assertIn("failed", statuses)
 
     def test_disabled_channel_stops_queued_delivery(self) -> None:
@@ -798,7 +804,7 @@ class NotificationTests(unittest.TestCase):
             result = deliver_task(db, db.worker_tasks.get(task_id))
         self.assertEqual(result["worker_outcome"], "business_failed")
         send.assert_not_called()
-        self.assertIn("已禁用", db.list_notification_deliveries()[0]["error_message"])
+        self.assertIn("已禁用", db.notification_deliveries.list_deliveries()[0]["error_message"])
 
     def test_changed_channel_target_stops_historical_event(self) -> None:
         db = self.database
@@ -817,7 +823,7 @@ class NotificationTests(unittest.TestCase):
             result = deliver_task(db, db.worker_tasks.get(task_id))
         self.assertEqual(result["worker_outcome"], "business_failed")
         send.assert_not_called()
-        self.assertIn("配置已变更", db.list_notification_deliveries()[0]["error_message"])
+        self.assertIn("配置已变更", db.notification_deliveries.list_deliveries()[0]["error_message"])
 
     def test_permanent_failure_can_be_reactivated_after_same_target_repair(self) -> None:
         db = self.database
@@ -892,16 +898,16 @@ class NotificationTests(unittest.TestCase):
 
     def test_summary_counts_latest_channel_state(self) -> None:
         db = self.database
-        db.record_notification_delivery(
+        db.notification_deliveries.record(
             task_id=1, event_type="x", channel="webhook", status="retryable"
         )
-        db.record_notification_delivery(
+        db.notification_deliveries.record(
             task_id=1, event_type="x", channel="webhook", status="success"
         )
-        db.record_notification_delivery(
+        db.notification_deliveries.record(
             task_id=2, event_type="x", channel="email", status="failed"
         )
-        summary = db.notification_delivery_summary()
+        summary = db.notification_deliveries.summary()
         self.assertEqual(summary["success"], 1)
         self.assertEqual(summary["retryable"], 0)
         self.assertEqual(summary["failed"], 1)
@@ -916,10 +922,10 @@ class NotificationTests(unittest.TestCase):
                 (str(previous["status"]), str(current["status"]))
             )
         )
-        db.update_job(job_id, status="failed", error_message="boom")
-        db.update_job(job_id, status="failed", error_message="still boom")
-        db.update_job(job_id, status="submitted")
-        db.update_job(job_id, status="done")
+        db.job_commands.update(job_id, status="failed", error_message="boom")
+        db.job_commands.update(job_id, status="failed", error_message="still boom")
+        db.job_commands.update(job_id, status="submitted")
+        db.job_commands.update(job_id, status="done")
         self.assertEqual(
             transitions,
             [("created", "failed"), ("failed", "submitted"), ("submitted", "done")],
@@ -1103,7 +1109,7 @@ class NotificationTests(unittest.TestCase):
         verify_token = "verify-token"
         unsubscribe_token = "unsubscribe-token"
         with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": key}):
-            self.database.create_guest_notification_subscription(
+            self.database.guest_notification_subscriptions.create(
                 request_id=request_id,
                 email_encrypted=secret_store.store("guest@example.com"),
                 email_hash=hashlib.sha256(b"guest@example.com").hexdigest(),
@@ -1113,14 +1119,14 @@ class NotificationTests(unittest.TestCase):
                 unsubscribe_token_encrypted=secret_store.store(unsubscribe_token),
                 unsubscribe_token_hash=token_hash(unsubscribe_token),
             )
-            stored = self.database.get_guest_notification_subscription(request_id)
+            stored = self.database.guest_notification_subscriptions.get_for_request(request_id)
             self.assertNotIn("guest@example.com", str(stored))
             self.assertNotIn(verify_token, str(stored))
-            self.assertIsNotNone(self.database.verify_guest_notification_subscription(verify_token))
-            self.assertIsNone(self.database.verify_guest_notification_subscription(verify_token))
-            self.assertIsNotNone(self.database.opt_out_guest_notification_subscription(unsubscribe_token))
+            self.assertIsNotNone(self.database.guest_notification_subscriptions.verify(verify_token))
+            self.assertIsNone(self.database.guest_notification_subscriptions.verify(verify_token))
+            self.assertIsNotNone(self.database.guest_notification_subscriptions.opt_out(unsubscribe_token))
             self.assertIsNotNone(
-                self.database.get_guest_notification_subscription(request_id)["opted_out_at"]
+                self.database.guest_notification_subscriptions.get_for_request(request_id)["opted_out_at"]
             )
 
     def test_settings_reject_invalid_delivery_pagination_and_test_payload(self) -> None:
@@ -1139,7 +1145,7 @@ class NotificationTests(unittest.TestCase):
             config = _enabled_config()
             self.assertEqual(service._test_email(config, "https://example.com")[1], 200)
             self.assertEqual(service._test_email(config, "https://example.com")[1], 200)
-        summary = self.database.notification_delivery_summary()
+        summary = self.database.notification_deliveries.summary()
         self.assertEqual(summary["success"], 2)
         self.assertEqual(summary["total"], 2)
 
@@ -1177,7 +1183,7 @@ class NotificationTests(unittest.TestCase):
         db = self.database
         request_id = self._create_request("anon-sub")
         with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": key}):
-            db.create_guest_notification_subscription(
+            db.guest_notification_subscriptions.create(
                 request_id=request_id,
                 email_encrypted=secret_store.store("guest@example.com"),
                 email_hash=hashlib.sha256(b"guest@example.com").hexdigest(),
@@ -1196,7 +1202,7 @@ class NotificationTests(unittest.TestCase):
         # 仍在处理中的申请不应被匿名化
         fresh_id = self._create_request("anon-fresh")
         with mock.patch.dict(os.environ, {"FNOS_ROOT_KEY": key}):
-            db.create_guest_notification_subscription(
+            db.guest_notification_subscriptions.create(
                 request_id=fresh_id,
                 email_encrypted=secret_store.store("fresh@example.com"),
                 email_hash=hashlib.sha256(b"fresh@example.com").hexdigest(),
@@ -1207,15 +1213,15 @@ class NotificationTests(unittest.TestCase):
                 unsubscribe_token_hash=token_hash("u2"),
             )
 
-        count = db.anonymize_guest_notification_subscriptions(older_than="2024-01-01T00:00:00Z")
+        count = db.guest_notification_subscriptions.anonymize_terminal(older_than="2024-01-01T00:00:00Z")
         self.assertEqual(count, 1)
-        old = db.get_guest_notification_subscription(request_id)
+        old = db.guest_notification_subscriptions.get_for_request(request_id)
         self.assertEqual(old["email_encrypted"], "")
         self.assertEqual(old["email_hash"], "")
         self.assertEqual(old["verification_token_hash"], "")
         self.assertEqual(old["unsubscribe_token_encrypted"], "")
         self.assertTrue(old["unsubscribe_token_hash"].startswith("anon:"))
-        fresh = db.get_guest_notification_subscription(fresh_id)
+        fresh = db.guest_notification_subscriptions.get_for_request(fresh_id)
         self.assertNotEqual(fresh["email_encrypted"], "")
 
     def test_migration_includes_encrypted_verification_token(self) -> None:

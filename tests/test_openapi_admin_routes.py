@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from flask import Flask, jsonify
@@ -27,9 +28,32 @@ class OpenApiAdminRouteTests(unittest.TestCase):
             batch["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/OrganizerMappingsBatchUpdateRequest",
         )
-        retry_refresh = paths["/api/admin/sixpan/jobs/{job_id}/retry-media-refresh"]["post"]
-        self.assertEqual(retry_refresh["parameters"][0]["name"], "job_id")
-        self.assertEqual(retry_refresh["security"], [{"cookieAuth": []}])
+
+    def test_v1_job_and_detection_contracts_are_structured(self) -> None:
+        spec = get_openapi_spec()
+        job = spec["components"]["schemas"]["ImportJob"]
+        self.assertEqual(
+            {
+                "source_provider_kind",
+                "source_form",
+                "search_source_id",
+                "transfer_strategy",
+                "destination_id",
+                "destination_provider_kind",
+            },
+            set(job["required"]) - {"id"},
+        )
+        detection = spec["components"]["schemas"]["SourceDetectionResponse"]
+        link = detection["properties"]["link"]
+        self.assertTrue(
+            {"provider_kind", "source_form", "search_source_id"}.issubset(
+                link["properties"]
+            )
+        )
+        encoded = json.dumps(spec, ensure_ascii=False)
+        self.assertNotIn("target_route", encoded)
+        self.assertNotIn('"route"', encoded)
+        self.assertNotIn("source_type", encoded)
 
     def test_operational_health_routes_are_documented(self) -> None:
         paths = get_openapi_spec()["paths"]
@@ -48,6 +72,8 @@ class OpenApiAdminRouteTests(unittest.TestCase):
         paths = get_openapi_spec()["paths"]
         self.assertNotIn("/api/admin/sixpan/oauth/device-code", paths)
         self.assertNotIn("/api/admin/sixpan/oauth/device-code/check", paths)
+        self.assertNotIn("/api/admin/sixpan/sync", paths)
+        self.assertNotIn("/api/admin/sixpan/jobs/{job_id}/retry-media-refresh", paths)
 
     def test_settings_blueprint_does_not_expose_sensitive_export_via_get(self) -> None:
         app = Flask(__name__)
@@ -79,7 +105,7 @@ class OpenApiAdminRouteTests(unittest.TestCase):
         self.assertEqual(client.post("/api/admin/advanced-config/export").status_code, 200)
         self.assertEqual(client.post("/api/admin/settings/all").status_code, 200)
 
-    def test_sixpan_media_refresh_retry_route_is_admin_protected(self) -> None:
+    def test_sixpan_media_refresh_retry_route_is_retired(self) -> None:
         app = Flask(__name__)
         calls: list[int] = []
 
@@ -111,7 +137,7 @@ class OpenApiAdminRouteTests(unittest.TestCase):
             "/api/admin/sixpan/jobs/21/retry-media-refresh"
         )
 
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 404)
         self.assertEqual(calls, [])
         self.assertEqual(
             app.test_client()

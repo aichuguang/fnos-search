@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from pathlib import Path
 
@@ -9,7 +11,7 @@ from fnos_media_import.services.admin_dashboard_service import (
 )
 
 
-class _JobQueries:
+class _JobQueries(RepositoryFakeMixin):
     def __init__(self, items: list[dict[str, object]]) -> None:
         self.items = items
 
@@ -17,7 +19,7 @@ class _JobQueries:
         return self.items[offset : offset + limit]
 
 
-class _RequestQueries:
+class _RequestQueries(RepositoryFakeMixin):
     def __init__(self, items: list[dict[str, object]]) -> None:
         self.items = items
 
@@ -47,8 +49,8 @@ class AdminDashboardWorkbenchTests(unittest.TestCase):
                 "title": f"任务 {index}",
                 "category": "movie",
                 "category_label": "电影",
-                "source_type": "quark",
-                "target_route": "quark_to_mobile",
+                "source_provider_kind": "quark",
+                "source_form": "share",
                 "status": "done" if index == 1 else "transferring",
                 "updated_at": f"2026-08-{index:02d}T12:00:00+08:00",
                 "raw_data": {"private": "dashboard must not expose this"},

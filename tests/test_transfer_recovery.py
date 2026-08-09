@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 from dataclasses import dataclass
 
@@ -16,7 +18,7 @@ class _Execution:
     phase: str
 
 
-class _Executions:
+class _Executions(RepositoryFakeMixin):
     def __init__(self, rows):
         self.rows = rows
 
@@ -24,7 +26,7 @@ class _Executions:
         return list(self.rows)
 
 
-class _Queue:
+class _Queue(RepositoryFakeMixin):
     def __init__(self):
         self.calls = []
         self.created = True

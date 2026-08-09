@@ -1,167 +1,23 @@
 from __future__ import annotations
 
-import threading
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import unittest
 import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from fnos_media_import.app import _public_adapter_capabilities
+from fnos_media_import.public_web import _public_adapter_capabilities
 from fnos_media_import.content_guard import evaluate_submission_content_risk
 from fnos_media_import.database import Database
-from fnos_media_import.services.rclone_history_repair_worker import RcloneHistoryRepairWorker
-from fnos_media_import.services.rclone_waiting_job_recovery_service import RcloneWaitingJobRecoveryService
-
-
-class _RecoveryDatabase:
-    def __init__(self) -> None:
-        self.jobs = [{"id": value} for value in range(60, 0, -1)]
-        self.runs = [{"id": value, "status": "success", "exit_code": 0} for value in range(600, 0, -1)]
-        self.job_offsets: list[int] = []
-        self.run_offsets: list[int] = []
-
-    def list_jobs(self, *, limit: int, offset: int, status: str, source_type: str):
-        if status != "waiting_transfer" or source_type != "quark":
-            return []
-        self.job_offsets.append(offset)
-        return self.jobs[offset : offset + limit]
-
-    def list_rclone_runs(self, *, limit: int, offset: int):
-        self.run_offsets.append(offset)
-        return self.runs[offset : offset + limit]
-
-
-class RcloneRecoveryPaginationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.database = _RecoveryDatabase()
-        self.service = RcloneWaitingJobRecoveryService(
-            database=self.database,
-            state_lock=threading.Lock(),
-            is_running=lambda: False,
-            file_identity=lambda _event: "",
-            is_pollution_file=lambda _name: False,
-            finalize_run=lambda _run_id, _exit_code: None,
-        )
-
-    def test_waiting_jobs_scan_all_pages_instead_of_starving_old_jobs(self) -> None:
-        jobs = self.service._waiting_jobs(limit=1)
-
-        self.assertEqual(len(jobs), 60)
-        self.assertEqual(self.database.job_offsets, [0, 50])
-
-    def test_run_lookup_pages_until_requested_old_run_is_found(self) -> None:
-        runs = self.service._runs_by_ids([1])
-
-        self.assertEqual(runs[1]["id"], 1)
-        self.assertEqual(self.database.run_offsets, [0, 500])
-
-
-class _LeaseDatabase:
-    def __init__(self) -> None:
-        self.release_count = 0
-
-    @staticmethod
-    def acquire_scheduler_lease(_name: str, _owner: str, _seconds: int) -> bool:
-        return True
-
-    def release_scheduler_lease(self, _name: str, _owner: str) -> None:
-        self.release_count += 1
-
-
-class RcloneRecoveryWorkerTests(unittest.TestCase):
-    def test_worker_repeats_recovery_until_shutdown(self) -> None:
-        database = _LeaseDatabase()
-        reached_two = threading.Event()
-        calls = 0
-
-        def repair(*, limit: int):
-            nonlocal calls
-            calls += 1
-            if calls >= 2:
-                reached_two.set()
-            return {"success": True, "run_ids": [], "limit": limit}
-
-        worker = RcloneHistoryRepairWorker(
-            database=database,
-            owner_id="worker-a",
-            repair=repair,
-            log=lambda _message: None,
-            limit=5,
-            interval_seconds=0.05,
-        )
-        worker.start()
-        self.assertTrue(reached_two.wait(1.0))
-        worker.shutdown()
-
-        self.assertGreaterEqual(calls, 2)
-        self.assertFalse(worker.thread and worker.thread.is_alive())
-
-    def test_lease_acquisition_error_does_not_kill_periodic_thread(self) -> None:
-        database = _LeaseDatabase()
-        original_acquire = database.acquire_scheduler_lease
-        acquire_calls = 0
-
-        def flaky_acquire(name: str, owner: str, seconds: int) -> bool:
-            nonlocal acquire_calls
-            acquire_calls += 1
-            if acquire_calls == 1:
-                raise RuntimeError("database busy")
-            return original_acquire(name, owner, seconds)
-
-        database.acquire_scheduler_lease = flaky_acquire
-        repaired = threading.Event()
-        worker = RcloneHistoryRepairWorker(
-            database=database,
-            owner_id="worker-a",
-            repair=lambda **_kwargs: repaired.set() or {"success": True, "run_ids": []},
-            log=lambda _message: None,
-            interval_seconds=0.05,
-        )
-        worker.start()
-        self.assertTrue(repaired.wait(1.0))
-        worker.shutdown()
-
-        self.assertGreaterEqual(acquire_calls, 2)
-
-    def test_shutdown_does_not_release_lease_while_repair_is_still_running(self) -> None:
-        database = _LeaseDatabase()
-        repair_started = threading.Event()
-        allow_repair_to_finish = threading.Event()
-
-        def blocking_repair(*, limit: int):
-            repair_started.set()
-            allow_repair_to_finish.wait(5.0)
-            return {"success": True, "run_ids": [], "limit": limit}
-
-        worker = RcloneHistoryRepairWorker(
-            database=database,
-            owner_id="worker-a",
-            repair=blocking_repair,
-            log=lambda _message: None,
-            interval_seconds=0.05,
-        )
-        worker.start()
-        try:
-            self.assertTrue(repair_started.wait(1.0))
-            worker.shutdown()
-
-            self.assertTrue(worker.thread and worker.thread.is_alive())
-            self.assertEqual(database.release_count, 0)
-        finally:
-            allow_repair_to_finish.set()
-            if worker.thread:
-                worker.thread.join(timeout=2.0)
-
-        self.assertFalse(worker.thread and worker.thread.is_alive())
-        self.assertEqual(database.release_count, 1)
-
-
+from fnos_media_import.repositories import RepositorySet
 class SearchCacheCleanupTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"search-cache-cleanup-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -170,14 +26,14 @@ class SearchCacheCleanupTests(unittest.TestCase):
                 candidate.unlink()
 
     def test_new_cache_write_prunes_expired_rows(self) -> None:
-        expired_id = self.database.save_search_cache(
+        expired_id = self.database.search_cache_commands.save(
             "expired",
             keyword="old",
             item={"title": "Old", "url": "https://example.invalid/old"},
             expires_minutes=-1,
         )
 
-        self.database.save_search_cache(
+        self.database.search_cache_commands.save(
             "active",
             keyword="new",
             item={"title": "New", "url": "https://example.invalid/new"},
@@ -234,7 +90,6 @@ class PublicAdapterCapabilityTests(unittest.TestCase):
         item = self._cloud189(
             _public_adapter_capabilities(
                 {
-                    "routes": {"cloud189": {"enabled": True}},
                     "cloud189": {},
                     "cloud139": {},
                     "cmcc_upload": {},
@@ -244,10 +99,12 @@ class PublicAdapterCapabilityTests(unittest.TestCase):
             )
         )
 
-        self.assertFalse(item["route_enabled"])
         self.assertFalse(item["configured"])
         self.assertFalse(item["enabled"])
         self.assertFalse(item["capabilities"]["submit"])
+        self.assertEqual("tianyi", item["provider_kind"])
+        self.assertEqual("share", item["source_form"])
+        self.assertEqual("tianyi", item["search_source_id"])
 
     def test_configured_cloud189_webhook_exposes_submit_capability(self) -> None:
         class ConfiguredCloud189:

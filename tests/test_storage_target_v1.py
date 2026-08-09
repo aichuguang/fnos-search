@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fnos_media_import.accounts.service import ProviderAccountService
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.domain.models import AccountTestResult, NativeLocator, TargetCategory
 from fnos_media_import.storage.assignment_service import AssignmentError, SourceAssignmentService
 from fnos_media_import.storage.target_service import StorageTargetService
@@ -17,8 +18,9 @@ KEY = bytes.fromhex("11" * 32)
 class StorageTargetV1Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.db = Database(Path(self.temp.name) / "targets.db")
-        self.db.init_schema()
+        self._db_infrastructure = Database(Path(self.temp.name) / "targets.db")
+        self._db_infrastructure.init_schema()
+        self.db = RepositorySet.from_database(self._db_infrastructure)
         self.accounts = ProviderAccountService(self.db, lambda: KEY)
         self.targets = StorageTargetService(self.db)
         self.assignments = SourceAssignmentService(self.db, self.targets)

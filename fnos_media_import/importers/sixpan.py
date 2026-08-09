@@ -378,7 +378,7 @@ class SixPanOfflineImporter:
     def describe(self) -> dict[str, Any]:
         return {
             "name": "6盘离线",
-            "adapter_type": "sixpan_offline",
+            "adapter_type": "sixpan_provider",
             "configured": self.configured,
             "capabilities": {
                 "submit": self.configured,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import threading
 import time
 import unittest
@@ -7,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.services.search_cache_maintenance_worker import SearchCacheMaintenanceWorker
 
 
@@ -14,8 +17,9 @@ class SearchCachePruneRepositoryTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"search-cache-maintenance-{uuid.uuid4().hex}.db"
-        self.database = Database(self.db_path)
-        self.database.init_schema()
+        self._database_infrastructure = Database(self.db_path)
+        self._database_infrastructure.init_schema()
+        self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -24,13 +28,13 @@ class SearchCachePruneRepositoryTests(unittest.TestCase):
                 candidate.unlink()
 
     def test_prune_expired_is_bounded_and_preserves_active_rows(self) -> None:
-        self.database.save_search_cache(
+        self.database.search_cache_commands.save(
             "active",
             keyword="active",
             item={"title": "Active", "url": "https://example.invalid/active"},
             expires_minutes=60,
         )
-        self.database.save_search_cache_many(
+        self.database.search_cache_commands.save_many(
             [
                 (
                     f"expired-{index}",
@@ -42,16 +46,16 @@ class SearchCachePruneRepositoryTests(unittest.TestCase):
             expires_minutes=-1,
         )
 
-        self.assertEqual(self.database.prune_expired_search_cache(limit=2), 2)
-        self.assertEqual(self.database.prune_expired_search_cache(limit=2), 1)
-        self.assertEqual(self.database.prune_expired_search_cache(limit=2), 0)
+        self.assertEqual(self.database.search_cache_commands.prune_expired(limit=2), 2)
+        self.assertEqual(self.database.search_cache_commands.prune_expired(limit=2), 1)
+        self.assertEqual(self.database.search_cache_commands.prune_expired(limit=2), 0)
 
         with self.database.connect() as connection:
             rows = connection.execute("SELECT public_id FROM search_cache ORDER BY public_id").fetchall()
         self.assertEqual([str(row["public_id"]) for row in rows], ["active"])
 
 
-class _MaintenanceDatabase:
+class _MaintenanceDatabase(RepositoryFakeMixin):
     def __init__(self, *, remaining: int = 0, block_prune: bool = False) -> None:
         self.remaining = remaining
         self.block_prune = block_prune

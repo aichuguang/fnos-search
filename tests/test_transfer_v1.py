@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import os
 import shutil
 import tempfile
@@ -50,9 +52,9 @@ from fnos_media_import.transfer.cleanup import (
     LocalFilesystemOps,
     TransferCleanupService,
 )
-from fnos_media_import.transfer.mobile_relay_executor import (
+from fnos_media_import.transfer.provider_relay_executor import (
     DownloadStatus,
-    MobileRelayExecutor,
+    ProviderRelayExecutor,
 )
 from fnos_media_import.transfer.native_executor import NativeTransferExecutor
 from fnos_media_import.transfer.rclone_adapter import RcloneOperationAdapter
@@ -117,10 +119,10 @@ def make_plan(
         paths["destination_staging"] = None
     if final is not None:
         paths["destination_final"] = {
-            "kind": "native" if strategy in {"native_save", "native_offline", "relay_upload_mobile"} else "openlist",
-            "namespace_id": f"native:{dest_kind}:{dest_kind}_lib" if strategy in {"native_save", "native_offline", "relay_upload_mobile"} else dest_ns,
+            "kind": "native" if strategy in {"native_save", "native_offline", "relay_upload_provider"} else "openlist",
+            "namespace_id": f"native:{dest_kind}:{dest_kind}_lib" if strategy in {"native_save", "native_offline", "relay_upload_provider"} else dest_ns,
             "path": final,
-            **({} if strategy in {"native_save", "native_offline", "relay_upload_mobile"} else destination_mount),
+            **({} if strategy in {"native_save", "native_offline", "relay_upload_provider"} else destination_mount),
         }
     else:
         paths["destination_final"] = (
@@ -194,7 +196,7 @@ def make_plan(
 # ---------------------------------------------------------------------------
 # FAKE 依赖
 # ---------------------------------------------------------------------------
-class _EventLog:
+class _EventLog(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.items: list[tuple[str, dict]] = []
 
@@ -205,7 +207,7 @@ class _EventLog:
         return [name for name, _ in self.items]
 
 
-class _FakeNativeAdapter:
+class _FakeNativeAdapter(RepositoryFakeMixin):
     def __init__(
         self,
         kind: str,
@@ -291,7 +293,7 @@ class _FakeNativeAdapter:
         return CancelResult("not_cancellable", "unsupported")
 
 
-class _FakeRcloneService:
+class _FakeRcloneService(RepositoryFakeMixin):
     def __init__(self, *, start_ok: bool = True, run_status: str = "success", running: bool = False, events: _EventLog | None = None) -> None:
         self.start_ok = start_ok
         self.run_status = run_status
@@ -336,7 +338,7 @@ class _FakeRcloneService:
         return {"success": True, "message": "stopped"}
 
 
-class _ScriptedRcloneService:
+class _ScriptedRcloneService(RepositoryFakeMixin):
     """可按脚本返回 rclone status 的服务，用于取消/未知结果测试。"""
 
     def __init__(self, statuses: list[str]) -> None:
@@ -380,7 +382,7 @@ class _FakeResolver:
         return path
 
 
-class _FakeMaterializer:
+class _FakeMaterializer(RepositoryFakeMixin):
     def __init__(self, receipt: OperationReceipt | None = None, events: _EventLog | None = None) -> None:
         self.receipt = receipt or OperationReceipt(operation_id="landing-op", status="completed", provider_kind="quark")
         self.events = events
@@ -406,7 +408,7 @@ def _visibility_poller(result, events: _EventLog | None = None):
     return poller
 
 
-class _FakeTargetLister:
+class _FakeTargetLister(RepositoryFakeMixin):
     def __init__(self, *, exists: bool = True, file_count: int = 2, total_size: int = 100, unknown: bool = False, events: _EventLog | None = None) -> None:
         self.exists = exists
         self.file_count = file_count
@@ -424,7 +426,7 @@ class _FakeTargetLister:
         return ListedFiles(exists=self.exists, file_count=self.file_count, total_size=self.total_size)
 
 
-class _FakeAck:
+class _FakeAck(RepositoryFakeMixin):
     def __init__(self, *, acked: bool = True, fail_first: int = 0, events: _EventLog | None = None) -> None:
         self.acked = acked
         self.fail_first = fail_first
@@ -440,7 +442,7 @@ class _FakeAck:
         return AckResult(acked=self.acked, message="acked")
 
 
-class _FakeOrganizer:
+class _FakeOrganizer(RepositoryFakeMixin):
     def __init__(self, *, status: str = "done", events: _EventLog | None = None) -> None:
         self.status = status
         self.events = events
@@ -458,7 +460,7 @@ class _FakeFinalizer:
         return {"status": "done"}
 
 
-class _FakeCleanup:
+class _FakeCleanup(RepositoryFakeMixin):
     def __init__(self, *, ok: bool = True, events: _EventLog | None = None) -> None:
         self.ok = ok
         self.events = events
@@ -471,7 +473,7 @@ class _FakeCleanup:
         return CleanupResult(ok=self.ok, items=[])
 
 
-class _FakeDownloadAdapter:
+class _FakeDownloadAdapter(RepositoryFakeMixin):
     def __init__(self, *, status: str = "completed", events: _EventLog | None = None) -> None:
         self.status = status
         self.events = events
@@ -489,28 +491,38 @@ class _FakeDownloadAdapter:
         return DownloadStatus(self.status)
 
 
-class _FakeUploader:
-    def __init__(self, *, status: str = "done", auth_expired: bool = False, events: _EventLog | None = None) -> None:
+class _FakeUploader(RepositoryFakeMixin):
+    def __init__(
+        self,
+        *,
+        status: str = "done",
+        auth_expired: bool = False,
+        events: _EventLog | None = None,
+        provider_kind: str = "",
+        event_prefix: str = "cmcc",
+    ) -> None:
         self.status = status
         self.auth_expired = auth_expired
         self.events = events
         self.calls = []
+        self.provider_kind = provider_kind
+        self.event_prefix = event_prefix
 
     def upload_local_dir(self, *, local_dir, target_locator, idempotency_key, progress=None):
         self.calls.append((local_dir, target_locator, idempotency_key))
         if self.events is not None:
-            self.events.add("cmcc_upload")
+            self.events.add(f"{self.event_prefix}_upload")
         if self.auth_expired:
             return UploadOutcome("auth_expired", "移动云认证已过期")
         return UploadOutcome(self.status)
 
     def verify_target(self, *, target_locator, expected_file_count, expected_total_size):
         if self.events is not None:
-            self.events.add("cmcc_verify")
+            self.events.add(f"{self.event_prefix}_verify")
         return TransferVerifyResult("ok")
 
 
-class _FakeAlert:
+class _FakeAlert(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.calls = []
 
@@ -518,7 +530,7 @@ class _FakeAlert:
         self.calls.append((account_id, code, message))
 
 
-class _FakeFilesystem:
+class _FakeFilesystem(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.deleted: list[dict] = []
 
@@ -1067,7 +1079,7 @@ class RcloneReconcileFenceTests(unittest.TestCase):
         self.assertEqual(service.start_calls, 0)
 
 
-class RelayMobileTests(unittest.TestCase):
+class ProviderRelayTests(unittest.TestCase):
     def _orchestrator(self, events: _EventLog, *, uploader_status: str = "done", auth_expired: bool = False):
         download = _FakeDownloadAdapter(events=events)
         uploader = _FakeUploader(status=uploader_status, auth_expired=auth_expired, events=events)
@@ -1075,12 +1087,12 @@ class RelayMobileTests(unittest.TestCase):
         plan = make_plan(
             source_kind="quark",
             dest_kind="mobile",
-            strategy="relay_upload_mobile",
+            strategy="relay_upload_provider",
             landing="/_fnos_ingress/job-1",
             final="/移动云/电影",
             local_temp="/data/relay/job-1",
         )
-        executor = MobileRelayExecutor(
+        executor = ProviderRelayExecutor(
             download,
             uploader,
             source_materializer=_FakeMaterializer(events=events),
@@ -1091,20 +1103,20 @@ class RelayMobileTests(unittest.TestCase):
         ack = _FakeAck(events=events)
         cleanup = _FakeCleanup(events=events)
         verifier = TransferVerifier(target_lister=_FakeTargetLister(events=events))
-        orch = TransferOrchestrator(plan, {"relay_upload_mobile": executor}, verifier=verifier, cleanup=cleanup, ack_service=ack, finalizer_service=_FakeFinalizer())
+        orch = TransferOrchestrator(plan, {"relay_upload_provider": executor}, verifier=verifier, cleanup=cleanup, ack_service=ack, finalizer_service=_FakeFinalizer())
         return orch, download, uploader, alert, cleanup
 
-    def test_relay_only_mobile_destination(self) -> None:
+    def test_provider_relay_rejects_same_provider(self) -> None:
         plan = make_plan(
             source_kind="quark",
-            dest_kind="tianyi",
-            strategy="relay_upload_mobile",
+            dest_kind="quark",
+            strategy="relay_upload_provider",
             landing="/_fnos_ingress/job-1",
             final="/影视/电影",
             local_temp="/data/relay/job-1",
         )
-        executor = MobileRelayExecutor(_FakeDownloadAdapter(), _FakeUploader(), source_materializer=_FakeMaterializer())
-        orch = TransferOrchestrator(plan, {"relay_upload_mobile": executor})
+        executor = ProviderRelayExecutor(_FakeDownloadAdapter(), _FakeUploader(), source_materializer=_FakeMaterializer())
+        orch = TransferOrchestrator(plan, {"relay_upload_provider": executor})
         _drive(orch)
         self.assertEqual(orch.state.phase, PHASE_FAILED)
         self.assertEqual(orch.state.error_code, ErrorCode.INVALID_PLAN)
@@ -1141,7 +1153,7 @@ class RelayMobileTests(unittest.TestCase):
         plan = make_plan(
             source_kind="quark",
             dest_kind="mobile",
-            strategy="relay_upload_mobile",
+            strategy="relay_upload_provider",
             landing="/_fnos_ingress/job-1",
             final="/移动云/电影",
             local_temp="/data/relay/job-1",
@@ -1149,7 +1161,7 @@ class RelayMobileTests(unittest.TestCase):
         )
         download = _FakeDownloadAdapter()
         uploader = _FakeUploader()
-        executor = MobileRelayExecutor(
+        executor = ProviderRelayExecutor(
             download,
             uploader,
             source_materializer=_FakeMaterializer(),
@@ -1159,7 +1171,7 @@ class RelayMobileTests(unittest.TestCase):
         cleanup = _FakeCleanup()
         orch = TransferOrchestrator(
             plan,
-            {"relay_upload_mobile": executor},
+            {"relay_upload_provider": executor},
             verifier=TransferVerifier(target_lister=_FakeTargetLister()),
             cleanup=cleanup,
             ack_service=_FakeAck(),
@@ -1168,6 +1180,79 @@ class RelayMobileTests(unittest.TestCase):
         _drive(orch)
         self.assertEqual(orch.state.phase, PHASE_COMPLETED)
         self.assertEqual(len(cleanup.calls), 0, "delete_source_after_ack=False 时不做清理")
+
+
+class RelayProviderTests(unittest.TestCase):
+    def test_tianyi_provider_relay_runs_shared_pipeline(self) -> None:
+        events = _EventLog()
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="tianyi",
+            strategy="relay_upload_provider",
+            landing="/_fnos_ingress/job-1",
+            final="root-folder-id::\u7535\u5f71",
+            local_temp="/data/relay/job-1",
+        )
+        uploader = _FakeUploader(
+            events=events,
+            provider_kind="tianyi",
+            event_prefix="tianyi",
+        )
+        download = _FakeDownloadAdapter(events=events)
+        executor = ProviderRelayExecutor(
+            download,
+            uploader,
+            source_materializer=_FakeMaterializer(events=events),
+            visibility_poller=_visibility_poller(VisibilityStatus.visible, events),
+            relay_root="/data/relay",
+        )
+        cleanup = _FakeCleanup(events=events)
+        orch = TransferOrchestrator(
+            plan,
+            {"relay_upload_provider": executor},
+            verifier=TransferVerifier(target_lister=_FakeTargetLister(events=events)),
+            cleanup=cleanup,
+            ack_service=_FakeAck(events=events),
+            finalizer_service=_FakeFinalizer(),
+        )
+
+        _drive(orch)
+
+        self.assertEqual(orch.state.phase, PHASE_COMPLETED)
+        order = events.names()
+        self.assertLess(order.index("relay_download_check"), order.index("tianyi_upload"))
+        self.assertLess(order.index("tianyi_upload"), order.index("tianyi_verify"))
+        self.assertLess(order.index("tianyi_verify"), order.index("ack"))
+        self.assertEqual(download.calls[0][1], "/data/relay/job-1")
+        self.assertEqual(uploader.calls[0][1]["namespace_id"], "native:tianyi:tianyi_lib")
+
+    def test_provider_relay_rejects_same_provider_source(self) -> None:
+        plan = make_plan(
+            source_kind="tianyi",
+            dest_kind="tianyi",
+            strategy="relay_upload_provider",
+            landing="/_fnos_ingress/job-1",
+            final="root-folder-id::\u7535\u5f71",
+            local_temp="/data/relay/job-1",
+        )
+        uploader = _FakeUploader(provider_kind="tianyi", event_prefix="tianyi")
+        orch = TransferOrchestrator(
+            plan,
+            {
+                "relay_upload_provider": ProviderRelayExecutor(
+                    _FakeDownloadAdapter(),
+                    uploader,
+                    source_materializer=_FakeMaterializer(),
+                    relay_root="/data/relay",
+                )
+            },
+        )
+
+        _drive(orch)
+
+        self.assertEqual(orch.state.phase, PHASE_FAILED)
+        self.assertEqual(orch.state.error_code, ErrorCode.INVALID_PLAN)
+        self.assertEqual(uploader.calls, [])
 
 
 class CleanupSafetyTests(unittest.TestCase):
@@ -1323,7 +1408,7 @@ class UnsupportedPlanTests(unittest.TestCase):
         plan = make_plan(
             source_kind="quark",
             dest_kind="mobile",
-            strategy="relay_upload_mobile",
+            strategy="relay_upload_provider",
             landing="/_fnos_ingress/job-1",
             final="/移动云/电影",
             local_temp="/data/relay/job-1",
@@ -1337,7 +1422,7 @@ class UnsupportedPlanTests(unittest.TestCase):
         missing_temp = make_plan(
             source_kind="quark",
             dest_kind="mobile",
-            strategy="relay_upload_mobile",
+            strategy="relay_upload_provider",
             landing="/_fnos_ingress/job-1",
             final="/移动云/电影",
         )
@@ -1347,7 +1432,7 @@ class UnsupportedPlanTests(unittest.TestCase):
         missing_final = make_plan(
             source_kind="quark",
             dest_kind="mobile",
-            strategy="relay_upload_mobile",
+            strategy="relay_upload_provider",
             landing="/_fnos_ingress/job-1",
             local_temp="/data/relay/job-1",
         )
@@ -1379,6 +1464,10 @@ class RcloneReceiptRecoveryTests(unittest.TestCase):
         def get_run(self, run_id):
             self.requested_run_id = run_id
             return self.run
+
+        def poll_run(self, run_id, *, operation_key="", receipt=None):
+            del operation_key, receipt
+            return self.get_run(run_id)
 
     @staticmethod
     def _receipt():

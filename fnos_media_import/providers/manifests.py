@@ -187,7 +187,7 @@ TIANYI_MANIFEST = manifest(
             "default": "https://cloud.189.cn",
         },
     ],
-    components={"search", "inspect", "native_save", "materialize"},
+    components={"search", "inspect", "native_save", "materialize", "relay"},
     capabilities=ProviderCapabilities(
         supports_search=True,
         supports_share_inspection=True,
@@ -196,7 +196,7 @@ TIANYI_MANIFEST = manifest(
         supports_operation_polling=True,
         supports_native_verify=True,
         supports_source_materialization=True,
-        supports_relay_upload=False,
+        supports_relay_upload=True,
         supports_rclone_dest=True,
         supports_direct_final=True,
         supports_quota=False,

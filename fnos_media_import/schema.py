@@ -24,10 +24,10 @@ BASE_SCHEMA_SQL = r"""
                     title TEXT NOT NULL,
                     category TEXT NOT NULL,
                     category_label TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
+                    source_provider_kind TEXT NOT NULL CHECK(length(trim(source_provider_kind)) > 0),
+                    source_form TEXT NOT NULL CHECK(length(trim(source_form)) > 0),
                     source_url TEXT NOT NULL,
-                    password TEXT,
-                    target_route TEXT NOT NULL,
+                    password TEXT NOT NULL DEFAULT '' CHECK(password = ''),
                     target_path TEXT,
                     status TEXT NOT NULL,
                     external_task_id TEXT,
@@ -35,12 +35,14 @@ BASE_SCHEMA_SQL = r"""
                     raw_data TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    destination_id TEXT,
-                    plan_version INTEGER
+                    destination_id TEXT NOT NULL,
+                    plan_version INTEGER NOT NULL CHECK(plan_version = 1),
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    config_revision INTEGER NOT NULL DEFAULT 1,
+                    executor_id TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON import_jobs(status);
-                CREATE INDEX IF NOT EXISTS idx_jobs_source_type ON import_jobs(source_type);
                 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON import_jobs(created_at);
                 CREATE INDEX IF NOT EXISTS idx_jobs_destination_id ON import_jobs(destination_id);
                 DROP INDEX IF EXISTS idx_jobs_unique_source_category;

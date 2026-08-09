@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests._repository_v1_fakes import RepositoryFakeMixin
+
 import shutil
 import unittest
 import uuid
@@ -10,6 +12,7 @@ from flask import Flask
 
 from fnos_media_import.accounts.service import ProviderAccountService
 from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.domain.models import AccountTestResult
 from fnos_media_import.openlist.connection_service import OpenListConnectionService
 from fnos_media_import.openlist.mount_service import OpenListMountService
@@ -23,7 +26,7 @@ KEY = bytes.fromhex("31" * 32)
 WORK_TEST_ROOT = Path.cwd() / "codex_tmp" / "storage-setup-v1-tests"
 
 
-class MemoryWebDAV:
+class MemoryWebDAV(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
         self.dirs = {"/夸克", "/六盘"}
@@ -67,12 +70,84 @@ class MemoryWebDAV:
         return path in self.files or path.rstrip("/") in self.dirs
 
 
+class FakeProviderUploader(RepositoryFakeMixin):
+    def __init__(
+        self,
+        webdav: MemoryWebDAV,
+        *,
+        provider_kind: str,
+        display_name: str,
+        webdav_root: str,
+    ) -> None:
+        self.webdav = webdav
+        self.provider_kind = provider_kind
+        self.display_name = display_name
+        self.webdav_root = webdav_root
+        self.upload_ok = True
+        self.organizer_ok = True
+        self.probe_calls: list[dict[str, Any]] = []
+        self.folder_calls: list[str] = []
+        self.folders = {
+            "-11": [
+                {"folder_id": "root-folder-id", "name": "\u5a92\u4f53\u5e93", "parent_folder_id": "-11"},
+            ],
+            "root-folder-id": [
+                {"folder_id": "movie-folder-id", "name": "\u7535\u5f71", "parent_folder_id": "root-folder-id"},
+            ],
+        }
+
+    def list_folders(self, parent_folder_id: str = "-11") -> list[dict[str, Any]]:
+        parent = str(parent_folder_id or "-11")
+        self.folder_calls.append(parent)
+        return [dict(item) for item in self.folders.get(parent, [])]
+
+    def probe_target(self, *, target_locator: dict[str, Any], observer: Any = None) -> dict[str, Any]:
+        self.probe_calls.append(dict(target_locator or {}))
+        if not self.upload_ok:
+            return {
+                "ok": False,
+                "upload_verified": False,
+                "organizer_mutation_verified": False,
+                "code": "PROVIDER_UPLOAD_PROBE_FAILED",
+                "message": "native upload failed",
+            }
+        if not self.organizer_ok:
+            return {
+                "ok": False,
+                "upload_verified": True,
+                "organizer_mutation_verified": False,
+                "code": "OPENLIST_MUTATION_PROBE_FAILED",
+                "message": "organizer mutation failed",
+            }
+        file_name = "fnos-native-probe.txt"
+        content = b"provider-native-probe"
+        self.webdav.files[f"{self.webdav_root}/{file_name}"] = content
+        observed = observer(
+            {
+                "file_id": "probe-file-id",
+                "file_name": file_name,
+                "file_size": len(content),
+                "content": content,
+            }
+        ) if callable(observer) else {}
+        observed = dict(observed or {}) if isinstance(observed, dict) else {}
+        return {
+            "ok": bool(observed.get("organizer_mutation_verified", not callable(observer))),
+            "upload_verified": True,
+            "organizer_mutation_verified": bool(
+                observed.get("organizer_mutation_verified", not callable(observer))
+            ),
+            "message": observed.get("message") or "native upload probe passed",
+        }
+
+
 class StorageSetupV1Tests(unittest.TestCase):
     def setUp(self) -> None:
         WORK_TEST_ROOT.mkdir(parents=True, exist_ok=True)
         self.db_path = WORK_TEST_ROOT / f"setup-{uuid.uuid4().hex}.db"
-        self.db = Database(self.db_path)
-        self.db.init_schema()
+        self._db_infrastructure = Database(self.db_path)
+        self._db_infrastructure.init_schema()
+        self.db = RepositorySet.from_database(self._db_infrastructure)
         self.addCleanup(self._cleanup_database)
         self.webdav = MemoryWebDAV()
         self.accounts = ProviderAccountService(
@@ -98,6 +173,38 @@ class StorageSetupV1Tests(unittest.TestCase):
             mount_service=self.mounts,
             target_service=self.targets,
             assignment_service=self.assignments,
+            connection_factory=self.db.connect,
+        )
+        self.mobile_uploader = FakeProviderUploader(
+            self.webdav,
+            provider_kind="mobile",
+            display_name="\u79fb\u52a8\u4e91\u76d8",
+            webdav_root="/\u79fb\u52a8",
+        )
+        self.tianyi_uploader = FakeProviderUploader(
+            self.webdav,
+            provider_kind="tianyi",
+            display_name="\u5929\u7ffc\u4e91\u76d8",
+            webdav_root="/\u5929\u7ffc",
+        )
+        self.service.set_provider_uploader_resolver(
+            lambda provider_kind, _account_id, _revision: (
+                {
+                    "mobile": self.mobile_uploader,
+                    "tianyi": self.tianyi_uploader,
+                }.get(provider_kind)
+            )
+        )
+        self.service.set_provider_folder_resolver(
+            lambda provider_kind, _account_id, _revision: (
+                {
+                    "mobile": self.mobile_uploader,
+                    "tianyi": self.tianyi_uploader,
+                }.get(provider_kind)
+            )
+        )
+        self.mounts.set_relay_upload_capability_resolver(
+            lambda provider_kind: provider_kind in {"mobile", "tianyi"}
         )
 
     def _cleanup_database(self) -> None:
@@ -316,6 +423,330 @@ class StorageSetupV1Tests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.code, "IDENTITY_CONFIRMATION_REQUIRED")
+        self.assertEqual(self.mounts.list_mounts(), [])
+        self.assertEqual(self.targets.list_targets(), [])
+
+    def test_mobile_put_405_creates_native_only_location(self) -> None:
+        mobile = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
+        self.webdav.dirs.add("/\u79fb\u52a8")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+
+        def reject_put(_path: str, _content: bytes) -> None:
+            raise RuntimeError("\u5199\u5165\u6587\u4ef6\u5931\u8d25\uff1aHTTP 405")
+
+        self.webdav.put_bytes = reject_put
+        result = self.service.save_location(
+            {
+                "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                "kind": "provider",
+                "account_id": mobile,
+                "connection_id": "openlist_main",
+                "webdav_root": "/\u79fb\u52a8",
+                "native_root": "root-folder-id",
+                "native_root_name": "/\u5a92\u4f53\u5e93",
+                "confirm_identity": True,
+            }
+        )
+
+        self.assertIn("Provider \u539f\u751f\u76f4\u4f20", result["message"])
+        target = self.targets.get_target(result["destination_id"])
+        mount_id = self.service._target_mount_id(target)
+        mount = self.mounts.get_mount(mount_id)
+        self.assertTrue(mount["readable"])
+        self.assertFalse(mount["writable"])
+        self.assertEqual(mount["identity_status"], "declared")
+        self.assertTrue(mount["native_locator"]["upload_verified"])
+        self.assertTrue(mount["native_locator"]["organizer_mutation_verified"])
+        self.assertEqual(mount["native_locator"]["display_name"], "/\u5a92\u4f53\u5e93")
+        self.assertTrue(mount["native_locator"]["probe_fingerprint"])
+
+        probe = self.mounts.probe_mount(mount_id, persist_result=False)
+        self.assertTrue(probe["ok"], probe)
+        self.assertFalse(probe["webdav_file_write_required"])
+        self.assertFalse(probe["writable"])
+        create_check = next(
+            item for item in probe["checks"] if item["name"] == "\u4e34\u65f6\u76ee\u5f55\u4e0e\u6587\u4ef6\u521b\u5efa"
+        )
+        self.assertFalse(create_check["required"])
+
+        snapshot = self.service.snapshot()
+        location = next(
+            item for item in snapshot["locations"] if item["destination_id"] == result["destination_id"]
+        )
+        self.assertTrue(location["ready"], location)
+        self.assertTrue(location["native_only"])
+        self.assertIn("mobile", location["eligible_source_ids"])
+        self.assertIn("tianyi", location["eligible_source_ids"])
+        self.assertIn("quark", location["eligible_source_ids"])
+        self.assertEqual(location["native_root_name"], "/\u5a92\u4f53\u5e93")
+        self.assertEqual(len(self.mobile_uploader.probe_calls), 1)
+
+    def test_mobile_native_probe_failure_leaves_no_location(self) -> None:
+        account_id = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
+        self.webdav.dirs.add("/\u79fb\u52a8")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        self.mobile_uploader.upload_ok = False
+
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_location(
+                {
+                    "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                    "kind": "provider",
+                    "account_id": account_id,
+                    "connection_id": "openlist_main",
+                    "webdav_root": "/\u79fb\u52a8",
+                    "native_root": "root-folder-id",
+                    "confirm_identity": True,
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "PROVIDER_UPLOAD_PROBE_FAILED")
+        self.assertEqual(self.mounts.list_mounts(), [])
+        self.assertEqual(self.targets.list_targets(), [])
+
+    def test_tianyi_put_405_creates_provider_relay_location(self) -> None:
+        account_id = self._account("tianyi", "\u5929\u7ffc\u4e91\u4e3b\u8d26\u53f7")
+        self.webdav.dirs.add("/\u5929\u7ffc")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+
+        def reject_put(_path: str, _content: bytes) -> None:
+            raise RuntimeError("\u5199\u5165\u6587\u4ef6\u5931\u8d25\uff1aHTTP 405")
+
+        self.webdav.put_bytes = reject_put
+        result = self.service.save_location(
+            {
+                "name": "\u5929\u7ffc\u4e91\u4e3b\u76d8",
+                "kind": "provider",
+                "account_id": account_id,
+                "connection_id": "openlist_main",
+                "webdav_root": "/\u5929\u7ffc",
+                "native_root": "root-folder-id",
+                "native_root_name": "/\u5a92\u4f53\u5e93",
+                "confirm_identity": True,
+            }
+        )
+
+        self.assertIn("Provider \u539f\u751f\u76f4\u4f20", result["message"])
+        target = self.targets.get_target(result["destination_id"])
+        mount_id = self.service._target_mount_id(target)
+        mount = self.mounts.get_mount(mount_id)
+        self.assertEqual(mount["native_locator"]["kind"], "folder_id")
+        self.assertEqual(mount["native_locator"]["value"], "root-folder-id")
+        self.assertTrue(mount["readable"])
+        self.assertFalse(mount["writable"])
+        self.assertTrue(mount["native_locator"]["upload_verified"])
+        self.assertTrue(mount["native_locator"]["organizer_mutation_verified"])
+
+        probe = self.mounts.probe_mount(mount_id, persist_result=False)
+        self.assertTrue(probe["ok"], probe)
+        self.assertFalse(probe["webdav_file_write_required"])
+        self.assertFalse(probe["writable"])
+
+        snapshot = self.service.snapshot()
+        location = next(
+            item for item in snapshot["locations"] if item["destination_id"] == result["destination_id"]
+        )
+        self.assertTrue(location["ready"], location)
+        self.assertTrue(location["native_only"])
+        self.assertTrue(location["native_upload_verified"])
+        self.assertTrue(location["organizer_mutation_verified"])
+        self.assertIn("quark", location["eligible_source_ids"])
+        self.assertIn("mobile", location["eligible_source_ids"])
+        self.assertIn("tianyi", location["eligible_source_ids"])
+        self.assertEqual(len(self.tianyi_uploader.probe_calls), 1)
+
+        for category_key in target.categories:
+            self.assignments.upsert(
+                "tianyi",
+                category_key,
+                result["destination_id"],
+            )
+        preflight = self.service.preflight()
+        directory_check = next(
+            item for item in preflight["checks"] if item["name"] == f"\u76ee\u5f55 {mount['name']}"
+        )
+        self.assertTrue(directory_check["ok"], directory_check)
+
+    def test_tianyi_relay_requires_upload_and_organizer_proofs(self) -> None:
+        account_id = self._account("tianyi", "\u5929\u7ffc\u4e91\u4e3b\u8d26\u53f7")
+        self.webdav.dirs.add("/\u5929\u7ffc")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        payload = {
+            "name": "\u5929\u7ffc\u4e91\u4e3b\u76d8",
+            "kind": "provider",
+            "account_id": account_id,
+            "connection_id": "openlist_main",
+            "webdav_root": "/\u5929\u7ffc",
+            "native_root": "root-folder-id",
+            "confirm_identity": True,
+        }
+
+        self.tianyi_uploader.upload_ok = False
+        with self.assertRaises(StorageSetupError) as upload_failure:
+            self.service.save_location(payload)
+        self.assertEqual(upload_failure.exception.code, "PROVIDER_UPLOAD_PROBE_FAILED")
+        self.assertEqual(self.mounts.list_mounts(), [])
+        self.assertEqual(self.targets.list_targets(), [])
+
+        self.tianyi_uploader.upload_ok = True
+        self.tianyi_uploader.organizer_ok = False
+        with self.assertRaises(StorageSetupError) as organizer_failure:
+            self.service.save_location(payload)
+        self.assertEqual(organizer_failure.exception.code, "OPENLIST_MUTATION_PROBE_FAILED")
+        self.assertEqual(self.mounts.list_mounts(), [])
+        self.assertEqual(self.targets.list_targets(), [])
+
+    def test_webdav_writable_state_cannot_replace_provider_native_proofs(self) -> None:
+        writable_mount = {
+            "provider_kind": "tianyi",
+            "readable": True,
+            "writable": True,
+            "native_locator": {"kind": "folder_id", "value": "root-folder-id"},
+        }
+
+        self.assertEqual(
+            self.service._mount_native_proofs("tianyi", writable_mount),
+            (False, False),
+        )
+        self.assertEqual(
+            self.service._mount_native_proofs("mobile", writable_mount),
+            (False, False),
+        )
+
+    def test_mobile_organizer_probe_failure_leaves_no_location(self) -> None:
+        account_id = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
+        self.webdav.dirs.add("/\u79fb\u52a8")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        self.mobile_uploader.organizer_ok = False
+
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_location(
+                {
+                    "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                    "kind": "provider",
+                    "account_id": account_id,
+                    "connection_id": "openlist_main",
+                    "webdav_root": "/\u79fb\u52a8",
+                    "native_root": "root-folder-id",
+                    "confirm_identity": True,
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "OPENLIST_MUTATION_PROBE_FAILED")
+        self.assertEqual(self.mounts.list_mounts(), [])
+        self.assertEqual(self.targets.list_targets(), [])
+
+    def test_identity_confirmation_is_checked_before_native_probe(self) -> None:
+        account_id = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
+        self.webdav.dirs.add("/\u79fb\u52a8")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_location(
+                {
+                    "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                    "kind": "provider",
+                    "account_id": account_id,
+                    "connection_id": "openlist_main",
+                    "webdav_root": "/\u79fb\u52a8",
+                    "native_root": "root-folder-id",
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "IDENTITY_CONFIRMATION_REQUIRED")
+        self.assertEqual(self.mobile_uploader.probe_calls, [])
+
+    def test_unchanged_mobile_location_reuses_native_probe_proof(self) -> None:
+        account_id = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
+        self.webdav.dirs.add("/\u79fb\u52a8")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        location = self.service.save_location(
+            {
+                "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                "kind": "provider",
+                "account_id": account_id,
+                "connection_id": "openlist_main",
+                "webdav_root": "/\u79fb\u52a8",
+                "native_root": "root-folder-id",
+                "native_root_name": "/\u5a92\u4f53\u5e93",
+                "confirm_identity": True,
+            }
+        )
+        target = self.targets.get_target(location["destination_id"])
+
+        self.service.save_location(
+            {
+                "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                "kind": "provider",
+                "account_id": account_id,
+                "connection_id": "openlist_main",
+                "webdav_root": "/\u79fb\u52a8",
+                "native_root": "root-folder-id",
+                "native_root_name": "/\u5a92\u4f53\u5e93",
+                "expected_revision": target.current_revision,
+            },
+            location["destination_id"],
+        )
+
+        self.assertEqual(len(self.mobile_uploader.probe_calls), 1)
+
+    def test_tianyi_native_folder_browser_service_and_api(self) -> None:
+        account_id = self._account("tianyi", "\u5929\u7ffc\u4e3b\u8d26\u53f7")
+        root = self.service.list_account_folders(account_id)
+        self.assertEqual(root["parent_id"], "-11")
+        self.assertEqual(root["items"][0]["folder_id"], "root-folder-id")
+
+        app = Flask(__name__ + "_folders")
+        app.register_blueprint(
+            create_storage_setup_blueprint(
+                StorageSetupBlueprintContext(admin_required=lambda view: view, service=self.service)
+            )
+        )
+        response = app.test_client().get(
+            f"/api/admin/storage-setup/accounts/{account_id}/folders?parent_id=root-folder-id"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["items"][0]["folder_id"], "movie-folder-id")
+        self.assertEqual(self.tianyi_uploader.folder_calls, ["-11", "root-folder-id"])
+
+    def test_non_relay_provider_put_405_still_fails_closed(self) -> None:
+        quark = self._account("quark", "\u5938\u514b\u4e3b\u8d26\u53f7")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+
+        def reject_put(_path: str, _content: bytes) -> None:
+            raise RuntimeError("\u5199\u5165\u6587\u4ef6\u5931\u8d25\uff1aHTTP 405")
+
+        self.webdav.put_bytes = reject_put
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_location(
+                {
+                    "name": "\u5938\u514b\u4e3b\u76d8",
+                    "kind": "provider",
+                    "account_id": quark,
+                    "connection_id": "openlist_main",
+                    "webdav_root": "/\u5938\u514b",
+                    "native_root": "/\u5a92\u4f53\u5e93",
+                    "confirm_identity": True,
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "OPENLIST_PROBE_FAILED")
         self.assertEqual(self.mounts.list_mounts(), [])
         self.assertEqual(self.targets.list_targets(), [])
 

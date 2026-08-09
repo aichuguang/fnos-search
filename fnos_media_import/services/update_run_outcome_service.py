@@ -95,7 +95,7 @@ class UpdateRunOutcomeService:
             }
             raw_data["last_existing_sync"] = {**baseline_sync, "synced_at": utc_now()}
             self.record_stage(data.run_id, "sync_existing", "扫描到 OpenList 目录已有新增集，更新追更基线", baseline_sync)
-            self.database.add_update_event(
+            self.database.update.add_update_event(
                 data.subscription_id,
                 data.run_id,
                 "info",
@@ -121,7 +121,7 @@ class UpdateRunOutcomeService:
             target_episodes=data.target_episodes,
             raw_data=raw_data,
         )
-        self.database.update_update_subscription(
+        self.database.update.update_update_subscription(
             data.subscription_id,
             {
                 "last_run_at": utc_now(),
@@ -160,30 +160,18 @@ class UpdateRunOutcomeService:
             "canonical_openlist_root": data.root_context.get("canonical_openlist_root") or "",
         }
         self.record_stage(data.run_id, "finish", "定时追更执行完成", summary)
-        finish = getattr(self.database, "finish_update_run", None)
-        if callable(finish):
-            finished = finish(
-                data.run_id,
-                data.owner_id,
-                status="success",
-                candidate_count=data.candidate_count,
-                imported_count=data.submitted,
-                skipped_count=data.skipped,
-                summary=summary,
-            )
-        else:
-            self.database.update_update_run(
-                data.run_id,
-                status="success",
-                candidate_count=data.candidate_count,
-                imported_count=data.submitted,
-                skipped_count=data.skipped,
-                summary=summary,
-            )
-            finished = True
+        finished = self.database.update.finish_update_run(
+            data.run_id,
+            data.owner_id,
+            status="success",
+            candidate_count=data.candidate_count,
+            imported_count=data.submitted,
+            skipped_count=data.skipped,
+            summary=summary,
+        )
         if not finished:
             raise RuntimeError("追更运行完成时已失去租约，拒绝覆盖运行状态")
-        self.database.add_update_event(data.subscription_id, data.run_id, "info", "定时追更执行完成", summary)
+        self.database.update.add_update_event(data.subscription_id, data.run_id, "info", "定时追更执行完成", summary)
         return {"success": True, "run_id": data.run_id, **summary}
 
 
@@ -214,13 +202,9 @@ def _result_episode(database: Any, item: dict[str, Any]) -> int | None:
     if episode:
         return episode
     candidate_id = _to_int(item.get("candidate_id"))
-    get_candidate = getattr(database, "get_update_candidate", None)
-    if not candidate_id or not callable(get_candidate):
+    if not candidate_id:
         return None
-    try:
-        candidate = get_candidate(candidate_id)
-    except Exception:  # noqa: BLE001
-        return None
+    candidate = database.update.get_update_candidate(candidate_id)
     return _to_int(candidate.get("episode")) if isinstance(candidate, dict) else None
 
 

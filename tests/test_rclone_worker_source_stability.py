@@ -148,7 +148,9 @@ class RcloneWorkerSourceStabilityTests(unittest.TestCase):
             ["job-42/剧集/Movie.part1.mkv", "job-42/剧集/正常.mkv"],
         )
         snapshot_filter = self.content.index("relative_path.casefold().endswith(suffixes)")
-        manifest_persistence = self.content.index('if ! persist_staging_manifest "$file_list"')
+        manifest_persistence = self.content.index(
+            'if ! persist_staging_manifest "$copy_file_list"'
+        )
         self.assertLess(snapshot_filter, manifest_persistence)
 
     def test_stable_output_decodes_snapshot_back_to_relative_paths(self) -> None:
@@ -175,7 +177,7 @@ class RcloneWorkerSourceStabilityTests(unittest.TestCase):
         self.assertNotIn("|| true", listing)
         self.assertIn('if ! first="$(list_remote_file_snapshots "$remote")"; then', stability)
         self.assertIn('if ! second="$(list_remote_file_snapshots "$remote")"; then', stability)
-        self.assertIn("本轮拒绝按空目录继续", stability)
+        self.assertIn("refusing an empty manifest", stability)
 
 
 if __name__ == "__main__":

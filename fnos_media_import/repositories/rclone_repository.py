@@ -7,6 +7,7 @@ import sqlite3
 from contextlib import AbstractContextManager
 from typing import Any, Callable
 
+from ..planning import is_data_plane_strategy
 from ..planning.job_plan import plan_path, plan_strategy, validated_v1_execution_plan_from_job
 from ..time_utils import utc_now_iso
 
@@ -99,7 +100,7 @@ def _job_owns_staging_directory(job: dict[str, Any] | None, job_id: int) -> bool
         planned_job_id = int(plan.get("job_id") or 0)
     except (TypeError, ValueError):
         return False
-    return plan_strategy(plan) in {"rclone_copy", "relay_upload_mobile"} and planned_job_id == int(job_id)
+    return is_data_plane_strategy(plan_strategy(plan)) and planned_job_id == int(job_id)
 
 
 def _job_matches_staging_callback_paths(
@@ -111,7 +112,7 @@ def _job_matches_staging_callback_paths(
     except Exception:  # noqa: BLE001 - old jobs cannot be callback targets
         return False, False
     strategy = plan_strategy(plan)
-    if strategy not in {"rclone_copy", "relay_upload_mobile"}:
+    if not is_data_plane_strategy(strategy):
         return False, False
     # Only task-scoped V1 paths are callback roots.  Never include a category
     # final root because it would make an unrelated historical file appear to
@@ -201,7 +202,7 @@ class RcloneRepository:
         statuses = ("waiting_transfer", "waiting_openlist", "transferring", "organizing")
         # V1 source providers only.  Removed cloud139/UC aliases are not
         # eligible for automatic callback recovery and must be reviewed.
-        source_types = ("mobile", "quark", "tianyi", "sixpan", "local", "generic")
+        source_provider_kinds = ("mobile", "quark", "tianyi", "sixpan", "local", "generic")
         category_values = _rclone_category_match_values(category)
         if not category_values:
             return None
@@ -220,7 +221,7 @@ class RcloneRepository:
                     WHERE id = ?
                       AND (category IN ({','.join(['?'] * len(category_values))})
                            OR category_label IN ({','.join(['?'] * len(category_values))}))
-                      AND source_type IN ({','.join(['?'] * len(source_types))})
+                      AND source_provider_kind IN ({','.join(['?'] * len(source_provider_kinds))})
                       AND status IN ({','.join(['?'] * len(statuses))})
                     LIMIT 1
                     """,
@@ -228,7 +229,7 @@ class RcloneRepository:
                         explicit_job_id,
                         *category_values,
                         *category_values,
-                        *source_types,
+                        *source_provider_kinds,
                         *statuses,
                     ),
                 ).fetchone()
@@ -250,12 +251,12 @@ class RcloneRepository:
                 SELECT * FROM import_jobs
                 WHERE (category IN ({','.join(['?'] * len(category_values))})
                        OR category_label IN ({','.join(['?'] * len(category_values))}))
-                  AND source_type IN ({','.join(['?'] * len(source_types))})
+                  AND source_provider_kind IN ({','.join(['?'] * len(source_provider_kinds))})
                   AND status IN ({','.join(['?'] * len(statuses))})
                 ORDER BY id DESC
                 LIMIT 50
                 """,
-                (*category_values, *category_values, *source_types, *statuses),
+                (*category_values, *category_values, *source_provider_kinds, *statuses),
             ).fetchall()
         candidates = [self._row_decoder(row) for row in rows if row is not None]
         for candidate in candidates:

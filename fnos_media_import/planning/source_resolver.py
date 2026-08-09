@@ -56,8 +56,7 @@ class SourceResolver:
     """把一个可信资源记录解析为 ``SourceDescriptor``。
 
     ``detect_link(url)`` 是服务端注入的 URL 分类函数，返回带
-    ``provider_kind``/``source_form`` 的对象或 dict；兼容现有
-    ``LinkInfo``（只有 ``source_type``）时通过翻译表映射。
+    ``provider_kind``/``source_form``/``search_source_id`` 的对象或 dict。
     """
 
     def __init__(
@@ -124,16 +123,18 @@ def _normalize_classification(
     source_catalog: list[dict[str, Any]] | None = None,
 ) -> LinkClassification:
     if isinstance(result, dict):
-        provider = str(result.get("provider_kind") or result.get("kind") or result.get("source_type") or "").strip()
+        provider = str(result.get("provider_kind") or result.get("kind") or "").strip()
         source_form = str(result.get("source_form") or result.get("form") or "").strip()
         reason = str(result.get("reason") or "").strip()
+        declared_search_source_id = str(result.get("search_source_id") or "").strip()
     else:
         provider = (
-            str(getattr(result, "provider_kind", "") or getattr(result, "kind", "") or getattr(result, "source_type", "") or "")
+            str(getattr(result, "provider_kind", "") or getattr(result, "kind", "") or "")
             .strip()
         )
         source_form = str(getattr(result, "source_form", "") or getattr(result, "form", "") or "").strip()
         reason = str(getattr(result, "reason", "") or "").strip()
+        declared_search_source_id = str(getattr(result, "search_source_id", "") or "").strip()
 
     catalog = list(source_catalog if source_catalog is not None else [*_builtin_source_catalog(), _LOCAL_SOURCE])
     matched = next(
@@ -152,7 +153,7 @@ def _normalize_classification(
         raise SourceResolutionError(f"无法识别来源 Provider：{provider or 'unknown'}")
     if source_form not in VALID_SOURCE_FORMS:
         raise SourceResolutionError(f"无法识别来源形态：{source_form or 'unknown'}")
-    search_source_id = str(matched.get("search_source_id") or provider)
+    search_source_id = declared_search_source_id or str(matched.get("search_source_id") or provider)
     return LinkClassification(
         provider_kind=provider,
         source_form=source_form,
