@@ -308,6 +308,9 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
         missing.append("transfer.strategy")
     elif executor != expected_executor:
         missing.append("transfer.executor")
+    destination_provider = str(destination.get("provider_kind") or "").strip().lower()
+    if strategy == "rclone_copy" and destination_provider in {"mobile", "tianyi"}:
+        missing.append("transfer.strategy_for_destination")
     operation_key = str(transfer.get("idempotency_key") or "").strip()
     if not operation_key:
         missing.append("transfer.idempotency_key")

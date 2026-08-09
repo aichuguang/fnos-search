@@ -1,7 +1,7 @@
 """TransferOrchestrator —— 按 V1 冻结计划驱动 §13.1 状态机的编排器。
 
 职责：
-- planning 阶段校验计划与策略约束（磁链->六盘、同源原生、relay 只到移动云、rclone 不到移动云）。
+- planning 阶段校验计划与策略约束（磁链->六盘、同源原生、Provider relay 只到移动云/天翼、rclone 不直接写入移动云/天翼）。
 - 按策略选择执行器，驱动 来源物化 -> 可见性等待 -> 传输 -> 目标校验 -> 整理 -> ACK -> 清理。
 - 幂等：保存 OperationReceipt；未知结果进入 manual_review，绝不重复创建原生转存（§13.3）。
 - 取消：区分「未提交直接取消 / 已提交请求取消 / 结果未知 cancel_pending /
@@ -330,8 +330,11 @@ class TransferOrchestrator:
                 return TransferError(ErrorCode.INVALID_PLAN, "同 Provider 传输必须使用 native_save")
             return None
         if strategy == "rclone_copy":
-            if dest_kind == "mobile":
-                return TransferError(ErrorCode.INVALID_PLAN, "rclone_copy 不允许直接写入移动云目标")
+            if dest_kind in {"mobile", "tianyi"}:
+                return TransferError(
+                    ErrorCode.INVALID_PLAN,
+                    "rclone_copy 不允许直接写入移动云或天翼目标",
+                )
             return None
         return TransferError(ErrorCode.INVALID_PLAN, f"未知策略：{strategy}")
 

@@ -266,6 +266,18 @@ class V1JobContractHardCutover:
             )
             self._delete_ids(
                 connection,
+                "organizer_ai_suggestions",
+                "id",
+                related.get("organizer_ai_suggestions", ()),
+            )
+            self._delete_ids(
+                connection,
+                "organizer_tmdb_matches",
+                "id",
+                related.get("organizer_tmdb_matches", ()),
+            )
+            self._delete_ids(
+                connection,
                 "organizer_runs",
                 "id",
                 related.get("organizer_runs", ()),
@@ -344,6 +356,18 @@ class V1JobContractHardCutover:
         self._delete_ids(connection, "import_execution_plans", "job_id", deleted)
         self._delete_ids(connection, "job_events", "job_id", deleted)
         self._delete_ids(connection, "organizer_operations", "id", related.get("organizer_operations", ()))
+        self._delete_ids(
+            connection,
+            "organizer_ai_suggestions",
+            "id",
+            related.get("organizer_ai_suggestions", ()),
+        )
+        self._delete_ids(
+            connection,
+            "organizer_tmdb_matches",
+            "id",
+            related.get("organizer_tmdb_matches", ()),
+        )
         self._delete_ids(connection, "organizer_runs", "id", related.get("organizer_runs", ()))
         self._delete_ids(connection, "organizer_mappings", "id", related.get("organizer_mappings", ()))
         self._delete_ids(connection, "organizer_files", "id", related.get("organizer_files", ()))
@@ -424,6 +448,8 @@ class V1JobContractHardCutover:
                 "organizer_files",
                 "organizer_mappings",
                 "organizer_operations",
+                "organizer_ai_suggestions",
+                "organizer_tmdb_matches",
                 "organizer_runs",
                 "organizer_locks",
                 "rclone_runs",
@@ -493,6 +519,12 @@ class V1JobContractHardCutover:
         result["organizer_files"] = organizer_children("organizer_files")
         result["organizer_mappings"] = organizer_children("organizer_mappings")
         result["organizer_operations"] = organizer_children("organizer_operations")
+        result["organizer_ai_suggestions"] = organizer_children(
+            "organizer_ai_suggestions"
+        )
+        result["organizer_tmdb_matches"] = organizer_children(
+            "organizer_tmdb_matches"
+        )
         result["organizer_runs"] = organizer_children("organizer_runs")
         organizer_run_set = set(result["organizer_runs"])
 

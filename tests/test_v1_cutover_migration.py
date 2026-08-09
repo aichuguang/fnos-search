@@ -73,6 +73,8 @@ class V1CutoverMigrationTests(unittest.TestCase):
         self.assertEqual(dry_run["cleanup"]["advanced_config_fields_removed"], 5)
         self.assertEqual(dry_run["cleanup"]["organizer_strm_pending_tasks"], 1)
         self.assertEqual(dry_run["cleanup"]["organizer_strm_worker_tasks"], 1)
+        self.assertEqual(dry_run["cleanup"]["organizer_ai_suggestions"], 1)
+        self.assertEqual(dry_run["cleanup"]["organizer_tmdb_matches"], 1)
         self.assertEqual(dry_run["cleanup"]["worker_tasks"], 5)
 
         database = Database(self.path)
@@ -144,6 +146,8 @@ class V1CutoverMigrationTests(unittest.TestCase):
 
             for table in (
                 "organizer_operations",
+                "organizer_ai_suggestions",
+                "organizer_tmdb_matches",
                 "organizer_runs",
                 "organizer_mappings",
                 "organizer_files",
@@ -623,6 +627,18 @@ class V1CutoverMigrationTests(unittest.TestCase):
             connection.execute(
                 "INSERT INTO organizer_locks(id,lock_key,task_id,run_id,created_at) "
                 "VALUES (55,'lock-55',50,53,?)",
+                (NOW,),
+            )
+            connection.execute(
+                "INSERT INTO organizer_ai_suggestions("
+                "id,task_id,provider,model,prompt,response,parsed,created_at"
+                ") VALUES (57,50,'test','model','prompt','response','{}',?)",
+                (NOW,),
+            )
+            connection.execute(
+                "INSERT INTO organizer_tmdb_matches("
+                "id,task_id,query,media_type,tmdb_id,title,year,score,raw_data,created_at"
+                ") VALUES (58,50,'query','movie',123,'Movie','2026',1.0,'{}',?)",
                 (NOW,),
             )
             connection.execute(

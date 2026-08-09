@@ -39,6 +39,12 @@ def organizer_v1_plan(
     ).to_dict()
     selection_hash = str(selection["selection_hash"])
     strategy = str(strategy or "native_save").strip().lower()
+    destination_provider = {
+        "native_save": "quark",
+        "native_offline": "sixpan",
+        "rclone_copy": "sixpan",
+        "relay_upload_provider": "mobile",
+    }.get(strategy, "quark")
     executor = {
         "native_save": "native",
         "native_offline": "native_offline",
@@ -47,7 +53,11 @@ def organizer_v1_plan(
     }.get(strategy, "native")
     destination_final_ref = {
         "kind": "openlist" if strategy == "rclone_copy" else "native",
-        "namespace_id": namespace if strategy == "rclone_copy" else f"native:mobile:{destination_id}",
+        "namespace_id": (
+            namespace
+            if strategy == "rclone_copy"
+            else f"native:{destination_provider}:{destination_id}"
+        ),
         "path": str(destination_final),
     }
     paths: dict[str, Any] = {
@@ -102,7 +112,7 @@ def organizer_v1_plan(
         },
         "destination": {
             "id": destination_id,
-            "provider_kind": "mobile",
+            "provider_kind": destination_provider,
             "target_revision": 1,
             "binding_id": f"binding-{job_id}",
             "binding_revision": 1,

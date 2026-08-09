@@ -420,7 +420,7 @@ class OpenListMount:
 
 @dataclass(frozen=True)
 class NativeLocator:
-    """同源原生保存 / 移动云上传时由 Provider Adapter 解释的定位器。"""
+    """同源原生保存或移动云/天翼原生 API 上传时由 Provider Adapter 解释的定位器。"""
 
     kind: str  # folder_id | provider_path | none
     value: str = ""

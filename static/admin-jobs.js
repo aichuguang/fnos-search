@@ -181,8 +181,7 @@
                 native_save: "同源原生转存",
                 native_offline: "原生离线任务",
                 rclone_copy: "OpenList / rclone 跨盘搬运",
-                relay_upload_provider: "Provider 中继上传",
-                relay_upload_mobile: "移动云中继上传",
+                relay_upload_provider: "Provider 原生 API 直传（本地中转）",
             };
             const key = String(value || "").toLowerCase();
             return map[key] || value || "-";
@@ -693,7 +692,7 @@
             const timelineSummary = job.timeline_summary || {};
             const checks = Array.isArray(job.completion_checks) ? job.completion_checks : [];
             const strategy = String(job.transfer_strategy || "").toLowerCase();
-            const rcloneStaging = ["rclone_copy", "relay_upload_provider", "relay_upload_mobile"].includes(strategy);
+            const rcloneStaging = ["rclone_copy", "relay_upload_provider"].includes(strategy);
             const stagingPath = job.official_save_path || job.target_path || "-";
             const rcloneTargetPath = job.rclone_target_path || "未配置";
             const openlistVisiblePath = job.openlist_visible_path || (rcloneStaging ? "等待 rclone 搬运完成后生成" : "-");

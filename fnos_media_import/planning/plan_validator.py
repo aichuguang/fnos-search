@@ -688,6 +688,10 @@ class PlanValidator:
                 errors.append("rclone_copy requires an rclone or local destination locator")
             if source_form == "magnet":
                 errors.append("magnet sources cannot use rclone_copy")
+            if dest_provider in {"mobile", "tianyi"}:
+                errors.append(
+                    "rclone_copy cannot write Mobile or Tianyi targets; use Provider API relay"
+                )
             if not source_caps.supports_source_materialization:
                 errors.append("source Adapter does not advertise supports_source_materialization")
             if dest_provider not in {"local", "generic", "openlist_generic"} and not destination_caps.supports_rclone_dest:

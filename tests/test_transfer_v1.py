@@ -759,7 +759,7 @@ class RcloneCopyTests(unittest.TestCase):
         verifier = TransferVerifier(target_lister=lister)
         plan = make_plan(
             source_kind="quark",
-            dest_kind="tianyi",
+            dest_kind="sixpan",
             strategy="rclone_copy",
             landing="/_fnos_ingress/job-1",
             staging="/影视/_fnos_staging/job-1",
@@ -804,7 +804,7 @@ class RcloneCopyTests(unittest.TestCase):
         self.assertEqual(copy_run["job_id"], 1)
         self.assertEqual(copy_run["job_dir_name"], "job-1")
         self.assertEqual(copy_run["delete_source_after_ack"], True)
-        self.assertEqual(copy_run["destination_id"], "tianyi_lib")
+        self.assertEqual(copy_run["destination_id"], "sixpan_lib")
 
     def test_rclone_target_missing_retries_verify_without_cleanup(self) -> None:
         events = _EventLog()
@@ -826,7 +826,7 @@ class RcloneCopyTests(unittest.TestCase):
         resolver = _FakeResolver()
         plan = make_plan(
             source_kind="quark",
-            dest_kind="tianyi",
+            dest_kind="sixpan",
             strategy="rclone_copy",
             landing="/_fnos_ingress/job-1",
             staging="/影视/_fnos_staging/job-1",
@@ -861,7 +861,7 @@ class RcloneCopyTests(unittest.TestCase):
         resolver = _FakeResolver()
         plan = make_plan(
             source_kind="quark",
-            dest_kind="tianyi",
+            dest_kind="sixpan",
             strategy="rclone_copy",
             landing="/_fnos_ingress/job-1",
             staging="/影视/_fnos_staging/job-1",
@@ -914,7 +914,7 @@ class RcloneCopyTests(unittest.TestCase):
 
         plan = make_plan(
             source_kind="quark",
-            dest_kind="tianyi",
+            dest_kind="sixpan",
             strategy="rclone_copy",
             landing="/_fnos_ingress/job-1",
             staging="/影视/_fnos_staging/job-1",
@@ -963,7 +963,7 @@ class RcloneCopyTests(unittest.TestCase):
 
         plan = make_plan(
             source_kind="quark",
-            dest_kind="tianyi",
+            dest_kind="sixpan",
             strategy="rclone_copy",
             landing="/_fnos_ingress/job-1",
             staging="/影视/_fnos_staging/job-1",
@@ -990,20 +990,26 @@ class RcloneCopyTests(unittest.TestCase):
         self.assertEqual(executor.poll_calls, 1)
         self.assertEqual(executor.cancel_calls, 0)
 
-    def test_rclone_rejects_mobile_destination(self) -> None:
-        plan = make_plan(
-            source_kind="quark",
-            dest_kind="mobile",
-            strategy="rclone_copy",
-            landing="/_fnos_ingress/job-1",
-            staging="/移动云/_fnos_staging/job-1",
-            final="/移动云/电影",
-        )
-        executor = RcloneTransferExecutor(_FakeRcloneService(), _FakeResolver(), source_materializer=_FakeMaterializer())
-        orch = TransferOrchestrator(plan, {"rclone_copy": executor})
-        _drive(orch)
-        self.assertEqual(orch.state.phase, PHASE_FAILED)
-        self.assertEqual(orch.state.error_code, ErrorCode.INVALID_PLAN)
+    def test_rclone_rejects_provider_api_upload_destinations(self) -> None:
+        for destination in ("mobile", "tianyi"):
+            with self.subTest(destination=destination):
+                plan = make_plan(
+                    source_kind="quark",
+                    dest_kind=destination,
+                    strategy="rclone_copy",
+                    landing="/_fnos_ingress/job-1",
+                    staging=f"/{destination}/_fnos_staging/job-1",
+                    final=f"/{destination}/电影",
+                )
+                executor = RcloneTransferExecutor(
+                    _FakeRcloneService(),
+                    _FakeResolver(),
+                    source_materializer=_FakeMaterializer(),
+                )
+                orch = TransferOrchestrator(plan, {"rclone_copy": executor})
+                _drive(orch)
+                self.assertEqual(orch.state.phase, PHASE_FAILED)
+                self.assertEqual(orch.state.error_code, ErrorCode.INVALID_PLAN)
 
 
 class RcloneReconcileFenceTests(unittest.TestCase):
@@ -1259,7 +1265,7 @@ class CleanupSafetyTests(unittest.TestCase):
     def _plan(self, landing=None, local_temp=None, job_id=1):
         return make_plan(
             source_kind="quark",
-            dest_kind="tianyi",
+            dest_kind="sixpan",
             strategy="rclone_copy",
             landing=landing,
             staging="/影视/_fnos_staging/job-1" if landing else None,
@@ -1393,7 +1399,7 @@ class UnsupportedPlanTests(unittest.TestCase):
     def test_known_strategy_without_executor_fails_closed(self) -> None:
         plan = make_plan(
             source_kind="quark",
-            dest_kind="tianyi",
+            dest_kind="sixpan",
             strategy="rclone_copy",
             landing="/_fnos_ingress/job-1",
             staging="/影视/_fnos_staging/job-1",
@@ -1442,7 +1448,7 @@ class UnsupportedPlanTests(unittest.TestCase):
     def test_rclone_path_contract_requires_destination_staging(self) -> None:
         plan = make_plan(
             source_kind="quark",
-            dest_kind="tianyi",
+            dest_kind="sixpan",
             strategy="rclone_copy",
             landing="/_fnos_ingress/job-1",
             final="/影视/电影",

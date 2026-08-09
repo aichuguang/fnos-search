@@ -65,6 +65,8 @@ class StorageV1RetirementTests(unittest.TestCase):
     def test_mobile_and_tianyi_advertise_provider_relay_upload(self) -> None:
         self.assertTrue(MOBILE_MANIFEST.capabilities.supports_relay_upload)
         self.assertTrue(TIANYI_MANIFEST.capabilities.supports_relay_upload)
+        self.assertFalse(MOBILE_MANIFEST.capabilities.supports_rclone_dest)
+        self.assertFalse(TIANYI_MANIFEST.capabilities.supports_rclone_dest)
         self.assertIn("relay", MOBILE_MANIFEST.components)
         self.assertIn("relay", TIANYI_MANIFEST.components)
 

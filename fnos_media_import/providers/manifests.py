@@ -197,7 +197,7 @@ TIANYI_MANIFEST = manifest(
         supports_native_verify=True,
         supports_source_materialization=True,
         supports_relay_upload=True,
-        supports_rclone_dest=True,
+        supports_rclone_dest=False,
         supports_direct_final=True,
         supports_quota=False,
     ),

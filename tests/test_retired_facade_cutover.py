@@ -38,6 +38,10 @@ class RetiredFacadeCutoverTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("def __call__", verifier_source)
 
+        jobs_script = (ROOT / "static" / "admin-jobs.js").read_text(encoding="utf-8")
+        self.assertNotIn("relay_upload_mobile", jobs_script)
+        self.assertIn("Provider 原生 API 直传", jobs_script)
+
     def test_planner_and_staging_facades_are_deleted(self) -> None:
         self.assertFalse(
             (ROOT / "fnos_media_import" / "services" / "import_planner.py").exists()

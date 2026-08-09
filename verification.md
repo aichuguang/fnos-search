@@ -243,13 +243,16 @@ OK
 - rclone Worker 头部文案改为“script-embedded provider upload backends retired”，避免误读为 Provider relay 被退役。
 - 删除无调用的 `evaluate_bt_content_risk` 兼容 façade 与 `TransferVerifier.__call__` 裸调用兼容。
 - 更新设计、存储、部署和回滚文档，统一使用 `relay_upload_provider`，并明确 Mobile/Tianyi 双 Provider API relay。
+- `TIANYI_MANIFEST` 与 `MOBILE_MANIFEST` 均显式声明 `supports_rclone_dest=false`；Planner 只能为其选择 `relay_upload_provider`，PlanValidator、canonical job reader 与 TransferOrchestrator 三层同时拒绝伪造的 `rclone_copy -> mobile/tianyi` 计划。
+- 管理端删除 `relay_upload_mobile` 旧策略别名，统一显示“Provider 原生 API 直传（本地中转）”；Organizer/rclone 测试夹具同步改为合法的 SixPan/local rclone 目标。
+- v29 硬切换迁移补齐 `organizer_ai_suggestions` 与 `organizer_tmdb_matches` 的显式统计和清理，dry-run、apply 与外键完整性测试均覆盖这两类执行子记录。
 
 ### 11.3 最终测试结果
 
 使用测试进程内的 Windows tempfile ACL 继承方案执行：
 
 ```text
-Ran 983 tests in 171.812s
+Ran 984 tests in 172.429s
 
 OK
 ```
@@ -257,7 +260,7 @@ OK
 安装 pytest 后全量执行：
 
 ```text
-992 passed, 174 subtests passed in 179.60s
+993 passed, 178 subtests passed in 182.36s
 ```
 
 定向复核：
@@ -269,10 +272,10 @@ OK
 静态门禁：
 
 - `python -m compileall -q fnos_media_import tests scripts`：通过；
-- `python -m ruff check fnos_media_import tests`：通过；
+- `python -m ruff check .`：通过；
 - `tests.test_source_encoding`：通过；
 - Git Bash `bash -n scripts/fnos_rclone_worker.sh`：通过；
-- 所有最终修改 JavaScript 的 `node --check`：通过；
+- `static/` 下全部 23 个 JavaScript 文件的 `node --check`：通过；
 - 工作树与文档暂存区 `git diff --check` / `git diff --cached --check`：通过。
 
 ### 11.4 未执行项

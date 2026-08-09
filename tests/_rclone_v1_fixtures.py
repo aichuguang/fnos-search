@@ -89,11 +89,11 @@ def rclone_v1_plan(
         },
         "destination": {
             "id": "library-main",
-            "provider_kind": "tianyi",
+            "provider_kind": "sixpan",
             "target_revision": 1,
             "binding_id": "binding-library-main",
             "binding_revision": 1,
-            "account_id": "account-tianyi",
+            "account_id": "account-sixpan",
             "account_revision": 1,
         },
         "routing": {

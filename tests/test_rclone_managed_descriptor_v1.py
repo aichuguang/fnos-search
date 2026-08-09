@@ -92,12 +92,12 @@ def _plan(*, local_target: bool = False, identity_root: str = "/") -> dict:
         },
         "destination": {
             "id": "library-main",
-            "provider_kind": "tianyi",
+            "provider_kind": "local" if local_target else "sixpan",
             "target_revision": 1,
             "binding_id": "binding-library-main",
             "binding_revision": 1,
-            "account_id": "account-tianyi",
-            "account_revision": 1,
+            "account_id": None if local_target else "account-sixpan",
+            "account_revision": None if local_target else 1,
         },
         "routing": {
             "assignment_id": "assignment-quark-movie",

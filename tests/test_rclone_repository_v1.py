@@ -34,10 +34,10 @@ def _v1_job(job_id: int = 12, strategy: str = "rclone_copy") -> dict:
             "selection": selection.to_dict(),
         },
         "destination": {
-            "id": "mobile_main" if strategy == "relay_upload_provider" else "tianyi_main",
-            "provider_kind": "mobile" if strategy == "relay_upload_provider" else "tianyi",
+            "id": "mobile_main" if strategy == "relay_upload_provider" else "sixpan_main",
+            "provider_kind": "mobile" if strategy == "relay_upload_provider" else "sixpan",
             "target_revision": 1,
-            "binding_id": "binding_mobile" if strategy == "relay_upload_provider" else "binding_tianyi",
+            "binding_id": "binding_mobile" if strategy == "relay_upload_provider" else "binding_sixpan",
             "binding_revision": 1,
         },
         "routing": {
@@ -45,7 +45,7 @@ def _v1_job(job_id: int = 12, strategy: str = "rclone_copy") -> dict:
             "assignment_revision": 1,
             "search_source_id": "quark",
             "category_key": "movie",
-            "destination_id": "mobile_main" if strategy == "relay_upload_provider" else "tianyi_main",
+            "destination_id": "mobile_main" if strategy == "relay_upload_provider" else "sixpan_main",
             "enabled": True,
         },
         "target_category": {"category_key": "movie", "public_label": "电影"},
@@ -68,12 +68,12 @@ def _v1_job(job_id: int = 12, strategy: str = "rclone_copy") -> dict:
             },
             "destination_staging": None if strategy == "relay_upload_provider" else {
                 "kind": "openlist",
-                "namespace_id": "openlist:ol:tianyi",
+                "namespace_id": "openlist:ol:sixpan",
                 "path": f"/_fnos_staging/movie/job-{job_id}",
             },
             "destination_final": {
                 "kind": "native" if strategy == "relay_upload_provider" else "openlist",
-                "namespace_id": "native:mobile:mobile_lib" if strategy == "relay_upload_provider" else "openlist:ol:tianyi",
+                "namespace_id": "native:mobile:mobile_lib" if strategy == "relay_upload_provider" else "openlist:ol:sixpan",
                 "path": f"/电影/job-{job_id}",
             },
             "local_temp": {
@@ -89,7 +89,7 @@ def _v1_job(job_id: int = 12, strategy: str = "rclone_copy") -> dict:
         "id": job_id,
         "plan_version": 1,
         "category": "movie",
-        "destination_id": "mobile_main" if strategy == "relay_upload_provider" else "tianyi_main",
+        "destination_id": "mobile_main" if strategy == "relay_upload_provider" else "sixpan_main",
         "raw_data": {},
         "_canonical_execution_plan": plan,
     }

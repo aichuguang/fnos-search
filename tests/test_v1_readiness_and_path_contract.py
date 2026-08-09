@@ -13,6 +13,7 @@ from fnos_media_import.planning.plan_validator import PlanValidator
 from fnos_media_import.planning.planner import ImportPlanner
 from fnos_media_import.transfer import TransferError, TransferPlan
 from fnos_media_import.transfer.provider_relay_executor import ProviderRelayExecutor
+from tests._rclone_v1_fixtures import rclone_v1_plan
 
 
 class _Mounts:
@@ -194,6 +195,30 @@ class V1PathContractTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "local_temp"):
             validated_v1_execution_plan_from_job(job)
+
+    def test_job_reader_rejects_rclone_upload_to_mobile_and_tianyi(self) -> None:
+        for provider_kind in ("mobile", "tianyi"):
+            with self.subTest(provider_kind=provider_kind):
+                plan = rclone_v1_plan(job_id=7, category="movie")
+                plan["destination"].update(
+                    {
+                        "provider_kind": provider_kind,
+                        "account_id": f"account-{provider_kind}",
+                        "account_revision": 1,
+                    }
+                )
+                plan["transfer"]["idempotency_key"] = compute_operation_key(plan)
+                attach_plan_integrity(plan)
+                job = {
+                    "id": 7,
+                    "plan_version": 1,
+                    "category": "movie",
+                    "destination_id": "library-main",
+                    "_canonical_execution_plan": plan,
+                    "raw_data": {},
+                }
+                with self.assertRaisesRegex(ValueError, "strategy_for_destination"):
+                    validated_v1_execution_plan_from_job(job)
 
     def test_job_reader_requires_both_v1_version_markers(self) -> None:
         plan = {
