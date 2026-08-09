@@ -43,7 +43,7 @@ class BtbtlaResource:
 
 
 class BtbtlaClient:
-    def __init__(self, config: dict[str, Any], routes: dict[str, Any]):
+    def __init__(self, config: dict[str, Any]):
         self.base_url = str(config.get("base_url") or "https://www.btbtla.com").strip().rstrip("/")
         self.timeout = _bounded_int(config.get("timeout"), 15, 1, 120)
         self.max_results = _bounded_int(config.get("max_results"), 20, 1, 100)
@@ -54,7 +54,6 @@ class BtbtlaClient:
         self.use_env_proxy = _as_bool(config.get("use_env_proxy"), False)
         self.proxy_enabled = _as_bool(config.get("proxy_enabled"), False)
         self.proxy_url = str(config.get("proxy_url") or "").strip()
-        self.routes = routes or {}
         self._session_lock = threading.RLock()
         self.session = requests.Session()
         self._configure_proxy()
@@ -324,7 +323,7 @@ class BtbtlaClient:
         magnet = _extract_magnet(html_text)
         if not magnet:
             raise ValueError("Download page did not contain a magnet link")
-        link = detect_link(magnet, self.routes)
+        link = detect_link(magnet)
         return {
             "success": True,
             "magnet": magnet,

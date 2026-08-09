@@ -240,6 +240,19 @@ class V1CutoverMigrationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "v29.*v28"):
                 old_runner.ensure_compatible(connection)
 
+    def test_offline_apply_does_not_remove_another_process_lock(self) -> None:
+        self._build_v28_mixed_database()
+        lock_path = self.path.with_name(f".{self.path.name}.v1-hard-cutover.lock")
+        lock_path.write_text("pid=4242\n", encoding="ascii")
+
+        try:
+            with self.assertRaises(FileExistsError):
+                apply_database(self.path)
+
+            self.assertEqual("pid=4242\n", lock_path.read_text(encoding="ascii"))
+        finally:
+            lock_path.unlink(missing_ok=True)
+
     def test_cutover_preserves_caller_owned_exclusive_transaction(self) -> None:
         self._build_v28_mixed_database()
         owner = sqlite3.connect(self.path, timeout=1, isolation_level=None)

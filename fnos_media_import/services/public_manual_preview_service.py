@@ -12,7 +12,6 @@ class PublicManualPreviewService:
         cache: Any,
         new_public_id: Callable[[], str],
         detect_link: Callable[..., Any],
-        routes: Callable[[], dict[str, Any]],
         resource_detail: Callable[..., dict[str, Any]],
         present_item: Callable[..., dict[str, Any]],
         detail_capability: Callable[..., dict[str, Any]],
@@ -25,7 +24,6 @@ class PublicManualPreviewService:
         self.cache = cache
         self.new_public_id = new_public_id
         self.detect_link = detect_link
-        self.routes = routes
         self.resource_detail = resource_detail
         self.present_item = present_item
         self.detail_capability = detail_capability
@@ -36,8 +34,7 @@ class PublicManualPreviewService:
         self.tianyi_importer = tianyi_importer or (lambda: None)
 
     def preview(self, *, url: str, password: str, title: str) -> dict[str, Any]:
-        routes = self.routes()
-        link = self.detect_link(url, routes, password=password)
+        link = self.detect_link(url, password=password)
         public_id = self.new_public_id()
         cache_item = {
             "title": title,
@@ -76,7 +73,6 @@ class PublicManualPreviewService:
         tianyi = self.tianyi_importer()
         detail = self.resource_detail(
             cached,
-            routes=routes,
             quark_importer=self.quark_importer(),
             cloud139_importer=cloud139,
             sixpan_importer=sixpan,

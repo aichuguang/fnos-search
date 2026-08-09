@@ -48,16 +48,9 @@ def normalize_url(url: str) -> str:
     return (url or "").strip()
 
 
-def detect_link(url: str, routes: dict | None = None, password: str = "") -> LinkInfo:
-    """Classify a source without choosing a transfer route.
+def detect_link(url: str, *, password: str = "") -> LinkInfo:
+    """Classify a source without choosing a destination or transfer strategy."""
 
-    Destination and transfer strategy are selected later from the immutable
-    assignment and execution plan. The optional ``routes`` argument remains
-    accepted only so callers can be migrated independently; its contents are
-    deliberately ignored.
-    """
-
-    del routes
     normalized = normalize_url(url)
     lower = normalized.lower()
     parsed = urlparse(normalized if "://" in normalized else f"https://{normalized}")

@@ -13,7 +13,6 @@ class PublicBtResolveService:
         btbtla: Callable[[], Any],
         present_item: Callable[..., dict[str, Any]],
         resource_detail: Callable[..., dict[str, Any]],
-        routes: Callable[[], dict[str, Any]],
         quark_importer: Callable[[], Any],
         cloud139_importer: Callable[[], Any],
         sixpan_importer: Callable[[], Any],
@@ -23,7 +22,6 @@ class PublicBtResolveService:
         self.btbtla = btbtla
         self.present_item = present_item
         self.resource_detail = resource_detail
-        self.routes = routes
         self.quark_importer = quark_importer
         self.cloud139_importer = cloud139_importer
         self.sixpan_importer = sixpan_importer
@@ -68,7 +66,6 @@ class PublicBtResolveService:
             "item": self.present_item(item, public_id=public_id, hide_full_links=hidden),
             "detail": self.resource_detail(
                 cached_after,
-                routes=self.routes(),
                 quark_importer=self.quark_importer(),
                 cloud139_importer=self.cloud139_importer(),
                 sixpan_importer=self.sixpan_importer(),

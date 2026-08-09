@@ -137,7 +137,7 @@ class _CachedDatabase(RepositoryFakeMixin):
 
 class TianyiPublicFlowTests(unittest.TestCase):
     def test_cloud189_link_is_supported_without_legacy_routes(self) -> None:
-        link = detect_link("https://cloud.189.cn/t/AbC123", {})
+        link = detect_link("https://cloud.189.cn/t/AbC123")
 
         self.assertEqual(link.provider_kind, "tianyi")
         self.assertEqual(link.source_form, "share")
@@ -145,7 +145,7 @@ class TianyiPublicFlowTests(unittest.TestCase):
         self.assertTrue(link.supported)
 
     def test_pansou_tianyi_result_is_available_to_guest_search(self) -> None:
-        client = PanSouClient({}, {})
+        client = PanSouClient({})
 
         item = client._row_to_item(
             "Example",
@@ -209,7 +209,6 @@ class TianyiPublicFlowTests(unittest.TestCase):
 
         detail = _public_resource_detail(
             cached,
-            routes={},
             quark_importer=object(),
             cloud139_importer=_Cloud139Stub(),
             tianyi_importer=importer,
@@ -237,7 +236,6 @@ class TianyiPublicFlowTests(unittest.TestCase):
         result = _public_resource_child_files(
             self._cached_resource(),
             fid="dir-1",
-            routes={},
             quark_importer=object(),
             cloud139_importer=_Cloud139Stub(),
             tianyi_importer=importer,
@@ -264,7 +262,6 @@ class TianyiPublicFlowTests(unittest.TestCase):
             cache=cache,
             new_public_id=lambda: "MANUAL-189",
             detect_link=detect_link,
-            routes=lambda: {},
             resource_detail=_public_resource_detail,
             present_item=_public_resource_item,
             detail_capability=_detail_capability_for_source,
@@ -290,7 +287,7 @@ class TianyiPublicFlowTests(unittest.TestCase):
         self.assertEqual(cache.records["MANUAL-189"]["password"], "4321")
 
     def test_tianyi_preflight_allows_valid_and_rejects_invalid_or_unconfigured_share(self) -> None:
-        link = detect_link("https://cloud.189.cn/t/AbC123", {}, password="4321")
+        link = detect_link("https://cloud.189.cn/t/AbC123", password="4321")
         common = {
             "title": "Example",
             "raw": {"size": 1024},
@@ -336,7 +333,6 @@ class TianyiPublicFlowTests(unittest.TestCase):
             search_cache=lambda public_id: cached if public_id == "PUBLIC-189" else None,
             categories=lambda: {"movie": {"label": "Movie"}},
             category=lambda _key: {"label": "Movie"},
-            routes=lambda: {},
             limited_text=lambda value, *_args, **_kwargs: str(value or ""),
             validate_url=lambda value, _security: str(value or ""),
             safe_string_list=lambda *_args, **_kwargs: [],

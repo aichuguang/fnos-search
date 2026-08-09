@@ -13,7 +13,6 @@ adding another upload-capable Provider does not require another orchestrator.
 
 from __future__ import annotations
 
-import inspect
 from typing import Any
 
 from fnos_media_import.transfer import (
@@ -416,7 +415,7 @@ class ProviderRelayExecutor:
             "local_dir": self._relay_dir(),
         }
         try:
-            value = _call_supported(verify_target, kwargs)
+            value = verify_target(**kwargs)
         except TransferError as exc:
             return TransferVerifyResult("unknown", exc.message, code=exc.code)
         except Exception as exc:  # noqa: BLE001
@@ -441,16 +440,6 @@ class ProviderRelayExecutor:
             "已请求停止中继下载/上传",
             operation_id=receipt.operation_id,
         )
-
-
-def _call_supported(method: Any, kwargs: dict[str, Any]) -> Any:
-    try:
-        parameters = inspect.signature(method).parameters
-    except (TypeError, ValueError):
-        return method(**kwargs)
-    if any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
-        return method(**kwargs)
-    return method(**{key: value for key, value in kwargs.items() if key in parameters})
 
 
 def _upload_outcome_dict(outcome: UploadOutcome) -> dict[str, Any]:

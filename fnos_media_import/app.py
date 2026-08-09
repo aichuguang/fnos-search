@@ -551,10 +551,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     organizer_service = runtime_build.organizer_service
     btbtla_proxy_diagnostics_service = BtbtlaProxyDiagnosticsService(
         current_config=lambda: app_config.raw.get("btbtla", {}),
-        # Provider/source routing is V1 catalog data, not a mutable YAML
-        # ``routes`` section.  The legacy section is rejected at load time;
-        # keep low-level diagnostics on the neutral built-in classifier map.
-        current_routes=lambda: {},
     )
 
     job_service = JobService(job_repositories)
@@ -3293,7 +3289,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             password = _limited_text(payload.get("password"), "提取码", _config_int(security_config, "max_password_length", 32))
         except PublicInputError as exc:
             return jsonify({"success": False, "message": str(exc)}), 400
-        link = detect_link(url, {}, password=password)
+        link = detect_link(url, password=password)
         tianyi = _active_tianyi_importer()
         public_link = {
             "provider_kind": link.provider_kind,
@@ -3314,7 +3310,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         cache=db,
         new_public_id=_new_public_id,
         detect_link=detect_link,
-        routes=lambda: {},
         resource_detail=_public_resource_detail,
         present_item=_public_resource_item,
         detail_capability=_detail_capability_for_source,
@@ -3377,7 +3372,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return PublicResourceService(
             PublicResourceDependencies(
                 cache_get=db.search_cache_queries.get_active,
-                routes={},
                 quark_importer=quark_importer,
                 cloud139_importer=cloud139_importer,
                 sixpan_importer=generic_importers.get("sixpan"),
@@ -3393,7 +3387,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         importer=lambda: generic_importers.get("sixpan"),
         validate_url=lambda value: _validate_public_url(value, security_config),
         detect_link=detect_link,
-        routes=lambda: {},
         summarize=_sixpan_parse_summary,
     )
 
@@ -3420,7 +3413,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         btbtla=lambda: btbtla,
         present_item=_public_resource_item,
         resource_detail=_public_resource_detail,
-        routes=lambda: {},
         quark_importer=lambda: quark_importer,
         cloud139_importer=lambda: cloud139_importer,
         sixpan_importer=lambda: generic_importers.get("sixpan"),
@@ -3509,7 +3501,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         search_cache=db.search_cache_queries.get_active,
         categories=lambda: app_config.categories,
         category=lambda key: app_config.category(key),
-        routes=lambda: {},
         limited_text=_limited_text,
         validate_url=_validate_public_url,
         safe_string_list=_safe_public_string_list,
@@ -3519,7 +3510,6 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         detect_link=detect_link,
         security_config=lambda: security_config,
         config_int=_config_int,
-        validate_destination=None,
     )
 
     def _cancel_unbound_public_import_job(

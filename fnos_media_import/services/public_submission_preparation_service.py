@@ -30,7 +30,6 @@ class PublicSubmissionPreparationService:
         search_cache: Callable[[str], dict[str, Any] | None],
         categories: Callable[[], dict[str, Any]],
         category: Callable[[str], dict[str, Any]],
-        routes: Callable[[], dict[str, Any]],
         limited_text: Callable[..., str],
         validate_url: Callable[[Any, dict[str, Any]], str],
         safe_string_list: Callable[..., list[str]],
@@ -40,16 +39,10 @@ class PublicSubmissionPreparationService:
         security_config: Callable[[], dict[str, Any]],
         config_int: Callable[[dict[str, Any], str, int], int],
         safe_tianyi_selection: Callable[[Any], Any] | None = None,
-        validate_destination: Callable[..., str | None] | None = None,
     ) -> None:
-        # ``validate_destination`` is deprecated in v4: the guest no longer
-        # selects a destination.  It is kept in the constructor only for
-        # callers that still pass it (app.py); the preparation service ignores
-        # it and the server resolves the target from source_destination_assignments.
         self.search_cache = search_cache
         self.categories = categories
         self.category = category
-        self.routes = routes
         self.limited_text = limited_text
         self.validate_url = validate_url
         self.safe_string_list = safe_string_list
@@ -59,7 +52,6 @@ class PublicSubmissionPreparationService:
         self.detect_link = detect_link
         self.security_config = security_config
         self.config_int = config_int
-        self.validate_destination = validate_destination
 
     def prepare(self, payload: dict[str, Any]) -> PreparedPublicSubmission:
         security = self.security_config()
@@ -152,9 +144,7 @@ class PublicSubmissionPreparationService:
         else:
             prepared["sixpan_selection"] = {}
 
-        link = self.detect_link(
-            prepared["url"], self.routes(), password=prepared["password"]
-        )
+        link = self.detect_link(prepared["url"], password=prepared["password"])
         category_key = str(prepared.get("category") or "").strip()
         if not category_key:
             raise PublicSubmissionPreparationError("资源分类不能为空")

@@ -246,13 +246,15 @@ OK
 - `TIANYI_MANIFEST` 与 `MOBILE_MANIFEST` 均显式声明 `supports_rclone_dest=false`；Planner 只能为其选择 `relay_upload_provider`，PlanValidator、canonical job reader 与 TransferOrchestrator 三层同时拒绝伪造的 `rclone_copy -> mobile/tianyi` 计划。
 - 管理端删除 `relay_upload_mobile` 旧策略别名，统一显示“Provider 原生 API 直传（本地中转）”；Organizer/rclone 测试夹具同步改为合法的 SixPan/local rclone 目标。
 - v29 硬切换迁移补齐 `organizer_ai_suggestions` 与 `organizer_tmdb_matches` 的显式统计和清理，dry-run、apply 与外键完整性测试均覆盖这两类执行子记录。
+- 硬切换 CLI 只允许实际持有独占锁的进程关闭并删除锁文件，锁竞争回归测试已覆盖。
+- 生产构造器已删除旧 `route/routes/current_routes` 输入；Provider、relay、Organizer 与取消入队均直接调用 V1 正式签名，不再运行时探测旧接口。
 
 ### 11.3 最终测试结果
 
 使用测试进程内的 Windows tempfile ACL 继承方案执行：
 
 ```text
-Ran 984 tests in 172.429s
+Ran 987 tests in 176.690s
 
 OK
 ```
@@ -260,7 +262,7 @@ OK
 安装 pytest 后全量执行：
 
 ```text
-993 passed, 178 subtests passed in 182.36s
+996 passed, 194 subtests passed in 176.86s
 ```
 
 定向复核：

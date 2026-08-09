@@ -78,11 +78,10 @@ class PanSouTokenManager:
 
 
 class PanSouClient:
-    def __init__(self, config: dict[str, Any], routes: dict[str, Any]):
+    def __init__(self, config: dict[str, Any]):
         self.base_url = str(config.get("base_url", "")).rstrip("/")
         self.timeout = _bounded_int(config.get("timeout"), 20, 1, 300)
         self.verify_tls = _as_bool(config.get("verify_tls"), True)
-        self.routes = routes
         self.cloud_types = _normalize_cloud_types(config.get("cloud_types"), DEFAULT_CLOUD_TYPES)
         self.result_type = _normalize_choice(config.get("res"), {"all", "results", "merge"}, "merge")
         self.source_scope = _normalize_choice(config.get("src"), {"all", "tg", "plugin"}, "all")
@@ -352,7 +351,7 @@ class PanSouClient:
             return None
         title = row.get("note") or row.get("content") or row.get("title") or row.get("work_title") or row.get("name") or keyword
         password = row.get("password") or row.get("pwd") or row.get("passcode") or row.get("code") or ""
-        link_info = detect_link(url, self.routes, password=password)
+        link_info = detect_link(url, password=password)
         return {
             "title": title,
             "keyword": keyword,

@@ -448,7 +448,8 @@ class _FakeOrganizer(RepositoryFakeMixin):
         self.events = events
         self.calls = 0
 
-    def organize(self, plan):
+    def organize(self, plan, *, organizer_task_id=None):
+        del organizer_task_id
         self.calls += 1
         if self.events is not None:
             self.events.add("organize")
@@ -516,7 +517,17 @@ class _FakeUploader(RepositoryFakeMixin):
             return UploadOutcome("auth_expired", "移动云认证已过期")
         return UploadOutcome(self.status)
 
-    def verify_target(self, *, target_locator, expected_file_count, expected_total_size):
+    def verify_target(
+        self,
+        *,
+        target_locator,
+        expected_file_count,
+        expected_total_size,
+        idempotency_key,
+        local_dir,
+    ):
+        del target_locator, expected_file_count, expected_total_size
+        del idempotency_key, local_dir
         if self.events is not None:
             self.events.add(f"{self.event_prefix}_verify")
         return TransferVerifyResult("ok")

@@ -11,11 +11,10 @@ from .matcher import episode_from_text
 
 
 class UpdateDiscovery:
-    def __init__(self, *, search_service: Any, quark_importer: Any, cloud139_importer: Any, routes: dict[str, Any], db: Any = None, cache_ttl_seconds: int = 21600, negative_cache_ttl_seconds: int = 600) -> None:
+    def __init__(self, *, search_service: Any, quark_importer: Any, cloud139_importer: Any, db: Any = None, cache_ttl_seconds: int = 21600, negative_cache_ttl_seconds: int = 600) -> None:
         self.search_service = search_service
         self.quark = quark_importer
         self.cloud139 = cloud139_importer
-        self.routes = routes
         self.db = db
         self.cache_ttl_seconds = max(60, int(cache_ttl_seconds or 21600))
         self.negative_cache_ttl_seconds = max(60, int(negative_cache_ttl_seconds or 600))
@@ -61,7 +60,7 @@ class UpdateDiscovery:
                 url = str(item.get("url") or item.get("source_url") or "")
                 if not url:
                     continue
-                link = detect_link(url, self.routes, password=str(item.get("password") or ""))
+                link = detect_link(url, password=str(item.get("password") or ""))
                 if link.provider_kind == "quark" and self.quark:
                     expanded = self._expand_search_cloud_candidate(subscription, source, item, {"type": "quark", "url": link.url or url, "password": link.password or item.get("password") or ""})
                     if expanded:

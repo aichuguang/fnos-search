@@ -24,7 +24,6 @@ class BtbtlaProxyProbeTests(unittest.TestCase):
                 "request_retries": 2,
                 "retry_delay_seconds": 0,
             },
-            {},
         )
         response = Mock(status_code=200, encoding="utf-8", apparent_encoding="utf-8", text="<html></html>")
         client.session.get = Mock(
@@ -55,7 +54,6 @@ class BtbtlaProxyProbeTests(unittest.TestCase):
                 "request_retries": 2,
                 "retry_delay_seconds": 0,
             },
-            {},
         )
         client.session.get = Mock(
             side_effect=requests.exceptions.InvalidSchema("Missing dependencies for SOCKS support."),
@@ -75,7 +73,6 @@ class BtbtlaProxyProbeTests(unittest.TestCase):
                 "request_retries": 2,
                 "retry_delay_seconds": 0,
             },
-            {},
         )
         response = Mock(status_code=200, url="https://www.btbtla.com/")
         client.session.get = Mock(
@@ -104,7 +101,6 @@ class BtbtlaProxyProbeTests(unittest.TestCase):
                 "proxy_enabled": True,
                 "proxy_url": "socks5h://proxy-user:proxy-pass@proxy.local:1080",
             },
-            {},
         )
         client.session.get = Mock(
             return_value=SimpleNamespace(
@@ -148,7 +144,6 @@ class BtbtlaProxyProbeTests(unittest.TestCase):
                 "proxy_enabled": True,
                 "proxy_url": "socks5h://proxy.local:1080",
             },
-            {},
         )
         client.session.get = Mock()
         try:
@@ -173,7 +168,6 @@ class BtbtlaProxyProbeTests(unittest.TestCase):
                 "use_env_proxy": True,
                 "proxy_enabled": False,
             },
-            {},
         )
         client.session.get = Mock()
         try:
@@ -196,7 +190,6 @@ class BtbtlaProxyProbeTests(unittest.TestCase):
                 "proxy_enabled": True,
                 "proxy_url": "socks5h://proxy.local:1080",
             },
-            {},
         )
         client.session.get = Mock(
             side_effect=requests.exceptions.InvalidSchema("Missing dependencies for SOCKS support."),
@@ -221,7 +214,6 @@ class BtbtlaProxyProbeTests(unittest.TestCase):
                             "proxy_enabled": True,
                             "proxy_url": proxy_url,
                         },
-                        {},
                     )
 
     def test_advanced_config_save_rejects_invalid_proxy_port(self) -> None:
@@ -257,7 +249,6 @@ class BtbtlaProxyDiagnosticsServiceTests(unittest.TestCase):
                 "proxy_enabled": True,
                 "proxy_url": "socks5h://saved-user:saved-pass@proxy.local:1080",
             },
-            current_routes=lambda: {"magnet": {"enabled": True}},
         )
 
         with patch(
@@ -274,10 +265,9 @@ class BtbtlaProxyDiagnosticsServiceTests(unittest.TestCase):
                 }
             )
 
-        candidate, routes = client_class.call_args.args
+        (candidate,) = client_class.call_args.args
         self.assertEqual(candidate["proxy_url"], "socks5h://saved-user:saved-pass@proxy.local:1080")
         self.assertEqual(candidate["timeout"], 20)
-        self.assertEqual(routes, {"magnet": {"enabled": True}})
         self.assertTrue(result["tested_unsaved_values"])
         fake_client.close.assert_called_once()
 
@@ -286,7 +276,6 @@ class BtbtlaProxyDiagnosticsServiceTests(unittest.TestCase):
         fake_client.probe_connection.return_value = {"success": True, "message": "ok"}
         service = BtbtlaProxyDiagnosticsService(
             current_config=lambda: {"request_retries": 2, "retry_delay_seconds": 0.4},
-            current_routes=lambda: {},
         )
 
         with patch(
@@ -302,14 +291,13 @@ class BtbtlaProxyDiagnosticsServiceTests(unittest.TestCase):
                 }
             )
 
-        candidate, _routes = client_class.call_args.args
+        (candidate,) = client_class.call_args.args
         self.assertEqual(candidate["request_retries"], 4)
         self.assertEqual(candidate["retry_delay_seconds"], 0.2)
 
     def test_service_error_does_not_leak_proxy_credentials(self) -> None:
         service = BtbtlaProxyDiagnosticsService(
             current_config=lambda: {},
-            current_routes=lambda: {},
         )
         with patch(
             "fnos_media_import.services.btbtla_proxy_diagnostics_service.BtbtlaClient",

@@ -1017,10 +1017,10 @@ def apply_database(path: Path) -> dict[str, Any]:
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
-        try:
-            lock_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -9,7 +9,6 @@ fallback.
 
 from __future__ import annotations
 
-import inspect
 from typing import Any, Callable
 
 from ..domain.models import AccountTestResult, NativeLocator, ProviderCapabilities
@@ -121,7 +120,7 @@ class _FrozenImporterAdapter:
             raise TransferError(ErrorCode.SHARE_INVALID, "Provider 未实现分享检查")
         url = str(locator.get("url") or "")
         password = str(locator.get("password") or "")
-        value = _call_supported(check, {"share_url": url, "password": password})
+        value = check(share_url=url, password=password)
         if not isinstance(value, tuple) or len(value) != 2:
             raise TransferError(ErrorCode.SHARE_INVALID, "Provider 分享检查返回格式无效")
         ok, data = value
@@ -174,7 +173,7 @@ class _FrozenImporterAdapter:
         selection_name = self._selection_argument()
         if selection_name:
             kwargs[selection_name] = selection
-        result = _call_supported(importer.import_resource, kwargs)
+        result = importer.import_resource(**kwargs)
         return self._freeze_receipt(result, request)
 
     def native_offline(self, request: NativeOfflineRequest) -> OperationReceipt:
@@ -187,9 +186,8 @@ class _FrozenImporterAdapter:
         selection = _selection_payload(source)
         ignore_files = selection.get("ignore_files")
         importer = self._importer_for_request(request)
-        result = _call_supported(
-            importer.import_resource,
-            {
+        result = importer.import_resource(
+            **{
                 "title": str(source.get("title") or request.source.canonical_source_id or "磁链任务"),
                 "source_url": str(source.get("url") or request.source.canonical_source_id or ""),
                 "category": {"label": "未分类"},
@@ -198,7 +196,7 @@ class _FrozenImporterAdapter:
                 "ignore_files": list(ignore_files)
                 if isinstance(ignore_files, (list, tuple))
                 else [],
-            },
+            }
         )
         return self._freeze_receipt(result, request)
 
@@ -207,9 +205,8 @@ class _FrozenImporterAdapter:
         importer = self._importer_for_request(request)
         materialize = getattr(importer, "materialize_resource", None)
         if callable(materialize):
-            result = _call_supported(
-                materialize,
-                {
+            result = materialize(
+                **{
                     "title": title,
                     "share_url": share_url,
                     "password": password,
@@ -220,7 +217,7 @@ class _FrozenImporterAdapter:
                     "landing_path": request.landing_path,
                     "category_key": request.category_key,
                     "selection": selection,
-                },
+                }
             )
             return self._freeze_receipt(result, request)
         return self._materialize_without_importer_method(request)
@@ -599,23 +596,6 @@ def _field(value: Any, name: str) -> Any:
     if isinstance(value, dict):
         return value.get(name)
     return getattr(value, name, None)
-
-
-def _call_supported(method: Any, kwargs: dict[str, Any]) -> Any:
-    """Call a provider importer method without masking an internal TypeError."""
-
-    try:
-        signature = inspect.signature(method)
-    except (TypeError, ValueError):
-        return method(**kwargs)
-    if any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    ):
-        return method(**kwargs)
-    return method(
-        **{key: value for key, value in kwargs.items() if key in signature.parameters}
-    )
 
 
 def _normalize_cancel(value: Any, receipt: OperationReceipt) -> CancelResult:

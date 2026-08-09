@@ -260,9 +260,6 @@ class UpdateService:
             search_service=search_service,
             quark_importer=quark_importer,
             cloud139_importer=cloud139_importer,
-            # Provider/source routing is V1 DB catalog data.  The removed
-            # global ``routes`` section must never influence discovery.
-            routes={},
             db=self.db,
             cache_ttl_seconds=int(scheduler.get("preview_cache_ttl_seconds") or 21600),
             negative_cache_ttl_seconds=int(scheduler.get("negative_preview_cache_ttl_seconds") or 600),

@@ -212,11 +212,10 @@ class RuntimeBuilder:
         self._require_v1_dependencies()
         runtime_config = self._runtime_config(config)
         # Search source enablement and destination routing are V1 database
-        # concerns.  The search adapters keep a route argument for their
-        # low-level API shape, but must never receive the removed global
-        # ``config.routes`` section.
-        pansou = PanSouClient(runtime_config.raw["pansou"], {})
-        btbtla = BtbtlaClient(runtime_config.raw.get("btbtla", {}), {})
+        # concerns. Search clients only classify sources and never receive the
+        # retired global ``config.routes`` section.
+        pansou = PanSouClient(runtime_config.raw["pansou"])
+        btbtla = BtbtlaClient(runtime_config.raw.get("btbtla", {}))
         quark = self._build_quark_importer()
         cloud139 = self._active_importer("mobile", "移动云")
         generic = {
@@ -238,7 +237,7 @@ class RuntimeBuilder:
         search = SearchService(self._database, aggregator)
         source_resolver = SourceResolver(
             detect_link=lambda url, password="", **_kwargs: detect_link(
-                url, {}, password=password
+                url, password=password
             ),
             config=runtime_config.raw,
             source_catalog_provider=self._provider_registry.search_sources,

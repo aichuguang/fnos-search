@@ -73,7 +73,7 @@ class ImportService:
         )
 
     def detect(self, url: str, password: str = "") -> dict[str, Any]:
-        return detect_link(url, {}, password=password).to_dict()
+        return detect_link(url, password=password).to_dict()
 
     def create_import_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.job_creation.create(payload)

@@ -7,7 +7,6 @@ from typing import Any, Callable
 @dataclass(frozen=True)
 class PublicResourceDependencies:
     cache_get: Callable[[str], dict[str, Any] | None]
-    routes: dict[str, Any]
     quark_importer: Any
     cloud139_importer: Any
     sixpan_importer: Any
@@ -27,7 +26,6 @@ class PublicResourceService:
             return {"success": False, "message": "资源详情不存在或已过期，请重新搜索"}, 404
         detail = self._deps.build_detail(
             cached,
-            routes=self._deps.routes,
             quark_importer=self._deps.quark_importer,
             cloud139_importer=self._deps.cloud139_importer,
             sixpan_importer=self._deps.sixpan_importer,
@@ -44,7 +42,6 @@ class PublicResourceService:
         result = self._deps.child_files(
             cached,
             fid=fid,
-            routes=self._deps.routes,
             quark_importer=self._deps.quark_importer,
             cloud139_importer=self._deps.cloud139_importer,
             tianyi_importer=self._deps.tianyi_importer,

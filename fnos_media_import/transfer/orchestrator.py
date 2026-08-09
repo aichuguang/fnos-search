@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -1018,22 +1017,13 @@ class TransferOrchestrator:
         return str(descriptor.get("namespace_id") or "").strip().lower().startswith("native:")
 
     def _invoke_organizer(self) -> Any:
-        """Pass the frozen Organizer task id when the service supports it."""
+        """Pass the frozen Organizer task id through the formal V1 contract."""
 
         method = getattr(self.organizer_service, "organize", None)
         if not callable(method):
             raise TypeError("Organizer 服务不可调用")
         task_id = int(self.state.organizer_task_id or 0)
-        try:
-            signature = inspect.signature(method)
-        except (TypeError, ValueError):
-            signature = None
-        if signature is not None and (
-            "organizer_task_id" in signature.parameters
-            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
-        ):
-            return method(self.plan, organizer_task_id=task_id or None)
-        return method(self.plan)
+        return method(self.plan, organizer_task_id=task_id or None)
 
     def _executor(self) -> Any:
         if not self.state.executor_strategy:

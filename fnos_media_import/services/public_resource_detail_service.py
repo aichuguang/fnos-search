@@ -30,7 +30,6 @@ class PublicResourceDetailService:
     def build(
         self,
         cached: dict[str, Any],
-        routes: dict[str, Any],
         quark_importer: Any,
         cloud139_importer: Any,
         sixpan_importer: Any | None = None,
@@ -47,7 +46,7 @@ class PublicResourceDetailService:
             return self._bt_detail(
                 cached, raw, source_url, title, btbtla_client, hide_full_links
             )
-        link = self.detect_link(source_url, routes, password=password)
+        link = self.detect_link(source_url, password=password)
         base_item = {
             **raw,
             "title": title,

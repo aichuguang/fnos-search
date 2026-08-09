@@ -431,8 +431,8 @@ Shell 中删除的是脚本内嵌的旧上传后端，不是 Python Provider rel
 
 ### 10.3 最终自动化证据
 
-- Windows tempfile ACL 测试方案下全量 unittest：`983/983` 通过。
-- 安装 pytest 后全量运行：`992 passed, 174 subtests passed`。
+- Windows tempfile ACL 测试方案下全量 unittest：`987/987` 通过。
+- 安装 pytest 后全量运行：`996 passed, 194 subtests passed`。
 - `compileall`、Ruff、UTF-8 源码测试、Git Bash `bash -n` 和所有修改 JavaScript 的 `node --check` 通过。
 - 代码阶段提交后，文档阶段暂存区已再次通过 `git diff --cached --check`；无 whitespace error。
 

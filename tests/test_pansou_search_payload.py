@@ -13,7 +13,6 @@ class PanSouSearchPayloadTests(unittest.TestCase):
                 "src": "all",
                 "plugins": [],
             },
-            {},
         )
 
         payload = client._search_payload("仙逆", ["pansou"], refresh=False)
@@ -28,7 +27,6 @@ class PanSouSearchPayloadTests(unittest.TestCase):
                 "src": "all",
                 "plugins": ["ash", "quark4k"],
             },
-            {},
         )
 
         payload = client._search_payload("仙逆", ["pansou"], refresh=False)

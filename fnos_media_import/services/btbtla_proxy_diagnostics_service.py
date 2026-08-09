@@ -26,10 +26,8 @@ class BtbtlaProxyDiagnosticsService:
         self,
         *,
         current_config: Callable[[], dict[str, Any]],
-        current_routes: Callable[[], dict[str, Any]],
     ) -> None:
         self.current_config = current_config
-        self.current_routes = current_routes
 
     def test(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         current = self.current_config()
@@ -44,11 +42,9 @@ class BtbtlaProxyDiagnosticsService:
             if field == "proxy_url" and str(value or "").strip() in SECRET_PLACEHOLDERS:
                 continue
             candidate[field] = value
-        routes = self.current_routes()
-        routes = routes if isinstance(routes, dict) else {}
         client: BtbtlaClient | None = None
         try:
-            client = BtbtlaClient(candidate, routes)
+            client = BtbtlaClient(candidate)
             result = client.probe_connection()
             result["tested_unsaved_values"] = bool(override)
             return result

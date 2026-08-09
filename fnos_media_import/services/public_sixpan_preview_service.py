@@ -13,14 +13,12 @@ class PublicSixpanPreviewService:
         importer: Callable[[], Any],
         validate_url: Callable[[Any], str],
         detect_link: Callable[..., Any],
-        routes: Callable[[], dict[str, Any]],
         summarize: Callable[[Any], dict[str, Any]],
     ) -> None:
         self.cache = cache
         self.importer = importer
         self.validate_url = validate_url
         self.detect_link = detect_link
-        self.routes = routes
         self.summarize = summarize
 
     def preview(
@@ -46,7 +44,7 @@ class PublicSixpanPreviewService:
             str(cached.get("title") or raw.get("title") or raw.get("note") or "BT 入库资源")
             if cached else "BT 入库资源"
         )
-        link = self.detect_link(source_url, self.routes(), password=password)
+        link = self.detect_link(source_url, password=password)
         if link.provider_kind != "sixpan" or link.source_form != "magnet":
             return {"success": False, "message": "该资源暂不支持内容预览", "items": []}, 400
         try:

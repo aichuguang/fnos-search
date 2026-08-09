@@ -110,7 +110,6 @@ class SpecialsDiscoveryTests(unittest.TestCase):
             search_service=None,
             quark_importer=None,
             cloud139_importer=None,
-            routes={},
         )
 
         queries = discovery._queries(

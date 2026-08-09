@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import os
 import posixpath
@@ -149,7 +148,6 @@ class CmccMobileUploader:
             if isinstance(entry, dict) and entry.get("success") and int(entry.get("size") or -1) == size:
                 uploaded.append(_cmcc_result_from_dict(entry.get("result"), relative_path, size))
                 continue
-            file_key = f"{operation_key}:file:{hashlib.sha256(relative_path.encode('utf-8')).hexdigest()[:24]}"
             kwargs: dict[str, Any] = {
                 "local_file": full_path,
                 "target_parent_file_id": target_parent_id,
@@ -159,7 +157,7 @@ class CmccMobileUploader:
                 "progress": callback,
             }
             try:
-                result = self._call_upload_file(kwargs, file_key)
+                result = self._call_upload_file(kwargs)
             except CmccAuthExpired:
                 return UploadOutcome("auth_expired", "mobile account authorization expired")
             except CmccAuthConfigError as exc:
@@ -195,21 +193,10 @@ class CmccMobileUploader:
         total_size = sum(int(item.size or 0) for item in uploaded)
         return UploadOutcome("done", "mobile upload completed", file_count=len(uploaded), total_size=total_size)
 
-    def _call_upload_file(self, kwargs: dict[str, Any], file_key: str) -> Any:
+    def _call_upload_file(self, kwargs: dict[str, Any]) -> Any:
         method = getattr(self.uploader, "upload_file", None)
         if not callable(method):
             raise TransferError(ErrorCode.AUTH_CONFIG, "mobile uploader does not expose upload_file")
-        try:
-            params = inspect.signature(method).parameters
-        except (TypeError, ValueError):
-            params = {}
-        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        if "target_relative_dir" not in params and not accepts_kwargs:
-            raise TransferError(ErrorCode.INVALID_PLAN, "mobile uploader must support target_relative_dir")
-        if "idempotency_key" in params or accepts_kwargs:
-            kwargs["idempotency_key"] = file_key
-        if not accepts_kwargs:
-            kwargs = {key: value for key, value in kwargs.items() if key in params}
         return method(**kwargs)
 
     @staticmethod

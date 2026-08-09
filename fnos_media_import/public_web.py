@@ -567,7 +567,6 @@ def _public_result_key(item: dict[str, Any]) -> str:
 
 def _public_resource_detail(
     cached: dict[str, Any],
-    routes: dict[str, Any],
     quark_importer: Any,
     cloud139_importer: Cloud139Importer,
     sixpan_importer: Any | None = None,
@@ -587,7 +586,6 @@ def _public_resource_detail(
     )
     return service.build(
         cached,
-        routes,
         quark_importer,
         cloud139_importer,
         sixpan_importer=sixpan_importer,
@@ -600,7 +598,6 @@ def _public_resource_detail(
 def _public_resource_child_files(
     cached: dict[str, Any],
     fid: str,
-    routes: dict[str, Any],
     quark_importer: Any,
     cloud139_importer: Cloud139Importer,
     tianyi_importer: Any | None = None,
@@ -609,7 +606,7 @@ def _public_resource_child_files(
     source_url = str(cached.get("source_url") or raw.get("url") or raw.get("source_url") or "")
     password = str(cached.get("password") or raw.get("password") or raw.get("pwd") or "")
     title = str(cached.get("title") or raw.get("title") or raw.get("note") or "temp_check")
-    link = detect_link(source_url, routes, password=password)
+    link = detect_link(source_url, password=password)
     provider_kind = str(link.provider_kind or "").strip().lower()
     if provider_kind == "mobile":
         data = cloud139_importer.list_files(link.url, fid=fid, password=link.password, title=title)

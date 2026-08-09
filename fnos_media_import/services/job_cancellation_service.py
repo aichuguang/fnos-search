@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -542,22 +541,7 @@ class JobCancellationService:
         if not callable(enqueue):
             return None
         try:
-            try:
-                signature = inspect.signature(enqueue)
-            except (TypeError, ValueError):
-                signature = None
-            accepts_reactivate = bool(
-                signature is None
-                or "reactivate" in signature.parameters
-                or any(
-                    parameter.kind == inspect.Parameter.VAR_KEYWORD
-                    for parameter in signature.parameters.values()
-                )
-            )
-            if accepts_reactivate:
-                result = enqueue(job_id, reactivate=bool(reactivate))
-            else:
-                result = enqueue(job_id)
+            result = enqueue(job_id, reactivate=bool(reactivate))
         except Exception as exc:  # noqa: BLE001
             return {
                 "success": False,
