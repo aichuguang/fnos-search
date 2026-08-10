@@ -9,6 +9,10 @@ from fnos_media_import.public_web import (
     _adapter_placeholders,
     _public_adapter_capabilities,
 )
+from fnos_media_import.providers.active import (
+    ActiveProviderImporter,
+    ActiveProviderUnavailable,
+)
 
 
 class _ConfiguredQuarkImporter:
@@ -40,6 +44,22 @@ class QuarkCapabilityTests(unittest.TestCase):
         self.assertTrue(quark["configured"])
         self.assertTrue(quark["enabled"])
         self.assertEqual(quark["status"], "implemented")
+
+    def test_public_config_fails_closed_when_sixpan_account_is_inactive(self) -> None:
+        def unavailable():
+            raise ActiveProviderUnavailable("\u5f53\u524d\u516d\u76d8\u8d26\u53f7\u672a\u6fc0\u6d3b")
+
+        items = _public_adapter_capabilities(
+            {},
+            generic_importers={
+                "sixpan": ActiveProviderImporter("\u516d\u76d8", unavailable),
+            },
+        )
+
+        sixpan = next(item for item in items if item["key"] == "sixpan")
+        self.assertFalse(sixpan["configured"])
+        self.assertFalse(sixpan["enabled"])
+        self.assertEqual(sixpan["status"], "unavailable")
 
 
 class QuarkCapabilityCompositionTests(unittest.TestCase):

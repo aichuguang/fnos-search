@@ -227,7 +227,14 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
                 "account_id": account_id,
                 "provider_kind": "quark",
                 "identity_root": "/",
-                "native_locator": {"kind": "path", "value": "/FNOS"},
+                "native_locator": {
+                    "kind": "path",
+                    "value": "/FNOS",
+                    "display_name": "Provider root",
+                    "upload_verified": True,
+                    "organizer_mutation_verified": True,
+                    "probe_fingerprint": "source-proof",
+                },
             }
         )
         with self.db.connect() as connection:

@@ -13,9 +13,9 @@
         notice: { message: "正在读取配置…", kind: "" },
         directoryOptions: [],
         directoryError: "",
-        nativeDirectoryOptions: [],
+        nativeTree: {},
+        nativeRoot: "",
         nativeDirectoryError: "",
-        nativeDirectoryTrail: [],
         preflight: null,
         authSession: null,
         authSessionHidden: false,
@@ -119,6 +119,25 @@
                 delete element.dataset.busyWasDisabled;
             }
         });
+    }
+
+    function setButtonLoading(button, loading) {
+        if (!(button instanceof HTMLButtonElement) || !button.dataset.loadingLabel) return;
+        if (loading) {
+            if (!Object.prototype.hasOwnProperty.call(button.dataset, "loadingOriginalHtml")) {
+                button.dataset.loadingOriginalHtml = button.innerHTML;
+            }
+            button.classList.add("is-loading");
+            button.setAttribute("aria-busy", "true");
+            button.innerHTML = `<span class="button-spinner" aria-hidden="true"></span><span>${esc(button.dataset.loadingLabel)}</span>`;
+            return;
+        }
+        if (Object.prototype.hasOwnProperty.call(button.dataset, "loadingOriginalHtml")) {
+            button.innerHTML = button.dataset.loadingOriginalHtml;
+            delete button.dataset.loadingOriginalHtml;
+        }
+        button.classList.remove("is-loading");
+        button.removeAttribute("aria-busy");
     }
 
     async function load(message) {
@@ -230,50 +249,76 @@
         return schemaFields(provider?.native_locator_schema)[0] || null;
     }
 
+    function nativeBrowseRoot() {
+        const provider = providerFor(state.editor?.values?.provider_kind || "");
+        return nativeLocatorField(provider)?.browse_root || "-11";
+    }
+
+    function nativeUsesPathLocator() {
+        const name = nativeLocatorField(providerFor(state.editor?.values?.provider_kind || ""))?.name || "";
+        return ["path", "provider_path"].includes(name);
+    }
+
     function usesNativeFolderBrowser(provider) {
-        return nativeLocatorField(provider)?.name === "folder_id";
+        return Boolean(nativeLocatorField(provider)?.browseable);
     }
 
     function resetNativeDirectoryState() {
-        state.nativeDirectoryOptions = [];
+        state.nativeTree = {};
+        state.nativeRoot = "";
         state.nativeDirectoryError = "";
-        state.nativeDirectoryTrail = [];
     }
 
-    function nativeDirectoryCurrent() {
-        const trail = state.nativeDirectoryTrail || [];
-        return trail[trail.length - 1] || { folder_id: "-11", name: "\u6839\u76ee\u5f55" };
-    }
-
-    function nativeDirectoryDisplayName(trail = state.nativeDirectoryTrail) {
-        const items = Array.isArray(trail) ? trail : [];
-        const names = items.slice(1).map((item) => String(item?.name || "").trim()).filter(Boolean);
-        return names.length ? `/${names.join("/")}` : "\u6839\u76ee\u5f55";
+    function joinNativePath(parentPath, name) {
+        const base = String(parentPath || "/").replace(/\/+$/, "");
+        const segment = String(name || "").trim();
+        if (!segment) return base || "/";
+        return `${base || ""}/${segment}`;
     }
 
     function renderNativeDirectoryBrowser(values, locatorField) {
         const selectedName = values.native_root_name || (values.native_root ? `ID: ${values.native_root}` : "");
-        const current = nativeDirectoryCurrent();
-        const trail = state.nativeDirectoryTrail.length
-            ? state.nativeDirectoryTrail
-            : [{ folder_id: "-11", name: "\u6839\u76ee\u5f55" }];
-        const folders = state.nativeDirectoryOptions || [];
+        const root = state.nativeRoot || nativeBrowseRoot();
         return `<section class="storage-native-browser span-2" aria-label="${esc(locatorField?.label || "\u4e91\u76d8\u539f\u751f\u76ee\u5f55")}">
             <input type="hidden" name="native_root" value="${esc(values.native_root || "")}">
             <input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}">
             <header>
-                <div><strong>${esc(locatorField?.label || "\u4e91\u76d8\u4fdd\u5b58\u6839\u76ee\u5f55")}</strong><small>${selectedName ? `\u5df2\u9009\uff1a${esc(selectedName)}` : "\u8bf7\u4ece\u4e0b\u65b9\u76ee\u5f55\u4e2d\u9009\u62e9"}</small></div>
-                <button type="button" class="secondary mini" data-native-directory-action="select-current" ${current.folder_id ? "" : "disabled"}>\u9009\u62e9\u5f53\u524d\u76ee\u5f55</button>
+                <div><strong>${esc(locatorField?.label || "\u4e91\u76d8\u4fdd\u5b58\u6839\u76ee\u5f55")}</strong><small>${selectedName ? `\u5df2\u9009\uff1a${esc(selectedName)}` : "\u8bf7\u4ece\u4e0b\u65b9\u76ee\u5f55\u6811\u4e2d\u9009\u62e9"}</small></div>
             </header>
-            <div class="storage-native-breadcrumbs" aria-label="\u539f\u751f\u76ee\u5f55\u8def\u5f84">
-                ${trail.map((item, index) => `<button type="button" class="secondary mini" data-native-directory-action="breadcrumb" data-index="${index}">${esc(item.name || (index ? item.folder_id : "\u6839\u76ee\u5f55"))}</button>`).join('<span aria-hidden="true">/</span>')}
-            </div>
-            <div class="storage-native-folder-list">
-                ${folders.length ? folders.map((item) => `<button type="button" class="storage-native-folder" data-native-directory-action="enter" data-folder-id="${esc(item.folder_id)}" data-folder-name="${esc(item.name || item.folder_id)}"><span class="icon-slot icon-folder" aria-hidden="true"></span><span>${esc(item.name || item.folder_id)}</span><small>\u8fdb\u5165</small></button>`).join("") : `<div class="storage-empty-inline">${state.nativeDirectoryError ? "\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25" : "\u5f53\u524d\u76ee\u5f55\u6ca1\u6709\u5b50\u76ee\u5f55"}</div>`}
+            <div class="storage-native-tree">
+                ${state.nativeTree[root] ? renderNativeTreeNodes(root, 0) : '<div class="storage-tree-row storage-tree-note">\u52a0\u8f7d\u4e2d\u2026</div>'}
             </div>
             ${state.nativeDirectoryError ? `<div class="storage-inline-error" role="alert">${esc(state.nativeDirectoryError)}</div>` : ""}
             <label class="storage-native-selection"><span>\u5df2\u9009\u539f\u751f\u76ee\u5f55</span><input name="native_root_selection" required readonly value="${esc(selectedName)}" placeholder="\u8bf7\u9009\u62e9\u4e00\u4e2a\u4e91\u76d8\u76ee\u5f55"></label>
         </section>`;
+    }
+
+    function renderNativeTreeNodes(folderId, depth) {
+        const node = state.nativeTree[folderId];
+        if (!node) return "";
+        const indent = depth * 18;
+        const chevron = node.loading ? "\u2026" : (node.expanded ? "\u25be" : "\u25b8");
+        const row = `<div class="storage-tree-row" style="padding-left:${indent}px">
+            <button type="button" class="storage-tree-toggle" data-native-tree-action="toggle" data-folder-id="${esc(node.folder_id)}" ${node.loading ? "disabled" : ""} aria-label="\u5c55\u5f00\u6216\u6298\u53e0">${chevron}</button>
+            <span class="icon-slot icon-folder" aria-hidden="true"></span>
+            <button type="button" class="storage-tree-label" data-native-tree-action="select" data-folder-id="${esc(node.folder_id)}" title="${esc(node.path || node.name)}">${esc(node.name)}</button>
+            <button type="button" class="secondary mini" data-native-tree-action="select" data-folder-id="${esc(node.folder_id)}">\u9009\u62e9</button>
+        </div>`;
+        let body = row;
+        if (node.loading) {
+            body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">\u52a0\u8f7d\u4e2d\u2026</div>`;
+        }
+        if (node.error) {
+            body += `<div class="storage-tree-row storage-tree-note storage-tree-error" style="padding-left:${indent + 18}px" role="alert">${esc(node.error)}</div>`;
+        }
+        if (node.expanded && node.loaded) {
+            if (!node.children.length) {
+                body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">\u6b64\u76ee\u5f55\u6ca1\u6709\u5b50\u76ee\u5f55</div>`;
+            } else {
+                body += node.children.map((childId) => renderNativeTreeNodes(childId, depth + 1)).join("");
+            }
+        }
+        return body;
     }
 
     function authInputSchema(provider, authDefinition) {
@@ -354,7 +399,7 @@
         return `
             <div class="storage-section-heading">
                 <div><h4>保存位置</h4><p>先维护 OpenList 连接，再把账号或通用网盘映射为保存位置。</p></div>
-                <div class="storage-heading-actions"><button type="button" class="secondary" data-openlist-action="add">添加 OpenList</button><button type="button" data-location-action="add">添加保存位置</button></div>
+                <div class="storage-heading-actions">${connections.length ? "" : '<button type="button" class="secondary" data-openlist-action="add">\u6dfb\u52a0 OpenList</button>'}<button type="button" data-location-action="add">添加保存位置</button></div>
             </div>
             <div class="storage-openlist-list">
                 ${connections.length ? connections.map(renderOpenListConnectionRow).join("") : `<div class="storage-empty-state"><strong>尚未连接 OpenList</strong><p>本地位置可以直接创建；云盘位置需要先添加 WebDAV 连接。</p></div>`}
@@ -407,8 +452,30 @@
                 <label><span>用户名</span><input name="username" required value="${esc(values.username || "")}" autocomplete="username"></label>
                 <label><span>密码</span><input name="password" type="password" ${values.connection_id ? "" : "required"} placeholder="${values.connection_id ? "已保存，留空保持不变" : "WebDAV 密码"}" autocomplete="new-password"></label>
             </div>
-            <div class="storage-form-actions"><button type="submit">保存并检测</button><button type="button" class="secondary" data-setup-action="cancel-editor">取消</button></div>
+            <div class="storage-form-actions"><button type="submit" data-loading-label="\u6b63\u5728\u4fdd\u5b58\u5e76\u68c0\u6d4b\u8fde\u63a5\u2026">保存并检测</button><button type="button" class="secondary" data-setup-action="cancel-editor">取消</button></div>
         </form>`;
+    }
+
+    function renderOpenListDirectoryOptions(selectedValue) {
+        const selectedPath = String(selectedValue || "").trim();
+        const seen = new Set();
+        const options = [];
+        for (const item of state.directoryOptions || []) {
+            const path = String(item?.path || "").trim();
+            if (!path || seen.has(path)) continue;
+            seen.add(path);
+            options.push({ path, name: String(item?.name || path).trim() || path });
+        }
+        if (selectedPath && !seen.has(selectedPath)) {
+            options.unshift({ path: selectedPath, name: selectedPath });
+        }
+        const placeholder = options.length
+            ? "\u8bf7\u9009\u62e9 OpenList \u76ee\u5f55"
+            : "\u6682\u65e0\u53ef\u9009\u7684 OpenList \u76ee\u5f55";
+        return `<option value="" ${selectedPath ? "" : "selected"} disabled>${placeholder}</option>${options.map((item) => {
+            const label = item.name !== item.path ? `${item.name} \u00b7 ${item.path}` : item.path;
+            return `<option value="${esc(item.path)}" ${item.path === selectedPath ? "selected" : ""}>${esc(label)}</option>`;
+        }).join("")}`;
     }
 
     function renderLocationEditor() {
@@ -430,16 +497,16 @@
                 <label><span>位置类型</span><select name="kind" ${values.destination_id ? "disabled" : ""}><option value="provider" ${kind === "provider" ? "selected" : ""}>已接入的云盘</option><option value="generic" ${kind === "generic" ? "selected" : ""}>OpenList 其他网盘</option><option value="local" ${kind === "local" ? "selected" : ""}>本地目录</option></select></label>
                 ${kind === "provider" ? `<label><span>网盘类型</span><select name="provider_kind" required ${values.destination_id ? "disabled" : ""}><option value="">请选择网盘</option>${providerKinds.map((providerKind) => `<option value="${esc(providerKind)}" ${providerKind === selectedProviderKind ? "selected" : ""}>${esc(providerFor(providerKind)?.display_name || providerKind)}</option>`).join("")}</select></label><label><span>云盘账号</span><select name="account_id" required><option value="">请选择账号</option>${accounts.map((item) => `<option value="${esc(item.account_id)}" ${item.account_id === values.account_id ? "selected" : ""}>${esc(item.name)}${item.last_test_status === "ok" ? "" : "（待检测）"}</option>`).join("")}</select></label>` : ""}
                 ${kind !== "local" ? `<label><span>OpenList 连接</span><select name="connection_id" required><option value="">请选择连接</option>${connections.map((item) => `<option value="${esc(item.connection_id)}" ${item.connection_id === values.connection_id ? "selected" : ""}>${esc(item.name)}${item.last_test_status === "ok" ? "" : "（待检测）"}</option>`).join("")}</select></label>
-                <label class="span-2"><span>OpenList 中的目录</span><input name="webdav_root" list="storageDirectoryOptions" required value="${esc(values.webdav_root || "")}" placeholder="例如：/夸克/媒体库"><datalist id="storageDirectoryOptions">${state.directoryOptions.map((item) => `<option value="${esc(item.path)}">${esc(item.name || item.path)}</option>`).join("")}</datalist></label>` : ""}
+                <label class="span-2"><span>OpenList 中的目录</span><select name="webdav_root" required>${renderOpenListDirectoryOptions(values.webdav_root)}</select></label>` : ""}
                 ${kind === "provider" ? (nativeBrowser
                     ? renderNativeDirectoryBrowser(values, locatorField)
                     : `<label class="span-2"><span>${esc(locatorField?.label || "\u4e91\u76d8\u4fdd\u5b58\u6839\u76ee\u5f55")}</span><input name="native_root" required value="${esc(values.native_root || "")}" placeholder="\u540c\u6e90\u76f4\u8f6c\u548c\u8de8\u76d8\u843d\u5730\u4f7f\u7528"><input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}"></label>`)
                     : ""}
-                ${kind !== "local" ? `<label class="span-2 storage-identity-confirm"><input name="confirm_identity" type="checkbox" value="true" required><span>我确认该 OpenList 目录确实对应上面选择的账号或存储位置。修改目录、账号或挂载关系时会重新确认。</span></label>` : ""}
+                ${kind !== "local" ? `<label class="span-2 storage-identity-confirm"><input name="confirm_identity" type="checkbox" value="true" required ${values.confirm_identity === true || values.confirm_identity === "true" ? "checked" : ""}><span>我确认该 OpenList 目录确实对应上面选择的账号或存储位置。修改目录、账号或挂载关系时会重新确认。</span></label>` : ""}
             </div>
             ${state.directoryError ? `<div class="storage-inline-error" role="alert">${esc(state.directoryError)}</div>` : ""}
             <div class="storage-path-note">电影、电视剧、动漫等目录由系统自动生成，不再单独配置分类路径。</div>
-            <div class="storage-form-actions"><button type="submit">保存并检测目录</button><button type="button" class="secondary" data-setup-action="cancel-editor">取消</button></div>
+            <div class="storage-form-actions"><button type="submit" data-loading-label="\u6b63\u5728\u4fdd\u5b58\u5e76\u68c0\u6d4b\u76ee\u5f55\u2026">保存并检测目录</button><button type="button" class="secondary" data-setup-action="cancel-editor">取消</button></div>
         </form>`;
     }
 
@@ -589,6 +656,19 @@
         return Object.fromEntries(new FormData(form).entries());
     }
 
+    function syncLocationEditorValues(form) {
+        if (!form || state.editor?.type !== "location") return {};
+        const raw = formValues(form);
+        const confirmation = form.querySelector('[name="confirm_identity"]');
+        if (confirmation) raw.confirm_identity = confirmation.checked ? "true" : "";
+        state.editor.values = {
+            ...state.editor.values,
+            ...raw,
+            kind: raw.kind || state.editor.values.kind,
+        };
+        return raw;
+    }
+
     async function submitAccountV1(form) {
         const raw = formValues(form);
         const provider = providerFor(state.editor.provider_kind) || {};
@@ -649,7 +729,7 @@
         }
         state.editor = null;
         await load();
-        setNotice("OpenList WebDAV 已保存并连接成功。", "is-success");
+        setNotice("OpenList WebDAV \u4e0e rclone Remote \u5df2\u4fdd\u5b58\u5e76\u68c0\u6d4b\u6210\u529f\u3002", "is-success");
     }
 
     async function submitLocation(form) {
@@ -921,29 +1001,102 @@
         }
     }
 
-    async function loadNativeDirectoryOptions(accountId, parentId = "-11", trail = null) {
-        state.nativeDirectoryOptions = [];
-        state.nativeDirectoryError = "";
-        if (!accountId) {
-            state.nativeDirectoryTrail = [];
-            return;
-        }
-        state.nativeDirectoryTrail = Array.isArray(trail) && trail.length
-            ? trail
-            : [{ folder_id: "-11", name: "\u6839\u76ee\u5f55" }];
+    async function loadNativeDirectoryOptions(accountId) {
+        resetNativeDirectoryState();
+        if (!accountId) return;
+        const root = nativeBrowseRoot();
+        state.nativeRoot = root;
+        state.nativeTree[root] = {
+            folder_id: root,
+            name: "\u6839\u76ee\u5f55",
+            path: "/",
+            parent_id: "",
+            children: [],
+            loaded: false,
+            expanded: true,
+            loading: false,
+            error: "",
+        };
+        await loadNativeTreeNode(root, accountId);
+    }
+
+    async function loadNativeTreeNode(folderId, accountId) {
+        const node = state.nativeTree[folderId];
+        if (!node || node.loading) return;
+        node.loading = true;
+        node.error = "";
         try {
-            const result = await request(`/api/admin/storage-setup/accounts/${encodeURIComponent(accountId)}/folders?parent_id=${encodeURIComponent(parentId || "-11")}`);
-            state.nativeDirectoryOptions = (result.items || []).filter((item) => item?.folder_id);
+            const result = await request(`/api/admin/storage-setup/accounts/${encodeURIComponent(accountId)}/folders?parent_id=${encodeURIComponent(folderId)}`);
+            const items = (result.items || []).filter((item) => item?.folder_id);
+            node.children = [];
+            for (const item of items) {
+                const childId = String(item.folder_id || "");
+                const childName = String(item.name || childId);
+                state.nativeTree[childId] = {
+                    folder_id: childId,
+                    name: childName,
+                    path: joinNativePath(node.path, childName),
+                    parent_id: folderId,
+                    children: [],
+                    loaded: false,
+                    expanded: false,
+                    loading: false,
+                    error: "",
+                };
+                node.children.push(childId);
+            }
+            node.loaded = true;
         } catch (error) {
-            state.nativeDirectoryOptions = [];
-            state.nativeDirectoryError = error.message || "\u539f\u751f\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25";
+            node.error = error.message || "\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25";
+        } finally {
+            node.loading = false;
         }
+    }
+
+    function collapseNativeSiblingBranches(folderId) {
+        const ancestors = new Set();
+        let parentId = state.nativeTree[folderId]?.parent_id;
+        while (parentId) {
+            ancestors.add(parentId);
+            parentId = state.nativeTree[parentId]?.parent_id;
+        }
+        for (const key of Object.keys(state.nativeTree)) {
+            const node = state.nativeTree[key];
+            if (node.expanded && key !== folderId && !ancestors.has(key)) {
+                node.expanded = false;
+            }
+        }
+    }
+
+    async function toggleNativeTreeNode(folderId, accountId) {
+        const node = state.nativeTree[folderId];
+        if (!node) return;
+        if (!node.loaded && !node.loading) {
+            await loadNativeTreeNode(folderId, accountId);
+        }
+        const willExpand = !node.expanded;
+        if (willExpand) {
+            collapseNativeSiblingBranches(folderId);
+        }
+        node.expanded = willExpand;
+    }
+
+    function renderWithTreeScroll() {
+        const container = host.querySelector(".storage-native-tree");
+        const scrollTop = container ? container.scrollTop : 0;
+        render();
+        const next = host.querySelector(".storage-native-tree");
+        if (next) next.scrollTop = scrollTop;
     }
 
     host.addEventListener("submit", async (event) => {
         event.preventDefault();
         if (state.busy) return;
         const authSubmission = ["providerLoginForm", "providerChallengeForm"].includes(event.target.id);
+        const loadingButton = ["storageOpenListForm", "storageLocationForm"].includes(event.target.id)
+            ? (event.submitter || event.target.querySelector('button[type="submit"]'))
+            : null;
+        setButtonLoading(loadingButton, true);
         setBusy(true);
         try {
             if (event.target.id === "storageAccountForm") await submitAccountV1(event.target);
@@ -959,15 +1112,23 @@
             if (authSubmission) reportAuthError(error);
             else setNotice(error.message || "保存失败", "is-error");
         } finally {
+            setButtonLoading(loadingButton, false);
             setBusy(false);
         }
     });
 
     host.addEventListener("change", async (event) => {
         const form = event.target.closest("#storageLocationForm");
-        if (form && ["kind", "provider_kind", "account_id", "connection_id"].includes(event.target.name)) {
-            const raw = formValues(form);
-            state.editor.values = { ...state.editor.values, ...raw, kind: raw.kind || state.editor.values.kind };
+        if (form) {
+            const raw = syncLocationEditorValues(form);
+            if (event.target.name === "webdav_root") {
+                state.editor.values.confirm_identity = "";
+                const confirmation = form.querySelector('[name="confirm_identity"]');
+                if (confirmation) confirmation.checked = false;
+                return;
+            }
+            if (!["kind", "provider_kind", "account_id", "connection_id"].includes(event.target.name)) return;
+            state.editor.values.confirm_identity = "";
             if (event.target.name === "kind" && raw.kind !== "provider") {
                 state.editor.values.provider_kind = "";
                 state.editor.values.account_id = "";
@@ -991,7 +1152,10 @@
                     await loadNativeDirectoryOptions(raw.account_id);
                 }
             }
-            if (event.target.name === "connection_id") await loadDirectoryOptions(raw.connection_id);
+            if (event.target.name === "connection_id") {
+                state.editor.values.webdav_root = "";
+                await loadDirectoryOptions(raw.connection_id);
+            }
             render();
             return;
         }
@@ -1029,40 +1193,32 @@
             return;
         }
 
-        const nativeDirectoryAction = button.dataset.nativeDirectoryAction;
-        if (nativeDirectoryAction) {
+        const nativeTreeAction = button.dataset.nativeTreeAction;
+        if (nativeTreeAction) {
+            syncLocationEditorValues(button.closest("#storageLocationForm"));
             const accountId = state.editor?.values?.account_id || "";
             if (!accountId) {
                 state.nativeDirectoryError = "\u8bf7\u5148\u9009\u62e9\u4e91\u76d8\u8d26\u53f7";
                 render();
                 return;
             }
-            if (nativeDirectoryAction === "select-current") {
-                const current = nativeDirectoryCurrent();
-                state.editor.values.native_root = current.folder_id;
-                state.editor.values.native_root_name = nativeDirectoryDisplayName();
-                render();
+            const folderId = button.dataset.folderId || "";
+            if (nativeTreeAction === "toggle") {
+                await toggleNativeTreeNode(folderId, accountId);
+                renderWithTreeScroll();
                 return;
             }
-            setBusy(true);
-            try {
-                if (nativeDirectoryAction === "enter") {
-                    const next = {
-                        folder_id: button.dataset.folderId || "",
-                        name: button.dataset.folderName || button.dataset.folderId || "",
-                    };
-                    const trail = [...(state.nativeDirectoryTrail || []), next];
-                    await loadNativeDirectoryOptions(accountId, next.folder_id, trail);
+            if (nativeTreeAction === "select") {
+                const node = state.nativeTree[folderId];
+                if (!node) return;
+                if (nativeUsesPathLocator()) {
+                    state.editor.values.native_root = node.path || node.folder_id;
+                } else {
+                    state.editor.values.native_root = node.folder_id;
                 }
-                if (nativeDirectoryAction === "breadcrumb") {
-                    const index = Math.max(0, Number(button.dataset.index || 0));
-                    const trail = (state.nativeDirectoryTrail || []).slice(0, index + 1);
-                    const current = trail[trail.length - 1] || { folder_id: "-11", name: "\u6839\u76ee\u5f55" };
-                    await loadNativeDirectoryOptions(accountId, current.folder_id, trail);
-                }
+                state.editor.values.native_root_name = node.path || node.name;
                 render();
-            } finally {
-                setBusy(false);
+                return;
             }
             return;
         }

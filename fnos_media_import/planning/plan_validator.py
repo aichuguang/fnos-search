@@ -955,7 +955,17 @@ class PlanValidator:
                         errors.append("source landing is missing frozen Provider locator")
                     elif not frozen_locator:
                         errors.append("source mount revision 缺少 Provider locator")
-                    elif plan_locator != frozen_locator:
+                    # ``native_locator`` also stores probe evidence such as
+                    # upload/Organizer verification timestamps and display
+                    # labels.  The execution plan deliberately freezes only
+                    # the Provider locator identity consumed by the source
+                    # materializer.  Comparing the whole probe object makes a
+                    # valid mobile/Tianyi cross-provider plan impossible as
+                    # soon as those proofs are present on the mount revision.
+                    elif plan_locator != {
+                        "kind": _str(frozen_locator.get("kind")),
+                        "value": _str(frozen_locator.get("value")),
+                    }:
                         errors.append("source Provider locator does not match mount revision")
                     source_connection_id = _str(bindings.get("source_connection_id"))
                     source_connection_revision = _int_or(

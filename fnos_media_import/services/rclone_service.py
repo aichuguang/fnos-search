@@ -946,6 +946,11 @@ class RcloneService:
                 "ok": self._script_path().exists(),
                 "message": str(self._script_path()),
             },
+            {
+                "name": "rclone worker shell",
+                "ok": self.worker_command.shell_available(),
+                "message": self.worker_command.shell(),
+            },
             self.environment_checker.command_runner(
                 "rclone",
                 ["rclone", "version"],

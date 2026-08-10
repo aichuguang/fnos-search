@@ -735,6 +735,12 @@ class TianyiImporter:
                 recursive=0,
             )
             container = value.get("fileListAO") if isinstance(value.get("fileListAO"), dict) else {}
+            if not container:
+                raise TianyiApiError(
+                    "Cloud189 目录列表响应缺少 fileListAO",
+                    code="INVALID_RESPONSE",
+                    stage="provider_request",
+                )
             rows = list(container.get("fileList") or []) + list(container.get("folderList") or [])
             items.extend(self._normalize_item(item) for item in rows if isinstance(item, dict))
             if len(rows) < self.PAGE_SIZE:
@@ -1223,7 +1229,9 @@ class TianyiImporter:
                 stage="upload_request",
                 http_status=response.status_code,
             )
-        if response.status_code in {401, 403}:
+        if response.status_code == 401 or (
+            response.status_code == 403 and self._is_auth_rejection(code, message)
+        ):
             raise TianyiApiError(
                 "Cloud189 authentication expired",
                 code=code or "AUTH_EXPIRED",
@@ -1488,7 +1496,9 @@ class TianyiImporter:
                 stage="provider_request",
                 http_status=response.status_code,
             )
-        if response.status_code in {401, 403}:
+        if response.status_code == 401 or (
+            response.status_code == 403 and self._is_auth_rejection(code, provider_message)
+        ):
             raise TianyiApiError(
                 "Cloud189 authentication expired",
                 code=code or "AUTH_EXPIRED",
@@ -1594,7 +1604,9 @@ class TianyiImporter:
                     json_body=json_body,
                     retried=True,
                 )
-        if response.status_code in {401, 403}:
+        if response.status_code == 401 or (
+            response.status_code == 403 and self._is_auth_rejection(code, provider_message)
+        ):
             raise TianyiApiError(
                 "Cloud189 authentication expired",
                 code=code or "AUTH_EXPIRED",
@@ -1681,6 +1693,31 @@ class TianyiImporter:
         normalized = str(message or "").strip().lower().replace(" ", "")
         return "checkiperror" in normalized or (
             "curip=" in normalized and "cookiesip=" in normalized
+        )
+
+    @staticmethod
+    def _is_auth_rejection(code: Any, message: Any) -> bool:
+        """Return True when a 403/400 body is a session/auth rejection.
+
+        Cloud189 returns HTTP 403 for both authentication failures and
+        business rejections (e.g. ``InsufficientStorageSpace`` when the
+        account is out of quota).  Only the former must be surfaced as
+        "authentication expired"; business codes keep their real message.
+        """
+        code_text = str(code or "").strip()
+        normalized = str(message or "").strip().lower().replace(" ", "")
+        auth_codes = {
+            "invalid_session_key",
+            "invalidaccesstoken",
+            "userinvalidopentoken",
+            "accountcheckfailed",
+            "auth_expired",
+            "session_expired",
+        }
+        return (
+            code_text.lower() in auth_codes
+            or "usersessionboisnull" in normalized
+            or TianyiImporter._is_session_ip_mismatch(message)
         )
 
     def _session_key(self) -> str:
@@ -2520,23 +2557,59 @@ class TianyiImporter:
     def _message(value: Any, fallback: str) -> str:
         if not isinstance(value, dict):
             return fallback
-        return str(
-            value.get("res_message")
-            or value.get("res_msg")
-            or value.get("errorMsg")
-            or value.get("errorMessage")
-            or value.get("msg")
-            or value.get("error")
-            or value.get("error_description")
-            or value.get("message")
-            or fallback
+        return TianyiImporter._clean_cloud189_message(
+            str(
+                value.get("res_message")
+                or value.get("res_msg")
+                or value.get("errorMsg")
+                or value.get("errorMessage")
+                or value.get("msg")
+                or value.get("error")
+                or value.get("error_description")
+                or value.get("message")
+                or fallback
+            )
         )
 
     @staticmethod
+    def _clean_cloud189_message(text: str) -> str:
+        """Strip Cloud189 error-noise and map known business rejections.
+
+        The upload API returns ``msg`` values like
+        ``sessionKey=<uuid>,user free space has been used up,requestId=<uuid>``.
+        Drop the keyed noise and give the actionable cases a friendly message
+        instead of dumping the raw ``sessionKey``/``requestId`` at the user.
+        """
+        cleaned = ", ".join(
+            segment.strip()
+            for segment in str(text or "").split(",")
+            if segment.strip()
+            and segment.strip().partition("=")[0].strip().lower()
+            not in {"sessionkey", "requestid"}
+        ).strip(" ,")
+        lowered = cleaned.lower()
+        if "user free space has been used up" in lowered:
+            return "天翼云盘免费空间已用尽，请先清理空间或升级容量后再试"
+        if "invalidpartsize" in lowered or "invalid part size" in lowered:
+            return "天翼云上传分片参数无效"
+        return cleaned
+
+    @staticmethod
     def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
-        file_id = str(item.get("id") or item.get("fileId") or item.get("folderId") or "")
+        file_id = TianyiImporter._first_id(
+            item.get("id"), item.get("fileId"), item.get("folderId")
+        )
         name = str(item.get("name") or item.get("fileName") or "")
-        is_folder = TianyiImporter._as_bool(item.get("isFolder"), default=bool(item.get("folderId")))
+        is_folder_value = item.get("isFolder")
+        if is_folder_value is None:
+            # Cloud189 folder rows carry ``id``/``parentId`` and no ``fileId``;
+            # files carry ``fileId``.  Trust an explicit ``isFolder`` when
+            # present, otherwise fall back to that structural difference.
+            is_folder = bool(item.get("folderId")) or (
+                bool(item.get("parentId")) and not bool(item.get("fileId"))
+            )
+        else:
+            is_folder = TianyiImporter._as_bool(is_folder_value, default=False)
         return {
             "id": file_id,
             "file_id": file_id,
@@ -2664,6 +2737,16 @@ class TianyiImporter:
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "folder"}
+
+    @staticmethod
+    def _first_id(*values: Any) -> str:
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
 
     @staticmethod
     def _as_int(value: Any, *, default: int) -> int:

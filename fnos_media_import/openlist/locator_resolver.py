@@ -18,6 +18,7 @@ NAMESPACE_PREFIX = "openlist"
 
 MountRootResolver = Callable[[str, str], str]
 RevisionResolver = Callable[[str, int], Mapping[str, Any] | None]
+RuntimeIdentityValidator = Callable[[str, int], bool]
 
 
 def normalize_openlist_path(value: Any, *, allow_empty: bool = False) -> str:
@@ -63,6 +64,7 @@ class RcloneLocatorResolver:
         self._mount_root_resolver: MountRootResolver = lambda _cid, _mid: ""
         self._mount_revision_resolver: RevisionResolver | None = None
         self._connection_revision_resolver: RevisionResolver | None = None
+        self._connection_runtime_identity_validator: RuntimeIdentityValidator | None = None
         self.update_config(config)
 
     def update_config(self, config: Mapping[str, Any] | None = None) -> None:
@@ -98,6 +100,9 @@ class RcloneLocatorResolver:
         connection_revision_resolver = values.get("connection_revision_resolver")
         if callable(connection_revision_resolver):
             self._connection_revision_resolver = connection_revision_resolver
+        runtime_identity_validator = values.get("connection_runtime_identity_validator")
+        if callable(runtime_identity_validator):
+            self._connection_runtime_identity_validator = runtime_identity_validator
         self._validate_managed_remote()
 
     def bind_revision_services(
@@ -114,10 +119,17 @@ class RcloneLocatorResolver:
 
         mount_reader = getattr(mount_service, "get_revision", None)
         connection_reader = getattr(connection_service, "get_revision", None)
+        runtime_identity_validator = getattr(
+            connection_service,
+            "runtime_identity_matches",
+            None,
+        )
         if callable(mount_reader):
             self._mount_revision_resolver = mount_reader
         if callable(connection_reader):
             self._connection_revision_resolver = connection_reader
+        if callable(runtime_identity_validator):
+            self._connection_runtime_identity_validator = runtime_identity_validator
         return self
 
     def _validate_managed_remote(self) -> None:
@@ -290,6 +302,15 @@ class RcloneLocatorResolver:
             connection_id=parsed_connection,
             connection_revision=conn_revision,
         )
+        runtime_identity_validator = self._connection_runtime_identity_validator
+        if callable(runtime_identity_validator) and not runtime_identity_validator(
+            parsed_connection,
+            conn_revision,
+        ):
+            raise OpenListValidationError(
+                "冻结 OpenList connection 与当前托管 rclone Remote 身份不一致，"
+                "请重新创建或重新规划该入库任务"
+            )
         return self.remote_path(str(snapshot.get("webdav_root") or ""), path)
 
     @staticmethod

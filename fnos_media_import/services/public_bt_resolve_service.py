@@ -9,7 +9,8 @@ class PublicBtResolveService:
     def __init__(
         self,
         *,
-        cache: Any,
+        cache_queries: Any,
+        cache_commands: Any,
         btbtla: Callable[[], Any],
         present_item: Callable[..., dict[str, Any]],
         resource_detail: Callable[..., dict[str, Any]],
@@ -18,7 +19,8 @@ class PublicBtResolveService:
         sixpan_importer: Callable[[], Any],
         hide_full_links: Callable[[], bool],
     ) -> None:
-        self.cache = cache
+        self.cache_queries = cache_queries
+        self.cache_commands = cache_commands
         self.btbtla = btbtla
         self.present_item = present_item
         self.resource_detail = resource_detail
@@ -35,7 +37,7 @@ class PublicBtResolveService:
         resource_url: str = "",
         resource_title: str = "",
     ) -> tuple[dict[str, Any], int]:
-        cached = self.cache.get_search_cache(public_id)
+        cached = self.cache_queries.get_active(public_id)
         if not cached:
             return {"success": False, "message": "资源详情不存在或已过期，请重新搜索"}, 404
         raw = cached.get("raw_data") if isinstance(cached.get("raw_data"), dict) else {}
@@ -54,9 +56,9 @@ class PublicBtResolveService:
             return {"success": False, "message": f"磁链解析失败：{exc}"}, 502
         title = resource_title or str(cached.get("title") or raw.get("title") or "BT 入库资源")
         item = self._magnet_item(title, raw, detail_url, resource_id, resource_url, resolved)
-        if not self.cache.update_search_cache_item(public_id, item, expires_minutes=60):
+        if not self.cache_commands.update(public_id, item, expires_minutes=60):
             return {"success": False, "message": "资源缓存已过期，请重新搜索"}, 404
-        cached_after = self.cache.get_search_cache(public_id) or cached
+        cached_after = self.cache_queries.get_active(public_id) or cached
         hidden = self.hide_full_links()
         client = self.btbtla()
         return {

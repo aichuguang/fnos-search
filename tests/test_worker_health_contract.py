@@ -7,7 +7,10 @@ from unittest.mock import patch
 
 from fnos_media_import.process_role import resolve_process_role
 from fnos_media_import.services.rclone_worker_runtime import RcloneWorkerRuntime
-from fnos_media_import.services.readiness_service import ReadinessService
+from fnos_media_import.services.readiness_service import (
+    ReadinessService,
+    routes_require_openlist,
+)
 from fnos_media_import.services.security_status_service import SecurityStatusService
 from fnos_media_import.services.trending_discovery_scheduler import TrendingDiscoveryScheduler
 from fnos_media_import.services.update_scheduler import UpdateScheduler
@@ -125,12 +128,14 @@ class ReadinessServiceTests(unittest.TestCase):
         self.assertEqual(status["checks"]["root_key"]["status"], "invalid")
         self.assertNotIn("root-secret-value", str(status))
 
-    def test_missing_active_provider_account_blocks_readiness(self) -> None:
+    def test_missing_active_provider_account_is_business_unconfigured(self) -> None:
         status = self._service(active_provider_accounts_probe=lambda: 0).status()
 
-        self.assertFalse(status["ok"])
+        self.assertTrue(status["ok"])
         self.assertEqual(status["checks"]["provider_accounts"]["active_count"], 0)
         self.assertEqual(status["checks"]["provider_accounts"]["status"], "unconfigured")
+        self.assertFalse(status["checks"]["provider_accounts"]["required"])
+        self.assertFalse(status["checks"]["provider_accounts"]["configured"])
 
     def test_openlist_is_not_checked_when_organizer_and_cross_disk_are_disabled(self) -> None:
         calls: list[str] = []
@@ -159,6 +164,48 @@ class ReadinessServiceTests(unittest.TestCase):
         self.assertFalse(status["checks"]["storage_targets"]["configured"])
         self.assertFalse(status["checks"]["storage_targets"]["required"])
         self.assertEqual(status["checks"]["storage_targets"]["status"], "unconfigured")
+
+    def test_cross_provider_share_routes_require_openlist(self) -> None:
+        sources = {
+            "mobile": {"provider_kind": "mobile", "source_form": "share"},
+            "sixpan_magnet": {
+                "provider_kind": "sixpan",
+                "source_form": "magnet",
+            },
+        }
+        targets = {
+            "mobile": SimpleNamespace(provider_kind="mobile", enabled=True),
+            "quark": SimpleNamespace(provider_kind="quark", enabled=True),
+            "sixpan": SimpleNamespace(provider_kind="sixpan", enabled=True),
+        }
+
+        self.assertFalse(
+            routes_require_openlist(
+                [{"search_source_id": "mobile", "destination_id": "mobile", "enabled": True}],
+                sources,
+                targets.get,
+            )
+        )
+        self.assertTrue(
+            routes_require_openlist(
+                [{"search_source_id": "mobile", "destination_id": "quark", "enabled": True}],
+                sources,
+                targets.get,
+            )
+        )
+        self.assertFalse(
+            routes_require_openlist(
+                [
+                    {
+                        "search_source_id": "sixpan_magnet",
+                        "destination_id": "sixpan",
+                        "enabled": True,
+                    }
+                ],
+                sources,
+                targets.get,
+            )
+        )
 
 
 class SecurityStatusTests(unittest.TestCase):

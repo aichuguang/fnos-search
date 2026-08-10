@@ -84,6 +84,9 @@ class StorageSetupService:
         target_service: Any,
         assignment_service: Any,
         connection_factory: Any,
+        rclone_webdav_sync: Any = None,
+        rclone_webdav_test: Any = None,
+        organizer_enabled: Any = None,
     ) -> None:
         self.accounts = accounts_service
         self.connections = connection_service
@@ -91,6 +94,9 @@ class StorageSetupService:
         self.targets = target_service
         self.assignments = assignment_service
         self.connection_factory = connection_factory
+        self.rclone_webdav_sync = rclone_webdav_sync
+        self.rclone_webdav_test = rclone_webdav_test
+        self.organizer_enabled = organizer_enabled
         self.provider_uploader_resolver: Any = None
         self.provider_folder_resolver: Any = None
 
@@ -103,6 +109,160 @@ class StorageSetupService:
         """Inject an account-revision-scoped native folder browser."""
 
         self.provider_folder_resolver = resolver
+
+    @staticmethod
+    def _safe_rclone_message(exc: BaseException, secrets_to_redact: tuple[str, ...]) -> str:
+        payload = getattr(exc, "payload", None)
+        message = ""
+        if isinstance(payload, dict):
+            message = _text(payload.get("message"))
+        if not message:
+            message = _text(exc)
+        for secret in secrets_to_redact:
+            if secret:
+                message = message.replace(secret, "***")
+        return message[:500]
+
+    def _sync_rclone_webdav(self, connection_id: str) -> dict[str, Any]:
+        """Persist and probe the worker-local managed WebDAV remote.
+
+        OpenList credentials stay server-side: the browser saves them once in
+        the encrypted connection revision, then this bridge resolves that
+        revision and forwards it directly to the isolated rclone worker.
+        """
+
+        if not callable(self.rclone_webdav_sync):
+            raise StorageSetupError(
+                "rclone WebDAV 配置服务尚未装配",
+                code="RCLONE_WEBDAV_SYNC_UNAVAILABLE",
+                status=503,
+                retryable=True,
+            )
+        connection = self.connections.get_connection(connection_id)
+        if connection is None:
+            raise StorageSetupError(
+                "OpenList 连接不存在，无法同步 rclone",
+                code="OPENLIST_NOT_FOUND",
+                status=404,
+            )
+        credentials = self.connections.resolve_credentials(
+            connection_id,
+            int(connection.get("revision") or 1),
+        )
+        password = str(credentials.get("password") or "")
+        payload = {
+            "url": credentials.get("base_url"),
+            "username": credentials.get("username"),
+            "password": password,
+        }
+        try:
+            result = self.rclone_webdav_sync(payload)
+        except StorageSetupError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalize worker/control-plane errors
+            status = int(
+                getattr(exc, "status_code", None)
+                or getattr(exc, "status", None)
+                or 503
+            )
+            message = self._safe_rclone_message(
+                exc,
+                (
+                    password,
+                    str(credentials.get("username") or ""),
+                ),
+            )
+            raise StorageSetupError(
+                f"rclone WebDAV 同步或连接检测失败：{message or 'Worker 不可用'}",
+                code="RCLONE_WEBDAV_SYNC_FAILED",
+                status=status,
+                retryable=status >= 500,
+            ) from exc
+        if not isinstance(result, dict) or not bool(result.get("success", True)):
+            message = _text((result or {}).get("message")) if isinstance(result, dict) else ""
+            raise StorageSetupError(
+                f"rclone WebDAV 同步或连接检测失败：{message or '返回结果无效'}",
+                code="RCLONE_WEBDAV_SYNC_FAILED",
+                status=503,
+                retryable=True,
+            )
+        expected_url = _text(credentials.get("base_url")).rstrip("/")
+        actual_url = _text(result.get("url")).rstrip("/")
+        expected_user = _text(credentials.get("username"))
+        actual_user = _text(result.get("user"))
+        if (actual_url and actual_url != expected_url) or (
+            actual_user and actual_user != expected_user
+        ):
+            raise StorageSetupError(
+                "rclone WebDAV 已连接，但 Remote 与当前 OpenList 配置不一致",
+                code="RCLONE_WEBDAV_SYNC_MISMATCH",
+                status=409,
+                retryable=False,
+            )
+        return {
+            key: result.get(key)
+            for key in (
+                "remote_name",
+                "configured",
+                "type",
+                "url",
+                "user",
+                "password_set",
+                "connection_status",
+                "message",
+            )
+            if key in result
+        }
+
+    def _probe_rclone_webdav(self, connection_id: str) -> dict[str, Any]:
+        if not callable(self.rclone_webdav_test):
+            raise StorageSetupError(
+                "rclone WebDAV 检测服务尚未装配",
+                code="RCLONE_WEBDAV_PROBE_UNAVAILABLE",
+                status=503,
+                retryable=True,
+            )
+        connection = self.connections.get_connection(connection_id)
+        if connection is None:
+            raise StorageSetupError(
+                "OpenList 连接不存在，无法检测 rclone",
+                code="OPENLIST_NOT_FOUND",
+                status=404,
+            )
+        try:
+            result = self.rclone_webdav_test()
+        except StorageSetupError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalize worker/control-plane errors
+            status = int(
+                getattr(exc, "status_code", None)
+                or getattr(exc, "status", None)
+                or 503
+            )
+            raise StorageSetupError(
+                f"rclone WebDAV 连接检测失败：{self._safe_rclone_message(exc, ()) or 'Worker 不可用'}",
+                code="RCLONE_WEBDAV_PROBE_FAILED",
+                status=status,
+                retryable=status >= 500,
+            ) from exc
+        if not isinstance(result, dict) or not bool(result.get("success", True)):
+            raise StorageSetupError(
+                f"rclone WebDAV 连接检测失败：{_text((result or {}).get('message')) or '返回结果无效'}",
+                code="RCLONE_WEBDAV_PROBE_FAILED",
+                status=503,
+                retryable=True,
+            )
+        expected_url = _text(connection.get("base_url")).rstrip("/")
+        actual_url = _text(result.get("url")).rstrip("/")
+        expected_user = _text(connection.get("username"))
+        actual_user = _text(result.get("user"))
+        if actual_url != expected_url or actual_user != expected_user:
+            raise StorageSetupError(
+                "rclone Remote 与当前 OpenList 连接不一致，请重新保存 OpenList",
+                code="RCLONE_WEBDAV_SYNC_MISMATCH",
+                status=409,
+            )
+        return result
 
     def _provider_catalog_item(self, provider_kind: str) -> dict[str, Any]:
         normalized = _text(provider_kind).lower()
@@ -466,6 +626,36 @@ class StorageSetupService:
             or not result.get("upload_verified")
             or not result.get("organizer_mutation_verified")
         ):
+            probe_code = str(result.get("code") or "").strip()
+            probe_message = str(result.get("message") or "").strip()
+            auth_failed = probe_code in {
+                "AUTH_EXPIRED",
+                "InvalidSessionKey",
+                "InvalidAccessToken",
+                "SESSION_IP_MISMATCH",
+                "SESSION_CREDENTIALS_MISSING",
+                "UserInvalidOpenToken",
+            } or "认证已失效" in probe_message or "authentication expired" in probe_message.lower()
+            quota_failed = probe_code in {
+                "InsufficientStorageSpace",
+                "INSUFFICIENTSTORAGESPACE",
+            } or "空间已用尽" in probe_message or "free space has been used up" in probe_message.lower()
+            if auth_failed:
+                raise StorageSetupError(
+                    "云盘认证已失效，请先重新登录账号后重试",
+                    code="PROVIDER_AUTH_EXPIRED",
+                    status=401,
+                    retryable=False,
+                    field_errors={"native_root": "云盘认证已失效，请先重新登录账号"},
+                )
+            if quota_failed:
+                raise StorageSetupError(
+                    probe_message or "云盘存储空间不足",
+                    code="PROVIDER_STORAGE_INSUFFICIENT",
+                    status=409,
+                    retryable=False,
+                    field_errors={"native_root": "云盘存储空间不足，请清理空间后重试"},
+                )
             raise StorageSetupError(
                 _text(result.get("message")) or "Provider 原生上传与整理链路检测未通过",
                 code=_text(result.get("code")) or "PROVIDER_UPLOAD_PROBE_FAILED",
@@ -531,10 +721,28 @@ class StorageSetupService:
             try:
                 if not visible(source, True):
                     raise RuntimeError("OpenList did not expose the native probe file")
-                if int(client.file_size(source) or 0) != expected_size:
-                    raise RuntimeError("OpenList probe file size does not match")
-                if content and bytes(client.read_bytes(source)) != content:
-                    raise RuntimeError("OpenList probe file content does not match")
+
+                def read_verified() -> bytes:
+                    last: BaseException | None = None
+                    for attempt in range(12):
+                        try:
+                            if int(client.file_size(source) or 0) != expected_size:
+                                raise RuntimeError("OpenList probe file size does not match")
+                            if content:
+                                data = bytes(client.read_bytes(source))
+                                if data != content:
+                                    raise RuntimeError(
+                                        "OpenList probe file content does not match"
+                                    )
+                                return data
+                            return b""
+                        except Exception as exc:  # noqa: BLE001 - retry eventual GET readiness
+                            last = exc
+                            if attempt < 11:
+                                time.sleep(0.5)
+                    raise RuntimeError(f"OpenList probe file read failed: {last}") from last
+
+                read_verified()
                 client.move(source, moved)
                 if not visible(moved, True) or not visible(source, False):
                     raise RuntimeError("OpenList MOVE result could not be verified")
@@ -805,14 +1013,23 @@ class StorageSetupService:
 
     def save_openlist(self, payload: dict[str, Any]) -> dict[str, Any]:
         connection_id = _text(payload.get("connection_id"))
+        existing_connections = self.connections.list_connections()
         if not connection_id:
-            # IDs are server-owned.  Never silently edit the first connection
-            # when an administrator intends to add another OpenList endpoint.
-            existing = self.connections.list_connections()
-            connection_id = (
-                "openlist_main"
-                if not existing
-                else _generated_id("openlist", payload.get("name") or "connection")
+            if existing_connections:
+                raise StorageSetupError(
+                    "当前入库链路只支持一个 OpenList WebDAV 连接，请编辑现有连接",
+                    code="OPENLIST_CONNECTION_LIMIT",
+                    status=409,
+                )
+            connection_id = "openlist_main"
+        elif not any(
+            _text(item.get("connection_id")) == connection_id
+            for item in existing_connections
+        ) and existing_connections:
+            raise StorageSetupError(
+                "当前入库链路只支持一个 OpenList WebDAV 连接，请编辑现有连接",
+                code="OPENLIST_CONNECTION_LIMIT",
+                status=409,
             )
         body = {
             "connection_id": connection_id,
@@ -826,14 +1043,23 @@ class StorageSetupService:
             )
         if "password" in payload:
             body["password"] = payload.get("password")
+        if "enabled" in payload:
+            body["enabled"] = payload.get("enabled")
         previous = self.connections.get_connection(connection_id)
         previous_credentials: dict[str, Any] | None = None
+        previous_mounts: list[dict[str, Any]] = []
         if previous is not None:
             previous_credentials = self.connections.resolve_credentials(
                 connection_id, int(previous.get("revision") or 1)
             )
+            previous_mounts = [
+                dict(mount)
+                for mount in self.mounts.list_mounts()
+                if _text(mount.get("connection_id")) == connection_id
+            ]
         created = previous is None
         item: dict[str, Any] | None = None
+        rclone_state: dict[str, Any] = {}
         try:
             if previous is not None:
                 body.pop("connection_id", None)
@@ -851,6 +1077,7 @@ class StorageSetupService:
                     status=503,
                     retryable=True,
                 )
+            rclone_state = self._sync_rclone_webdav(connection_id)
         except Exception:
             try:
                 if created:
@@ -860,7 +1087,7 @@ class StorageSetupService:
                     current = self.connections.get_connection(connection_id)
                     if current is None:
                         raise StorageSetupError("OpenList 连接在补偿期间消失")
-                    self.connections.update_connection(
+                    restored = self.connections.update_connection(
                         connection_id,
                         {
                             "name": previous.get("name"),
@@ -871,6 +1098,30 @@ class StorageSetupService:
                             "expected_revision": int((item or {}).get("revision") or 0),
                         },
                     )
+                    restored_revision = int((restored or {}).get("revision") or 0)
+                    for snapshot in previous_mounts:
+                        mount_id = _text(snapshot.get("mount_id"))
+                        current_mount = self.mounts.get_mount(mount_id)
+                        expected_mount_revision = int(snapshot.get("revision") or 0) + 2
+                        if (
+                            current_mount is None
+                            or int(current_mount.get("revision") or 0)
+                            != expected_mount_revision
+                        ):
+                            raise StorageSetupError(
+                                "OpenList 回滚期间检测到挂载已被并发修改",
+                                code="OPENLIST_COMPENSATION_CONFLICT",
+                                status=409,
+                            )
+                        restored_snapshot = {
+                            **snapshot,
+                            "connection_revision": restored_revision,
+                        }
+                        self.mounts.restore_mount_snapshot(
+                            mount_id,
+                            restored_snapshot,
+                            expected_revision=expected_mount_revision,
+                        )
             except Exception as compensation_error:
                 logger.exception(
                     "event=openlist_save_compensation_failed connection_id=%s created=%s",
@@ -887,7 +1138,12 @@ class StorageSetupService:
         item = self.connections.get_connection(connection_id)
         if item is None:  # pragma: no cover - guarded by successful test above
             raise StorageSetupError("OpenList 保存后无法读取")
-        return {"success": True, "item": item, "message": "OpenList 已保存并连接成功"}
+        return {
+            "success": True,
+            "item": item,
+            "rclone": rclone_state,
+            "message": "OpenList 已保存，WebDAV 与 rclone 连接检测成功",
+        }
 
     def delete_openlist(self, connection_id: str) -> dict[str, Any]:
         connection_id = _text(connection_id)
@@ -1006,6 +1262,20 @@ class StorageSetupService:
                     code="OPENLIST_NOT_FOUND",
                     status=404,
                     field_errors={"connection_id": "连接不存在"},
+                )
+            other_connection_ids = {
+                _text(item.get("connection_id"))
+                for item in self.mounts.list_mounts()
+                if _text(item.get("connection_id"))
+                and _text(item.get("connection_id")) != connection_id
+                and bool(item.get("enabled", True))
+            }
+            if other_connection_ids:
+                raise StorageSetupError(
+                    "同一入库运行时不能混用多个 OpenList 连接，请统一到现有连接",
+                    code="MULTIPLE_OPENLIST_CONNECTIONS_UNSUPPORTED",
+                    status=409,
+                    field_errors={"connection_id": "必须与现有保存位置使用同一连接"},
                 )
             if not webdav_root and existing:
                 old_mount_id = self._target_mount_id(existing)
@@ -1615,6 +1885,55 @@ class StorageSetupService:
         target_account_ids: set[str] = set()
         mount_ids: set[str] = set()
         tested_account_ids: set[str] = set()
+        dependency_checks: list[dict[str, Any]] = []
+        source_mount_keys: set[tuple[str, str]] = set()
+        rclone_required = False
+        organizer_required = bool(
+            self.organizer_enabled()
+            if callable(self.organizer_enabled)
+            else False
+        )
+
+        def add_source_mount(provider_kind: str, account_id: str) -> None:
+            key = (provider_kind, account_id)
+            if key in source_mount_keys:
+                return
+            source_mount_keys.add(key)
+            try:
+                mount = self.mounts.find_mount_for_account(
+                    provider_kind,
+                    account_id,
+                    readable=False,
+                )
+            except Exception as exc:
+                dependency_checks.append({
+                    "name": f"来源目录 {provider_kind}",
+                    "ok": False,
+                    "message": str(exc),
+                })
+                return
+            if mount is not None:
+                mount_ids.add(str(mount.get("mount_id") or ""))
+                return
+            candidates = [
+                item
+                for item in self.mounts.list_mounts()
+                if _text(item.get("provider_kind")) == provider_kind
+                and _text(item.get("account_id")) == account_id
+                and bool(item.get("enabled", True))
+            ]
+            if len(candidates) == 1:
+                mount_ids.add(_text(candidates[0].get("mount_id")))
+                return
+            dependency_checks.append({
+                "name": f"来源目录 {provider_kind}",
+                "ok": False,
+                "message": (
+                    "跨盘来源缺少可用的唯一 OpenList landing mount"
+                    if not candidates
+                    else "跨盘来源存在多个 OpenList landing mount，请只保留一个"
+                ),
+            })
 
         # Derive dependencies from the active routing matrix.  Unused broken
         # accounts/connections must not block a preflight for configured routes.
@@ -1637,13 +1956,42 @@ class StorageSetupService:
                     binding = None
                 if binding and getattr(binding, "account_id", None):
                     target_account_ids.add(str(binding.account_id))
-                for category in target.categories.values():
+                category_key = _text(cell.get("category_key"))
+                category = target.category(category_key) if category_key else None
+                if category is not None:
                     locator = category.rclone_locator
                     if getattr(locator, "mount_id", None):
                         mount_ids.add(str(locator.mount_id))
-                    organizer = category.organizer_locator
-                    if getattr(organizer, "mount_id", None):
-                        mount_ids.add(str(organizer.mount_id))
+                    organizer_locator = category.organizer_locator
+                    if getattr(organizer_locator, "mount_id", None):
+                        mount_ids.add(str(organizer_locator.mount_id))
+                source_provider = _text(source.get("provider_kind"))
+                source_form = _text(source.get("source_form") or "share").lower()
+                target_provider = _text(target.provider_kind)
+                cross_provider = bool(
+                    source_form != "magnet"
+                    and source_provider
+                    and target_provider
+                    and source_provider != target_provider
+                )
+                if cross_provider:
+                    rclone_required = True
+                    selection = selections.get(f"{source_provider}:default")
+                    if selection and selection.get("account_id"):
+                        add_source_mount(
+                            source_provider,
+                            _text(selection.get("account_id")),
+                        )
+                    if category is not None:
+                        destination_locator = category.rclone_locator
+                        if not isinstance(destination_locator, RcloneLocator):
+                            destination_locator = category.organizer_locator
+                        if getattr(destination_locator, "mount_id", None):
+                            mount_ids.add(str(destination_locator.mount_id))
+                if organizer_required and category is not None:
+                    organizer_locator = category.organizer_locator
+                    if getattr(organizer_locator, "mount_id", None):
+                        mount_ids.add(str(organizer_locator.mount_id))
 
         for source_kind in sorted(kind for kind in source_provider_kinds if kind):
             selection = selections.get(f"{source_kind}:default")
@@ -1685,11 +2033,14 @@ class StorageSetupService:
             except Exception as exc:
                 checks.append({"name": f"目标账号 {account.name}", "ok": False, "message": str(exc)})
 
+        checks.extend(dependency_checks)
+
         connections = {item["connection_id"]: item for item in self.connections.list_connections()}
-        for connection_id in sorted({
+        required_connection_ids = {
             str((self.mounts.get_mount(mid) or {}).get("connection_id") or "")
             for mid in mount_ids
-        } - {""}):
+        } - {""}
+        for connection_id in sorted(required_connection_ids):
             connection = connections.get(connection_id)
             if connection is None:
                 checks.append({"name": f"OpenList {connection_id}", "ok": False, "message": "连接不存在"})
@@ -1703,6 +2054,33 @@ class StorageSetupService:
                 checks.append({"name": f"OpenList {connection['name']}", "ok": bool(result.get("ok")), "message": result.get("message")})
             except Exception as exc:
                 checks.append({"name": f"OpenList {connection['name']}", "ok": False, "message": str(exc)})
+
+        if rclone_required:
+            if len(required_connection_ids) != 1:
+                checks.append({
+                    "name": "rclone OpenList Remote",
+                    "ok": False,
+                    "message": (
+                        "跨盘路由缺少可解析的 OpenList 连接"
+                        if not required_connection_ids
+                        else "当前运行时只支持一个 OpenList WebDAV 连接，路由中检测到多个连接"
+                    ),
+                })
+            else:
+                connection_id = next(iter(required_connection_ids))
+                try:
+                    result = self._probe_rclone_webdav(connection_id)
+                    checks.append({
+                        "name": "rclone OpenList Remote",
+                        "ok": True,
+                        "message": _text(result.get("message")) or "rclone WebDAV 连接成功",
+                    })
+                except Exception as exc:
+                    checks.append({
+                        "name": "rclone OpenList Remote",
+                        "ok": False,
+                        "message": str(exc),
+                    })
 
         for mount_id in sorted(mount_ids):
             mount = self.mounts.get_mount(mount_id)

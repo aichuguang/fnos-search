@@ -78,18 +78,20 @@ class FakeProviderUploader(RepositoryFakeMixin):
         provider_kind: str,
         display_name: str,
         webdav_root: str,
+        root_folder_id: str = "-11",
     ) -> None:
         self.webdav = webdav
         self.provider_kind = provider_kind
         self.display_name = display_name
         self.webdav_root = webdav_root
+        self.root_folder_id = str(root_folder_id or "-11")
         self.upload_ok = True
         self.organizer_ok = True
         self.probe_calls: list[dict[str, Any]] = []
         self.folder_calls: list[str] = []
         self.folders = {
-            "-11": [
-                {"folder_id": "root-folder-id", "name": "\u5a92\u4f53\u5e93", "parent_folder_id": "-11"},
+            self.root_folder_id: [
+                {"folder_id": "root-folder-id", "name": "\u5a92\u4f53\u5e93", "parent_folder_id": self.root_folder_id},
             ],
             "root-folder-id": [
                 {"folder_id": "movie-folder-id", "name": "\u7535\u5f71", "parent_folder_id": "root-folder-id"},
@@ -97,7 +99,7 @@ class FakeProviderUploader(RepositoryFakeMixin):
         }
 
     def list_folders(self, parent_folder_id: str = "-11") -> list[dict[str, Any]]:
-        parent = str(parent_folder_id or "-11")
+        parent = str(parent_folder_id or self.root_folder_id)
         self.folder_calls.append(parent)
         return [dict(item) for item in self.folders.get(parent, [])]
 
@@ -167,6 +169,9 @@ class StorageSetupV1Tests(unittest.TestCase):
         )
         self.targets = StorageTargetService(self.db)
         self.assignments = SourceAssignmentService(self.db, self.targets)
+        self.rclone_sync_calls: list[dict[str, Any]] = []
+        self.rclone_state: dict[str, Any] = {}
+        self.rclone_sync_error: Exception | None = None
         self.service = StorageSetupService(
             accounts_service=self.accounts,
             connection_service=self.connections,
@@ -174,12 +179,23 @@ class StorageSetupV1Tests(unittest.TestCase):
             target_service=self.targets,
             assignment_service=self.assignments,
             connection_factory=self.db.connect,
+            rclone_webdav_sync=self._sync_rclone_webdav,
+            rclone_webdav_test=self._test_rclone_webdav,
+            organizer_enabled=lambda: False,
         )
         self.mobile_uploader = FakeProviderUploader(
             self.webdav,
             provider_kind="mobile",
             display_name="\u79fb\u52a8\u4e91\u76d8",
             webdav_root="/\u79fb\u52a8",
+            root_folder_id="/",
+        )
+        self.quark_uploader = FakeProviderUploader(
+            self.webdav,
+            provider_kind="quark",
+            display_name="\u5938\u514b\u7f51\u76d8",
+            webdav_root="/\u5938\u514b",
+            root_folder_id="0",
         )
         self.tianyi_uploader = FakeProviderUploader(
             self.webdav,
@@ -191,6 +207,7 @@ class StorageSetupV1Tests(unittest.TestCase):
             lambda provider_kind, _account_id, _revision: (
                 {
                     "mobile": self.mobile_uploader,
+                    "quark": self.quark_uploader,
                     "tianyi": self.tianyi_uploader,
                 }.get(provider_kind)
             )
@@ -199,6 +216,7 @@ class StorageSetupV1Tests(unittest.TestCase):
             lambda provider_kind, _account_id, _revision: (
                 {
                     "mobile": self.mobile_uploader,
+                    "quark": self.quark_uploader,
                     "tianyi": self.tianyi_uploader,
                 }.get(provider_kind)
             )
@@ -206,6 +224,30 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.mounts.set_relay_upload_capability_resolver(
             lambda provider_kind: provider_kind in {"mobile", "tianyi"}
         )
+
+    def _sync_rclone_webdav(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.rclone_sync_calls.append(dict(payload))
+        if self.rclone_sync_error is not None:
+            raise self.rclone_sync_error
+        self.rclone_state = {
+            "success": True,
+            "configured": True,
+            "remote_name": "MP",
+            "type": "webdav",
+            "url": str(payload.get("url") or "").rstrip("/"),
+            "user": str(payload.get("username") or ""),
+            "password_set": bool(payload.get("password")),
+            "connection_status": "success",
+            "message": "rclone WebDAV connection passed",
+        }
+        return dict(self.rclone_state)
+
+    def _test_rclone_webdav(self) -> dict[str, Any]:
+        if self.rclone_sync_error is not None:
+            raise self.rclone_sync_error
+        if not self.rclone_state:
+            raise RuntimeError("rclone remote is unconfigured")
+        return dict(self.rclone_state)
 
     def _cleanup_database(self) -> None:
         try:
@@ -282,8 +324,8 @@ class StorageSetupV1Tests(unittest.TestCase):
     def test_complete_setup_creates_mount_target_binding_and_routes(self) -> None:
         quark = self._account("quark", "夸克主账号")
         sixpan = self._account("sixpan", "六盘主账号")
-        self._account("mobile", "移动云主账号")
-        self._account("tianyi", "天翼云主账号")
+        mobile = self._account("mobile", "移动云主账号")
+        tianyi = self._account("tianyi", "天翼云主账号")
         self.service.save_openlist(
             {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
         )
@@ -309,6 +351,30 @@ class StorageSetupV1Tests(unittest.TestCase):
                 "confirm_identity": True,
             }
         )
+        self.service.save_location(
+            {
+                "name": "移动云主盘",
+                "kind": "provider",
+                "account_id": mobile,
+                "connection_id": "openlist_main",
+                "webdav_root": "/移动",
+                "native_root": "root-folder-id",
+                "native_root_name": "/媒体库",
+                "confirm_identity": True,
+            }
+        )
+        self.service.save_location(
+            {
+                "name": "天翼云主盘",
+                "kind": "provider",
+                "account_id": tianyi,
+                "connection_id": "openlist_main",
+                "webdav_root": "/天翼",
+                "native_root": "root-folder-id",
+                "native_root_name": "/媒体库",
+                "confirm_identity": True,
+            }
+        )
         routes = [
             {"search_source_id": source, "default_destination_id": quark_location["destination_id"]}
             for source in ("mobile", "quark", "tianyi")
@@ -319,7 +385,7 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.service.save_routes({"routes": routes})
 
         snapshot = self.service.snapshot()
-        self.assertEqual(len(snapshot["locations"]), 2)
+        self.assertEqual(len(snapshot["locations"]), 4)
         self.assertTrue(all(location["ready"] for location in snapshot["locations"]))
         self.assertTrue(snapshot["progress"]["ready"])
         self.assertTrue(
@@ -351,14 +417,15 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(target.categories["movie"].native_locator.value, "媒体库/电影")
         self.assertEqual(target.categories["tv"].rclone_locator.relative_path, "电视剧")
 
-        extra = self.service.save_openlist(
+        extra = self.connections.create_connection(
             {
+                "connection_id": "unused_backup",
                 "name": "未使用的备用连接",
                 "base_url": "http://unused-openlist:5244/dav",
                 "username": "admin",
                 "password": "password",
             }
-        )["item"]
+        )
         self.connections.probe_runner = lambda context: {
             "ok": context["connection_id"] != extra["connection_id"],
             "message": "连接成功" if context["connection_id"] != extra["connection_id"] else "连接失败",
@@ -508,6 +575,68 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(self.mounts.list_mounts(), [])
         self.assertEqual(self.targets.list_targets(), [])
 
+    def test_tianyi_probe_auth_failure_is_reported_as_re_login(self) -> None:
+        account_id = self._account("tianyi", "天翼云主账号")
+        self.webdav.dirs.add("/天翼")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        self.tianyi_uploader.probe_target = lambda **_kwargs: {
+            "ok": False,
+            "upload_verified": False,
+            "organizer_mutation_verified": False,
+            "code": "AUTH_EXPIRED",
+            "message": "Cloud189 authentication expired",
+        }
+
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_location(
+                {
+                    "name": "天翼云主盘",
+                    "kind": "provider",
+                    "account_id": account_id,
+                    "connection_id": "openlist_main",
+                    "webdav_root": "/天翼",
+                    "native_root": "root-folder-id",
+                    "confirm_identity": True,
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "PROVIDER_AUTH_EXPIRED")
+        self.assertEqual(raised.exception.status, 401)
+        self.assertIn("重新登录", str(raised.exception))
+
+    def test_tianyi_probe_quota_failure_is_reported_as_storage_full(self) -> None:
+        account_id = self._account("tianyi", "天翼云主账号")
+        self.webdav.dirs.add("/天翼")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        self.tianyi_uploader.probe_target = lambda **_kwargs: {
+            "ok": False,
+            "upload_verified": False,
+            "organizer_mutation_verified": False,
+            "code": "InsufficientStorageSpace",
+            "message": "天翼云盘免费空间已用尽，请先清理空间或升级容量后再试",
+        }
+
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_location(
+                {
+                    "name": "天翼云主盘",
+                    "kind": "provider",
+                    "account_id": account_id,
+                    "connection_id": "openlist_main",
+                    "webdav_root": "/天翼",
+                    "native_root": "root-folder-id",
+                    "confirm_identity": True,
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "PROVIDER_STORAGE_INSUFFICIENT")
+        self.assertEqual(raised.exception.status, 409)
+        self.assertIn("空间", str(raised.exception))
+
     def test_tianyi_put_405_creates_provider_relay_location(self) -> None:
         account_id = self._account("tianyi", "\u5929\u7ffc\u4e91\u4e3b\u8d26\u53f7")
         self.webdav.dirs.add("/\u5929\u7ffc")
@@ -646,6 +775,42 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(self.mounts.list_mounts(), [])
         self.assertEqual(self.targets.list_targets(), [])
 
+    def test_mobile_organizer_probe_retries_transient_read_failure(self) -> None:
+        account_id = self._account("mobile", "移动云主账号")
+        self.webdav.dirs.add("/移动")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        original_read = self.webdav.read_bytes
+        attempts = {"n": 0}
+
+        def flaky_read(path: str) -> bytes:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("读取文件失败：HTTP 400")
+            return original_read(path)
+
+        self.webdav.read_bytes = flaky_read  # type: ignore[method-assign]
+
+        result = self.service.save_location(
+            {
+                "name": "移动云主盘",
+                "kind": "provider",
+                "account_id": account_id,
+                "connection_id": "openlist_main",
+                "webdav_root": "/移动",
+                "native_root": "root-folder-id",
+                "confirm_identity": True,
+            }
+        )
+
+        self.assertGreaterEqual(attempts["n"], 2)
+        target = self.targets.get_target(result["destination_id"])
+        mount_id = self.service._target_mount_id(target)
+        mount = self.mounts.get_mount(mount_id)
+        self.assertTrue(mount["native_locator"]["upload_verified"])
+        self.assertTrue(mount["native_locator"]["organizer_mutation_verified"])
+
     def test_identity_confirmation_is_checked_before_native_probe(self) -> None:
         account_id = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
         self.webdav.dirs.add("/\u79fb\u52a8")
@@ -723,6 +888,44 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(response.get_json()["items"][0]["folder_id"], "movie-folder-id")
         self.assertEqual(self.tianyi_uploader.folder_calls, ["-11", "root-folder-id"])
 
+    def test_quark_native_folder_browser_service_and_api(self) -> None:
+        account_id = self._account("quark", "夸克主账号")
+        root = self.service.list_account_folders(account_id, "0")
+        self.assertEqual(root["parent_id"], "0")
+        self.assertEqual(root["items"][0]["folder_id"], "root-folder-id")
+
+        app = Flask(__name__ + "_quark_folders")
+        app.register_blueprint(
+            create_storage_setup_blueprint(
+                StorageSetupBlueprintContext(admin_required=lambda view: view, service=self.service)
+            )
+        )
+        response = app.test_client().get(
+            f"/api/admin/storage-setup/accounts/{account_id}/folders?parent_id=root-folder-id"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["items"][0]["folder_id"], "movie-folder-id")
+        self.assertEqual(self.quark_uploader.folder_calls, ["0", "root-folder-id"])
+
+    def test_mobile_native_folder_browser_service_and_api(self) -> None:
+        account_id = self._account("mobile", "移动云主账号")
+        root = self.service.list_account_folders(account_id, "/")
+        self.assertEqual(root["parent_id"], "/")
+        self.assertEqual(root["items"][0]["folder_id"], "root-folder-id")
+
+        app = Flask(__name__ + "_mobile_folders")
+        app.register_blueprint(
+            create_storage_setup_blueprint(
+                StorageSetupBlueprintContext(admin_required=lambda view: view, service=self.service)
+            )
+        )
+        response = app.test_client().get(
+            f"/api/admin/storage-setup/accounts/{account_id}/folders?parent_id=root-folder-id"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["items"][0]["folder_id"], "movie-folder-id")
+        self.assertEqual(self.mobile_uploader.folder_calls, ["/", "root-folder-id"])
+
     def test_non_relay_provider_put_405_still_fails_closed(self) -> None:
         quark = self._account("quark", "\u5938\u514b\u4e3b\u8d26\u53f7")
         self.service.save_openlist(
@@ -750,7 +953,7 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(self.mounts.list_mounts(), [])
         self.assertEqual(self.targets.list_targets(), [])
 
-    def test_multiple_openlist_connections_do_not_overwrite_the_first(self) -> None:
+    def test_storage_setup_rejects_a_second_managed_openlist_connection(self) -> None:
         first = self.service.save_openlist(
             {
                 "name": "主 OpenList",
@@ -759,20 +962,134 @@ class StorageSetupV1Tests(unittest.TestCase):
                 "password": "password-a",
             }
         )["item"]
-        second = self.service.save_openlist(
-            {
-                "name": "备用 OpenList",
-                "base_url": "http://openlist-b:5244/dav",
-                "username": "admin-b",
-                "password": "password-b",
-            }
-        )["item"]
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_openlist(
+                {
+                    "name": "备用 OpenList",
+                    "base_url": "http://openlist-b:5244/dav",
+                    "username": "admin-b",
+                    "password": "password-b",
+                }
+            )
 
         self.assertEqual(first["connection_id"], "openlist_main")
-        self.assertNotEqual(second["connection_id"], first["connection_id"])
+        self.assertEqual(raised.exception.code, "OPENLIST_CONNECTION_LIMIT")
+        self.assertEqual(len(self.connections.list_connections()), 1)
         self.assertEqual(
             self.connections.get_connection(first["connection_id"])["base_url"],
             "http://openlist-a:5244/dav",
+        )
+
+        with self.assertRaises(StorageSetupError) as explicit_id:
+            self.service.save_openlist(
+                {
+                    "connection_id": "openlist_backup",
+                    "name": "显式备用 OpenList",
+                    "base_url": "http://openlist-c:5244/dav",
+                    "username": "admin-c",
+                    "password": "password-c",
+                }
+            )
+        self.assertEqual(explicit_id.exception.code, "OPENLIST_CONNECTION_LIMIT")
+        self.assertEqual(len(self.connections.list_connections()), 1)
+
+    def test_openlist_save_syncs_rclone_without_returning_password(self) -> None:
+        result = self.service.save_openlist(
+            {
+                "name": "主 OpenList",
+                "base_url": "http://openlist:5244/dav/",
+                "username": "admin",
+                "password": "server-only-secret",
+            }
+        )
+
+        self.assertEqual(len(self.rclone_sync_calls), 1)
+        self.assertEqual(self.rclone_sync_calls[0]["password"], "server-only-secret")
+        self.assertEqual(result["rclone"]["connection_status"], "success")
+        self.assertNotIn("server-only-secret", str(result))
+        self.assertNotIn("password", result["rclone"])
+
+    def test_openlist_update_reuses_encrypted_password_for_rclone_sync(self) -> None:
+        original = self.service.save_openlist(
+            {
+                "name": "主 OpenList",
+                "base_url": "http://openlist-old:5244/dav",
+                "username": "admin",
+                "password": "saved-secret",
+            }
+        )["item"]
+
+        self.service.save_openlist(
+            {
+                "connection_id": original["connection_id"],
+                "expected_revision": original["revision"],
+                "name": "主 OpenList",
+                "base_url": "http://openlist-new:5244/dav",
+                "username": "new-admin",
+            }
+        )
+
+        self.assertEqual(self.rclone_sync_calls[-1]["password"], "saved-secret")
+        self.assertEqual(
+            self.rclone_sync_calls[-1]["url"],
+            "http://openlist-new:5244/dav",
+        )
+        self.assertEqual(self.rclone_sync_calls[-1]["username"], "new-admin")
+
+    def test_rclone_sync_failure_restores_connection_and_mount_probe_state(self) -> None:
+        quark = self._account("quark", "夸克主账号")
+        original_connection = self.service.save_openlist(
+            {
+                "name": "主 OpenList",
+                "base_url": "http://openlist-old:5244/dav",
+                "username": "admin",
+                "password": "saved-secret",
+            }
+        )["item"]
+        location = self.service.save_location(
+            {
+                "name": "夸克主盘",
+                "kind": "provider",
+                "account_id": quark,
+                "connection_id": original_connection["connection_id"],
+                "webdav_root": "/夸克",
+                "native_root": "/媒体库",
+                "confirm_identity": True,
+            }
+        )
+        target = self.targets.get_target(location["destination_id"])
+        mount_id = self.service._target_mount_id(target)
+        original_mount = self.mounts.get_mount(mount_id)
+        self.rclone_sync_error = RuntimeError("worker unavailable")
+
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_openlist(
+                {
+                    "connection_id": original_connection["connection_id"],
+                    "expected_revision": original_connection["revision"],
+                    "name": "错误的新连接",
+                    "base_url": "http://openlist-new:5244/dav",
+                    "username": "new-admin",
+                    "password": "new-secret",
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "RCLONE_WEBDAV_SYNC_FAILED")
+        restored_connection = self.connections.get_connection(
+            original_connection["connection_id"]
+        )
+        self.assertEqual(
+            restored_connection["base_url"],
+            original_connection["base_url"],
+        )
+        restored_mount = self.mounts.get_mount(mount_id)
+        self.assertEqual(restored_mount["identity_status"], original_mount["identity_status"])
+        self.assertEqual(restored_mount["readable"], original_mount["readable"])
+        self.assertEqual(restored_mount["writable"], original_mount["writable"])
+        self.assertEqual(restored_mount["native_locator"], original_mount["native_locator"])
+        self.assertEqual(
+            restored_mount["connection_revision"],
+            restored_connection["revision"],
         )
 
     def test_failed_target_revision_restores_existing_mount(self) -> None:

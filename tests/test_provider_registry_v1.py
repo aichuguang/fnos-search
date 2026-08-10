@@ -127,6 +127,15 @@ class ProviderRegistryV1Tests(unittest.TestCase):
         self.assertEqual(payload["runtime_schema"]["fields"][0]["name"], "app_id")
         self.assertEqual(registry.search_sources()[0]["provider_kind"], "115")
 
+    def test_builtin_manifests_expose_folder_browser_metadata(self) -> None:
+        from fnos_media_import.providers.manifests import BUILTIN_MANIFESTS
+
+        for kind, expected_root in (("mobile", "/"), ("quark", "0"), ("tianyi", "-11")):
+            manifest_item = BUILTIN_MANIFESTS[kind]
+            locator = manifest_item.native_locator_schema["fields"][0]
+            self.assertTrue(locator.get("browseable"))
+            self.assertEqual(locator.get("browse_root"), expected_root)
+
     def test_registry_is_the_account_probe_and_source_catalog_truth(self) -> None:
         provider_manifest = manifest(
             "115",

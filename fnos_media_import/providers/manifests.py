@@ -46,7 +46,7 @@ MOBILE_MANIFEST = manifest(
         supports_direct_final=True,
         supports_quota=False,
     ),
-    locator_fields=[{"name": "provider_path", "label": "移动云保存目录", "required": True}],
+    locator_fields=[{"name": "provider_path", "label": "移动云保存目录", "required": True, "browseable": True, "browse_root": "/"}],
     auth_methods=[
         {
             "kind": "managed_account",
@@ -128,7 +128,7 @@ QUARK_MANIFEST = manifest(
         supports_direct_final=True,
         supports_quota=False,
     ),
-    locator_fields=[{"name": "path", "label": "夸克保存目录", "required": True}],
+    locator_fields=[{"name": "path", "label": "夸克保存目录", "required": True, "browseable": True, "browse_root": "0"}],
     auth_methods=[
         {
             "kind": "qrcode",
@@ -201,7 +201,7 @@ TIANYI_MANIFEST = manifest(
         supports_direct_final=True,
         supports_quota=False,
     ),
-    locator_fields=[{"name": "folder_id", "label": "天翼保存目录 ID", "required": True}],
+    locator_fields=[{"name": "folder_id", "label": "天翼保存目录 ID", "required": True, "browseable": True, "browse_root": "-11"}],
     auth_methods=[
         {
             "kind": "password",

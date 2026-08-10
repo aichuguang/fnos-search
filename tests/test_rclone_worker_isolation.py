@@ -32,6 +32,7 @@ from fnos_media_import.services.rclone_worker_client import (
     RcloneWorkerClient,
     RcloneWorkerRequestError,
 )
+from fnos_media_import.services.rclone_worker_command import RcloneWorkerCommandBuilder
 
 
 class _Response(RepositoryFakeMixin):
@@ -258,6 +259,16 @@ class RcloneWorkerClientTests(unittest.TestCase):
 
 
 class LocalRcloneExecutionTests(unittest.TestCase):
+    def test_worker_command_reports_a_missing_shell_before_execution(self) -> None:
+        builder = RcloneWorkerCommandBuilder(
+            {"shell": "sh"},
+            Path("."),
+            which=lambda _name: None,
+        )
+
+        self.assertEqual(builder.command(Path("worker.sh")), ["sh", "worker.sh"])
+        self.assertFalse(builder.shell_available())
+
     def test_environment_checker_builds_direct_rclone_commands(self) -> None:
         calls: list[list[str]] = []
 

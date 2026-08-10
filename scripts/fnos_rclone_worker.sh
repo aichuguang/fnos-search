@@ -618,6 +618,7 @@ copy_file() {
       --transfers 1 \
       --checkers 1 \
       --no-traverse \
+      --disable Copy \
       --buffer-size "$BUFFER_SIZE" \
       --retries "$RCLONE_UPLOAD_RETRIES" \
       --low-level-retries "$RCLONE_LOW_LEVEL_RETRIES" \
@@ -632,6 +633,7 @@ copy_file() {
       --transfers 1 \
       --checkers 1 \
       --no-traverse \
+      --disable Copy \
       --buffer-size "$BUFFER_SIZE" \
       --retries "$RCLONE_UPLOAD_RETRIES" \
       --low-level-retries "$RCLONE_LOW_LEVEL_RETRIES" \

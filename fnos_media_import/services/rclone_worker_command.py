@@ -26,9 +26,15 @@ class RcloneWorkerCommandBuilder:
         configured = Path(str(self.config.get("script_path") or "scripts/fnos_rclone_worker.sh"))
         return configured if configured.is_absolute() else self.base_dir / configured
 
-    def command(self, script_path: Path | None = None) -> list[str]:
-        path = script_path or self.script_path()
+    def shell(self) -> str:
         shell = str(self.config.get("shell") or "sh")
         if Path(shell).name == "bash" and not self.which(shell):
             shell = "sh"
-        return [shell, str(path)]
+        return shell
+
+    def shell_available(self) -> bool:
+        return bool(self.which(self.shell()))
+
+    def command(self, script_path: Path | None = None) -> list[str]:
+        path = script_path or self.script_path()
+        return [self.shell(), str(path)]

@@ -141,6 +141,24 @@ class Cloud139Importer:
             "data": {"items": items, "share": {"title": title or "139 分享", "pdir_fid": pdir}},
         }
 
+    def list_folders(self, parent_folder_id: str = "/") -> list[dict[str, Any]]:
+        """List folders in the user's own 139 drive for the storage picker."""
+        if not self.configured:
+            raise RuntimeError(self.check_configuration().message)
+        parent = str(parent_folder_id or "/").strip() or "/"
+        folders: list[dict[str, Any]] = []
+        for row in self._cmcc().list_dir(parent):
+            folder_id, name, is_folder = _cmcc_drive_item(row)
+            if is_folder and folder_id:
+                folders.append(
+                    {
+                        "folder_id": folder_id,
+                        "name": name,
+                        "parent_folder_id": parent,
+                    }
+                )
+        return folders
+
     def import_resource(
         self,
         title: str,
@@ -475,6 +493,38 @@ def _share_item_is_dir(item: Any) -> bool:
         return False
     item_type = str(item.get("type") or item.get("fileType") or "").strip().lower()
     return item_type in {"dir", "folder", "catalog"}
+
+
+def _cmcc_drive_item(item: Any) -> tuple[str, str, bool]:
+    """Extract (folder_id, name, is_folder) from a 139 drive list row."""
+    if not isinstance(item, dict):
+        return "", "", False
+    folder_id = str(
+        item.get("fileId")
+        or item.get("file_id")
+        or item.get("id")
+        or item.get("contentID")
+        or item.get("contentId")
+        or item.get("catalogID")
+        or item.get("caID")
+        or ""
+    ).strip()
+    name = str(
+        item.get("name")
+        or item.get("fileName")
+        or item.get("contentName")
+        or item.get("catalogName")
+        or item.get("caName")
+        or folder_id
+        or "未命名目录"
+    ).strip()
+    is_folder = _share_item_is_dir(item)
+    if not is_folder:
+        raw_type = str(
+            item.get("type") or item.get("fileType") or item.get("category") or ""
+        ).strip().lower()
+        is_folder = raw_type in {"folder", "dir", "directory", "catalog", "1"}
+    return folder_id, name, is_folder
 
 
 def _dict_of_str(value: Any) -> dict[str, str]:

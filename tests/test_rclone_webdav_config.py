@@ -49,7 +49,7 @@ class FakeRcloneRunner(RepositoryFakeMixin):
             if self.fail_save:
                 return self._result(command, returncode=1, stderr="save failed")
             values = str(kwargs.get("input") or "").split("\n")
-            operation, remote, url, username, password = values[:5]
+            _config_path, operation, remote, url, username, password = values[:6]
             existing_pass = str(self.configs.get(remote, {}).get("pass") or "")
             self.configs[remote] = {
                 "type": "webdav",
@@ -122,6 +122,55 @@ class RcloneWebdavConfigServiceTests(unittest.TestCase):
             )
         )
         self.assertTrue(any("lsd" in call["command"] for call in runner.calls))
+
+    def test_configured_shell_and_config_path_are_used_for_every_operation(self) -> None:
+        runner = FakeRcloneRunner()
+        service = RcloneWebdavConfigService(
+            lambda: {
+                "remote_name": "MP",
+                "config_path": "/custom/rclone/runtime.conf",
+                "shell": "/usr/local/bin/bash",
+            },
+            runner=runner,
+        )
+
+        service.save(
+            {
+                "url": "http://openlist:5244/dav",
+                "username": "admin",
+                "password": "secret",
+            }
+        )
+
+        shell_calls = [
+            call
+            for call in runner.calls
+            if call["command"][-1]
+            in {
+                RcloneWebdavConfigService._BACKUP_SCRIPT,
+                RcloneWebdavConfigService._SAVE_SCRIPT,
+                RcloneWebdavConfigService._RESTORE_SCRIPT,
+            }
+        ]
+        self.assertTrue(shell_calls)
+        self.assertTrue(
+            all(call["command"][0] == "/usr/local/bin/bash" for call in shell_calls)
+        )
+        rclone_calls = [call for call in runner.calls if call["command"][0] == "rclone"]
+        self.assertTrue(rclone_calls)
+        self.assertTrue(
+            all(
+                call["command"][call["command"].index("--config") + 1]
+                == "/custom/rclone/runtime.conf"
+                for call in rclone_calls
+            )
+        )
+        self.assertTrue(
+            all(
+                "/custom/rclone/runtime.conf" in str(call["input"] or "")
+                for call in shell_calls
+            )
+        )
 
     def test_empty_password_keeps_existing_password(self) -> None:
         runner = FakeRcloneRunner(

@@ -206,6 +206,37 @@ class QuarkImporter:
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "message": f"夸克文件列表获取失败：{exc}"}
 
+    def list_folders(self, parent_folder_id: str = "0") -> list[dict[str, Any]]:
+        """List folders in the user's own Quark drive for the storage picker."""
+        if not self.cookie:
+            raise QuarkApiError(self._configuration_message())
+        parent = str(parent_folder_id or "0")
+        payload = self._get(
+            "/1/clouddrive/file/sort",
+            params={
+                "pr": "ucpro",
+                "fr": "pc",
+                "uc_param_str": "",
+                "pdir_fid": parent,
+                "_page": 1,
+                "_size": 200,
+                "_fetch_total": 1,
+                "_sort": "file_type:asc,updated_at:desc",
+            },
+        )
+        folders: list[dict[str, Any]] = []
+        for row in self._extract_file_rows(payload):
+            item = self._file_item(row)
+            if item["is_dir"] and item["fid"]:
+                folders.append(
+                    {
+                        "folder_id": item["fid"],
+                        "name": item["name"],
+                        "parent_folder_id": parent,
+                    }
+                )
+        return folders
+
     def import_resource(
         self,
         title: str,

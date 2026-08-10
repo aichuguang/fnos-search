@@ -3,8 +3,10 @@ from __future__ import annotations
 from tests._repository_v1_fakes import RepositoryFakeMixin
 
 import copy
+import tempfile
 import unittest
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from types import SimpleNamespace
 
@@ -16,6 +18,8 @@ from fnos_media_import.services.job_admin_command_service import (
     JobAdminCommandDependencies,
     JobAdminCommandService,
 )
+from fnos_media_import.database import Database
+from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.transfer.dispatch import TransferDispatchService
 
 
@@ -24,13 +28,10 @@ class _Jobs(RepositoryFakeMixin):
         self.job = {"id": 42, "status": status, "raw_data": {}}
         self.events: list[tuple[Any, ...]] = []
 
-    def get_job(self, _job_id: int) -> dict[str, Any]:
+    def get(self, _job_id: int) -> dict[str, Any]:
         return copy.deepcopy(self.job)
 
-    def update_job(self, _job_id: int, **updates: Any) -> None:
-        self.job.update(copy.deepcopy(updates))
-
-    def update_job_if_status(
+    def update_if_status(
         self,
         _job_id: int,
         expected_statuses: set[str] | list[str] | tuple[str, ...],
@@ -85,7 +86,8 @@ def _service(
 ) -> JobCancellationService:
     return JobCancellationService(
         JobCancellationDependencies(
-            jobs=jobs,
+            job_queries=jobs,
+            job_commands=jobs,
             cleaner=cleaner,
             merge_raw_data=lambda current, patch: {**(current or {}), **patch},
             payload_bool=lambda payload, key, default: bool(payload.get(key, default)),
@@ -97,6 +99,64 @@ def _service(
 
 
 class JobCancellationV1Tests(unittest.TestCase):
+    def test_production_query_and_command_repositories_are_wired_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "job-cancel.db")
+            database.init_schema()
+            repositories = RepositorySet.from_database(database)
+            job_id, created = repositories.job_commands.create(
+                {
+                    "title": "cancel target",
+                    "category": "movie",
+                    "category_label": "Movie",
+                    "source_provider_kind": "quark",
+                    "source_form": "share",
+                    "source_url": "source-ref:test",
+                    "password": "",
+                    "status": "transferring",
+                    "destination_id": "dest-test",
+                    "plan_version": 1,
+                    "raw_data": {},
+                    "idempotency_key": "cancel-wiring-1",
+                }
+            )
+            self.assertTrue(created)
+            cleaner = _Cleaner()
+            service = JobCancellationService(
+                JobCancellationDependencies(
+                    job_queries=repositories.job_queries,
+                    job_commands=repositories.job_commands,
+                    cleaner=cleaner,
+                    merge_raw_data=lambda current, patch: {
+                        **(current or {}),
+                        **patch,
+                    },
+                    payload_bool=lambda payload, key, default: bool(
+                        payload.get(key, default)
+                    ),
+                    cancelled_status="cancelled",
+                    execution_repository=_ExecutionRepository(None),
+                    enqueue_transfer=lambda job_id, **_kwargs: {
+                        "success": True,
+                        "job_id": job_id,
+                    },
+                )
+            )
+
+            result = service.cancel(
+                repositories.job_queries.get(job_id),
+                reason="admin cancel",
+                payload={"cleanup": False},
+                request_item=None,
+                cleanup_default=True,
+                stop_running_default=False,
+                admin_username="admin",
+            )
+
+            self.assertTrue(result["cancelled"])
+            self.assertEqual(repositories.job_queries.get(job_id)["status"], "cancelled")
+            self.assertEqual(cleaner.cancel_calls, [])
+
     def test_cancelled_job_reactivates_durable_transfer_worker(self) -> None:
         jobs = _Jobs()
         cleaner = _Cleaner()

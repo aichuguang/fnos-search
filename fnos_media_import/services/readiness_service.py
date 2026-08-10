@@ -3,6 +3,53 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
+def routes_require_openlist(
+    assignments: Any,
+    sources: dict[str, dict[str, Any]],
+    target_loader: Callable[[str], Any],
+) -> bool:
+    """Return whether an enabled route needs the OpenList/rclone data plane.
+
+    Same-Provider share saves and SixPan magnet offline tasks are native.  An
+    enabled share route whose destination Provider differs from its source
+    must first materialize through the source OpenList mount, regardless of
+    whether the final leg is a regular rclone copy or a Provider relay upload.
+    """
+
+    for assignment in assignments or []:
+        enabled = (
+            assignment.get("enabled", True)
+            if isinstance(assignment, dict)
+            else getattr(assignment, "enabled", False)
+        )
+        if not bool(enabled):
+            continue
+        source_id = str(
+            assignment.get("search_source_id")
+            if isinstance(assignment, dict)
+            else getattr(assignment, "search_source_id", "")
+        ).strip()
+        destination_id = str(
+            assignment.get("destination_id")
+            if isinstance(assignment, dict)
+            else getattr(assignment, "destination_id", "")
+        ).strip()
+        source = sources.get(source_id) or {}
+        source_provider = str(source.get("provider_kind") or "").strip()
+        source_form = str(source.get("source_form") or "share").strip().lower()
+        if not source_provider or not destination_id or source_form == "magnet":
+            continue
+        target = target_loader(destination_id)
+        if target is None or not bool(getattr(target, "enabled", True)):
+            continue
+        destination_provider = str(
+            getattr(target, "provider_kind", "") or ""
+        ).strip()
+        if destination_provider and destination_provider != source_provider:
+            return True
+    return False
+
+
 class ReadinessService:
     """Builds a role-aware readiness response without exposing secrets."""
 
@@ -48,13 +95,22 @@ class ReadinessService:
             )
 
         if self.active_provider_accounts_probe is not None:
-            checks["provider_accounts"] = self._count_check(
+            provider_accounts = self._count_check(
                 self.active_provider_accounts_probe,
                 ready_status="ready",
                 missing_status="unconfigured",
                 missing_message="没有已启用、检测通过且可读取凭证的激活 Provider 账号",
                 count_key="active_count",
             )
+            provider_accounts["required"] = False
+            provider_accounts["configured"] = bool(provider_accounts.get("ok"))
+            # Provider accounts are business setup, not a process dependency.
+            # Keeping them required deadlocks a fresh Compose installation:
+            # the web container waits for a healthy worker, while the worker
+            # cannot become healthy until the unavailable web UI creates an
+            # account.
+            provider_accounts["ok"] = True
+            checks["provider_accounts"] = provider_accounts
 
         if self.openlist_required is not None:
             try:

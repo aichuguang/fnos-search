@@ -9,13 +9,13 @@ class PublicSixpanPreviewService:
     def __init__(
         self,
         *,
-        cache: Any,
+        cache_queries: Any,
         importer: Callable[[], Any],
         validate_url: Callable[[Any], str],
         detect_link: Callable[..., Any],
         summarize: Callable[[Any], dict[str, Any]],
     ) -> None:
-        self.cache = cache
+        self.cache_queries = cache_queries
         self.importer = importer
         self.validate_url = validate_url
         self.detect_link = detect_link
@@ -32,7 +32,7 @@ class PublicSixpanPreviewService:
         importer = self.importer()
         if not importer or not getattr(importer, "configured", False):
             return {"success": False, "message": "快速入库服务暂不可用，请联系管理员", "items": []}, 400
-        cached = self.cache.get_search_cache(public_id) if public_id else None
+        cached = self.cache_queries.get_active(public_id) if public_id else None
         raw = cached.get("raw_data") if cached and isinstance(cached.get("raw_data"), dict) else {}
         source_url = str(cached.get("source_url") or raw.get("url") or raw.get("source_url") or "") if cached else ""
         if not source_url:

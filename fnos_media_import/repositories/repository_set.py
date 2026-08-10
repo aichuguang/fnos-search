@@ -285,12 +285,14 @@ class UpdateRepositories:
 
     update: UpdateRepository
     job_queries: JobQueryRepository
+    scheduler_leases: SchedulerLeaseRepository
 
     @classmethod
     def from_set(cls, repositories: RepositorySet) -> "UpdateRepositories":
         return cls(
             update=repositories.update,
             job_queries=repositories.job_queries,
+            scheduler_leases=repositories.scheduler_leases,
         )
 
 

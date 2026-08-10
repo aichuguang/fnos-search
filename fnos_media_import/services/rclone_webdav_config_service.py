@@ -22,9 +22,9 @@ class RcloneWebdavConfigService:
     BACKUP_PATH = "/config/rclone/rclone.conf.webui.bak"
     _CONTROL_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
     _BACKUP_SCRIPT = """set -eu
-config=/config/rclone/rclone.conf
-backup=/config/rclone/rclone.conf.webui.bak
-temporary=/config/rclone/rclone.conf.webui.bak.tmp
+IFS= read -r config
+IFS= read -r backup
+temporary="${backup}.tmp"
 [ -f "$config" ] || : > "$config"
 rm -f "$temporary"
 cp "$config" "$temporary"
@@ -32,9 +32,9 @@ chmod 600 "$temporary"
 mv -f "$temporary" "$backup"
 """
     _RESTORE_SCRIPT = """set -eu
-config=/config/rclone/rclone.conf
-backup=/config/rclone/rclone.conf.webui.bak
-temporary=/config/rclone/rclone.conf.webui.restore.tmp
+IFS= read -r config
+IFS= read -r backup
+temporary="${config}.webui.restore.tmp"
 [ -f "$backup" ]
 rm -f "$temporary"
 cp "$backup" "$temporary"
@@ -42,17 +42,18 @@ chmod 660 "$temporary"
 mv -f "$temporary" "$config"
 """
     _SAVE_SCRIPT = """set -eu
+IFS= read -r config
 IFS= read -r operation
 IFS= read -r remote_name
 IFS= read -r webdav_url
 IFS= read -r webdav_user
 IFS= read -r webdav_password
 if [ "$operation" = "create" ]; then
-  rclone config create "$remote_name" webdav url "$webdav_url" vendor other user "$webdav_user" pass "$webdav_password" --obscure --config /config/rclone/rclone.conf
+  rclone config create "$remote_name" webdav url "$webdav_url" vendor other user "$webdav_user" pass "$webdav_password" --obscure --config "$config"
 elif [ -n "$webdav_password" ]; then
-  rclone config update "$remote_name" url "$webdav_url" vendor other user "$webdav_user" pass "$webdav_password" --obscure --config /config/rclone/rclone.conf
+  rclone config update "$remote_name" url "$webdav_url" vendor other user "$webdav_user" pass "$webdav_password" --obscure --config "$config"
 else
-  rclone config update "$remote_name" url "$webdav_url" vendor other user "$webdav_user" --config /config/rclone/rclone.conf
+  rclone config update "$remote_name" url "$webdav_url" vendor other user "$webdav_user" --config "$config"
 fi
 """
 
@@ -70,7 +71,11 @@ fi
 
     def status(self, remote_name: Any = None) -> dict[str, Any]:
         remote = self._validate_remote_name(remote_name or self._default_remote_name())
-        configs = self._config_dump()
+        configs = self._config_dump(self._config_path())
+        return self._status_from_configs(remote, configs)
+
+    @staticmethod
+    def _status_from_configs(remote: str, configs: Mapping[str, Any]) -> dict[str, Any]:
         item = configs.get(remote)
         if not isinstance(item, Mapping):
             return {
@@ -106,7 +111,10 @@ fi
         password = self._validate_text(payload.get("password"), "密码", max_length=1024, required=False, trim=False)
 
         with self._lock:
-            configs = self._config_dump()
+            config_path = self._config_path()
+            backup_path = self._backup_path(config_path)
+            shell = self._shell()
+            configs = self._config_dump(config_path)
             current = configs.get(remote)
             if isinstance(current, Mapping):
                 remote_type = str(current.get("type") or "").strip().lower()
@@ -123,21 +131,31 @@ fi
                 if not password:
                     raise RcloneWebdavConfigError("首次配置 WebDAV 时必须填写密码")
 
-            self._backup()
+            self._backup(config_path, backup_path, shell)
             secret_values = [password] if password else []
             try:
                 result = self._run(
-                    ["sh", "-c", self._SAVE_SCRIPT],
-                    input_text="\n".join((operation, remote, url, username, password)) + "\n",
+                    [shell, "-c", self._SAVE_SCRIPT],
+                    input_text="\n".join(
+                        (config_path, operation, remote, url, username, password)
+                    )
+                    + "\n",
                 )
                 if result.returncode != 0:
                     detail = self._safe_process_message(result, secret_values)
                     message = "rclone 配置写入失败，请确认配置目录权限正常"
                     raise RcloneWebdavConfigError(f"{message}：{detail}" if detail else message, 502)
-                self._test_remote(remote, secret_values=secret_values)
-                state = self.status(remote)
+                self._test_remote(
+                    remote,
+                    config_path=config_path,
+                    secret_values=secret_values,
+                )
+                state = self._status_from_configs(
+                    remote,
+                    self._config_dump(config_path),
+                )
             except RcloneWebdavConfigError as exc:
-                restored = self._restore()
+                restored = self._restore(config_path, backup_path, shell)
                 suffix = "，已恢复保存前的配置" if restored else "，且自动恢复失败，请检查 rclone 配置文件"
                 raise RcloneWebdavConfigError(f"{exc}{suffix}", exc.status_code) from exc
 
@@ -152,17 +170,21 @@ fi
     def test(self, remote_name: Any = None) -> dict[str, Any]:
         remote = self._validate_remote_name(remote_name or self._default_remote_name())
         with self._lock:
-            state = self.status(remote)
+            config_path = self._config_path()
+            state = self._status_from_configs(
+                remote,
+                self._config_dump(config_path),
+            )
             if not state["configured"]:
                 raise RcloneWebdavConfigError("请先保存 WebDAV 配置")
             if state["type"] != "webdav":
                 raise RcloneWebdavConfigError(f"Remote“{remote}”不是 WebDAV 类型", 409)
-            self._test_remote(remote)
+            self._test_remote(remote, config_path=config_path)
         state.update({"connection_status": "success", "message": "WebDAV 连接成功"})
         return state
 
-    def _config_dump(self) -> dict[str, Any]:
-        result = self._run(["rclone", "config", "dump", "--config", self.CONFIG_PATH])
+    def _config_dump(self, config_path: str) -> dict[str, Any]:
+        result = self._run(["rclone", "config", "dump", "--config", config_path])
         if result.returncode != 0:
             detail = self._safe_process_message(result, [])
             message = "无法读取 rclone 配置，请确认 rclone 可用且配置目录权限正常"
@@ -175,9 +197,15 @@ fi
             raise RcloneWebdavConfigError("rclone 配置格式无法识别，请检查配置文件", 502)
         return data
 
-    def _test_remote(self, remote: str, *, secret_values: list[str] | None = None) -> None:
+    def _test_remote(
+        self,
+        remote: str,
+        *,
+        config_path: str,
+        secret_values: list[str] | None = None,
+    ) -> None:
         result = self._run(
-            ["rclone", "lsd", f"{remote}:", "--config", self.CONFIG_PATH]
+            ["rclone", "lsd", f"{remote}:", "--config", config_path]
         )
         if result.returncode == 0:
             return
@@ -187,16 +215,22 @@ fi
             message = f"{message}：{detail}"
         raise RcloneWebdavConfigError(message, 502)
 
-    def _backup(self) -> None:
-        result = self._run(["sh", "-c", self._BACKUP_SCRIPT])
+    def _backup(self, config_path: str, backup_path: str, shell: str) -> None:
+        result = self._run(
+            [shell, "-c", self._BACKUP_SCRIPT],
+            input_text=f"{config_path}\n{backup_path}\n",
+        )
         if result.returncode != 0:
             detail = self._safe_process_message(result, [])
             message = "无法备份 rclone 配置，已停止保存"
             raise RcloneWebdavConfigError(f"{message}：{detail}" if detail else message, 503)
 
-    def _restore(self) -> bool:
+    def _restore(self, config_path: str, backup_path: str, shell: str) -> bool:
         try:
-            result = self._run(["sh", "-c", self._RESTORE_SCRIPT])
+            result = self._run(
+                [shell, "-c", self._RESTORE_SCRIPT],
+                input_text=f"{config_path}\n{backup_path}\n",
+            )
         except RcloneWebdavConfigError:
             return False
         return result.returncode == 0
@@ -221,6 +255,26 @@ fi
 
     def _default_remote_name(self) -> str:
         return str(self._current_config().get("remote_name") or "MP")
+
+    def _config_path(self) -> str:
+        return self._validate_text(
+            self._current_config().get("config_path") or self.CONFIG_PATH,
+            "rclone 配置路径",
+            max_length=4096,
+            required=True,
+        )
+
+    @staticmethod
+    def _backup_path(config_path: str) -> str:
+        return f"{config_path}.webui.bak"
+
+    def _shell(self) -> str:
+        return self._validate_text(
+            self._current_config().get("shell") or "sh",
+            "rclone Worker shell",
+            max_length=4096,
+            required=True,
+        )
 
     def _validate_remote_name(self, value: Any) -> str:
         remote = self._validate_text(value, "Remote 名称", max_length=64, required=True)

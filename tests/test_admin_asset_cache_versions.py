@@ -8,7 +8,7 @@ from pathlib import Path
 class AdminAssetCacheVersionTests(unittest.TestCase):
     def test_changed_admin_assets_use_current_release_version(self) -> None:
         source = Path("templates/admin.html").read_text(encoding="utf-8")
-        expected_version = "20260809-v1-cutover-v001"
+        expected_version = "20260810-storage-flow-v005"
         for asset in (
             "admin-media.js",
             "admin-jobs.js",

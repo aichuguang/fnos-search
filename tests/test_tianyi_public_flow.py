@@ -259,7 +259,8 @@ class TianyiPublicFlowTests(unittest.TestCase):
         cache = _ManualCache()
         importer = _TianyiStub()
         service = PublicManualPreviewService(
-            cache=cache,
+            cache_queries=cache.search_cache_queries,
+            cache_commands=cache.search_cache_commands,
             new_public_id=lambda: "MANUAL-189",
             detect_link=detect_link,
             resource_detail=_public_resource_detail,
@@ -507,7 +508,7 @@ class TianyiPublicFlowTests(unittest.TestCase):
         self.assertEqual(template.count("20260809-v1-cutover-v001"), 4)
         self.assertEqual(request_template.count("20260809-v1-cutover-v001"), 4)
         self.assertIn(
-            "/static/resource-search-workbench.js?v=20260809-v1-cutover-v001",
+            "/static/resource-search-workbench.js?v=20260810-storage-flow-v005",
             admin_template,
         )
 

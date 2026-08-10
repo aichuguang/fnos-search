@@ -61,7 +61,14 @@ class _Mounts:
                 "writable": False,
                 "enabled": True,
                 "identity_status": "declared",
-                "native_locator": {"kind": "path", "value": "/FNOS"},
+                "native_locator": {
+                    "kind": "path",
+                    "value": "/FNOS",
+                    "display_name": "Provider root",
+                    "upload_verified": True,
+                    "organizer_mutation_verified": True,
+                    "probe_fingerprint": "source-proof",
+                },
             }
         if mount_id == "destination" and revision == 1:
             return {

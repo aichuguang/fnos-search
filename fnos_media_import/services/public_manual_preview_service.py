@@ -9,7 +9,8 @@ class PublicManualPreviewService:
     def __init__(
         self,
         *,
-        cache: Any,
+        cache_queries: Any,
+        cache_commands: Any,
         new_public_id: Callable[[], str],
         detect_link: Callable[..., Any],
         resource_detail: Callable[..., dict[str, Any]],
@@ -21,7 +22,8 @@ class PublicManualPreviewService:
         hide_full_links: Callable[[], bool],
         tianyi_importer: Callable[[], Any] | None = None,
     ) -> None:
-        self.cache = cache
+        self.cache_queries = cache_queries
+        self.cache_commands = cache_commands
         self.new_public_id = new_public_id
         self.detect_link = detect_link
         self.resource_detail = resource_detail
@@ -58,8 +60,13 @@ class PublicManualPreviewService:
                 "source": "manual_link",
             },
         }
-        self.cache.save_search_cache(public_id, keyword="manual_link", item=cache_item, expires_minutes=60)
-        cached = self.cache.get_search_cache(public_id) or {
+        self.cache_commands.save(
+            public_id,
+            keyword="manual_link",
+            item=cache_item,
+            expires_minutes=60,
+        )
+        cached = self.cache_queries.get_active(public_id) or {
             "public_id": public_id,
             "title": title,
             "source_type": link.resource_kind,

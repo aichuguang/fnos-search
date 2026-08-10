@@ -106,6 +106,122 @@ class TianyiImporterTests(unittest.TestCase):
             recursive=0,
         )
 
+    def test_normalize_item_detects_cloud189_folder_without_is_folder(self) -> None:
+        importer = TianyiImporter({})
+        folder = importer._normalize_item({"id": 0, "parentId": "-11", "name": "同步盘"})
+        self.assertTrue(folder["is_folder"])
+        self.assertEqual(folder["file_id"], "0")
+
+        file_item = importer._normalize_item(
+            {"fileId": "abc", "name": "a.mkv", "isFolder": False}
+        )
+        self.assertFalse(file_item["is_folder"])
+        self.assertEqual(file_item["file_id"], "abc")
+
+    def test_list_drive_folders_uses_pc_contract(self) -> None:
+        importer = TianyiImporter({"session_key": "session-1", "session_secret": "secret-1"})
+        with patch.object(
+            importer,
+            "_get",
+            return_value={
+                "res_code": 0,
+                "fileListAO": {
+                    "fileList": [{"id": "file-1", "name": "a.mkv", "isFolder": False}],
+                    "folderList": [
+                        {"id": "dir-1", "name": "电影", "isFolder": True},
+                        {"id": "dir-2", "name": "电视剧", "folderId": "dir-2"},
+                    ],
+                },
+            },
+        ) as get:
+            folders = importer.list_drive_folders("-11")
+
+        self.assertEqual(
+            folders,
+            [
+                {"folder_id": "dir-1", "name": "电影", "parent_folder_id": "-11"},
+                {"folder_id": "dir-2", "name": "电视剧", "parent_folder_id": "-11"},
+            ],
+        )
+        get.assert_called_once_with(
+            "/listFiles.action",
+            folderId="-11",
+            fileType=0,
+            mediaAttr=0,
+            orderBy="lastOpTime",
+            descending=True,
+            pageNum=1,
+            pageSize=1000,
+            iconOption=5,
+            recursive=0,
+        )
+
+    def test_list_drive_items_raises_when_response_lacks_file_list_ao(self) -> None:
+        importer = TianyiImporter({"session_key": "session-1", "session_secret": "secret-1"})
+        with patch.object(importer, "_get", return_value={"res_code": 0}):
+            with self.assertRaisesRegex(Exception, "fileListAO"):
+                importer._list_drive_items("-11")
+
+    def test_is_auth_rejection_distinguishes_business_403(self) -> None:
+        self.assertTrue(TianyiImporter._is_auth_rejection("InvalidSessionKey", "check ip error"))
+        self.assertTrue(TianyiImporter._is_auth_rejection("", "usersessionboisnull"))
+        self.assertFalse(
+            TianyiImporter._is_auth_rejection(
+                "InsufficientStorageSpace", "user free space has been used up"
+            )
+        )
+        self.assertFalse(
+            TianyiImporter._is_auth_rejection("InvalidPartSize", "invalid part size")
+        )
+
+    def test_clean_cloud189_message_strips_noise_and_maps_quota(self) -> None:
+        self.assertEqual(
+            TianyiImporter._clean_cloud189_message(
+                "sessionKey=abc-123,user free space has been used up,requestId=xyz"
+            ),
+            "天翼云盘免费空间已用尽，请先清理空间或升级容量后再试",
+        )
+        self.assertEqual(
+            TianyiImporter._clean_cloud189_message("sessionKey=abc,invalid part Size,requestId=x"),
+            "天翼云上传分片参数无效",
+        )
+        self.assertEqual(
+            TianyiImporter._clean_cloud189_message("some other error"),
+            "some other error",
+        )
+
+    def test_upload_403_business_error_is_not_mislabeled_as_auth(self) -> None:
+        class Response:
+            status_code = 403
+
+            def __init__(self) -> None:
+                self.text = json.dumps(
+                    {
+                        "code": "InsufficientStorageSpace",
+                        "msg": "sessionKey=s,user free space has been used up,requestId=r",
+                    }
+                )
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "code": "InsufficientStorageSpace",
+                    "msg": "sessionKey=s,user free space has been used up,requestId=r",
+                }
+
+        importer = TianyiImporter(
+            {"session_key": "session-1", "session_secret": "0123456789abcdef0123456789abcdef"}
+        )
+        with patch.object(importer.http.session, "request", return_value=Response()):
+            with self.assertRaises(TianyiApiError) as raised:
+                importer._upload_request(
+                    "GET",
+                    "/person/initMultiUpload",
+                    params={"parentFolderId": "0", "fileName": "x.bin"},
+                )
+
+        self.assertEqual(raised.exception.code, "InsufficientStorageSpace")
+        self.assertIn("空间已用尽", str(raised.exception))
+
     def test_share_inspection_uses_v2_contract_and_normalizes_items(self) -> None:
         with patch.object(
             self.importer,

@@ -64,6 +64,8 @@ def create_openlist_blueprint(context: OpenListRouteContext) -> Blueprint:
 def default_handlers(
     connection_service: OpenListConnectionService,
     mount_service: OpenListMountService,
+    *,
+    connection_save: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Callable[..., Any]]:
     def json_payload(*, required: bool) -> dict[str, Any]:
         has_body = bool(request.get_data(cache=True))
@@ -91,6 +93,10 @@ def default_handlers(
     def create_connection() -> tuple[Any, int]:
         try:
             payload = json_payload(required=True)
+            if callable(connection_save):
+                result = dict(connection_save(payload) or {})
+                result.setdefault("success", True)
+                return jsonify(result), 201
             item = connection_service.create_connection(payload)
         except Exception as exc:  # noqa: BLE001 - API boundary must always return JSON
             return _error_response(exc)
@@ -99,6 +105,12 @@ def default_handlers(
     def update_connection(connection_id: str) -> tuple[Any, int]:
         try:
             payload = json_payload(required=True)
+            if callable(connection_save):
+                result = dict(
+                    connection_save({**payload, "connection_id": connection_id}) or {}
+                )
+                result.setdefault("success", True)
+                return jsonify(result), 200
             item = connection_service.update_connection(connection_id, payload)
         except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
@@ -266,10 +278,11 @@ def _error_response(exc: BaseException) -> tuple[Any, int]:
             status,
             str(exc)[:500],
         )
+    public_error = isinstance(exc, OpenListError) or explicit_status is not None
     payload: dict[str, Any] = {
         "success": False,
-        "code": code if status < 500 or isinstance(exc, OpenListError) else "INTERNAL_ERROR",
-        "message": str(exc) if isinstance(exc, OpenListError) else "OpenList 管理服务发生内部错误",
+        "code": code if status < 500 or public_error else "INTERNAL_ERROR",
+        "message": str(exc) if public_error else "OpenList 管理服务发生内部错误",
         "trace_id": trace_id,
         "retryable": retryable,
     }

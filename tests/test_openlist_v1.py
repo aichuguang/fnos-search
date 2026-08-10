@@ -274,6 +274,110 @@ class OpenListConnectionTests(unittest.TestCase):
         self.assertEqual(getattr(caught.exception, "status", 0), 409)
         self.assertEqual(self.service.get_connection("ol_main")["revision"], first["revision"])
 
+    def test_operational_connection_edit_is_blocked_while_plan_is_active(self) -> None:
+        self._create()
+        now = utc_now_iso()
+        job_id, created = self.database.job_commands.create(
+            {
+                "title": "active-openlist-plan",
+                "category": "movie",
+                "category_label": "Movie",
+                "source_provider_kind": "quark",
+                "source_form": "share",
+                "source_url": "source-record:active-openlist-plan",
+                "target_path": "/openlist/movie",
+                "status": "waiting_transfer",
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": "openlist:active-plan",
+            }
+        )
+        self.assertTrue(created)
+        with self.database.connect() as conn:
+            conn.execute(
+                "INSERT INTO import_execution_plans(job_id, schema_version, plan_json, plan_hash, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    job_id,
+                    1,
+                    json.dumps(
+                        {"bindings": {"destination_connection_id": "ol_main"}}
+                    ),
+                    "hash",
+                    now,
+                ),
+            )
+
+        with self.assertRaises(OpenListValidationError) as caught:
+            self.service.update_connection(
+                "ol_main",
+                {"password": "rotated-secret", "expected_revision": 1},
+            )
+
+        self.assertEqual(
+            getattr(caught.exception, "code", ""),
+            "OPENLIST_CONNECTION_IN_USE",
+        )
+        self.assertEqual(getattr(caught.exception, "status", 0), 409)
+        self.assertTrue(getattr(caught.exception, "retryable", False))
+        self.assertEqual(self.service.get_connection("ol_main")["revision"], 1)
+
+        # Display-only edits, including an explicitly repeated identical
+        # password, do not rewrite the managed Remote identity.
+        renamed = self.service.update_connection(
+            "ol_main",
+            {
+                "name": "仅修改展示名称",
+                "password": "s3cret",
+                "expected_revision": 1,
+            },
+        )
+        self.assertEqual(renamed["revision"], 2)
+        self.assertTrue(self.service.runtime_identity_matches("ol_main", 1))
+
+    def test_terminal_plan_allows_edit_but_old_runtime_identity_fails_closed(self) -> None:
+        self._create(password="old-secret")
+        now = utc_now_iso()
+        job_id, created = self.database.job_commands.create(
+            {
+                "title": "completed-openlist-plan",
+                "category": "movie",
+                "category_label": "Movie",
+                "source_provider_kind": "quark",
+                "source_form": "share",
+                "source_url": "source-record:completed-openlist-plan",
+                "target_path": "/openlist/movie",
+                "status": "done",
+                "destination_id": "native-main",
+                "plan_version": 1,
+                "idempotency_key": "openlist:completed-plan",
+            }
+        )
+        self.assertTrue(created)
+        with self.database.connect() as conn:
+            conn.execute(
+                "INSERT INTO import_execution_plans(job_id, schema_version, plan_json, plan_hash, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    job_id,
+                    1,
+                    json.dumps(
+                        {"bindings": {"destination_connection_id": "ol_main"}}
+                    ),
+                    "hash",
+                    now,
+                ),
+            )
+
+        updated = self.service.update_connection(
+            "ol_main",
+            {"password": "new-secret", "expected_revision": 1},
+        )
+
+        self.assertEqual(updated["revision"], 2)
+        self.assertFalse(self.service.runtime_identity_matches("ol_main", 1))
+        self.assertTrue(self.service.runtime_identity_matches("ol_main", 2))
+
     def test_delete_connection_rejects_execution_plan_reference(self) -> None:
         self._create()
         now = utc_now_iso()
@@ -860,6 +964,53 @@ class RcloneLocatorResolverTests(unittest.TestCase):
         with self.assertRaises(OpenListValidationError):
             resolver.resolve("c", "m", "")
 
+    def test_frozen_rclone_path_rejects_changed_runtime_connection_identity(self) -> None:
+        resolver = RcloneLocatorResolver(
+            {
+                "remote_name": "ol_main",
+                "config_path": "/config/rclone.conf",
+                "connection_runtime_identity_validator": lambda _connection_id, _revision: False,
+            }
+        )
+        mount_snapshot = {
+            "mount_id": "mount-main",
+            "revision": 3,
+            "connection_id": "ol_main",
+            "connection_revision": 2,
+            "namespace_id": "openlist:ol_main:mount-main",
+            "enabled": True,
+            "identity_status": "declared",
+            "storage_identity_id": "storage:main",
+            "identity_root": "/",
+            "webdav_root": "/影视",
+            "readable": True,
+            "writable": True,
+        }
+        connection_snapshot = {
+            "connection_id": "ol_main",
+            "revision": 2,
+            "enabled": True,
+            "credential_configured": True,
+        }
+
+        with self.assertRaisesRegex(
+            OpenListValidationError,
+            "当前托管 rclone Remote 身份不一致",
+        ):
+            resolver.resolve_frozen_remote(
+                namespace_id="openlist:ol_main:mount-main",
+                mount_id="mount-main",
+                mount_revision=3,
+                connection_id="ol_main",
+                connection_revision=2,
+                storage_identity_id="storage:main",
+                identity_root="/",
+                path="/电影/job-42",
+                role="source",
+                mount_snapshot=mount_snapshot,
+                connection_snapshot=connection_snapshot,
+            )
+
 
 class OpenListBlueprintTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -904,6 +1055,58 @@ class OpenListBlueprintTests(unittest.TestCase):
         payload = json.dumps(response.get_json())
         self.assertNotIn("password", payload)
         self.assertNotIn("password_ciphertext", payload)
+
+    def test_managed_connection_writes_use_storage_setup_callback(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def managed_save(payload: dict[str, Any]) -> dict[str, Any]:
+            calls.append(dict(payload))
+            return {
+                "success": True,
+                "item": {
+                    "connection_id": str(payload.get("connection_id") or "openlist_main"),
+                    "revision": len(calls),
+                },
+                "rclone": {"connection_status": "success"},
+            }
+
+        application = Flask("managed-openlist-writes")
+        application.register_blueprint(
+            create_openlist_blueprint(
+                OpenListRouteContext(
+                    admin_required=lambda view: view,
+                    handlers=default_handlers(
+                        self.connection_service,
+                        self.mount_service,
+                        connection_save=managed_save,
+                    ),
+                )
+            )
+        )
+        client = application.test_client()
+
+        created = client.post(
+            "/api/admin/openlist/connections",
+            json={
+                "connection_id": "managed",
+                "base_url": "http://openlist:5244/dav",
+                "username": "admin",
+                "password": "server-only",
+            },
+        )
+        updated = client.patch(
+            "/api/admin/openlist/connections/managed",
+            json={"name": "改名", "expected_revision": 1},
+        )
+
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(calls[0]["connection_id"], "managed")
+        self.assertEqual(calls[1]["connection_id"], "managed")
+        self.assertEqual(
+            updated.get_json()["rclone"]["connection_status"],
+            "success",
+        )
 
     def test_connection_test_route(self) -> None:
         self.client.post(

@@ -279,6 +279,16 @@ class RetiredFacadeCutoverTests(unittest.TestCase):
             with self.subTest(factory=factory):
                 self.assertIn(factory, app_source)
 
+        self.assertIn("counts=db.rclone", app_source)
+        self.assertIn("counts=db.organizer", app_source)
+        self.assertNotIn("counts=db)", app_source)
+        self.assertIn("job_queries=db.job_queries", app_source)
+        self.assertIn("job_commands=db.job_commands", app_source)
+        self.assertIn("cache_queries=db.search_cache_queries", app_source)
+        self.assertIn("cache_commands=db.search_cache_commands", app_source)
+        self.assertNotIn("cache=db,", app_source)
+        self.assertIn("except SearchProvidersUnavailableError as exc:", app_source)
+
         runtime_source = (package / "runtime_builder.py").read_text(
             encoding="utf-8"
         )

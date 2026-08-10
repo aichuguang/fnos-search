@@ -179,6 +179,18 @@ class RcloneWorkerSourceStabilityTests(unittest.TestCase):
         self.assertIn('if ! second="$(list_remote_file_snapshots "$remote")"; then', stability)
         self.assertIn("refusing an empty manifest", stability)
 
+    def test_cross_mount_copy_disables_webdav_server_side_copy(self) -> None:
+        copy_file = self.content[
+            self.content.index("copy_file() {") : self.content.index("copy_scoped_job() {")
+        ]
+
+        # Every OpenList mount shares the managed WebDAV remote.  Without
+        # this flag rclone treats a cross-mount transfer as a same-backend
+        # server-side COPY; OpenList then returns object-not-found when the
+        # two paths belong to different storage drivers.  Streaming through
+        # rclone is the required cross-provider behavior.
+        self.assertEqual(copy_file.count("--disable Copy"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

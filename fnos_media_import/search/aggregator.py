@@ -11,6 +11,10 @@ from .base import SearchProvider
 logger = logging.getLogger(__name__)
 
 
+class SearchProvidersUnavailableError(RuntimeError):
+    """All enabled search providers failed before returning any result."""
+
+
 class SearchAggregator:
     """多搜索源聚合器。
 
@@ -38,7 +42,7 @@ class SearchAggregator:
 
         enabled = [provider for provider in self.providers if provider.is_enabled()]
         if not enabled:
-            raise RuntimeError("没有启用的搜索源")
+            raise SearchProvidersUnavailableError("没有启用的搜索源")
 
         query_keywords = self._expanded_keywords(keyword)
         all_items: list[dict[str, Any]] = []
@@ -83,9 +87,9 @@ class SearchAggregator:
 
         if not all_items and provider_errors:
             if len(enabled) == 1 and len(provider_errors) == 1:
-                raise RuntimeError(provider_errors[0]["message"])
+                raise SearchProvidersUnavailableError(provider_errors[0]["message"])
             messages = "；".join(f"{item['provider']}：{item['message']}" for item in provider_errors[:3])
-            raise RuntimeError(f"搜索源暂不可用：{messages}")
+            raise SearchProvidersUnavailableError(f"搜索源暂不可用：{messages}")
 
         dedupe_started = time.perf_counter()
         deduped = self._dedupe(all_items)

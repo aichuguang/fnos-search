@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 
+class JobQueries(Protocol):
+    def get(self, job_id: int) -> dict[str, Any] | None: ...
+
+
 class JobCommands(Protocol):
-    def get_job(self, job_id: int) -> dict[str, Any] | None: ...
-    def update_job(self, job_id: int, **updates: Any) -> None: ...
-    def update_job_if_status(
+    def update_if_status(
         self,
         job_id: int,
         expected_statuses: set[str] | list[str] | tuple[str, ...],
@@ -23,7 +25,8 @@ class CancelledTaskCleaner(Protocol):
 
 @dataclass(frozen=True)
 class JobCancellationDependencies:
-    jobs: JobCommands
+    job_queries: JobQueries
+    job_commands: JobCommands
     cleaner: CancelledTaskCleaner
     merge_raw_data: Callable[[Any, dict[str, Any]], dict[str, Any]]
     payload_bool: Callable[[dict[str, Any], str, bool], bool]
@@ -76,7 +79,7 @@ class JobCancellationService:
                         "retryable": True,
                     }
             return self._skipped_result(
-                job=self._deps.jobs.get_job(job_id) or job,
+                job=self._deps.job_queries.get(job_id) or job,
                 message=str(transfer_preflight.get("message") or "任务已进入不可安全取消阶段"),
                 state_conflict=True,
                 retryable=bool(transfer_preflight.get("retryable")),
@@ -106,7 +109,7 @@ class JobCancellationService:
         cancel_raw = claim["cancel_raw"]
         already_cancelled = bool(claim["already_cancelled"])
         durable_transfer_owned = self._is_durable_transfer_owned(job_id, cancelled_job)
-        self._deps.jobs.add_event(
+        self._deps.job_commands.add_event(
             job_id,
             "warn",
             f"重复取消任务：{reason}" if already_cancelled else f"任务已取消：{reason}",
@@ -189,14 +192,14 @@ class JobCancellationService:
                 "errors": [],
             }
 
-        self._deps.jobs.add_event(
+        self._deps.job_commands.add_event(
             job_id,
             "info" if cleanup.get("success", True) else "error",
             cleanup.get("message") or "取消清理完成",
             {"cleanup": cleanup},
         )
         return {
-            "job": self._deps.jobs.get_job(job_id),
+            "job": self._deps.job_queries.get(job_id),
             "cleanup": cleanup,
             "message": cleanup.get("message") or "已取消任务",
             "cancelled": True,
@@ -221,9 +224,9 @@ class JobCancellationService:
         admin_username: str | None,
     ) -> dict[str, Any]:
         supplied_status = _normalized_status(supplied_job.get("status"))
-        current = self._deps.jobs.get_job(job_id)
+        current = self._deps.job_queries.get(job_id)
         state_conflict = current is None or _normalized_status((current or {}).get("status")) != supplied_status
-        updater = getattr(self._deps.jobs, "update_job_if_status", None)
+        updater = getattr(self._deps.job_commands, "update_if_status", None)
         if not callable(updater):
             return {
                 "cancelled": False,
@@ -304,7 +307,7 @@ class JobCancellationService:
             if not already_cancelled:
                 updates.update(status=self._deps.cancelled_status, error_message=reason)
             if updater(job_id, {current_status}, **updates):
-                latest = self._deps.jobs.get_job(job_id)
+                latest = self._deps.job_queries.get(job_id)
                 if not latest or _normalized_status(latest.get("status")) != _normalized_status(
                     self._deps.cancelled_status
                 ):
@@ -328,7 +331,7 @@ class JobCancellationService:
                     "state_conflict": False,
                 }
             state_conflict = True
-            current = self._deps.jobs.get_job(job_id)
+            current = self._deps.job_queries.get(job_id)
 
         return {
             "cancelled": False,

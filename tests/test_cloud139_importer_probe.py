@@ -65,6 +65,48 @@ class Cloud139ImporterProbeTests(unittest.TestCase):
         self.assertEqual(result.status, "probe_failed")
         self.assertIn("认证检测失败", result.message)
 
+    def test_list_folders_returns_only_drive_folders(self) -> None:
+        class Client:
+            phone = "13800000000"
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def list_dir(
+                self,
+                parent_file_id: str,
+                *,
+                page_size: int = 100,
+                max_pages: int = 100,
+            ):
+                del page_size, max_pages
+                self.calls.append(parent_file_id)
+                return [
+                    {"fileId": "dir-1", "name": "电影", "type": "folder"},
+                    {"fileId": "file-1", "name": "a.mkv", "type": "file"},
+                    {"fileId": "dir-2", "fileName": "电视剧", "isFolder": True},
+                    {"fileId": "file-2", "name": "b.mkv", "fileType": "file"},
+                ]
+
+        importer = self._importer()
+        client = Client()
+        with patch.object(importer, "_cmcc", return_value=client):
+            folders = importer.list_folders("/")
+
+        self.assertEqual(
+            folders,
+            [
+                {"folder_id": "dir-1", "name": "电影", "parent_folder_id": "/"},
+                {"folder_id": "dir-2", "name": "电视剧", "parent_folder_id": "/"},
+            ],
+        )
+        self.assertEqual(client.calls, ["/"])
+
+    def test_list_folders_unconfigured_raises(self) -> None:
+        importer = Cloud139Importer({})
+        with self.assertRaisesRegex(RuntimeError, "未配置"):
+            importer.list_folders("/")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,32 @@ _DAV = "{DAV:}"
 _AUTHENTICATED_STATUSES = frozenset({200, 201, 204, 207, 405})
 
 
+class _SameOriginAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Do not leak OpenList Basic auth to cross-origin download URLs.
+
+    OpenList commonly answers WebDAV ``GET`` with a 302 redirect to a signed
+    object-storage URL.  ``urllib`` copies request headers to redirects by
+    default, including ``Authorization``.  Object storage then sees both the
+    signed query parameters and the unrelated Basic auth header and may reject
+    the otherwise valid URL with ``InvalidArgument``.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and _url_origin(req.full_url) != _url_origin(newurl):
+            redirected.remove_header("Authorization")
+            redirected.remove_header("Proxy-Authorization")
+        return redirected
+
+
 class OpenListWebDAVClient:
     """最小 WebDAV 客户端：PROPFIND / MKCOL / PUT / GET / MOVE / DELETE。"""
 
@@ -77,7 +103,10 @@ class OpenListWebDAVClient:
             request.add_header("Authorization", f"Basic {token}")
         # OpenList 常部署在局域网 / Docker 网关；默认不读取环境代理，避免误走
         # 本机 HTTP_PROXY 导致内网请求超时。
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _SameOriginAuthRedirectHandler(),
+        )
         try:
             with opener.open(request, timeout=self.timeout) as response:
                 return response.status, response.read()
@@ -123,7 +152,9 @@ class OpenListWebDAVClient:
     def read_bytes(self, path: str) -> bytes:
         status, body = self._request("GET", path)
         if status not in (200, 206):
-            raise OpenListWebDAVError(f"读取文件失败：HTTP {status}")
+            raise OpenListWebDAVError(
+                f"读取文件失败：HTTP {status}{_webdav_error_detail(status, body)}"
+            )
         return body
 
     def file_size(self, path: str) -> int | None:
@@ -146,6 +177,30 @@ class OpenListWebDAVClient:
     def exists(self, path: str) -> bool:
         status, _ = self._request("PROPFIND", path, headers={"Depth": "0"})
         return status in (200, 207)
+
+
+def _webdav_error_detail(status: int, body: bytes) -> str:
+    """Attach a short OpenList error-body excerpt so a 4xx is self-explanatory."""
+    if status in (200, 201, 202, 204, 206, 404):
+        return ""
+    text = (body or b"")[:300].decode("utf-8", errors="replace").strip()
+    return f"（{text}）" if text else ""
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urllib.parse.urlparse(str(url or ""))
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is None:
+        if scheme == "http":
+            port = 80
+        elif scheme == "https":
+            port = 443
+    return scheme, hostname, port
 
 
 def _parse_multistatus(body: bytes, *, base_url: str) -> list[dict[str, Any]]:

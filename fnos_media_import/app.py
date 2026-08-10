@@ -68,6 +68,7 @@ from .organizer.openlist_client import VIDEO_EXTENSIONS, OpenListClient
 from .organizer.service import OrganizerService, build_frozen_openlist_client_resolver
 from .providers.btbtla import BtbtlaClient
 from .providers.hot_sources import IqiyiHotSource, TencentHotSource, YoukuHotSource
+from .providers.active import get_optional_provider_method
 from .services.import_service import ImportService
 from .services.job_service import JobService
 from .services.rclone_service import RcloneService
@@ -142,7 +143,7 @@ from .services.media_dashboard_service import (
 from .services.durable_worker_runtime import DurableWorkerRuntime
 from .services.worker_task_dispatcher import WorkerTaskDispatcher
 from .services.worker_queue_diagnostics_service import WorkerQueueDiagnosticsService
-from .services.readiness_service import ReadinessService
+from .services.readiness_service import ReadinessService, routes_require_openlist
 from .services.worker_watchdog import WorkerWatchdog
 from .services.notification_settings_service import NotificationSettingsService
 from .notifications import events as notification_events
@@ -153,6 +154,7 @@ from .notifications.scheduler import NotificationDigestScheduler
 from .notifications.transitions import emit_organizer_review_required
 from .notifications.worker import make_notification_deliver_handler
 from .services.public_submission_preflight_service import PublicSubmissionPreflightService
+from .search.aggregator import SearchProvidersUnavailableError
 from .services.public_manual_preview_service import PublicManualPreviewService
 from .services.public_bt_resolve_service import PublicBtResolveService
 from .services.public_sixpan_preview_service import PublicSixpanPreviewService
@@ -1632,18 +1634,14 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         if bool(organizer.get("enabled")):
             return True
         # A cross-Provider rclone/relay route needs a readable source landing
-        # mount even when Organizer is disabled.
-        with db.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT 1
-                  FROM storage_targets t
-                  JOIN provider_account_selections s ON s.account_id=t.account_scope
-                 WHERE t.enabled=1 AND t.provider_kind NOT IN ('local','generic','openlist_generic')
-                 LIMIT 1
-                """
-            ).fetchone()
-        return row is not None
+        # mount even when Organizer is disabled. ``storage_targets.account_scope``
+        # stores a scope such as ``default`` rather than an account id, so it
+        # must not be joined to provider_account_selections.account_id.
+        return routes_require_openlist(
+            v1_rules_service.list_assignments(),
+            v1_rules_service.sources(),
+            v1_target_service.get_target,
+        )
 
     def _readiness_valid_mount_count() -> int:
         with db.connect() as connection:
@@ -1901,7 +1899,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def _job_cancellation_service() -> JobCancellationService:
         return JobCancellationService(
             JobCancellationDependencies(
-                jobs=db,
+                job_queries=db.job_queries,
+                job_commands=db.job_commands,
                 cleaner=rclone_controller,
                 merge_raw_data=_merge_raw_data,
                 payload_bool=_payload_bool,
@@ -2065,7 +2064,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         )
 
     def _rclone_admin_query_application() -> RcloneAdminQueryService:
-        return RcloneAdminQueryService(RcloneAdminQueryDependencies(rclone=rclone_controller, counts=db))
+        return RcloneAdminQueryService(
+            RcloneAdminQueryDependencies(
+                rclone=rclone_controller,
+                counts=db.rclone,
+            )
+        )
 
     def api_admin_rclone_file_retry(event_id: int):
         payload = request.get_json(silent=True) or {}
@@ -2246,7 +2250,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return jsonify({"success": True, "items": result["items"], "pagination": _page_meta(result["total"], page, per_page)})
 
     def _organizer_admin_query_application() -> OrganizerAdminQueryService:
-        return OrganizerAdminQueryService(OrganizerAdminQueryDependencies(organizer=organizer_service, counts=db))
+        return OrganizerAdminQueryService(
+            OrganizerAdminQueryDependencies(
+                organizer=organizer_service,
+                counts=db.organizer,
+            )
+        )
 
     def api_admin_organizer_rollback(run_id: int):
         result, status_code = _organizer_admin_command_application().rollback(run_id)
@@ -2625,6 +2634,23 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         target_service=v1_target_service,
         assignment_service=v1_rules_service,
         connection_factory=db.connect,
+        rclone_webdav_sync=lambda payload: (
+            rclone_worker_client.webdav_save(dict(payload))
+            if rclone_worker_client is not None
+            else rclone_webdav_config_service.save(dict(payload))
+        ),
+        rclone_webdav_test=lambda: (
+            rclone_worker_client.webdav_test()
+            if rclone_worker_client is not None
+            else rclone_webdav_config_service.test()
+        ),
+        organizer_enabled=lambda: bool(
+            (
+                app_config.raw.get("organizer", {})
+                if isinstance(app_config.raw.get("organizer"), dict)
+                else {}
+            ).get("enabled", False)
+        ),
     )
     app.extensions["v1_storage_setup_service"] = v1_storage_setup_service
 
@@ -3071,8 +3097,9 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             importer = _active_tianyi_importer()
         else:
             importer = generic_importers.get(adapter_key)
-        if importer and hasattr(importer, "probe"):
-            result = importer.probe()
+        probe = get_optional_provider_method(importer, "probe")
+        if probe:
+            result = probe()
             return jsonify(
                 {
                     "success": True,
@@ -3226,7 +3253,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return PublicSearchService(
             PublicSearchDependencies(
                 search=search_service,
-                cache=db,
+                cache_queries=db.search_cache_queries,
+                cache_commands=db.search_cache_commands,
                 new_public_id=_new_public_id,
                 present_item=present,
                 log_info=app.logger.info,
@@ -3263,14 +3291,31 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             _payload_bool(payload, "background", False),
             search_options["async_poll"],
         )
-        result = _public_search_application().search(
-            keyword,
-            sources=sources,
-            token=token,
-            options=search_options,
-            hide_full_links=public_settings.get("hide_full_links", True),
-            trace_id=trace_id,
-        )
+        try:
+            result = _public_search_application().search(
+                keyword,
+                sources=sources,
+                token=token,
+                options=search_options,
+                hide_full_links=public_settings.get("hide_full_links", True),
+                trace_id=trace_id,
+            )
+        except SearchProvidersUnavailableError as exc:
+            app.logger.warning(
+                "search_trace=%s stage=public_route_unavailable error=%s",
+                trace_id,
+                str(exc)[:500],
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "code": "SEARCH_PROVIDERS_UNAVAILABLE",
+                    "message": "搜索源暂不可用，请稍后重试",
+                    "retryable": True,
+                    "trace_id": trace_id,
+                    "items": [],
+                }
+            ), 503
         app.logger.info(
             "search_trace=%s stage=public_route_done total_ms=%.1f items=%d",
             trace_id,
@@ -3307,7 +3352,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return jsonify({"success": True, "link": public_link})
 
     public_manual_preview_service = PublicManualPreviewService(
-        cache=db,
+        cache_queries=db.search_cache_queries,
+        cache_commands=db.search_cache_commands,
         new_public_id=_new_public_id,
         detect_link=detect_link,
         resource_detail=_public_resource_detail,
@@ -3383,7 +3429,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         )
 
     public_sixpan_preview_service = PublicSixpanPreviewService(
-        cache=db,
+        cache_queries=db.search_cache_queries,
         importer=lambda: generic_importers.get("sixpan"),
         validate_url=lambda value: _validate_public_url(value, security_config),
         detect_link=detect_link,
@@ -3409,7 +3455,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return jsonify(result), status_code
 
     public_bt_resolve_service = PublicBtResolveService(
-        cache=db,
+        cache_queries=db.search_cache_queries,
+        cache_commands=db.search_cache_commands,
         btbtla=lambda: btbtla,
         present_item=_public_resource_item,
         resource_detail=_public_resource_detail,
@@ -3811,9 +3858,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     def api_admin_sixpan_probe():
         importer = generic_importers.get("sixpan")
-        if not importer or not hasattr(importer, "probe"):
+        probe = get_optional_provider_method(importer, "probe")
+        if not probe:
             return jsonify({"success": False, "message": "六盘离线适配器不可用"}), 400
-        result = importer.probe()
+        result = probe()
         return jsonify({"success": result.ok, "status": result.status, "message": result.message, "details": result.details})
 
     callback_service = RcloneCallbackService(
@@ -3911,7 +3959,11 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         create_openlist_blueprint(
             OpenListRouteContext(
                 admin_required=admin_required,
-                handlers=default_handlers(v1_openlist_connections, v1_openlist_mounts),
+                handlers=default_handlers(
+                    v1_openlist_connections,
+                    v1_openlist_mounts,
+                    connection_save=v1_storage_setup_service.save_openlist,
+                ),
             )
         )
     )

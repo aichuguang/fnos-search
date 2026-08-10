@@ -17,6 +17,7 @@ from .constants import CATEGORY_LABELS
 from .importers.cloud139 import Cloud139Importer
 from .importers.sixpan import SixPanOfflineImporter
 from .importers.tianyi import TianyiImporter
+from .providers.active import get_optional_provider_method
 from .services.public_resource_detail_service import PublicResourceDetailService
 from .services.public_submission_preflight_service import PublicSubmissionPreflightService
 from .web_input import _clip_text, _config_bool, _config_int, _safe_int_value
@@ -361,9 +362,17 @@ def _adapter_placeholders(
     ]
     for key, name, source_types, provider_kind, source_form, search_source_id, message in placeholder_specs:
         importer = generic_importers.get(key)
-        description = importer.describe() if importer and hasattr(importer, "describe") else {}
+        description = {}
+        describer = get_optional_provider_method(importer, "describe")
+        if describer:
+            try:
+                candidate = describer()
+                if isinstance(candidate, dict):
+                    description = candidate
+            except Exception:  # noqa: BLE001 - optional metadata must fail closed
+                description = {}
         if importer and not description:
-            checker = getattr(importer, "check_configuration", None)
+            checker = get_optional_provider_method(importer, "check_configuration")
             if callable(checker):
                 try:
                     check = checker()

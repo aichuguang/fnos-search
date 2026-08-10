@@ -291,3 +291,79 @@ OK
 - OpenList、Organizer、取消、重试和 Worker 重启恢复。
 
 执行步骤与回滚要求见 `docs/v1-hard-cutover-deploy.md`。
+
+## 12. OpenList 原生上传探针跨域下载修复（2026-08-10）
+
+现场复现确认：移动云原生上传成功，OpenList `PROPFIND` 也能看到探针文件及正确大小，但 WebDAV `GET` 经 302 跳转到对象存储签名地址后返回 `InvalidArgument`。根因是 Python `urllib` 默认把 OpenList 请求中的 Basic `Authorization` 继续带到跨域对象存储地址；对象存储同时收到签名查询参数和无关的 Basic 认证头，因此拒绝请求。
+
+本轮修复：
+
+- WebDAV 客户端只在同源跳转中保留认证头；跨协议、主机或端口跳转时移除 `Authorization` 与 `Proxy-Authorization`；
+- 保持 OpenList 自身同源跳转的 Basic 认证行为不变；
+- 探针读回重试耗尽时保留最后一次底层错误，避免只显示无诊断价值的 `OpenList probe file read failed`；
+- 新增本地双 HTTP 服务回归测试，精确模拟“OpenList 302 到对象存储、携带 Basic 时返回 400”的现场行为。
+
+验证结果：
+
+- OpenList、连接韧性与 Storage Setup 相关回归：`104 passed, 6 subtests passed`；
+- 新增跨域/同源重定向测试：`2` 项通过；
+- `ruff check` 与相关文件 `compileall`：通过；
+- 使用当前移动云账号的 `/webdav` 原生目录与 OpenList `/移动云` 挂载执行真实小文件探针，原生上传、OpenList 读回、MOVE、DELETE 全部通过；
+- 探针与诊断文件无残留；服务已重启，`http://127.0.0.1:5251/admin` 返回 HTTP 200。
+
+## 13. 入库、保存、rclone 与 Organizer 链路审计（2026-08-10）
+
+本轮未创建真实媒体任务、未保存入库规则、未启用 Organizer。外部写入仅使用可自动清理的小文件探针。
+
+### 13.1 新发现并修复的运行回归
+
+- rclone 运行记录、rclone 文件记录、Organizer 任务列表和 Organizer 执行记录接口此前均把完整 `RepositorySet` 误传给计数依赖，运行时分别调用不存在的 `count_rclone_*` / `count_organizer_*` 方法并返回 HTTP 500；现已改为注入 `db.rclone` 与 `db.organizer`。
+- 任务取消服务仍调用已退役的 `get_job` / `update_job_if_status` 聚合 façade；现已拆分注入 `job_queries` 与 `job_commands`，并使用正式仓储方法 `get`、`update_if_status`、`add_event`。
+- 公共搜索、手动链接预览、六盘磁链预览和 BTBTLA 解析仍使用已退役的搜索缓存 façade；现已统一改为显式注入 `search_cache_queries` 与 `search_cache_commands`。
+- 当全部外部搜索源失败时，访客搜索原先进入全局异常处理并返回 HTTP 500；现改为 HTTP 503、`SEARCH_PROVIDERS_UNAVAILABLE`、`retryable=true`，不再把外部搜索源超时伪装成服务内部错误。
+
+修复后实时路由审计确认以下接口均返回 HTTP 200：
+
+- `/api/admin/rclone/status`
+- `/api/admin/rclone/logs`
+- `/api/admin/rclone/runs`
+- `/api/admin/rclone/events`
+- `/api/admin/rclone/files`
+- `/api/admin/organizer/tasks`
+- `/api/admin/organizer/runs`
+- `/api/admin/jobs`
+- `/api/admin/system/events`
+- `/api/admin/system/task-logs`
+- `/api/public/config`
+
+当前 PanSou 地址在本机真实请求中超时；访客搜索已验证返回 HTTP 503，而不是 HTTP 500。该外部搜索源仍需单独恢复或替换。
+
+### 13.2 真实账号与 OpenList 小文件探针
+
+- 当前激活并通过实时账号检测：夸克、移动云、天翼、六盘，共 4 个来源类型；另有一个未激活的旧天翼账号，不参与当前运行链路。
+- OpenList `openlist_main` 认证和服务版本探测通过。
+- 天翼、夸克、六盘、移动云 4 个 mount 均通过根目录读取、小文件 PUT、内容读回、MOVE 与 DELETE，结果均为 `readable=true / writable=true`，且任务级探针目录已清理。
+- 天翼真实执行原生 API 小文件上传，并由 OpenList 完成可见性、内容读回、MOVE 和 DELETE，全部通过。
+- 移动云真实执行原生 API 小文件上传，并由 OpenList 完成可见性、内容读回、MOVE 和 DELETE，全部通过。
+- 4 个保存目标的结构、账号绑定、分类路径、rclone/OpenList locator 均通过目标校验。
+
+### 13.3 当前配置阻塞
+
+- Storage Setup 当前为 `3/4`：账号、OpenList、保存位置已完成，4 个来源的入库规则尚未选择默认保存目标。因此预检只失败于“来源保存规则”，当前不能宣称完整入库可用。
+- `organizer.enabled=false`，TMDB、AI、STRM 本地根目录均未配置；本轮只验证了 Organizer 所依赖的 OpenList 读取、MOVE、DELETE 数据面，没有执行影视识别、命名规划、正式整理、回滚或 STRM 刷新。
+- 当前 Windows 运行环境找不到 `rclone` 与 PATH 中的 `sh`，`/api/admin/rclone/check` 明确失败，`/api/admin/rclone/webdav-config` 返回 HTTP 503。Git Bash 的 shell 文件存在，但没有 rclone 可执行文件；本机也没有 Docker 命令，因此无法在正式镜像环境复验 rclone Remote、跨盘复制、Worker 回调和重启恢复。
+- 当前没有待处理、运行中或历史真实入库任务；为避免写入真实规则，本轮没有生成一条端到端媒体任务。因此“来源保存 → 跨盘 rclone/Provider relay → Organizer 正式落位”的最终发布门槛仍需在配置入库规则并具备正式 rclone Worker 后，以一个非生产小文件任务完成。
+
+### 13.4 相关范围验证
+
+按用户要求只执行本次涉及范围，不以全量测试作为验收结果：
+
+- Storage Setup、OpenList、目标/计划、Provider、rclone、readiness、UI、公共预览与取消链路：`292 passed, 78 subtests passed`。
+- 新增公共搜索异常映射、搜索缓存显式仓储与硬切换约束：`22 passed, 66 subtests passed`。
+- 生产任务取消仓储与公共缓存仓储补充验证：`14 passed`。
+- 源码编码：`1 passed`。
+- `python -m compileall -q fnos_media_import`：通过。
+- 相关 Python 文件 `ruff check`：通过。
+- `bash -n scripts/fnos_rclone_worker.sh`：通过。
+- `node --check static/admin-storage-v1.js`：通过。
+- `git diff --check`：通过，仅有 Git 的 LF/CRLF 提示，无空白错误。

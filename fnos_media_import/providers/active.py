@@ -70,4 +70,26 @@ class ActiveProviderImporter:
         return getattr(self.resolve(), name)
 
 
-__all__ = ["ActiveProviderImporter", "ActiveProviderUnavailable"]
+def get_optional_provider_method(importer: Any, name: str) -> Callable[..., Any] | None:
+    """Return an optional importer method without failing on an inactive proxy.
+
+    ``hasattr`` is unsafe for :class:`ActiveProviderImporter` because Python
+    implements it through attribute access, which invokes ``__getattr__`` and
+    resolves the active account.  Read-only capability discovery must fail
+    closed instead of turning an unconfigured Provider into an HTTP 500.
+    """
+
+    if importer is None:
+        return None
+    try:
+        value = getattr(importer, str(name or ""), None)
+    except ActiveProviderUnavailable:
+        return None
+    return value if callable(value) else None
+
+
+__all__ = [
+    "ActiveProviderImporter",
+    "ActiveProviderUnavailable",
+    "get_optional_provider_method",
+]

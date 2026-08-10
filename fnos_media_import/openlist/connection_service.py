@@ -7,8 +7,9 @@ re-entered.
 
 from __future__ import annotations
 
-import os
+import hmac
 import json
+import os
 import re
 import sqlite3
 import urllib.parse
@@ -27,6 +28,43 @@ from .webdav_client import OpenListWebDAVClient
 
 CONNECTION_KEY_ID = f"v2:{PURPOSE_OPENLIST}"
 _CONNECTION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+# The managed rclone worker reads one mutable WebDAV remote.  Operational
+# connection edits must therefore wait until every automatically executable
+# job using that connection has quiesced.  Review/terminal rows are excluded:
+# they are protected separately by the frozen-vs-current runtime identity
+# check when somebody explicitly retries them later.
+_PAUSED_OR_TERMINAL_JOB_STATUSES = frozenset(
+    {
+        "review",
+        "manual_review",
+        "done",
+        "success",
+        "failed",
+        "unsupported",
+        "cancelled",
+        "canceled",
+        "rejected",
+        "skipped",
+        "skipped_existing",
+    }
+)
+_PAUSED_OR_TERMINAL_TRANSFER_PHASES = frozenset(
+    {"manual_review", "completed", "failed", "cancelled", "canceled"}
+)
+_ACTIVE_RCLONE_RUN_STATUSES = frozenset(
+    {"queued", "starting", "running", "recovering", "cancel_pending"}
+)
+_ACTIVE_ORGANIZER_TASK_STATUSES = frozenset(
+    {
+        "pending",
+        "waiting_openlist",
+        "stabilizing",
+        "scanning",
+        "auto_approved",
+        "executing",
+    }
+)
 
 ProbeRunner = Callable[[dict[str, Any]], dict[str, Any]]
 MasterKeyProvider = Callable[[], bytes | str]
@@ -268,9 +306,18 @@ class OpenListConnectionService:
             if payload.get("password") is not None:
                 password = str(payload.get("password") or "")
                 if password:
-                    password_ciphertext, credential_key_id = _encrypt_password(
-                        password, self.master_key_provider
+                    current_password = _decrypt_password(
+                        password_ciphertext,
+                        credential_key_id,
+                        self.master_key_provider,
                     )
+                    if not hmac.compare_digest(
+                        password.encode("utf-8"),
+                        current_password.encode("utf-8"),
+                    ):
+                        password_ciphertext, credential_key_id = _encrypt_password(
+                            password, self.master_key_provider
+                        )
             connection_identity_changed = any(
                 (
                     str(row["base_url"] or "") != base_url,
@@ -279,6 +326,8 @@ class OpenListConnectionService:
                     bool(row["enabled"]) != bool(enabled),
                 )
             )
+            if connection_identity_changed:
+                self._assert_runtime_mutation_safe(conn, connection_id)
             revision = int(row["revision"] or 1) + 1
             now = utc_now_iso()
             next_test_status = (
@@ -381,6 +430,149 @@ class OpenListConnectionService:
             "credential_configured": bool(row["password_ciphertext"])
             and str(row["credential_key_id"] or "") == CONNECTION_KEY_ID,
         }
+
+    def runtime_identity_matches(self, connection_id: str, revision: int) -> bool:
+        """Return whether a frozen revision still matches the managed remote.
+
+        Display-only revisions intentionally compare equal.  URL, username,
+        enabled state and encrypted credential identity must all remain exact;
+        otherwise a historical rclone plan must fail closed instead of using
+        the single current Remote with stale paths.
+        """
+
+        try:
+            selected_revision = int(revision)
+        except (TypeError, ValueError):
+            return False
+        if selected_revision <= 0:
+            return False
+        with self.database.connect() as conn:
+            current = self._get_row(conn, connection_id)
+            frozen = conn.execute(
+                "SELECT * FROM openlist_connection_revisions "
+                "WHERE connection_id=? AND revision=?",
+                (connection_id, selected_revision),
+            ).fetchone()
+        if current is None or frozen is None:
+            return False
+        try:
+            config = json.loads(frozen["config_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return bool(
+            str(current["base_url"] or "") == str(config.get("base_url") or "")
+            and str(current["username"] or "") == str(config.get("username") or "")
+            and bool(current["enabled"]) == bool(config.get("enabled", True))
+            and bytes(current["password_ciphertext"] or b"")
+            == bytes(frozen["password_ciphertext"] or b"")
+            and str(current["credential_key_id"] or "")
+            == str(frozen["credential_key_id"] or "")
+        )
+
+    def _assert_runtime_mutation_safe(self, conn: Any, connection_id: str) -> None:
+        """Reject an operational edit while the shared Remote is in use."""
+
+        referenced_job_ids: set[int] = set()
+        if _table_exists(conn, "import_execution_plans"):
+            rows = conn.execute(
+                """
+                SELECT p.job_id, p.plan_json, COALESCE(j.status, '') AS job_status
+                  FROM import_execution_plans p
+                  LEFT JOIN import_jobs j ON j.id=p.job_id
+                """
+            ).fetchall()
+            for plan_row in rows:
+                if not _json_contains_connection_id(plan_row["plan_json"], connection_id):
+                    continue
+                job_id = int(plan_row["job_id"] or 0)
+                if job_id > 0:
+                    referenced_job_ids.add(job_id)
+                job_status = str(plan_row["job_status"] or "").strip().lower()
+                if job_status not in _PAUSED_OR_TERMINAL_JOB_STATUSES:
+                    self._raise_runtime_in_use(connection_id, f"入库任务 #{job_id}")
+
+        if _table_exists(conn, "transfer_executions"):
+            rows = conn.execute(
+                "SELECT job_id, phase, snapshot_json, receipt_json, cleanup_json "
+                "FROM transfer_executions"
+            ).fetchall()
+            for execution in rows:
+                job_id = int(execution["job_id"] or 0)
+                references_connection = job_id in referenced_job_ids or any(
+                    _json_contains_connection_id(execution[key], connection_id)
+                    for key in ("snapshot_json", "receipt_json", "cleanup_json")
+                )
+                if not references_connection:
+                    continue
+                referenced_job_ids.add(job_id)
+                phase = str(execution["phase"] or "").strip().lower()
+                if phase not in _PAUSED_OR_TERMINAL_TRANSFER_PHASES:
+                    self._raise_runtime_in_use(
+                        connection_id,
+                        f"传输任务 #{job_id}（{phase or 'unknown'}）",
+                    )
+
+        if _table_exists(conn, "rclone_runs"):
+            active_statuses = tuple(sorted(_ACTIVE_RCLONE_RUN_STATUSES))
+            placeholders = ",".join("?" for _ in active_statuses)
+            rows = conn.execute(
+                "SELECT id, job_id, status FROM rclone_runs "
+                f"WHERE lower(status) IN ({placeholders})",
+                active_statuses,
+            ).fetchall()
+            for run in rows:
+                job_id = int(run["job_id"] or 0)
+                # Legacy/unscoped runs also use the one managed Remote, so an
+                # identity edit is unsafe even without a plan reference.
+                if job_id <= 0 or job_id in referenced_job_ids:
+                    self._raise_runtime_in_use(
+                        connection_id,
+                        f"rclone 运行 #{int(run['id'] or 0)}",
+                    )
+
+        active_organizer_ids: set[int] = set()
+        if referenced_job_ids and _table_exists(conn, "organizer_tasks"):
+            placeholders = ",".join("?" for _ in referenced_job_ids)
+            rows = conn.execute(
+                f"SELECT id, job_id, status FROM organizer_tasks WHERE job_id IN ({placeholders})",
+                tuple(sorted(referenced_job_ids)),
+            ).fetchall()
+            for task in rows:
+                status = str(task["status"] or "").strip().lower()
+                if status in _ACTIVE_ORGANIZER_TASK_STATUSES:
+                    task_id = int(task["id"] or 0)
+                    active_organizer_ids.add(task_id)
+                    self._raise_runtime_in_use(
+                        connection_id,
+                        f"Organizer 任务 #{task_id}（{status}）",
+                    )
+
+        if _table_exists(conn, "worker_tasks"):
+            rows = conn.execute(
+                "SELECT id, task_type, payload FROM worker_tasks "
+                "WHERE status IN ('pending','running')"
+            ).fetchall()
+            for worker in rows:
+                payload = _json_object(worker["payload"])
+                job_id = _safe_positive_int(payload.get("job_id"))
+                organizer_task_id = _safe_positive_int(payload.get("task_id"))
+                if job_id in referenced_job_ids or organizer_task_id in active_organizer_ids:
+                    self._raise_runtime_in_use(
+                        connection_id,
+                        f"Worker 任务 #{int(worker['id'] or 0)}",
+                    )
+
+    @staticmethod
+    def _raise_runtime_in_use(connection_id: str, reference: str) -> None:
+        conflict = OpenListValidationError(
+            f"OpenList 连接 {connection_id} 正在被待执行或运行中的入库任务使用，"
+            "请等待任务结束或取消后再修改 URL、用户名、密码或启用状态"
+            f"（{reference}）"
+        )
+        conflict.code = "OPENLIST_CONNECTION_IN_USE"
+        conflict.status = 409
+        conflict.retryable = True
+        raise conflict
 
     def delete_connection(self, connection_id: str) -> dict[str, Any]:
         with self.database.connect() as conn:
@@ -611,6 +803,31 @@ def _json_contains_connection_id(raw: Any, connection_id: str) -> bool:
         return False
 
     return bool(wanted and contains(value))
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    try:
+        value = json.loads(str(raw or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_positive_int(value: Any) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _table_exists(conn: Any, table_name: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (str(table_name or ""),),
+        ).fetchone()
+    )
 
 
 def _mount_snapshot_json(row: Any, connection_revision: int) -> str:

@@ -110,19 +110,41 @@ class AdminSettingsUiTests(unittest.TestCase):
         self.assertNotIn("请继续扫码", source)
         self.assertIn(".storage-auth-error", styles)
         self.assertIn("function usesNativeFolderBrowser(provider)", source)
-        self.assertIn('data-native-directory-action="enter"', source)
+        self.assertIn('data-native-tree-action="toggle"', source)
         self.assertIn("/storage-setup/accounts/${encodeURIComponent(accountId)}/folders", source)
         self.assertIn("native_root_name: raw.native_root_name || null", source)
         self.assertIn("location.native_upload_capable", source)
         self.assertIn(".storage-native-browser", styles)
-        self.assertIn(".storage-native-folder-list", styles)
+        self.assertIn(".storage-native-tree", styles)
         self.assertIn(".storage-capability-list", styles)
         self.assertIn("@media (max-width: 700px)", styles)
         self.assertIn(".storage-route-row { grid-template-columns: 1fr;", styles)
 
+    def test_storage_directory_picker_uses_custom_select_and_preserves_form_state(self) -> None:
+        source = Path("static/admin-storage-v1.js").read_text(encoding="utf-8")
+        self.assertIn("function renderOpenListDirectoryOptions(selectedValue)", source)
+        self.assertIn('<select name="webdav_root" required>', source)
+        self.assertNotIn('list="storageDirectoryOptions"', source)
+        self.assertNotIn('<datalist id="storageDirectoryOptions">', source)
+        self.assertIn("function syncLocationEditorValues(form)", source)
+        self.assertIn('syncLocationEditorValues(button.closest("#storageLocationForm"))', source)
+        self.assertIn('state.editor.values.confirm_identity = ""', source)
+        self.assertIn('values.confirm_identity === true || values.confirm_identity === "true"', source)
+
+    def test_storage_save_and_probe_buttons_show_loading(self) -> None:
+        source = Path("static/admin-storage-v1.js").read_text(encoding="utf-8")
+        self.assertIn("function setButtonLoading(button, loading)", source)
+        self.assertIn('data-loading-label="\\u6b63\\u5728\\u4fdd\\u5b58\\u5e76\\u68c0\\u6d4b\\u8fde\\u63a5\\u2026"', source)
+        self.assertIn('data-loading-label="\\u6b63\\u5728\\u4fdd\\u5b58\\u5e76\\u68c0\\u6d4b\\u76ee\\u5f55\\u2026"', source)
+        self.assertIn("event.submitter", source)
+        self.assertIn("setButtonLoading(loadingButton, true)", source)
+        self.assertIn("setButtonLoading(loadingButton, false)", source)
+        self.assertIn('class="button-spinner" aria-hidden="true"', source)
+        self.assertIn('button.setAttribute("aria-busy", "true")', source)
+
     def test_provider_auth_script_cache_version_is_current(self) -> None:
         self.assertIn(
-            '/static/admin-storage-v1.js?v=20260809-v1-cutover-v001',
+            '/static/admin-storage-v1.js?v=20260810-storage-flow-v005',
             self.template,
         )
 

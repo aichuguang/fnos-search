@@ -12,6 +12,7 @@ from fnos_media_import.importers.quark import QuarkImporter
 from fnos_media_import.providers.active import (
     ActiveProviderImporter,
     ActiveProviderUnavailable,
+    get_optional_provider_method,
 )
 from fnos_media_import.providers.adapters import QuarkProviderAdapter
 from fnos_media_import.runtime_builder import RuntimeBuilder
@@ -62,6 +63,15 @@ class QuarkImporterV1Tests(unittest.TestCase):
             wrapper.check_configuration()
         self.assertTrue(wrapper.check_configuration().ok)
         self.assertEqual(wrapper.cookie, "new-account-cookie")
+
+    def test_optional_method_lookup_fails_closed_for_inactive_provider(self) -> None:
+        def unavailable():
+            raise ActiveProviderUnavailable("\u5f53\u524d\u516d\u76d8\u8d26\u53f7\u672a\u6fc0\u6d3b")
+
+        wrapper = ActiveProviderImporter("\u516d\u76d8", unavailable)
+
+        self.assertIsNone(get_optional_provider_method(wrapper, "describe"))
+        self.assertIsNone(get_optional_provider_method(wrapper, "probe"))
 
     def test_runtime_builder_binds_resolver_for_replacement_builds(self) -> None:
         active = QuarkImporter({"cookie": "new-account-cookie"})
@@ -126,6 +136,61 @@ class QuarkImporterV1Tests(unittest.TestCase):
     def test_unknown_business_code_still_fails_closed(self) -> None:
         with self.assertRaisesRegex(Exception, "夸克 API code=E_UNKNOWN"):
             self.importer._validate_response(200, {"code": "E_UNKNOWN"})
+
+    def test_list_folders_returns_only_drive_folders(self) -> None:
+        self.importer.http.get_json = Mock(
+            return_value=(
+                200,
+                {
+                    "code": 0,
+                    "data": {
+                        "list": [
+                            {"fid": "dir-1", "file_name": "电影", "file_type": "folder", "dir": True},
+                            {"fid": "file-1", "file_name": "a.mkv", "file_type": "file", "dir": False},
+                            {"fid": "dir-2", "file_name": "电视剧", "file_type": "folder"},
+                        ]
+                    },
+                },
+            )
+        )
+
+        folders = self.importer.list_folders("0")
+
+        self.assertEqual(
+            folders,
+            [
+                {"folder_id": "dir-1", "name": "电影", "parent_folder_id": "0"},
+                {"folder_id": "dir-2", "name": "电视剧", "parent_folder_id": "0"},
+            ],
+        )
+        url = self.importer.http.get_json.call_args.args[0]
+        self.assertIn("/1/clouddrive/file/sort", url)
+        self.assertEqual(self.importer.http.get_json.call_args.kwargs["params"]["pdir_fid"], "0")
+
+    def test_list_folders_requires_cookie(self) -> None:
+        importer = QuarkImporter({})
+        with self.assertRaisesRegex(Exception, "夸克"):
+            importer.list_folders("0")
+
+    def test_list_folders_missing_cookie_and_passes_through_child_parent(self) -> None:
+        self.importer.http.get_json = Mock(
+            return_value=(
+                200,
+                {
+                    "code": 0,
+                    "data": {
+                        "list": [
+                            {"fid": "dir-9", "file_name": "子目录", "file_type": "folder"},
+                        ]
+                    },
+                },
+            )
+        )
+
+        folders = self.importer.list_folders("dir-1")
+
+        self.assertEqual(folders[0]["parent_folder_id"], "dir-1")
+        self.assertEqual(self.importer.http.get_json.call_args.kwargs["params"]["pdir_fid"], "dir-1")
 
     def test_check_share_uses_token_then_detail(self) -> None:
         self.importer.http.post_json = Mock(return_value=(200, {"code": 0, "data": {"stoken": "st-1"}}))
