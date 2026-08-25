@@ -3,6 +3,9 @@
 !.env.example
 .claude/
 .venv/
+node_modules/
+**/node_modules/
+frontend/dist/
 venv/
 __pycache__/
 **/__pycache__/
