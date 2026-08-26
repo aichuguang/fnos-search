@@ -123,20 +123,59 @@ class StorageSetupService:
                 message = message.replace(secret, "***")
         return message[:500]
 
+    _RCLONE_ABSENT_CODES = frozenset(
+        {"RCLONE_UNAVAILABLE", "WORKER_UNAVAILABLE", "WORKER_TIMEOUT"}
+    )
+
+    @classmethod
+    def _rclone_plane_absent_payload(cls, payload: dict[str, Any]) -> bool:
+        codes = {
+            _text(payload.get("error_code")).upper(),
+            _text(payload.get("status")).upper(),
+            _text(payload.get("code")).upper(),
+        }
+        return bool(codes & cls._RCLONE_ABSENT_CODES)
+
+    @classmethod
+    def _rclone_plane_absent(cls, exc: BaseException) -> bool:
+        """Tell "no rclone here at all" apart from "rclone refused the request".
+
+        rclone only moves bytes between two different providers.  An OpenList
+        connection is also what drives Organizer and STRM, so a deployment with
+        no rclone binary and no reachable worker must still be able to save one.
+        Only a genuine rejection (bad credentials, a hijacked remote name, a
+        write that failed) may keep failing the save.
+        """
+
+        if _text(getattr(exc, "code", "")).upper() in cls._RCLONE_ABSENT_CODES:
+            return True
+        payload = getattr(exc, "payload", None)
+        return isinstance(payload, dict) and cls._rclone_plane_absent_payload(payload)
+
+    @staticmethod
+    def _rclone_degraded_state(message: str) -> dict[str, Any]:
+        return {
+            "configured": False,
+            "available": False,
+            "connection_status": "unavailable",
+            "message": message,
+        }
+
     def _sync_rclone_webdav(self, connection_id: str) -> dict[str, Any]:
         """Persist and probe the worker-local managed WebDAV remote.
 
         OpenList credentials stay server-side: the browser saves them once in
         the encrypted connection revision, then this bridge resolves that
         revision and forwards it directly to the isolated rclone worker.
+
+        A missing rclone runtime downgrades to an unconfigured remote rather
+        than failing the save; ``preflight`` still reports it as a hard failure
+        for any route that actually needs a cross-provider copy.
         """
 
         if not callable(self.rclone_webdav_sync):
-            raise StorageSetupError(
-                "rclone WebDAV 配置服务尚未装配",
-                code="RCLONE_WEBDAV_SYNC_UNAVAILABLE",
-                status=503,
-                retryable=True,
+            return self._rclone_degraded_state(
+                "当前部署没有可用的 rclone，已跳过 rclone Remote 同步；跨盘搬运不可用"
             )
         connection = self.connections.get_connection(connection_id)
         if connection is None:
@@ -172,6 +211,15 @@ class StorageSetupService:
                     str(credentials.get("username") or ""),
                 ),
             )
+            if self._rclone_plane_absent(exc):
+                logger.warning(
+                    "event=openlist_saved_without_rclone connection_id=%s reason=%s",
+                    connection_id,
+                    message or "rclone 不可用",
+                )
+                return self._rclone_degraded_state(
+                    f"OpenList 已保存，但 rclone 不可用，跨盘搬运暂不可用：{message or 'rclone 管理命令不可用'}"
+                )
             raise StorageSetupError(
                 f"rclone WebDAV 同步或连接检测失败：{message or 'Worker 不可用'}",
                 code="RCLONE_WEBDAV_SYNC_FAILED",
@@ -180,6 +228,15 @@ class StorageSetupService:
             ) from exc
         if not isinstance(result, dict) or not bool(result.get("success", True)):
             message = _text((result or {}).get("message")) if isinstance(result, dict) else ""
+            if isinstance(result, dict) and self._rclone_plane_absent_payload(result):
+                logger.warning(
+                    "event=openlist_saved_without_rclone connection_id=%s reason=%s",
+                    connection_id,
+                    message or "rclone Worker 不可用",
+                )
+                return self._rclone_degraded_state(
+                    f"OpenList 已保存，但 rclone 不可用，跨盘搬运暂不可用：{message or 'rclone Worker 不可用'}"
+                )
             raise StorageSetupError(
                 f"rclone WebDAV 同步或连接检测失败：{message or '返回结果无效'}",
                 code="RCLONE_WEBDAV_SYNC_FAILED",
@@ -1138,11 +1195,18 @@ class StorageSetupService:
         item = self.connections.get_connection(connection_id)
         if item is None:  # pragma: no cover - guarded by successful test above
             raise StorageSetupError("OpenList 保存后无法读取")
+        rclone_available = bool(rclone_state.get("available", True))
         return {
             "success": True,
             "item": item,
             "rclone": rclone_state,
-            "message": "OpenList 已保存，WebDAV 与 rclone 连接检测成功",
+            "rclone_available": rclone_available,
+            "message": (
+                "OpenList 已保存，WebDAV 与 rclone 连接检测成功"
+                if rclone_available
+                else _text(rclone_state.get("message"))
+                or "OpenList 已保存，但 rclone 不可用，跨盘搬运暂不可用"
+            ),
         }
 
     def delete_openlist(self, connection_id: str) -> dict[str, Any]:

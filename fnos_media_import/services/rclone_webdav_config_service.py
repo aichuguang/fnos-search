@@ -9,10 +9,18 @@ from typing import Any
 from urllib.parse import urlsplit
 
 
+RCLONE_UNAVAILABLE = "RCLONE_UNAVAILABLE"
+
+
 class RcloneWebdavConfigError(RuntimeError):
-    def __init__(self, message: str, status_code: int = 400) -> None:
+    def __init__(self, message: str, status_code: int = 400, *, code: str = "") -> None:
         super().__init__(message)
         self.status_code = status_code
+        # ``RCLONE_UNAVAILABLE`` marks "the binary/runtime is not here at all",
+        # as opposed to "rclone ran and rejected the request".  Callers that
+        # only need rclone for cross-provider transfers degrade on the former
+        # instead of failing an operation that never required rclone.
+        self.code = str(code or "")
 
 
 class RcloneWebdavConfigService:
@@ -247,11 +255,19 @@ fi
                 errors="replace",
             )
         except FileNotFoundError as exc:
-            raise RcloneWebdavConfigError("rclone 管理命令不可用", 503) from exc
+            raise RcloneWebdavConfigError(
+                "rclone 管理命令不可用",
+                503,
+                code=RCLONE_UNAVAILABLE,
+            ) from exc
         except subprocess.TimeoutExpired as exc:
             raise RcloneWebdavConfigError("rclone 操作超时，请检查 Worker 和 OpenList 连接", 504) from exc
         except OSError as exc:
-            raise RcloneWebdavConfigError("无法调用 rclone 管理配置", 503) from exc
+            raise RcloneWebdavConfigError(
+                "无法调用 rclone 管理配置",
+                503,
+                code=RCLONE_UNAVAILABLE,
+            ) from exc
 
     def _default_remote_name(self) -> str:
         return str(self._current_config().get("remote_name") or "MP")

@@ -18,6 +18,11 @@ from fnos_media_import.openlist.connection_service import OpenListConnectionServ
 from fnos_media_import.openlist.mount_service import OpenListMountService
 from fnos_media_import.storage.assignment_service import AssignmentConflictError, SourceAssignmentService
 from fnos_media_import.storage.setup_blueprint import StorageSetupBlueprintContext, create_storage_setup_blueprint
+from fnos_media_import.services.rclone_webdav_config_service import (
+    RCLONE_UNAVAILABLE,
+    RcloneWebdavConfigError,
+)
+from fnos_media_import.storage import setup_service as setup_service_module
 from fnos_media_import.storage.setup_service import StorageSetupError, StorageSetupService
 from fnos_media_import.storage.target_service import StorageTargetService
 
@@ -1035,6 +1040,167 @@ class StorageSetupV1Tests(unittest.TestCase):
             "http://openlist-new:5244/dav",
         )
         self.assertEqual(self.rclone_sync_calls[-1]["username"], "new-admin")
+
+    def test_missing_rclone_binary_still_saves_openlist(self) -> None:
+        # rclone 只用于跨盘搬运；OpenList 还要驱动整理和 STRM。
+        # 本地没有 rclone 时不能因此拒绝保存 OpenList。
+        self.rclone_sync_error = RcloneWebdavConfigError(
+            "rclone 管理命令不可用",
+            503,
+            code=RCLONE_UNAVAILABLE,
+        )
+
+        result = self.service.save_openlist(
+            {
+                "name": "主 OpenList",
+                "base_url": "http://openlist:5244/dav",
+                "username": "admin",
+                "password": "secret",
+            }
+        )
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["rclone_available"])
+        self.assertIn("rclone", result["message"])
+        self.assertEqual(result["rclone"]["connection_status"], "unavailable")
+        saved = self.connections.get_connection(result["item"]["connection_id"])
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved["base_url"], "http://openlist:5244/dav")
+
+    def test_unreachable_rclone_worker_still_saves_openlist(self) -> None:
+        class WorkerDown(RuntimeError):
+            status_code = 503
+            payload = {
+                "success": False,
+                "status": "worker_unavailable",
+                "error_code": "worker_unavailable",
+                "message": "无法连接 rclone Worker，请稍后重试",
+            }
+
+        self.rclone_sync_error = WorkerDown("无法连接 rclone Worker，请稍后重试")
+
+        result = self.service.save_openlist(
+            {
+                "name": "主 OpenList",
+                "base_url": "http://openlist:5244/dav",
+                "username": "admin",
+                "password": "secret",
+            }
+        )
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["rclone_available"])
+        self.assertIsNotNone(
+            self.connections.get_connection(result["item"]["connection_id"])
+        )
+
+    def test_openlist_saves_when_no_rclone_bridge_is_wired(self) -> None:
+        service = StorageSetupService(
+            accounts_service=self.accounts,
+            connection_service=self.connections,
+            mount_service=self.mounts,
+            target_service=self.targets,
+            assignment_service=self.assignments,
+            connection_factory=self.db.connect,
+            organizer_enabled=lambda: False,
+        )
+
+        result = service.save_openlist(
+            {
+                "name": "主 OpenList",
+                "base_url": "http://openlist:5244/dav",
+                "username": "admin",
+                "password": "secret",
+            }
+        )
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["rclone_available"])
+
+    def test_genuine_rclone_rejection_still_fails_the_save(self) -> None:
+        # rclone 在位但拒绝请求（凭据错误、Remote 名被占用）仍必须回滚，
+        # 否则会留下一个指向错误 Remote 的 OpenList 连接。
+        self.rclone_sync_error = RcloneWebdavConfigError(
+            "Remote“MP”已存在且类型不是 WebDAV，未覆盖原配置",
+            409,
+        )
+
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_openlist(
+                {
+                    "name": "主 OpenList",
+                    "base_url": "http://openlist:5244/dav",
+                    "username": "admin",
+                    "password": "secret",
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "RCLONE_WEBDAV_SYNC_FAILED")
+        self.assertEqual(self.connections.list_connections(), [])
+
+    def test_preflight_still_fails_cross_provider_routes_without_rclone(self) -> None:
+        # 保存放行了，但真正需要跨盘搬运的路由必须在预检里明确报错，
+        # 否则会让人以为没有 rclone 也能跨盘搬运。
+        mobile = self._account("mobile", "移动云盘")
+        quark = self._account("quark", "夸克主账号")
+        self.service.save_openlist(
+            {
+                "base_url": "http://openlist:5244/dav",
+                "username": "admin",
+                "password": "password",
+            }
+        )
+        location = self.service.save_location(
+            {
+                "name": "夸克目标",
+                "kind": "provider",
+                "account_id": quark,
+                "connection_id": "openlist_main",
+                "webdav_root": "/夸克",
+                "native_root": "/媒体库",
+                "confirm_identity": True,
+            }
+        )
+        self.assignments.sources = lambda: {
+            "mobile": {
+                "search_source_id": "mobile",
+                "provider_kind": "mobile",
+                "label": "移动云盘",
+                "source_form": "share",
+            }
+        }
+        self.assignments.matrix = lambda: {
+            "rows": [
+                {
+                    "search_source_id": "mobile",
+                    "provider_kind": "mobile",
+                    "label": "移动云盘",
+                    "assignments": [
+                        {
+                            "category_key": "movie",
+                            "destination_id": location["destination_id"],
+                            "ready": True,
+                        }
+                    ],
+                }
+            ]
+        }
+        self.assertTrue(mobile)
+        self.rclone_sync_error = RcloneWebdavConfigError(
+            "rclone 管理命令不可用",
+            503,
+            code=RCLONE_UNAVAILABLE,
+        )
+
+        result = self.service.preflight()
+
+        rclone_check = next(
+            item for item in result["checks"] if item["name"] == "rclone OpenList Remote"
+        )
+        self.assertFalse(rclone_check["ok"])
+        self.assertIn("rclone", str(rclone_check["message"]))
+        self.assertIn("不可用", str(rclone_check["message"]))
+        self.assertFalse(result["ok"])
 
     def test_rclone_sync_failure_restores_connection_and_mount_probe_state(self) -> None:
         quark = self._account("quark", "夸克主账号")
