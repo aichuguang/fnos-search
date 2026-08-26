@@ -13,7 +13,7 @@ from fnos_media_import.openlist.locator_resolver import RcloneLocatorResolver
 from fnos_media_import.planning.job_plan import (
     attach_plan_integrity,
     compute_operation_key,
-    compute_plan_hash,
+    compute_persisted_plan_hash,
 )
 
 
@@ -161,7 +161,7 @@ def rclone_v1_job(
     payload = dict(raw_data or {})
     payload.setdefault(
         "execution_plan_ref",
-        {"version": 1, "plan_hash": compute_plan_hash(plan)},
+        {"version": 1, "plan_hash": compute_persisted_plan_hash(plan)},
     )
     return {
         "id": job_id,

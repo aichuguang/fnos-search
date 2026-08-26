@@ -108,11 +108,40 @@ def compute_operation_key(plan: dict[str, Any]) -> str:
 
 
 def compute_plan_hash(plan: dict[str, Any]) -> str:
+    """Self-referential integrity hash stored in ``plan.integrity.plan_hash``.
+
+    ``integrity.plan_hash`` is stripped before hashing because a hash can never
+    cover itself.  Use :func:`compute_persisted_plan_hash` for anything that has
+    to agree with ``import_execution_plans.plan_hash`` or with an
+    ``execution_plan_ref`` summary.
+    """
+
     candidate = copy.deepcopy(plan if isinstance(plan, dict) else {})
     integrity = candidate.get("integrity")
     if isinstance(integrity, dict):
         integrity.pop("plan_hash", None)
     return hashlib.sha256(canonical_plan_json(candidate).encode("utf-8")).hexdigest()
+
+
+def compute_persisted_plan_hash(plan: dict[str, Any]) -> str:
+    """Hash the exact JSON that ``import_execution_plans.plan_json`` stores.
+
+    This is the storage-side identity of a plan: the whole envelope including
+    ``integrity.plan_hash``.  ``import_job_service._canonical_plan_hash``,
+    ``execution_repository`` and ``rclone_repository`` all derive
+    ``plan_hash`` this way, so every ``execution_plan_ref`` cross-check has to
+    use the same definition or it will reject valid plans.  The encoder is
+    spelled out here (instead of reusing ``canonical_plan_json``) so it stays
+    byte-identical to the storage encoder, which has no ``default`` fallback.
+    """
+
+    encoded = json.dumps(
+        plan if isinstance(plan, dict) else {},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def attach_plan_integrity(plan: dict[str, Any]) -> dict[str, Any]:
@@ -188,7 +217,7 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
     raw_data = _raw_data(raw_job)
     plan_ref = raw_data.get("execution_plan_ref") if isinstance(raw_data.get("execution_plan_ref"), dict) else {}
     declared_ref_hash = str(plan_ref.get("plan_hash") or "").strip()
-    if declared_ref_hash and declared_ref_hash != compute_plan_hash(plan):
+    if declared_ref_hash and declared_ref_hash != compute_persisted_plan_hash(plan):
         raise JobPlanError("job execution_plan_ref hash does not match import_execution_plans")
 
     missing: list[str] = []
@@ -408,6 +437,7 @@ __all__ = [
     "attach_plan_integrity",
     "canonical_plan_json",
     "compute_operation_key",
+    "compute_persisted_plan_hash",
     "compute_plan_hash",
     "job_plan_reason",
     "plan_path",

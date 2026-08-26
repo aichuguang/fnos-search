@@ -859,7 +859,12 @@ def _first_secret_path(value: Any, prefix: str = "plan") -> str:
 
 
 def _canonical_plan_hash(plan: dict[str, Any]) -> str:
-    """Hash the exact JSON representation persisted in import_execution_plans."""
+    """Hash the exact JSON representation persisted in import_execution_plans.
+
+    Must stay byte-compatible with ``planning.job_plan.compute_persisted_plan_hash``
+    (kept local because this module cannot import ``planning`` at module scope).
+    ``tests/test_execution_plan_ref_hash.py`` pins the two together.
+    """
 
     encoded = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
