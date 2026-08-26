@@ -328,8 +328,20 @@ def _adapter_placeholders(
         }
     ]
 
-    if cloud139_importer:
-        description = cloud139_importer.describe()
+    if cloud139_importer is not None:
+        # ``ActiveProviderImporter`` has no ``__bool__`` and proxies every
+        # attribute through ``resolve()``, so a plain ``cloud139_importer.describe()``
+        # turns an unactivated 移动云 account into an HTTP 500 for every guest.
+        # Read-only capability discovery must fail closed like the loop below.
+        description = {}
+        describer = get_optional_provider_method(cloud139_importer, "describe")
+        if describer:
+            try:
+                candidate = describer()
+                if isinstance(candidate, dict):
+                    description = candidate
+            except Exception:  # noqa: BLE001 - optional metadata must fail closed
+                description = {}
         cloud139_capabilities = (
             description.get("capabilities")
             if isinstance(description.get("capabilities"), dict)

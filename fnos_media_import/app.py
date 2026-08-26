@@ -64,11 +64,15 @@ from .importers.sixpan import SixPanOfflineImporter
 from .media.fnos import FnosMediaRefresher
 from .logging_setup import install_file_log_handler
 from .blueprints import AdaptersRouteContext, AdminShellRouteContext, AuthRouteContext, CallbackRouteContext, DiagnosticsRouteContext, JobsRouteContext, MediaRouteContext, OrganizerRouteContext, PublicRouteContext, RcloneRouteContext, RcloneWorkerControlContext, RequestsRouteContext, SettingsRouteContext, SixPanRouteContext, SystemRouteContext, UpdatesRouteContext, create_adapters_blueprint, create_admin_shell_blueprint, create_auth_blueprint, create_callbacks_blueprint, create_diagnostics_blueprint, create_jobs_blueprint, create_media_blueprint, create_organizer_blueprint, create_public_blueprint, create_rclone_blueprint, create_rclone_worker_control_blueprint, create_requests_blueprint, create_settings_blueprint, create_sixpan_blueprint, create_system_blueprint, create_updates_blueprint
-from .organizer.openlist_client import VIDEO_EXTENSIONS, OpenListClient
+from .organizer.openlist_client import (
+    VIDEO_EXTENSIONS,
+    OpenListClient,
+    api_base_url as openlist_api_base_url,
+)
 from .organizer.service import OrganizerService, build_frozen_openlist_client_resolver
 from .providers.btbtla import BtbtlaClient
 from .providers.hot_sources import IqiyiHotSource, TencentHotSource, YoukuHotSource
-from .providers.active import get_optional_provider_method
+from .providers.active import ActiveProviderUnavailable, get_optional_provider_method
 from .services.import_service import ImportService
 from .services.job_service import JobService
 from .services.rclone_service import RcloneService
@@ -3892,6 +3896,19 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             ), 413
         if isinstance(error, HTTPException):
             return jsonify({"success": False, "message": error.description}), error.code or 500
+        if isinstance(error, ActiveProviderUnavailable):
+            # An unactivated Provider account is a configuration state, not a
+            # server fault: report it as 503 with the actionable message rather
+            # than a 500 that hides which Provider needs activating.
+            app.logger.warning("provider_unavailable error=%s", error)
+            return jsonify(
+                {
+                    "success": False,
+                    "error_code": "provider_unavailable",
+                    "message": str(error),
+                    "retryable": False,
+                }
+            ), 503
         trace_id = uuid.uuid4().hex
         app.logger.exception("请求处理失败 trace_id=%s", trace_id)
         return jsonify(

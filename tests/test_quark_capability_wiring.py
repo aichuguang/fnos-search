@@ -61,6 +61,52 @@ class QuarkCapabilityTests(unittest.TestCase):
         self.assertFalse(sixpan["enabled"])
         self.assertEqual(sixpan["status"], "unavailable")
 
+    def test_public_config_fails_closed_when_mobile_account_is_inactive(self) -> None:
+        """An unactivated 移动云 account must not break guest config.
+
+        ``ActiveProviderImporter`` defines no ``__bool__`` and proxies every
+        attribute through ``resolve()``, so a bare ``cloud139_importer.describe()``
+        used to raise and turn ``GET /api/public/config`` into an HTTP 500 for
+        every visitor, taking the whole homepage down with it.
+        """
+
+        def unavailable():
+            raise ActiveProviderUnavailable(
+                "当前 mobile 账号未配置或未激活"
+            )
+
+        proxy = ActiveProviderImporter("移动云", unavailable)
+
+        placeholders = _adapter_placeholders({}, {}, cloud139_importer=proxy)
+        cloud139 = next(item for item in placeholders if item["key"] == "cloud139")
+        self.assertFalse(cloud139["configured"])
+        self.assertFalse(cloud139["enabled"])
+        self.assertEqual(cloud139["status"], "unconfigured")
+
+        items = _public_adapter_capabilities({}, cloud139_importer=proxy)
+        public_cloud139 = next(item for item in items if item["key"] == "cloud139")
+        self.assertFalse(public_cloud139["configured"])
+        self.assertFalse(public_cloud139["enabled"])
+        self.assertEqual(public_cloud139["status"], "unavailable")
+
+    def test_public_config_still_reports_a_configured_mobile_account(self) -> None:
+        """Failing closed must not mask a genuinely activated account."""
+
+        class _ConfiguredCloud139:
+            def describe(self):
+                return {
+                    "configured": True,
+                    "capabilities": {"submit": True, "task_poll": True},
+                    "config": {},
+                }
+
+        items = _public_adapter_capabilities(
+            {}, cloud139_importer=_ConfiguredCloud139()
+        )
+        cloud139 = next(item for item in items if item["key"] == "cloud139")
+        self.assertTrue(cloud139["configured"])
+        self.assertTrue(cloud139["enabled"])
+
 
 class QuarkCapabilityCompositionTests(unittest.TestCase):
     @classmethod
@@ -122,6 +168,49 @@ class QuarkCapabilityCompositionTests(unittest.TestCase):
         factory = keywords.get("account_importer_factory")
         self.assertIsInstance(factory, ast.Name)
         self.assertEqual(factory.id, "QuarkImporter")
+
+    def test_inactive_provider_is_mapped_to_503_not_500(self) -> None:
+        """An unactivated account is a configuration state, not a server fault.
+
+        Pins that the global error handler classifies
+        ``ActiveProviderUnavailable`` before the generic 500 fallback, so the
+        actionable "which Provider needs activating" message reaches the caller.
+        """
+
+        handler = self._function("handle_error")
+        checked: list[str] = []
+        for node in ast.walk(handler):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id == "isinstance":
+                if len(node.args) == 2 and isinstance(node.args[1], ast.Name):
+                    checked.append(node.args[1].id)
+
+        self.assertIn("ActiveProviderUnavailable", checked)
+
+        # The branch must actually return 503 and the provider_unavailable code,
+        # otherwise it falls through to the opaque internal-error tail.
+        branch = next(
+            node
+            for node in ast.walk(handler)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "isinstance"
+                and len(call.args) == 2
+                and isinstance(call.args[1], ast.Name)
+                and call.args[1].id == "ActiveProviderUnavailable"
+                for call in ast.walk(node.test)
+            )
+        )
+        constants = {
+            node.value
+            for node in ast.walk(branch)
+            if isinstance(node, ast.Constant)
+        }
+        self.assertIn(503, constants)
+        self.assertIn("provider_unavailable", constants)
 
     def test_quark_qrcode_uses_registry_account_tester(self) -> None:
         calls = [
