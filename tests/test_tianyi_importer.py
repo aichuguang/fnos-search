@@ -420,6 +420,45 @@ class TianyiImporterTests(unittest.TestCase):
         self.assertEqual(managed["targetFolderId"], "target")
         self.assertEqual(json.loads(managed["taskInfos"])[0]["dealWay"], 1)
 
+    def test_conflict_resolution_threads_the_task_type(self) -> None:
+        # DELETE 等待必须以 DELETE 解冲突；写死 SHARE_SAVE 会用错类型。
+        with patch.object(
+            self.importer,
+            "_post",
+            side_effect=[
+                {"targetFolderId": "target", "taskInfos": [{"fileId": "file-1"}]},
+                {},
+            ],
+        ) as post:
+            self.importer._resolve_conflicts("task-1", task_type="DELETE")
+        self.assertEqual(post.call_args_list[0].kwargs["form"]["type"], "DELETE")
+        self.assertEqual(post.call_args_list[1].kwargs["form"]["type"], "DELETE")
+
+    def test_wait_batch_task_resolves_name_conflicts_instead_of_timing_out(self) -> None:
+        # taskStatus==2 永不自愈：不解冲突就会耗尽 attempts 并以
+        # BATCH_TASK_TIMEOUT 收场，掩盖真实原因。
+        with (
+            patch.object(
+                self.importer,
+                "_post",
+                side_effect=[{"taskStatus": 2}, {"taskStatus": 4}],
+            ),
+            patch.object(self.importer, "_resolve_conflicts") as resolve,
+            patch("fnos_media_import.importers.tianyi.time.sleep"),
+        ):
+            self.assertTrue(self.importer._wait_batch_task("task-9", "DELETE"))
+        resolve.assert_called_once_with("task-9", task_type="DELETE")
+
+    def test_wait_batch_task_still_times_out_when_conflicts_never_clear(self) -> None:
+        with (
+            patch.object(self.importer, "_post", return_value={"taskStatus": 2}),
+            patch.object(self.importer, "_resolve_conflicts"),
+            patch("fnos_media_import.importers.tianyi.time.sleep"),
+            self.assertRaises(TianyiApiError) as caught,
+        ):
+            self.importer._wait_batch_task("task-9", "DELETE", attempts=3)
+        self.assertEqual(caught.exception.code, "BATCH_TASK_TIMEOUT")
+
     def test_verify_checks_expected_names_in_target_folder(self) -> None:
         receipt = OperationReceipt(
             operation_id="tianyi:task-1",

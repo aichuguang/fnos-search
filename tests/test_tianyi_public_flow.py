@@ -508,7 +508,7 @@ class TianyiPublicFlowTests(unittest.TestCase):
         self.assertEqual(template.count("20260809-v1-cutover-v001"), 4)
         self.assertEqual(request_template.count("20260809-v1-cutover-v001"), 4)
         self.assertIn(
-            "/static/resource-search-workbench.js?v=20260810-storage-flow-v005",
+            "/static/resource-search-workbench.js?v=20260810-storage-flow-v006",
             admin_template,
         )
 

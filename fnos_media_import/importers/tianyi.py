@@ -668,10 +668,10 @@ class TianyiImporter:
             form={"taskId": str(task_id), "type": "SHARE_SAVE"},
         )
 
-    def _resolve_conflicts(self, task_id: str) -> None:
+    def _resolve_conflicts(self, task_id: str, *, task_type: str = "SHARE_SAVE") -> None:
         conflict = self._post(
             "/batch/getConflictTaskInfo.action",
-            form={"taskId": str(task_id), "type": "SHARE_SAVE"},
+            form={"taskId": str(task_id), "type": str(task_type)},
         )
         task_infos = conflict.get("taskInfos") if isinstance(conflict.get("taskInfos"), list) else []
         managed = [{**dict(item), "dealWay": 1} for item in task_infos if isinstance(item, dict)]
@@ -679,7 +679,7 @@ class TianyiImporter:
             "/batch/manageBatchTask.action",
             form={
                 "taskId": str(task_id),
-                "type": "SHARE_SAVE",
+                "type": str(task_type),
                 "targetFolderId": str(conflict.get("targetFolderId") or ""),
                 "taskInfos": json.dumps(managed, ensure_ascii=False, separators=(",", ":")),
             },
@@ -1038,6 +1038,13 @@ class TianyiImporter:
             state = self._as_int(value.get("taskStatus"), default=-999)
             if state == 4:
                 return True
+            if state == 2:
+                # A name conflict parks the task forever: it never advances to
+                # 4 on its own, so without this the wait burned every attempt
+                # and failed with BATCH_TASK_TIMEOUT instead of the real cause.
+                self._resolve_conflicts(task_id, task_type=task_type)
+                time.sleep(max(0.0, float(interval)))
+                continue
             if state in {-1, 5, 6}:
                 raise TianyiApiError(
                     self._message(value, f"Cloud189 {task_type} task failed"),
