@@ -367,3 +367,183 @@ OK
 - `bash -n scripts/fnos_rclone_worker.sh`：通过。
 - `node --check static/admin-storage-v1.js`：通过。
 - `git diff --check`：通过，仅有 Git 的 LF/CRLF 提示，无空白错误。
+
+## 14. 缺少 rclone 时解耦 OpenList 保存（2026-08-26）
+
+### 14.1 问题与根因
+
+本机保存 OpenList 连接报 `rclone WebDAV 同步或连接检测失败：rclone 管理命令不可用`，连接无法落库。
+
+调用链：`RcloneWebdavConfigService._run` 找不到二进制抛 `FileNotFoundError` → `RcloneWebdavConfigError(503)`
+→ `StorageSetupService._sync_rclone_webdav` 的 `except Exception` 上抛 → `save_openlist` 的补偿事务把刚写入的
+连接与 mount 快照整体回滚 → 蓝图包装成带 `trace_id` 的错误返回。
+
+判断这是错误耦合：rclone 只负责跨盘搬运，而 OpenList 连接同时驱动目录整理与 STRM，同盘链路根本不碰 rclone。
+
+### 14.2 改动
+
+- `services/rclone_webdav_config_service.py`：新增 `RCLONE_UNAVAILABLE` 错误码，`RcloneWebdavConfigError`
+  增加 `code` 字段。`FileNotFoundError` 与 `OSError` 带上该码；`TimeoutExpired` 有意不带，因为超时说明 rclone 在位。
+- `storage/setup_service.py`：新增 `_rclone_plane_absent` / `_rclone_plane_absent_payload` / `_rclone_degraded_state`。
+  只有 `RCLONE_UNAVAILABLE`、`worker_unavailable`、`worker_timeout` 视为“控制面不存在”而降级放行；未接线的
+  rclone bridge 也直接返回降级态而不再抛错。`save_openlist` 返回 `rclone` 与 `rclone_available` 字段。
+- `_probe_rclone_webdav` 与 `preflight()` 未改，跨盘路由仍会硬失败。
+- `static/admin-storage-v1.js`：`submitOpenList` 读取响应，`rclone_available === false` 时显示告警而非成功。
+- `static/product.css`：补 `.storage-setup-notice.is-warning` 样式。
+
+### 14.3 验证
+
+- 保留回滚语义：凭据错误、Remote 名被其他类型占用、配置写入失败、rclone 在位超时、Worker 明确 409 拒绝，
+  共 5 类仍然整体回滚；仅二进制缺失、Worker 不可达、Worker 超时 3 类降级。以 8 种异常形态的分类矩阵逐一确认。
+- 本机真实无 rclone 的 subprocess 调用确认抛出 `code='RCLONE_UNAVAILABLE'`，被判定为 absent。
+- `tests/test_storage_setup_v1.py` 新增 5 个用例：缺二进制仍保存、Worker 不可达仍保存、未接线仍保存、
+  真实拒绝仍回滚、无 rclone 时跨盘预检仍失败。该文件 `42 passed`。
+- Storage Setup + rclone WebDAV 配置 + Worker 隔离 + OpenList 四套：`121 passed, 4 subtests passed`。
+- 全量：`1045 passed, 198 subtests passed`（187s），相对改动前 1040 基线无回归。
+- 改动的 3 个 Python 文件 `ruff check` 通过；`node --check static/admin-storage-v1.js` 通过。
+
+### 14.4 遗留
+
+- `worker_timeout` 归入降级是一个取舍：远端 Worker 在位但 120s 内没完成 WebDAV 写入时也会放行保存。
+  实际部署里该超时基本等价于 Worker 不可达，且跨盘路由仍被预检拦住，因此接受。
+- 本机仍无 rclone 与 Docker，跨盘搬运、Worker 回调、重启恢复的正式镜像复验仍是第 13.3 节列出的未覆盖项。
+
+## 15. 访客首页 500 与 PanSou 搜索 503 定位（2026-08-26）
+
+用户报告访客首页搜索报错，日志里实际是两个独立问题。
+
+### 15.1 `GET /api/public/config` HTTP 500（代码缺陷，已修）
+
+`public_web.py:331` 的 `if cloud139_importer:` 判断无效：`ActiveProviderImporter` 没有定义
+`__bool__`，代理对象恒为真，于是 `cloud139_importer.describe()` 经 `__getattr__` → `resolve()`
+抛出 `ActiveProviderUnavailable`，把「移动云账号未激活」这一配置状态变成访客首页的 HTTP 500。
+紧邻的 `placeholder_specs` 循环早已用 `get_optional_provider_method` 做了 fail-closed 加固，
+cloud139 分支在那轮加固里被漏掉。
+
+修复：
+- `public_web.py`：cloud139 分支改用 `is not None` + `get_optional_provider_method("describe")`，
+  异常时按空 description 处理，与 cloud189/sixpan 循环一致。该适配器降级为
+  `configured=false`，公共投影统一输出 `status="unavailable"`。
+- `app.py`：全局 `handle_error` 增加 `ActiveProviderUnavailable` → HTTP 503 `provider_unavailable`
+  分支，置于通用 500 兜底之前。未激活账号是配置状态，不应报服务器内部错误，也不该把
+  「哪个 Provider 需要激活」的可执行信息藏在 trace_id 后面。
+
+验证：
+- 复现确认 `bool(proxy) is True`（旧判断为何失效）、直接 `.describe()` 仍抛异常，
+  修复后 `_public_adapter_capabilities` 正常构建，4 个适配器均为 `unavailable`。
+- 逐一确认其余代理访问点已 fail closed：`proxy.configured`、`_importer_configured`、
+  `_detail_capability_for_source`（mobile/tianyi/sixpan）全部返回 False 而不抛异常；
+  `check_configuration` 仍按设计抛出，供后台探测显式报错。
+- 新增 3 个用例：移动云未激活时公共配置降级、已激活时不被误判为未配置、
+  错误处理器把 `ActiveProviderUnavailable` 映射为 503 且带 `provider_unavailable`。
+- 反向验证：临时回滚两处修复后新用例 2 失败，恢复后 10 passed，确认非空测试。
+
+### 15.2 `POST /api/public/search` HTTP 503（本节结论已被第 16 节推翻）
+
+> 修正：本节当时判定为「外部依赖故障、无需改代码」，是错的。504 的直接触发因素是我们
+> 自己请求里的 `conc=10` 参数。完整定位与修复见第 16 节。以下保留原始观测记录。
+
+实测上游 PanSou `81.70.158.50:8055`：
+- TCP 连接 0.0s 正常，`GET /` 200，`GET /api/health` 200 且 `auth_enabled=true`；
+- 用 `advanced_config` 里的真实账号登录取 token 成功；
+- 带 token 的 `POST /api/search` 在 timeout 放宽到 150s 后于 **60.1s 返回 HTTP 504**。
+
+当时只观测到「上游在线但搜索超时」，未变更我们自己的请求参数就下了外部故障的结论，
+这是本轮排查的方法缺口。另注意配置文件 `pansou.base_url` 是 `127.0.0.1:8055`，
+运行时被 `app_settings.advanced_config` 覆盖为远端地址，排查时勿只看配置文件。
+
+## 16. PanSou `conc` 参数导致搜索 504（2026-08-26）
+
+用户提示 0810 分支当时是「传的某个参数有问题」，据此复查请求体，确认根因是 `conc`。
+
+### 16.1 根因
+
+`conc` 是 PanSou 的搜索并发度。固定成 10 会让插件较多的实例把这次搜索分批扇出，
+冷搜索（未命中 PanSou 自身结果缓存）耗时超过上游网关超时，返回 HTTP 504；
+不传 `conc` 时由 PanSou 按自身配置决定并发，一次扇出完成。
+
+`providers/pansou.py` 的 `_search_payload` 本来就有 `if self.conc > 0` 的省略逻辑，
+问题只在默认值：`DEFAULT_CONCURRENCY = 10`，且 `config.py` 每次都显式下发 `conc`，
+所以必须同时改掉配置侧，否则改 Provider 默认值不生效。
+
+### 16.2 实测证据
+
+对同一上游、同一关键词做对照实验，请求带 `refresh=true` 以绕过 PanSou 结果缓存、
+强制真实插件扇出（第一次未加 `refresh` 时两组都是 0.1s / 17 条，是缓存假象）：
+
+| 请求 | 结果 |
+| --- | --- |
+| `conc=10` | HTTP 504，60s，0 条 |
+| 不传 `conc` | HTTP 200，约 4s，191 条 |
+
+3 个关键词、正反两种执行顺序，4/4 复现，排除缓存与顺序干扰。
+
+### 16.3 改动的四处 + 文档
+
+- `providers/pansou.py`：`DEFAULT_CONCURRENCY` 10 → 0（0 表示交给 PanSou 自己决定，
+  `_search_payload` 随之整个省略 `conc` 字段）。
+- `config.py:273`：`_env_int("PANSOU_CONC", 10)` → `0`。**关键**，此处一直显式下发 `conc`。
+- `static/admin.js:1419`：回填改为 `pansou.conc ?? 0`。
+- `static/admin.js:1752`：提交改为 `numberValue("advPansouConc", 0)`。**三处 UI 里最关键**，
+  它会在任意一次高级设置保存时把值写回 DB `advanced_config`，留 10 会静默复现该缺陷。
+- `templates/admin.html:762` 占位符、`config/config.example.yaml` 注释与示例同步为 0 并写明 504 风险。
+
+### 16.4 验证
+
+- 新增 3 个用例（`tests/test_pansou_search_payload.py`）：默认并发交给 PanSou、
+  显式并发仍被保留、随包配置默认值不得固定并发（后者直接加载真实配置，守住 `config.py` 那处）。
+  5 passed；反向验证回滚修复后 2 个失败，确认非空测试。
+- 确认 DB `advanced_config.pansou` 里没有 `conc` 键，新默认值在本机确实生效。
+- 走真实客户端端到端：`conc = 0`、payload 中无 `conc` 字段、`search OK in 5.8s items=16`。
+- `node --check static/admin.js` 通过；改动文件均为 UTF-8 无 BOM。
+- ruff 干净；本轮未重跑全量套件（第 15 节后曾全绿 1055 passed）。
+
+
+## 17. 全局清理源码里的 CJK \uXXXX 转义（2026-08-26）
+
+### 17.1 背景与判定标准
+
+用户要求：源码里不应出现 `\u4e91\u76d8\u4fdd\u5b58\u6839\u76ee\u5f55` 这类转义，中文一律写成
+真正的 UTF-8 字符。先把命中分成三类再动手，避免机械替换改坏语义：
+
+- TEXT：普通字符串/注释里的中文转义 —— 本轮要清理的目标。
+- RANGE：正则里的码位区间（如 `[\u4e00-\u9fff]`）—— **保留转义**。写成 `[一-龿]` 语义等价，
+  但会丢掉「这是一段码位区间」的意图，可读性反而更差。
+- VENDOR：`codex_tmp/` 第三方代码与 `.codex/` 工具自身 —— 不属于本项目源码，跳过。
+
+### 17.2 等价性证明（每类改动都有各自的证明手段）
+
+转义与字符在 Python 里是**同一个常量**，因此不同 token 用不同证明：
+
+| 改动类型 | 证明方式 | 理由 |
+| --- | --- | --- |
+| 普通字符串、注释 | 全文件 `ast.dump` 必须完全一致 | 常量相同，AST 有任何差异即语义被改 |
+| 原始字符串正则 | 编译后 `re._parser.parse` 树递归比对 | 常量确实变了，但 `re` 自己会解码 `\uXXXX`，匹配行为不变 |
+| f-string | 同上，占位符两侧同样掩码后再比 | Python 3.12 起 f-string 拆成多个 token |
+
+任何一项证明不通过就原样保留，绝不硬改。
+
+### 17.3 两个必须留转义的陷阱（都被证明手段挡住了）
+
+- **原始字符串里的 `\uu` 是数据不是转义**：`r"(\u7535\u89c6\u5267|...)"` 的反斜杠由 `re` 引擎消费。
+  文件级 AST 检查会整份拒绝这类文件，因此这 3 个文件改用逐 token + 正则解析树证明，
+  才把其中的普通字符串与可安全转换的正则分开处理。
+- **双反斜杠是断言字面量**：`tests/` 里 `'\u\uu6b63\u\uu5728'` 断言的是**另一个文件源码中出现的字面文本**。
+  转换器用 `(?<!\u\u)` 负向后顾跳过这类写法。
+- `tests/test_source_encoding.py:11` 的 `MOJIBAKE_MARKERS` **必须保持转义**：它是项目自身的乱码守卫，
+  一旦写成真字符，这个测试就会把自己的源码判成乱码。
+
+### 17.4 结果
+
+- 30 个文件完成转换，TEXT 命中从 313 行降到 1 行（即上面那个故意保留的守卫常量）。
+- RANGE 17 行、VENDOR 419 行按判定标准保留。
+- 顺带把 `static/admin-storage-v1.js` 里 `data-loading-label` 的中文转义改为 UTF-8，
+  并同步 `tests/test_admin_settings_ui.py` 中对应的两条断言（原断言锁的是旧转义字面量）。
+
+### 17.5 验证
+
+- 全量套件 **1068 passed, 198 subtests passed**（225s）—— 机械改动面广，这里跑全量而非挑模块。
+- `node --check` 通过：`static/admin.js`、`static/admin-storage-v1.js`。
+- ruff（E9,F63,F7,F82）干净。
+- `git diff --stat` 三个手工处理文件增删行数完全相等（60/60），确认只改了转义、没有行尾污染。
+- 保留 `.codex/scan_escapes.py` 作为后续复查工具，一次性转换脚本已删除。
