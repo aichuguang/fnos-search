@@ -901,6 +901,31 @@ class OpenListMountTests(unittest.TestCase):
         self.assertEqual([item["path"] for item in items], ["/剧集", "/影视"])
         self.assertTrue(all("name" in item for item in items))
 
+    def test_list_mountable_dirs_cascades_into_subdirectory(self) -> None:
+        fake = FakeWebDAV()
+        fake.dirs.update({"/影视", "/影视/电影", "/影视/电视剧", "/影视/电影/2026"})
+        fake.files["/影视/readme.txt"] = b"x"
+        service = OpenListMountService(
+            self.database,
+            connection_service=self.connection_service,
+            webdav_factory=lambda _creds: fake,
+        )
+        # 只返回目录，且逐级展开时只给出直接子级
+        items = service.list_mountable_dirs("ol_main", "/影视")
+        self.assertEqual([item["path"] for item in items], ["/影视/电影", "/影视/电视剧"])
+        self.assertEqual([item["name"] for item in items], ["电影", "电视剧"])
+        deeper = service.list_mountable_dirs("ol_main", "/影视/电影")
+        self.assertEqual([item["path"] for item in deeper], ["/影视/电影/2026"])
+
+    def test_list_mountable_dirs_rejects_traversal(self) -> None:
+        service = OpenListMountService(
+            self.database,
+            connection_service=self.connection_service,
+            webdav_factory=lambda _creds: FakeWebDAV(),
+        )
+        with self.assertRaises(OpenListValidationError):
+            service.list_mountable_dirs("ol_main", "/影视/../../etc")
+
     def test_mount_delete(self) -> None:
         self.mount_service.create_mount({"connection_id": "ol_main", "mount_id": "m4", "webdav_root": "/影视", "storage_identity_id": "storage:m4"})
         result = self.mount_service.delete_mount("m4")
@@ -1253,6 +1278,39 @@ class OpenListBlueprintTests(unittest.TestCase):
         response = self.client.delete("/api/admin/openlist/mounts/m1")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["deleted"])
+
+    def test_mount_dirs_api_supports_path_cascade(self) -> None:
+        self.client.post(
+            "/api/admin/openlist/connections",
+            json={
+                "connection_id": "ol_main",
+                "base_url": "http://127.0.0.1:5244/dav",
+                "username": "admin",
+                "password": "s3cret",
+            },
+        )
+        fake = FakeWebDAV()
+        fake.dirs.update({"/影视", "/影视/电影"})
+        self.mount_service.webdav_factory = lambda _creds: fake
+
+        response = self.client.get("/api/admin/openlist/mounts/dirs?connection_id=ol_main")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["path"] for item in response.get_json()["items"]], ["/影视"])
+
+        response = self.client.get(
+            "/api/admin/openlist/mounts/dirs",
+            query_string={"connection_id": "ol_main", "path": "/影视"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["path"] for item in response.get_json()["items"]], ["/影视/电影"])
+
+        # 越级路径必须被规范化层拒绝，不能借目录树逃出该连接的 WebDAV 视图
+        response = self.client.get(
+            "/api/admin/openlist/mounts/dirs",
+            query_string={"connection_id": "ol_main", "path": "/影视/../../etc"},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertFalse(response.get_json()["success"])
 
     def test_not_found_returns_404(self) -> None:
         response = self.client.patch("/api/admin/openlist/connections/missing", json={"name": "x"})

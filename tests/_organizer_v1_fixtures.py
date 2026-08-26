@@ -6,7 +6,7 @@ from fnos_media_import.domain.models import SelectionSnapshot
 from fnos_media_import.planning.job_plan import (
     attach_plan_integrity,
     compute_operation_key,
-    compute_plan_hash,
+    compute_persisted_plan_hash,
 )
 
 
@@ -167,7 +167,7 @@ def organizer_v1_job(
     payload = dict(raw_data or {})
     payload["execution_plan_ref"] = {
         "version": 1,
-        "plan_hash": compute_plan_hash(plan),
+        "plan_hash": compute_persisted_plan_hash(plan),
     }
     return {
         "id": job_id,
@@ -188,7 +188,7 @@ def attach_organizer_v1_task(
     plan: dict[str, Any],
 ) -> dict[str, Any]:
     raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-    plan_hash = compute_plan_hash(plan)
+    plan_hash = compute_persisted_plan_hash(plan)
     task.update(
         {
             "job_id": int(plan["job_id"]),

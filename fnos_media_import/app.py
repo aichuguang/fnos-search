@@ -2624,6 +2624,22 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     from .storage.setup_service import StorageSetupService
     from .services.source_record_service import SourceRecordService
 
+    def _openlist_api_client_from_credentials(credentials: dict[str, Any]) -> Any:
+        """Build a JSON-API OpenList client from stored WebDAV credentials.
+
+        The stored ``base_url`` is a WebDAV endpoint (``.../dav``); the fs APIs
+        live on the service root, so reuse the Organizer's conversion instead of
+        re-deriving it here.
+        """
+        options = (
+            app_config.raw.get("openlist", {})
+            if isinstance(app_config.raw.get("openlist"), dict)
+            else {}
+        )
+        config = {**dict(options), **dict(credentials or {})}
+        config["base_url"] = openlist_api_base_url(config.get("base_url"))
+        return OpenListClient(config)
+
     app.extensions["v1_accounts_service"] = v1_accounts_service
     app.extensions["v1_openlist_connections"] = v1_openlist_connections
     app.extensions["v1_openlist_mounts"] = v1_openlist_mounts
@@ -2655,6 +2671,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 else {}
             ).get("enabled", False)
         ),
+        openlist_api_factory=_openlist_api_client_from_credentials,
     )
     app.extensions["v1_storage_setup_service"] = v1_storage_setup_service
 

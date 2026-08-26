@@ -7,10 +7,12 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from flask import Flask
 
 from fnos_media_import.accounts.service import ProviderAccountService
+from fnos_media_import.config import CATEGORY_KEYS
 from fnos_media_import.database import Database
 from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.domain.models import AccountTestResult
@@ -779,6 +781,54 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "OPENLIST_MUTATION_PROBE_FAILED")
         self.assertEqual(self.mounts.list_mounts(), [])
         self.assertEqual(self.targets.list_targets(), [])
+
+    def test_native_probe_failure_logs_pairing_diagnostics(self) -> None:
+        account_id = self._account("mobile", "移动云主账号")
+        self.webdav.dirs.add("/移动")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+
+        def broken_move(source: str, destination: str) -> None:
+            raise RuntimeError("MOVE 失败")
+
+        self.webdav.move = broken_move  # type: ignore[method-assign]
+
+        with self.assertLogs("fnos_media_import.storage_setup", level="WARNING") as captured:
+            with self.assertRaises(StorageSetupError):
+                self.service.save_location(
+                    {
+                        "name": "移动云主盘",
+                        "kind": "provider",
+                        "account_id": account_id,
+                        "connection_id": "openlist_main",
+                        "webdav_root": "/移动",
+                        "native_root": "root-folder-id",
+                        "confirm_identity": True,
+                    }
+                )
+
+        failures = [
+            line for line in captured.output if "event=storage_native_probe_failed" in line
+        ]
+        self.assertEqual(len(failures), 1)
+        line = failures[0]
+        # 一行里同时给出 OpenList 目录、原生定位符和真实探测路径，配对错了看日志就知道。
+        self.assertIn("provider=mobile", line)
+        self.assertIn(f"account_id={account_id}", line)
+        self.assertIn("connection_id=openlist_main", line)
+        self.assertIn("webdav_root=/移动", line)
+        self.assertIn("native_locator_kind=provider_path", line)
+        self.assertIn("native_locator_value=root-folder-id", line)
+        self.assertIn("probe_root=/移动", line)
+        self.assertIn(
+            "probe_source_path=/移动/fnos-native-probe.txt", line
+        )
+        self.assertIn(
+            "probe_moved_path=/移动/fnos-native-probe.txt.moved", line
+        )
+        self.assertIn("upload_verified=True", line)
+        self.assertIn("organizer_mutation_verified=False", line)
 
     def test_mobile_organizer_probe_retries_transient_read_failure(self) -> None:
         account_id = self._account("mobile", "移动云主账号")
@@ -1827,6 +1877,163 @@ class StorageSetupV1Tests(unittest.TestCase):
             json={"phone": "13900000000", "access_token": "secret-token"},
         )
         self.assertEqual(response.status_code, 404)
+
+
+class OpenListMutationObserverTests(unittest.TestCase):
+    """Cover the OpenList-side half of the native upload probe.
+
+    These exercise ``_openlist_mutation_observer`` directly: the failures they
+    guard against are invisible through ``save_location``, which only sees the
+    aggregated probe verdict.
+    """
+
+    def setUp(self) -> None:
+        WORK_TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        self.db_path = WORK_TEST_ROOT / f"observer-{uuid.uuid4().hex}.db"
+        self._db_infrastructure = Database(self.db_path)
+        self._db_infrastructure.init_schema()
+        self.db = RepositorySet.from_database(self._db_infrastructure)
+        self.addCleanup(self._cleanup_database)
+        self.webdav = MemoryWebDAV()
+        self.connections = OpenListConnectionService(
+            self.db,
+            lambda: KEY,
+            probe_runner=lambda _context: {"ok": True, "message": "连接成功"},
+        )
+        self.mounts = OpenListMountService(
+            self.db,
+            connection_service=self.connections,
+            webdav_factory=lambda _credentials: self.webdav,
+        )
+        self.targets = StorageTargetService(self.db)
+        self.service = StorageSetupService(
+            accounts_service=ProviderAccountService(
+                self.db,
+                lambda: KEY,
+                tester=lambda *_args: AccountTestResult(True, "user***1", "账号检测通过"),
+            ),
+            connection_service=self.connections,
+            mount_service=self.mounts,
+            target_service=self.targets,
+            assignment_service=SourceAssignmentService(self.db, self.targets),
+            connection_factory=self.db.connect,
+            organizer_enabled=lambda: False,
+        )
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        # Keep the probe's own polling from making these tests slow: the
+        # production window is 12 attempts x 0.5s per visibility check.
+        patcher = mock.patch.object(setup_service_module.time, "sleep", lambda _seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _cleanup_database(self) -> None:
+        try:
+            self.db.close_all_connections()
+        except AttributeError:
+            pass
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(f"{self.db_path}{suffix}").unlink()
+            except FileNotFoundError:
+                pass
+
+    def _observe(self, file_name: str, content: bytes = b"probe") -> dict[str, Any]:
+        observer = self.service._openlist_mutation_observer("openlist_main", "/天翼")
+        return observer(
+            {
+                "file_id": "probe-file-id",
+                "file_name": file_name,
+                "file_size": len(content),
+                "content": content,
+            }
+        )
+
+    def test_invisible_probe_file_is_not_reported_as_deleted(self) -> None:
+        """``deleted`` gates the Provider's own cleanup, so it must not be guessed.
+
+        Inferring it from ``not exists()`` made an unreadable file look tidied
+        up, and the native uploader then skipped its cleanup — leaking one probe
+        file into the cloud drive on every failure.
+        """
+
+        self.webdav.dirs.add("/天翼")
+        result = self._observe("fnos-native-probe-abc.txt")
+
+        self.assertFalse(result["organizer_mutation_verified"])
+        self.assertFalse(result["deleted"])
+        self.assertIn("did not expose the native probe file", result["message"])
+
+    def test_probe_file_visible_to_openlist_passes_and_is_cleaned(self) -> None:
+        self.webdav.dirs.add("/天翼")
+        content = b"probe"
+        self.webdav.files["/天翼/fnos-native-probe-abc.txt"] = content
+
+        result = self._observe("fnos-native-probe-abc.txt", content)
+
+        self.assertTrue(result["organizer_mutation_verified"])
+        self.assertTrue(result["deleted"])
+        self.assertEqual(self.webdav.files, {})
+
+    def test_leftover_probe_file_is_deleted_and_reported_on_failure(self) -> None:
+        """A file OpenList can see but not serve must still be cleaned up."""
+
+        self.webdav.dirs.add("/天翼")
+        self.webdav.files["/天翼/fnos-native-probe-abc.txt"] = b"probe"
+
+        def unreadable(_path: str) -> bytes:
+            raise RuntimeError("OpenList GET failed")
+
+        self.webdav.read_bytes = unreadable
+
+        result = self._observe("fnos-native-probe-abc.txt", b"probe")
+
+        self.assertFalse(result["organizer_mutation_verified"])
+        self.assertTrue(result["deleted"])
+        self.assertEqual(self.webdav.files, {})
+
+    def test_stale_directory_cache_is_refreshed_until_the_file_appears(self) -> None:
+        """The probe file lands via the Provider API, behind OpenList's cache.
+
+        WebDAV has no refresh verb, so without an explicit invalidation the poll
+        just re-reads the same stale listing for its whole window.
+        """
+
+        self.webdav.dirs.add("/天翼")
+        path = "/天翼/fnos-native-probe-abc.txt"
+        content = b"probe"
+        refreshed: list[str] = []
+
+        class RefreshingApiClient:
+            def list_dir(inner_self, target: str, *, refresh: bool = False) -> list[Any]:
+                if refresh:
+                    refreshed.append(target)
+                    self.webdav.files[path] = content
+                return []
+
+        self.service.openlist_api_factory = lambda _credentials: RefreshingApiClient()
+
+        result = self._observe("fnos-native-probe-abc.txt", content)
+
+        self.assertTrue(result["organizer_mutation_verified"])
+        self.assertEqual(refreshed[0], "/天翼")
+
+    def test_probe_survives_a_missing_or_broken_refresh_client(self) -> None:
+        """Refresh is an optimisation; setup must not fail when it is absent."""
+
+        self.webdav.dirs.add("/天翼")
+        content = b"probe"
+        self.webdav.files["/天翼/fnos-native-probe-abc.txt"] = content
+
+        def exploding_factory(_credentials: dict[str, Any]) -> Any:
+            raise RuntimeError("OpenList API unreachable")
+
+        self.service.openlist_api_factory = exploding_factory
+
+        result = self._observe("fnos-native-probe-abc.txt", content)
+
+        self.assertTrue(result["organizer_mutation_verified"])
 
 
 if __name__ == "__main__":

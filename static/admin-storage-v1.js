@@ -11,7 +11,8 @@
         editor: null,
         busy: false,
         notice: { message: "正在读取配置…", kind: "" },
-        directoryOptions: [],
+        openlistTree: {},
+        openlistRoot: "",
         directoryError: "",
         nativeTree: {},
         nativeRoot: "",
@@ -25,6 +26,29 @@
         authError: "",
     };
     const AUTH_SESSION_STORAGE_KEY = "fnos.providerAuthSessionId";
+    // 「暂不入库（未分配）」——入库规则允许只配置已接入的来源，留空即取消该
+    // 来源的分配；访客从未分配的来源提交时仍会被拒绝。
+    const ROUTE_UNASSIGNED_LABEL = "暂不入库（未分配）";
+    // OpenList WebDAV 视图的根，逐级展开的起点。
+    const OPENLIST_ROOT_PATH = "/";
+    const OPENLIST_BROWSER_LABEL = "OpenList 中的目录";
+    const OPENLIST_PICK_HINT = "请从下方目录树中选择";
+    const OPENLIST_NEED_CONNECTION = "请先选择 OpenList 连接";
+    const OPENLIST_SELECTION_LABEL = "已选 OpenList 目录";
+    const OPENLIST_SELECTION_PLACEHOLDER = "请选择一个 OpenList 目录";
+    const LABEL_SELECTED = "已选：";
+    const LABEL_LOADING = "加载中…";
+    const LABEL_TOGGLE = "展开或折叠";
+    const LABEL_SELECT = "选择";
+    const LABEL_NO_CHILDREN = "此目录没有子目录";
+    const LABEL_ROOT_DIR = "根目录";
+    const LABEL_DIR_READ_FAILED = "目录读取失败";
+    const NATIVE_BROWSER_FALLBACK_LABEL = "云盘原生目录";
+    const NATIVE_ROOT_FALLBACK_LABEL = "云盘保存根目录";
+    const NATIVE_PICK_HINT = "请从下方目录树中选择";
+    const NATIVE_SELECTION_LABEL = "已选原生目录";
+    const NATIVE_SELECTION_PLACEHOLDER = "请选择一个云盘目录";
+    const NATIVE_NEED_ACCOUNT = "请先选择云盘账号";
     let authPollTimer = null;
     let authPollInFlight = false;
 
@@ -279,17 +303,17 @@
     function renderNativeDirectoryBrowser(values, locatorField) {
         const selectedName = values.native_root_name || (values.native_root ? `ID: ${values.native_root}` : "");
         const root = state.nativeRoot || nativeBrowseRoot();
-        return `<section class="storage-native-browser span-2" aria-label="${esc(locatorField?.label || "云盘原生目录")}">
+        return `<section class="storage-native-browser span-2" aria-label="${esc(locatorField?.label || NATIVE_BROWSER_FALLBACK_LABEL)}">
             <input type="hidden" name="native_root" value="${esc(values.native_root || "")}">
             <input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}">
             <header>
-                <div><strong>${esc(locatorField?.label || "云盘保存根目录")}</strong><small>${selectedName ? `已选：${esc(selectedName)}` : "请从下方目录树中选择"}</small></div>
+                <div><strong>${esc(locatorField?.label || NATIVE_ROOT_FALLBACK_LABEL)}</strong><small>${selectedName ? `${LABEL_SELECTED}${esc(selectedName)}` : NATIVE_PICK_HINT}</small></div>
             </header>
-            <div class="storage-native-tree">
-                ${state.nativeTree[root] ? renderNativeTreeNodes(root, 0) : '<div class="storage-tree-row storage-tree-note">加载中\u2026</div>'}
+            <div class="storage-native-tree" data-native-tree>
+                ${state.nativeTree[root] ? renderNativeTreeNodes(root, 0) : `<div class="storage-tree-row storage-tree-note">${LABEL_LOADING}</div>`}
             </div>
             ${state.nativeDirectoryError ? `<div class="storage-inline-error" role="alert">${esc(state.nativeDirectoryError)}</div>` : ""}
-            <label class="storage-native-selection"><span>已选原生目录</span><input name="native_root_selection" required readonly value="${esc(selectedName)}" placeholder="请选择一个云盘目录"></label>
+            <label class="storage-native-selection"><span>${NATIVE_SELECTION_LABEL}</span><input name="native_root_selection" required readonly value="${esc(selectedName)}" placeholder="${NATIVE_SELECTION_PLACEHOLDER}"></label>
         </section>`;
     }
 
@@ -299,21 +323,21 @@
         const indent = depth * 18;
         const chevron = node.loading ? "\u2026" : (node.expanded ? "\u25be" : "\u25b8");
         const row = `<div class="storage-tree-row" style="padding-left:${indent}px">
-            <button type="button" class="storage-tree-toggle" data-native-tree-action="toggle" data-folder-id="${esc(node.folder_id)}" ${node.loading ? "disabled" : ""} aria-label="展开或折叠">${chevron}</button>
+            <button type="button" class="storage-tree-toggle" data-native-tree-action="toggle" data-folder-id="${esc(node.folder_id)}" ${node.loading ? "disabled" : ""} aria-label="${LABEL_TOGGLE}">${chevron}</button>
             <span class="icon-slot icon-folder" aria-hidden="true"></span>
             <button type="button" class="storage-tree-label" data-native-tree-action="select" data-folder-id="${esc(node.folder_id)}" title="${esc(node.path || node.name)}">${esc(node.name)}</button>
-            <button type="button" class="secondary mini" data-native-tree-action="select" data-folder-id="${esc(node.folder_id)}">选择</button>
+            <button type="button" class="secondary mini" data-native-tree-action="select" data-folder-id="${esc(node.folder_id)}">${LABEL_SELECT}</button>
         </div>`;
         let body = row;
         if (node.loading) {
-            body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">加载中\u2026</div>`;
+            body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">${LABEL_LOADING}</div>`;
         }
         if (node.error) {
             body += `<div class="storage-tree-row storage-tree-note storage-tree-error" style="padding-left:${indent + 18}px" role="alert">${esc(node.error)}</div>`;
         }
         if (node.expanded && node.loaded) {
             if (!node.children.length) {
-                body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">此目录没有子目录</div>`;
+                body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">${LABEL_NO_CHILDREN}</div>`;
             } else {
                 body += node.children.map((childId) => renderNativeTreeNodes(childId, depth + 1)).join("");
             }
@@ -456,26 +480,50 @@
         </form>`;
     }
 
-    function renderOpenListDirectoryOptions(selectedValue) {
-        const selectedPath = String(selectedValue || "").trim();
-        const seen = new Set();
-        const options = [];
-        for (const item of state.directoryOptions || []) {
-            const path = String(item?.path || "").trim();
-            if (!path || seen.has(path)) continue;
-            seen.add(path);
-            options.push({ path, name: String(item?.name || path).trim() || path });
+    function renderOpenListDirectoryBrowser(values) {
+        const selectedPath = String(values.webdav_root || "").trim();
+        const root = state.openlistRoot || OPENLIST_ROOT_PATH;
+        const ready = Boolean(values.connection_id);
+        return `<section class="storage-native-browser span-2" aria-label="${OPENLIST_BROWSER_LABEL}">
+            <input type="hidden" name="webdav_root" value="${esc(selectedPath)}">
+            <header>
+                <div><strong>${OPENLIST_BROWSER_LABEL}</strong><small>${selectedPath ? `${LABEL_SELECTED}${esc(selectedPath)}` : (ready ? OPENLIST_PICK_HINT : OPENLIST_NEED_CONNECTION)}</small></div>
+            </header>
+            <div class="storage-native-tree" data-openlist-tree>
+                ${ready
+                    ? (state.openlistTree[root] ? renderOpenListTreeNodes(root, 0) : `<div class="storage-tree-row storage-tree-note">${LABEL_LOADING}</div>`)
+                    : `<div class="storage-tree-row storage-tree-note">${OPENLIST_NEED_CONNECTION}</div>`}
+            </div>
+            ${state.directoryError ? `<div class="storage-inline-error" role="alert">${esc(state.directoryError)}</div>` : ""}
+            <label class="storage-native-selection"><span>${OPENLIST_SELECTION_LABEL}</span><input name="webdav_root_selection" required readonly value="${esc(selectedPath)}" placeholder="${OPENLIST_SELECTION_PLACEHOLDER}"></label>
+        </section>`;
+    }
+
+    function renderOpenListTreeNodes(path, depth) {
+        const node = state.openlistTree[path];
+        if (!node) return "";
+        const indent = depth * 18;
+        const chevron = node.loading ? "\u2026" : (node.expanded ? "\u25be" : "\u25b8");
+        let body = `<div class="storage-tree-row" style="padding-left:${indent}px">
+            <button type="button" class="storage-tree-toggle" data-openlist-tree-action="toggle" data-path="${esc(node.path)}" ${node.loading ? "disabled" : ""} aria-label="${LABEL_TOGGLE}">${chevron}</button>
+            <span class="icon-slot icon-folder" aria-hidden="true"></span>
+            <button type="button" class="storage-tree-label" data-openlist-tree-action="select" data-path="${esc(node.path)}" title="${esc(node.path)}">${esc(node.name)}</button>
+            <button type="button" class="secondary mini" data-openlist-tree-action="select" data-path="${esc(node.path)}">${LABEL_SELECT}</button>
+        </div>`;
+        if (node.loading) {
+            body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">${LABEL_LOADING}</div>`;
         }
-        if (selectedPath && !seen.has(selectedPath)) {
-            options.unshift({ path: selectedPath, name: selectedPath });
+        if (node.error) {
+            body += `<div class="storage-tree-row storage-tree-note storage-tree-error" style="padding-left:${indent + 18}px" role="alert">${esc(node.error)}</div>`;
         }
-        const placeholder = options.length
-            ? "请选择 OpenList 目录"
-            : "暂无可选的 OpenList 目录";
-        return `<option value="" ${selectedPath ? "" : "selected"} disabled>${placeholder}</option>${options.map((item) => {
-            const label = item.name !== item.path ? `${item.name} \u00b7 ${item.path}` : item.path;
-            return `<option value="${esc(item.path)}" ${item.path === selectedPath ? "selected" : ""}>${esc(label)}</option>`;
-        }).join("")}`;
+        if (node.expanded && node.loaded) {
+            if (!node.children.length) {
+                body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">${LABEL_NO_CHILDREN}</div>`;
+            } else {
+                body += node.children.map((childPath) => renderOpenListTreeNodes(childPath, depth + 1)).join("");
+            }
+        }
+        return body;
     }
 
     function renderLocationEditor() {
@@ -497,14 +545,13 @@
                 <label><span>位置类型</span><select name="kind" ${values.destination_id ? "disabled" : ""}><option value="provider" ${kind === "provider" ? "selected" : ""}>已接入的云盘</option><option value="generic" ${kind === "generic" ? "selected" : ""}>OpenList 其他网盘</option><option value="local" ${kind === "local" ? "selected" : ""}>本地目录</option></select></label>
                 ${kind === "provider" ? `<label><span>网盘类型</span><select name="provider_kind" required ${values.destination_id ? "disabled" : ""}><option value="">请选择网盘</option>${providerKinds.map((providerKind) => `<option value="${esc(providerKind)}" ${providerKind === selectedProviderKind ? "selected" : ""}>${esc(providerFor(providerKind)?.display_name || providerKind)}</option>`).join("")}</select></label><label><span>云盘账号</span><select name="account_id" required><option value="">请选择账号</option>${accounts.map((item) => `<option value="${esc(item.account_id)}" ${item.account_id === values.account_id ? "selected" : ""}>${esc(item.name)}${item.last_test_status === "ok" ? "" : "（待检测）"}</option>`).join("")}</select></label>` : ""}
                 ${kind !== "local" ? `<label><span>OpenList 连接</span><select name="connection_id" required><option value="">请选择连接</option>${connections.map((item) => `<option value="${esc(item.connection_id)}" ${item.connection_id === values.connection_id ? "selected" : ""}>${esc(item.name)}${item.last_test_status === "ok" ? "" : "（待检测）"}</option>`).join("")}</select></label>
-                <label class="span-2"><span>OpenList 中的目录</span><select name="webdav_root" required>${renderOpenListDirectoryOptions(values.webdav_root)}</select></label>` : ""}
+                ${renderOpenListDirectoryBrowser(values)}` : ""}
                 ${kind === "provider" ? (nativeBrowser
                     ? renderNativeDirectoryBrowser(values, locatorField)
-                    : `<label class="span-2"><span>${esc(locatorField?.label || "云盘保存根目录")}</span><input name="native_root" required value="${esc(values.native_root || "")}" placeholder="同源直转和跨盘落地使用"><input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}"></label>`)
+                    : `<label class="span-2"><span>${esc(locatorField?.label || NATIVE_ROOT_FALLBACK_LABEL)}</span><input name="native_root" required value="${esc(values.native_root || "")}" placeholder="同源直转和跨盘落地使用"><input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}"></label>`)
                     : ""}
                 ${kind !== "local" ? `<label class="span-2 storage-identity-confirm"><input name="confirm_identity" type="checkbox" value="true" required ${values.confirm_identity === true || values.confirm_identity === "true" ? "checked" : ""}><span>我确认该 OpenList 目录确实对应上面选择的账号或存储位置。修改目录、账号或挂载关系时会重新确认。</span></label>` : ""}
             </div>
-            ${state.directoryError ? `<div class="storage-inline-error" role="alert">${esc(state.directoryError)}</div>` : ""}
             <div class="storage-path-note">电影、电视剧、动漫等目录由系统自动生成，不再单独配置分类路径。</div>
             <div class="storage-form-actions"><button type="submit" data-loading-label="正在保存并检测目录\u2026">保存并检测目录</button><button type="button" class="secondary" data-setup-action="cancel-editor">取消</button></div>
         </form>`;
@@ -525,7 +572,7 @@
         const eligible = locations.filter((item) => item.ready && (item.eligible_source_ids || []).includes(route.search_source_id));
         return `<article class="storage-route-row" data-source="${esc(route.search_source_id)}">
             <div class="storage-route-source"><span class="storage-provider-mark kind-${esc(route.provider_kind)}">${esc(route.icon_text || providerFor(route.provider_kind)?.icon_text || "源")}</span><div><strong>${esc(route.label)}</strong><small>搜索来源</small></div></div>
-            <label><span>默认保存到</span><select name="route_${esc(route.search_source_id)}" required><option value="">请选择保存位置</option>${locationOptions(eligible, route.default_destination_id)}</select></label>
+            <label><span>默认保存到</span><select name="route_${esc(route.search_source_id)}"><option value="">${esc(ROUTE_UNASSIGNED_LABEL)}</option>${locationOptions(eligible, route.default_destination_id)}</select></label>
             <div class="storage-route-summary"><span>执行链路</span><strong data-route-summary>${esc(route.chain_summary)}</strong></div>
             <details class="storage-route-overrides"><summary>按分类单独设置</summary><div>${(state.data.categories || []).map((category) => `<label><span>${esc(category.label)}</span><select name="override_${esc(route.search_source_id)}_${esc(category.key)}"><option value="">跟随默认</option>${locationOptions(eligible, route.overrides?.[category.key])}</select></label>`).join("")}</div></details>
         </article>`;
@@ -715,8 +762,9 @@
             expected_revision: state.editor.values?.revision,
         };
         if (raw.password) payload.password = raw.password;
+        let saved;
         try {
-            await request("/api/admin/storage-setup/openlist", { method: "PUT", body: JSON.stringify(payload) });
+            saved = await request("/api/admin/storage-setup/openlist", { method: "PUT", body: JSON.stringify(payload) });
         } catch (error) {
             if (error.code === "OPENLIST_CONNECTION_CONFLICT") {
                 state.editor = null;
@@ -729,6 +777,15 @@
         }
         state.editor = null;
         await load();
+        if (saved && saved.rclone_available === false) {
+            // rclone 缺失只影响跨盘搬运，OpenList 本身已保存成功，不能报成功也不能报失败。
+            setNotice(
+                saved.message
+                    || "OpenList 已保存，但 rclone 不可用，跨盘搬运暂不可用。",
+                "is-warning",
+            );
+            return;
+        }
         setNotice("OpenList WebDAV 与 rclone Remote 已保存并检测成功。", "is-success");
     }
 
@@ -753,7 +810,11 @@
             && usesNativeFolderBrowser(selectedProvider)
             && !payload.native_root
         ) {
-            throw new Error("请选择云盘原生保存目录");
+            throw new Error(NATIVE_SELECTION_PLACEHOLDER);
+        }
+        // 只读输入不参与浏览器约束校验，目录树的选择结果必须在这里兜底。
+        if (payload.kind !== "local" && !payload.webdav_root) {
+            throw new Error(OPENLIST_SELECTION_PLACEHOLDER);
         }
         const path = values.destination_id ? `/api/admin/storage-setup/locations/${values.destination_id}` : "/api/admin/storage-setup/locations";
         try {
@@ -980,7 +1041,7 @@
         };
         resetNativeDirectoryState();
         state.editor = { type: "location", values };
-        await loadDirectoryOptions(values.connection_id);
+        await loadDirectoryOptions(values.connection_id, values.webdav_root || "");
         const provider = providerFor(values.provider_kind || readyAccount?.provider_kind || "");
         if (values.account_id && usesNativeFolderBrowser(provider)) {
             await loadNativeDirectoryOptions(values.account_id);
@@ -988,17 +1049,124 @@
         render();
     }
 
-    async function loadDirectoryOptions(connectionId) {
-        state.directoryOptions = [];
+    function resetOpenListDirectoryState() {
+        state.openlistTree = {};
+        state.openlistRoot = "";
         state.directoryError = "";
+    }
+
+    async function loadDirectoryOptions(connectionId, selectedPath = "") {
+        resetOpenListDirectoryState();
         if (!connectionId) return;
-        try {
-            const result = await request(`/api/admin/openlist/mounts/dirs?connection_id=${encodeURIComponent(connectionId)}`);
-            state.directoryOptions = result.items || [];
-        } catch (error) {
-            state.directoryOptions = [];
-            state.directoryError = error.message || "OpenList 目录读取失败";
+        state.openlistRoot = OPENLIST_ROOT_PATH;
+        state.openlistTree[OPENLIST_ROOT_PATH] = {
+            path: OPENLIST_ROOT_PATH,
+            name: LABEL_ROOT_DIR,
+            parent_path: "",
+            children: [],
+            loaded: false,
+            expanded: true,
+            loading: false,
+            error: "",
+        };
+        await loadOpenListTreeNode(OPENLIST_ROOT_PATH, connectionId);
+        await expandOpenListPathChain(selectedPath, connectionId);
+    }
+
+    function normalizeTreePath(path) {
+        const trimmed = String(path || "").trim();
+        if (!trimmed) return "";
+        const withRoot = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+        return withRoot.length > 1 ? withRoot.replace(/\/+$/, "") : "/";
+    }
+
+    // 编辑已有保存位置时，把已选目录所在的分支逐级展开，避免只看到根目录。
+    async function expandOpenListPathChain(selectedPath, connectionId) {
+        const target = normalizeTreePath(selectedPath);
+        if (!target || target === OPENLIST_ROOT_PATH) return;
+        const segments = target.split("/").filter(Boolean);
+        let current = OPENLIST_ROOT_PATH;
+        for (let index = 0; index < segments.length; index += 1) {
+            const node = state.openlistTree[current];
+            if (!node) return;
+            if (!node.loaded && !node.loading) {
+                await loadOpenListTreeNode(current, connectionId);
+            }
+            if (node.error) return;
+            const wanted = normalizeTreePath(`${current === OPENLIST_ROOT_PATH ? "" : current}/${segments[index]}`);
+            const childPath = node.children.find((item) => normalizeTreePath(item) === wanted);
+            if (!childPath) return;
+            node.expanded = true;
+            current = childPath;
         }
+        const leaf = state.openlistTree[current];
+        if (leaf && !leaf.loaded && !leaf.loading) {
+            await loadOpenListTreeNode(current, connectionId);
+            leaf.expanded = true;
+        }
+    }
+
+    async function loadOpenListTreeNode(path, connectionId) {
+        const node = state.openlistTree[path];
+        if (!node || node.loading) return;
+        node.loading = true;
+        node.error = "";
+        try {
+            const query = `connection_id=${encodeURIComponent(connectionId)}&path=${encodeURIComponent(path)}`;
+            const result = await request(`/api/admin/openlist/mounts/dirs?${query}`);
+            const items = (result.items || []).filter((item) => String(item?.path || "").trim());
+            node.children = [];
+            const seen = new Set();
+            for (const item of items) {
+                const childPath = String(item.path).trim();
+                if (seen.has(childPath) || childPath === path) continue;
+                seen.add(childPath);
+                state.openlistTree[childPath] = {
+                    path: childPath,
+                    name: String(item.name || childPath).trim() || childPath,
+                    parent_path: path,
+                    children: [],
+                    loaded: false,
+                    expanded: false,
+                    loading: false,
+                    error: "",
+                };
+                node.children.push(childPath);
+            }
+            node.loaded = true;
+        } catch (error) {
+            node.error = error.message || LABEL_DIR_READ_FAILED;
+            // 根目录读取失败要显眼提示，子目录失败只标在该节点上。
+            if (path === OPENLIST_ROOT_PATH) state.directoryError = node.error;
+        } finally {
+            node.loading = false;
+        }
+    }
+
+    function collapseOpenListSiblingBranches(path) {
+        const ancestors = new Set();
+        let parentPath = state.openlistTree[path]?.parent_path;
+        while (parentPath) {
+            ancestors.add(parentPath);
+            parentPath = state.openlistTree[parentPath]?.parent_path;
+        }
+        for (const key of Object.keys(state.openlistTree)) {
+            const node = state.openlistTree[key];
+            if (node.expanded && key !== path && !ancestors.has(key)) {
+                node.expanded = false;
+            }
+        }
+    }
+
+    async function toggleOpenListTreeNode(path, connectionId) {
+        const node = state.openlistTree[path];
+        if (!node) return;
+        if (!node.loaded && !node.loading) {
+            await loadOpenListTreeNode(path, connectionId);
+        }
+        const willExpand = !node.expanded;
+        if (willExpand) collapseOpenListSiblingBranches(path);
+        node.expanded = willExpand;
     }
 
     async function loadNativeDirectoryOptions(accountId) {
@@ -1081,11 +1249,11 @@
         node.expanded = willExpand;
     }
 
-    function renderWithTreeScroll() {
-        const container = host.querySelector(".storage-native-tree");
+    function renderWithTreeScroll(selector = "[data-native-tree]") {
+        const container = host.querySelector(selector);
         const scrollTop = container ? container.scrollTop : 0;
         render();
-        const next = host.querySelector(".storage-native-tree");
+        const next = host.querySelector(selector);
         if (next) next.scrollTop = scrollTop;
     }
 
@@ -1121,12 +1289,6 @@
         const form = event.target.closest("#storageLocationForm");
         if (form) {
             const raw = syncLocationEditorValues(form);
-            if (event.target.name === "webdav_root") {
-                state.editor.values.confirm_identity = "";
-                const confirmation = form.querySelector('[name="confirm_identity"]');
-                if (confirmation) confirmation.checked = false;
-                return;
-            }
             if (!["kind", "provider_kind", "account_id", "connection_id"].includes(event.target.name)) return;
             state.editor.values.confirm_identity = "";
             if (event.target.name === "kind" && raw.kind !== "provider") {
@@ -1135,6 +1297,12 @@
                 state.editor.values.native_root = "";
                 state.editor.values.native_root_name = "";
                 resetNativeDirectoryState();
+            }
+            if (event.target.name === "kind") {
+                // 本地目录不经过 OpenList；切回 OpenList 类型时重新加载目录树。
+                state.editor.values.webdav_root = "";
+                if (raw.kind === "local") resetOpenListDirectoryState();
+                else await loadDirectoryOptions(state.editor.values.connection_id);
             }
             if (event.target.name === "provider_kind") {
                 state.editor.values.account_id = "";
@@ -1193,12 +1361,39 @@
             return;
         }
 
+        const openlistTreeAction = button.dataset.openlistTreeAction;
+        if (openlistTreeAction) {
+            syncLocationEditorValues(button.closest("#storageLocationForm"));
+            const connectionId = state.editor?.values?.connection_id || "";
+            if (!connectionId) {
+                state.directoryError = OPENLIST_NEED_CONNECTION;
+                render();
+                return;
+            }
+            const path = button.dataset.path || "";
+            if (openlistTreeAction === "toggle") {
+                await toggleOpenListTreeNode(path, connectionId);
+                renderWithTreeScroll("[data-openlist-tree]");
+                return;
+            }
+            if (openlistTreeAction === "select") {
+                const node = state.openlistTree[path];
+                if (!node) return;
+                state.editor.values.webdav_root = node.path;
+                // 目录换了就得重新确认目录与账号的对应关系。
+                state.editor.values.confirm_identity = "";
+                renderWithTreeScroll("[data-openlist-tree]");
+                return;
+            }
+            return;
+        }
+
         const nativeTreeAction = button.dataset.nativeTreeAction;
         if (nativeTreeAction) {
             syncLocationEditorValues(button.closest("#storageLocationForm"));
             const accountId = state.editor?.values?.account_id || "";
             if (!accountId) {
-                state.nativeDirectoryError = "请先选择云盘账号";
+                state.nativeDirectoryError = NATIVE_NEED_ACCOUNT;
                 render();
                 return;
             }

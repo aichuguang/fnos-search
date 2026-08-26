@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import posixpath
 import time
 from dataclasses import dataclass
@@ -75,6 +74,19 @@ def basename(value: Any) -> str:
     return posixpath.basename(normalize_path(value).rstrip("/"))
 
 
+def api_base_url(value: Any) -> str:
+    """Convert a WebDAV endpoint to the matching OpenList API root.
+
+    Connections store the WebDAV endpoint (``.../dav``), while the fs/admin
+    APIs this client speaks live on the service root.
+    """
+
+    base_url = str(value or "").strip().rstrip("/")
+    if base_url.casefold().endswith("/dav"):
+        return base_url[:-4].rstrip("/")
+    return base_url
+
+
 @dataclass
 class OpenListItem:
     name: str
@@ -99,6 +111,10 @@ class OpenListClient:
         self.request_retries = _bounded_int(config.get("request_retries"), default=3, minimum=0, maximum=8)
         self.retry_backoff_seconds = _bounded_float(config.get("retry_backoff_seconds"), default=0.5, minimum=0.0, maximum=10.0)
         self._unsupported_endpoints: set[str] = set()
+        # OpenList 的 fs/admin API 只认 /api/auth/login 换来的 JWT，Basic 认证
+        # 仅对 WebDAV 有效（fs API 会返回 HTTP 200 + code:401 token is invalidated）。
+        # 存储连接里只有用户名密码，所以这里按需登录换取 token 并缓存。
+        self._session_token: str = ""
         self.session = requests.Session()
         # requests.Session 默认会读取 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY。
         # OpenList 通常部署在本机、Docker 网关或内网 NAS 上，误走本机代理
@@ -113,6 +129,52 @@ class OpenListClient:
         """Release the task-scoped HTTP session owned by this client."""
 
         self.session.close()
+
+    def _login(self) -> str:
+        """Exchange username/password for a JWT and cache it on this client.
+
+        Returns an empty string when no password is configured, letting the
+        caller fall back to whatever ``Authorization`` header it can build.
+        Login failures raise so the original request surfaces a real reason
+        instead of a generic ``token is invalidated``.
+        """
+
+        if not self.password and not self.username:
+            return ""
+        response = self.session.post(
+            f"{self.base_url}/api/auth/login",
+            json={"username": self.username, "password": self.password},
+            timeout=self.timeout,
+            verify=self.verify_tls,
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            snippet = " ".join((response.text or "").split())[:180]
+            raise OpenListError(
+                f"OpenList 登录返回不是 JSON：HTTP {response.status_code} {snippet}"
+            ) from exc
+        if response.status_code >= 400 or not _ok(data if isinstance(data, dict) else {}):
+            detail = _api_error_message(data) if isinstance(data, dict) else ""
+            message = f"OpenList 登录失败：{detail or f'HTTP {response.status_code}'}"
+            if _is_transient_http_status(response.status_code) or _is_transient_api_message(detail):
+                raise OpenListTransientError(message)
+            raise OpenListError(message)
+        payload = data.get("data") if isinstance(data, dict) else {}
+        token = str((payload or {}).get("token") or "").strip()
+        if not token:
+            raise OpenListError("OpenList 登录成功但未返回 token")
+        self._session_token = token
+        return token
+
+    def _auth_header(self) -> str:
+        """Return the Authorization value for a fs/admin API call."""
+
+        if self.token:
+            return self.token.replace("Bearer ", "").replace("bearer ", "").strip()
+        if self._session_token:
+            return self._session_token
+        return self._login()
 
     def test(self) -> dict[str, Any]:
         if not self.base_url:
@@ -431,13 +493,10 @@ class OpenListClient:
         if not self.base_url:
             raise OpenListError("OpenList 地址为空")
         headers = dict(kwargs.pop("headers", {}) or {})
-        if self.token:
-            headers["Authorization"] = self.token.replace("Bearer ", "").replace("bearer ", "").strip()
-        elif self.username or self.password:
-            encoded = base64.b64encode(
-                f"{self.username}:{self.password}".encode("utf-8")
-            ).decode("ascii")
-            headers["Authorization"] = f"Basic {encoded}"
+        if "Authorization" not in headers and path != "/api/auth/login":
+            auth = self._auth_header()
+            if auth:
+                headers["Authorization"] = auth
         if "json" in kwargs:
             headers.setdefault("Content-Type", "application/json")
         timeout = kwargs.pop("timeout", self.timeout)
@@ -445,7 +504,12 @@ class OpenListClient:
         max_attempts = 1 + (self.request_retries if retryable else 0)
         last_error: requests.exceptions.RequestException | None = None
         attempts_made = 0
-        for attempt in range(1, max_attempts + 1):
+        # 重登后的那一次重试不占用常规重试预算：非重试端点的预算只有 1 次，
+        # 否则 token 过期会被当成请求失败直接抛出，而不是换 token 再试。
+        relogin_retries = 1
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
             attempts_made = attempt
             try:
                 response = self.session.request(
@@ -496,6 +560,27 @@ class OpenListClient:
 
             if isinstance(data, dict) and not _ok(data):
                 detail = _api_error_message(data)
+                # 一个缓存的 JWT 过期后，OpenList 仍回 HTTP 200，只在 body 里给
+                # code:401。重登一次并重试当前请求，避免长时间运行的客户端在
+                # token 到期后把所有调用都变成认证失败。
+                if (
+                    _is_auth_expired_failure(data, detail)
+                    and not self.token
+                    and self._session_token
+                    and relogin_retries > 0
+                    and path != "/api/auth/login"
+                ):
+                    response.close()
+                    relogin_retries -= 1
+                    self._session_token = ""
+                    try:
+                        refreshed = self._login()
+                    except OpenListError:
+                        refreshed = ""
+                    if refreshed:
+                        headers["Authorization"] = refreshed
+                        attempt -= 1
+                        continue
                 transient = _is_transient_api_failure(data)
                 if retryable and transient and attempt < max_attempts:
                     response.close()
@@ -669,6 +754,32 @@ def _is_transient_api_failure(data: dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         code = 0
     return _is_transient_http_status(code) or _is_transient_api_message(_api_error_message(data))
+
+
+def _is_auth_expired_failure(data: dict[str, Any], detail: Any = None) -> bool:
+    """Detect an expired/invalid JWT reported inside a HTTP 200 body.
+
+    OpenList answers an unusable token with ``code:401`` and a message like
+    ``token is invalidated`` while the HTTP status stays 200, so status-based
+    checks never see it.
+    """
+
+    try:
+        code = int(str(data.get("code") or data.get("status") or 0).strip())
+    except (TypeError, ValueError):
+        code = 0
+    if code in {401, 403}:
+        return True
+    message = " ".join(str(detail if detail is not None else _api_error_message(data)).split()).casefold()
+    markers = (
+        "token is invalidated",
+        "token is expired",
+        "token expired",
+        "invalid token",
+        "unauthorized",
+        "please login",
+    )
+    return any(marker in message for marker in markers)
 
 
 def _is_transient_api_message(value: Any) -> bool:

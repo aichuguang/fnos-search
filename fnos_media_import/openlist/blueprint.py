@@ -210,8 +210,10 @@ def default_handlers(
 
     def mount_dirs() -> tuple[Any, int]:
         connection_id = str(request.args.get("connection_id") or "").strip()
+        # path 留空即列 WebDAV 根，前端目录树按此逐级展开。
+        path = str(request.args.get("path") or "").strip()
         try:
-            items = mount_service.list_mountable_dirs(connection_id)
+            items = mount_service.list_mountable_dirs(connection_id, path)
         except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
         return jsonify({"success": True, "items": items}), 200

@@ -600,14 +600,20 @@ class OpenListMountService:
 
     # ---- 目录选择器（§17.3）----
 
-    def list_mountable_dirs(self, connection_id: str) -> list[dict[str, str]]:
-        """列出连接 WebDAV 根下的目录，供管理员选择 mount 根，不手输路径。"""
+    def list_mountable_dirs(self, connection_id: str, path: str = "") -> list[dict[str, str]]:
+        """列出连接 WebDAV 指定路径下的目录，供管理员逐级展开选择 mount 根。
+
+        ``path`` 留空即列出 WebDAV 根。路径先经 ``normalize_openlist_path``
+        规范化，越级（``..``）与 URL 协议会被拒绝，因此管理员只能在该连接的
+        WebDAV 视图内浏览。
+        """
         if self.connection_service is None:
             raise OpenListValidationError("缺少 connection_service，无法列出 OpenList 目录")
         credentials = self.connection_service.resolve_credentials(connection_id)
         client = self.webdav_factory(credentials)
+        base = normalize_openlist_path(path or "/")
         try:
-            entries = client.list_dir("/")
+            entries = client.list_dir(base)
         except Exception as exc:  # noqa: BLE001 - 统一包装为可读错误
             raise OpenListValidationError(f"列出 OpenList 目录失败：{_short(exc)}") from exc
         return [

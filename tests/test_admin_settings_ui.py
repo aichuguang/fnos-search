@@ -120,10 +120,18 @@ class AdminSettingsUiTests(unittest.TestCase):
         self.assertIn("@media (max-width: 700px)", styles)
         self.assertIn(".storage-route-row { grid-template-columns: 1fr;", styles)
 
-    def test_storage_directory_picker_uses_custom_select_and_preserves_form_state(self) -> None:
+    def test_storage_directory_picker_uses_cascading_tree_and_preserves_form_state(self) -> None:
         source = Path("static/admin-storage-v1.js").read_text(encoding="utf-8")
-        self.assertIn("function renderOpenListDirectoryOptions(selectedValue)", source)
-        self.assertIn('<select name="webdav_root" required>', source)
+        # OpenList 目录改成与云盘原生目录同款的懒加载级联树，不再是只能选根目录的扁平下拉
+        self.assertIn("function renderOpenListDirectoryBrowser(values)", source)
+        self.assertIn("function renderOpenListTreeNodes(path, depth)", source)
+        self.assertIn('data-openlist-tree-action="toggle"', source)
+        self.assertIn('data-openlist-tree-action="select"', source)
+        self.assertIn("/api/admin/openlist/mounts/dirs?${query}", source)
+        self.assertIn("path=${encodeURIComponent(path)}", source)
+        self.assertIn("function expandOpenListPathChain(selectedPath, connectionId)", source)
+        self.assertNotIn('<select name="webdav_root" required>', source)
+        self.assertNotIn("function renderOpenListDirectoryOptions", source)
         self.assertNotIn('list="storageDirectoryOptions"', source)
         self.assertNotIn('<datalist id="storageDirectoryOptions">', source)
         self.assertIn("function syncLocationEditorValues(form)", source)
@@ -134,8 +142,8 @@ class AdminSettingsUiTests(unittest.TestCase):
     def test_storage_save_and_probe_buttons_show_loading(self) -> None:
         source = Path("static/admin-storage-v1.js").read_text(encoding="utf-8")
         self.assertIn("function setButtonLoading(button, loading)", source)
-        self.assertIn('data-loading-label="\\u6b63\\u5728\\u4fdd\\u5b58\\u5e76\\u68c0\\u6d4b\\u8fde\\u63a5\\u2026"', source)
-        self.assertIn('data-loading-label="\\u6b63\\u5728\\u4fdd\\u5b58\\u5e76\\u68c0\\u6d4b\\u76ee\\u5f55\\u2026"', source)
+        self.assertIn('data-loading-label="正在保存并检测连接\\u2026"', source)
+        self.assertIn('data-loading-label="正在保存并检测目录\\u2026"', source)
         self.assertIn("event.submitter", source)
         self.assertIn("setButtonLoading(loadingButton, true)", source)
         self.assertIn("setButtonLoading(loadingButton, false)", source)
@@ -144,7 +152,7 @@ class AdminSettingsUiTests(unittest.TestCase):
 
     def test_provider_auth_script_cache_version_is_current(self) -> None:
         self.assertIn(
-            '/static/admin-storage-v1.js?v=20260810-storage-flow-v005',
+            '/static/admin-storage-v1.js?v=20260810-storage-flow-v006',
             self.template,
         )
 

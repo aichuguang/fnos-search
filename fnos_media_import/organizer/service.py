@@ -34,7 +34,7 @@ from ..media.fnos import FnosMediaRefresher
 from ..media_path_rules import sanitize_resource_dir_name, split_title_year
 from ..planning.job_plan import (
     JobPlanError,
-    compute_plan_hash,
+    compute_persisted_plan_hash,
     plan_path,
     plan_strategy,
     validated_v1_execution_plan_from_job,
@@ -51,6 +51,7 @@ from .openlist_client import (
     OpenListEndpointUnsupported,
     OpenListError,
     OpenListTransientError,
+    api_base_url,
     basename,
     dirname,
     join_path,
@@ -124,15 +125,6 @@ def _openlist_runtime_tuning(config: dict[str, Any] | None) -> dict[str, Any]:
         for key in _OPENLIST_RUNTIME_TUNING_KEYS
         if key in source and source[key] not in (None, "")
     }
-
-
-def _openlist_api_base_url(value: Any) -> str:
-    """Convert a frozen WebDAV endpoint to the matching OpenList API root."""
-
-    base_url = str(value or "").strip().rstrip("/")
-    if base_url.casefold().endswith("/dav"):
-        return base_url[:-4].rstrip("/")
-    return base_url
 
 
 def _plan_openlist_identity(plan: dict[str, Any]) -> dict[str, Any]:
@@ -381,7 +373,7 @@ def build_frozen_openlist_client_resolver(
             )
         client_config = {
             **tuning,
-            "base_url": _openlist_api_base_url(credentials["base_url"]),
+            "base_url": api_base_url(credentials["base_url"]),
             "username": str(credentials["username"]).strip(),
             "password": str(credentials["password"]),
         }
@@ -516,7 +508,7 @@ class OrganizerService:
         return {
             "schema_version": 1,
             "job_id": _safe_positive_int((job or {}).get("id")),
-            "plan_hash": str(existing.get("plan_hash") or compute_plan_hash(plan)),
+            "plan_hash": str(existing.get("plan_hash") or compute_persisted_plan_hash(plan)),
             "strategy": plan_strategy(plan),
         }
 
@@ -1547,7 +1539,7 @@ class OrganizerService:
             return f"existing Organizer root differs from paths.organizer: existing={existing_root}, plan={expected_root}"
         raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
         task_ref = raw_data.get("execution_plan_ref") if isinstance(raw_data.get("execution_plan_ref"), dict) else {}
-        expected_hash = compute_plan_hash(current_plan)
+        expected_hash = compute_persisted_plan_hash(current_plan)
         if task_ref and str(task_ref.get("plan_hash") or "") != expected_hash:
             return "existing Organizer task execution_plan_ref differs from linked job plan"
         return ""
@@ -1729,7 +1721,7 @@ class OrganizerService:
                     raise JobPlanError("V1 execution_plan is missing paths.organizer")
                 task_raw = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
                 task_ref = task_raw.get("execution_plan_ref") if isinstance(task_raw.get("execution_plan_ref"), dict) else {}
-                if str(task_ref.get("plan_hash") or "") != compute_plan_hash(plan):
+                if str(task_ref.get("plan_hash") or "") != compute_persisted_plan_hash(plan):
                     raise JobPlanError("Organizer task execution_plan_ref differs from linked job plan")
                 task_category = str(task.get("category") or "").strip()
                 plan_category = str(plan.get("category") or "").strip()

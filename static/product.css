@@ -6896,6 +6896,12 @@ body[data-page="admin"] .storage-setup-notice.is-error {
     background: rgba(104, 28, 48, .30);
 }
 
+body[data-page="admin"] .storage-setup-notice.is-warning {
+    color: #ffd79a;
+    border-color: rgba(255, 189, 106, .30);
+    background: rgba(104, 71, 20, .30);
+}
+
 body[data-page="admin"] .storage-setup-nav {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));

@@ -87,6 +87,7 @@ class StorageSetupService:
         rclone_webdav_sync: Any = None,
         rclone_webdav_test: Any = None,
         organizer_enabled: Any = None,
+        openlist_api_factory: Any = None,
     ) -> None:
         self.accounts = accounts_service
         self.connections = connection_service
@@ -97,6 +98,11 @@ class StorageSetupService:
         self.rclone_webdav_sync = rclone_webdav_sync
         self.rclone_webdav_test = rclone_webdav_test
         self.organizer_enabled = organizer_enabled
+        # Optional OpenList JSON-API client used only to invalidate directory
+        # caches.  WebDAV has no refresh verb, so without this the observer can
+        # only wait out a cache it cannot expire.  Absent factory degrades to
+        # plain polling rather than failing setup.
+        self.openlist_api_factory = openlist_api_factory
         self.provider_uploader_resolver: Any = None
         self.provider_folder_resolver: Any = None
 
@@ -685,6 +691,31 @@ class StorageSetupService:
         ):
             probe_code = str(result.get("code") or "").strip()
             probe_message = str(result.get("message") or "").strip()
+            # 探测失败最常见的原因是 webdav_root 与 native_root 指向了两个不同的
+            # 目录：原生 API 传上去了，OpenList 那侧却在另一个目录里找不到。两个
+            # 字段各自独立填写、后端不做一致性校验，所以把 OpenList 目录、原生
+            # 定位符和真实探测路径打在同一行，看日志就能判断是不是配对错了。
+            probe_paths = dict(getattr(observer, "probe_paths", None) or {})
+            logger.warning(
+                "event=storage_native_probe_failed provider=%s account_id=%s "
+                "connection_id=%s webdav_root=%s native_locator_kind=%s "
+                "native_locator_value=%s probe_root=%s probe_source_path=%s "
+                "probe_moved_path=%s upload_verified=%s organizer_mutation_verified=%s "
+                "code=%s message=%s",
+                provider_kind,
+                account.account_id,
+                connection_id,
+                webdav_root,
+                native_locator["kind"],
+                native_locator["value"],
+                probe_paths.get("root") or "",
+                probe_paths.get("source") or "",
+                probe_paths.get("moved") or "",
+                bool(result.get("upload_verified")),
+                bool(result.get("organizer_mutation_verified")),
+                probe_code,
+                probe_message,
+            )
             auth_failed = probe_code in {
                 "AUTH_EXPIRED",
                 "InvalidSessionKey",
@@ -733,6 +764,34 @@ class StorageSetupService:
         )
         return native_locator
 
+    def _openlist_dir_refresher(self, credentials: dict[str, Any]) -> Any:
+        """Return a best-effort OpenList directory cache invalidator.
+
+        WebDAV exposes no refresh verb, so cache invalidation has to go through
+        the JSON API (``/api/fs/list`` with ``refresh=true``).  Every failure
+        here is swallowed: refreshing is an optimisation over waiting, and the
+        caller still has its own polling window to fall back on.
+        """
+
+        factory = self.openlist_api_factory
+        if not callable(factory):
+            return lambda _path: None
+        try:
+            client = factory(dict(credentials or {}))
+        except Exception:  # noqa: BLE001 - refresh stays optional
+            return lambda _path: None
+        lister = getattr(client, "list_dir", None)
+        if not callable(lister):
+            return lambda _path: None
+
+        def refresh(path: str) -> None:
+            try:
+                lister(path, refresh=True)
+            except Exception:  # noqa: BLE001 - refresh stays optional
+                pass
+
+        return refresh
+
     def _openlist_mutation_observer(
         self,
         connection_id: str,
@@ -749,6 +808,12 @@ class StorageSetupService:
         credentials = self.connections.resolve_credentials(connection_id, revision)
         client = self.mounts.webdav_factory(credentials)
         root = posixpath.normpath("/" + _text(webdav_root).strip("/"))
+        refresh_dir = self._openlist_dir_refresher(credentials)
+        # The observer knows the real probe paths, the caller knows the native
+        # locator they were meant to pair with.  Publish the paths so the
+        # failure log in ``_probe_native_target`` can print both halves on one
+        # line — a wrong pairing is then visible from the log alone.
+        probe_paths: dict[str, str] = {"root": root}
 
         def observe(info: dict[str, Any]) -> dict[str, Any]:
             file_name = posixpath.basename(_text(info.get("file_name")))
@@ -760,11 +825,17 @@ class StorageSetupService:
                 }
             source = posixpath.join(root, file_name)
             moved = posixpath.join(root, f"{file_name}.moved")
+            probe_paths.update({"source": source, "moved": moved})
             content = bytes(info.get("content") or b"")
             expected_size = int(info.get("file_size") or len(content))
 
             def visible(path: str, expected: bool) -> bool:
-                for _attempt in range(12):
+                # The probe file is written straight through the Provider's
+                # native API, so OpenList's listing cache for ``root`` predates
+                # it.  Waiting alone cannot expire that cache; force a refresh
+                # before each recheck so the poll converges instead of burning
+                # every attempt against a stale directory.
+                for attempt in range(12):
                     try:
                         exists = bool(client.exists(path))
                     except Exception:  # noqa: BLE001 - retry eventual visibility
@@ -772,6 +843,8 @@ class StorageSetupService:
                     if exists is expected:
                         return True
                     time.sleep(0.5)
+                    if attempt < 11:
+                        refresh_dir(root)
                 return False
 
             deleted = False
@@ -815,22 +888,26 @@ class StorageSetupService:
                     "message": "OpenList read, MOVE and DELETE checks passed",
                 }
             except Exception as exc:  # noqa: BLE001 - return structured probe failure
+                # ``deleted`` tells the Provider uploader to skip its own native
+                # cleanup, so it may only be true for a DELETE this observer
+                # actually issued.  Inferring it from ``not exists()`` conflated
+                # "OpenList cannot see the file" with "the file is gone" and
+                # leaked one probe file into the cloud drive on every failure —
+                # precisely the case where OpenList visibility is what broke.
                 for candidate in (source, moved):
                     try:
                         if client.exists(candidate):
                             client.delete(candidate)
+                            deleted = True
                     except Exception:  # noqa: BLE001 - Provider cleanup is the fallback
                         pass
-                try:
-                    deleted = not client.exists(source) and not client.exists(moved)
-                except Exception:  # noqa: BLE001
-                    deleted = False
                 return {
                     "organizer_mutation_verified": False,
                     "deleted": deleted,
                     "message": f"OpenList organizer mutation probe failed: {exc}",
                 }
 
+        observe.probe_paths = probe_paths  # type: ignore[attr-defined]
         return observe
 
     def _location_view(
