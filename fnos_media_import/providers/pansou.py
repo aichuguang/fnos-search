@@ -12,7 +12,12 @@ from ..classifiers.link_classifier import detect_link
 
 
 DEFAULT_CLOUD_TYPES = ["quark", "tianyi", "mobile", "magnet"]
-DEFAULT_CONCURRENCY = 10
+# ``0`` means PanSou picks its own configured concurrency, and ``_search_payload``
+# then omits ``conc`` entirely. A pinned value of 10 makes instances with many
+# plugins process the search in batches: measured against a live PanSou, a cold
+# ``refresh`` search returned HTTP 504 after 60s with ``conc=10`` and HTTP 200 in
+# ~4s without it, for the same keyword.
+DEFAULT_CONCURRENCY = 0
 logger = logging.getLogger(__name__)
 
 

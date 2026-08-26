@@ -270,7 +270,10 @@ def _default_config() -> dict[str, Any]:
             "cloud_types": _env_cloud_types("PANSOU_CLOUD_TYPES", ["quark", "tianyi", "mobile", "magnet"]),
             "res": os.getenv("PANSOU_RES", "merge"),
             "src": os.getenv("PANSOU_SRC", "all"),
-            "conc": _env_int("PANSOU_CONC", 10),
+            # ``0`` delegates concurrency to PanSou's own configuration. Pinning
+            # it to 10 makes instances with many plugins fan out in batches, and
+            # a cold search then exceeds the upstream gateway timeout (HTTP 504).
+            "conc": _env_int("PANSOU_CONC", 0),
             "refresh": _env_bool("PANSOU_REFRESH", False),
             "channels": _env_csv("PANSOU_CHANNELS", []),
             "plugins": _env_csv("PANSOU_PLUGINS", []),

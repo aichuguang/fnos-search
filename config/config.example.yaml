@@ -32,9 +32,10 @@ submission:
   # auto=支持自动入库；review=全部进入审核；mixed=异常资源进入审核
   mode: "auto"
 
-# 可选：PanSou 搜索并发。0 表示不传 conc，交给 PanSou 自动设置。
+# 可选：PanSou 搜索并发。默认 0，即不传 conc，交给 PanSou 自动设置。
+# 固定为 10 会让插件多的实例分批扇出，冷搜索会超过上游网关超时（HTTP 504）。
 # pansou:
-#   conc: 10
+#   conc: 0
 
 # 可选：BTBTLA 搜索源配置，默认使用内置服务地址。
 # btbtla:

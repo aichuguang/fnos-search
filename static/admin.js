@@ -1416,7 +1416,9 @@ function renderAdvancedConfig() {
     renderAdvancedCloudTypes(pansou.cloud_types || []);
     setValue("advPansouRes", pansou.res || "merge");
     setValue("advPansouSrc", pansou.src || "all");
-    setNumber("advPansouConc", pansou.conc ?? 10);
+    // 0 表示不传 conc，交给 PanSou 自动决定并发。固定 10 会让插件多的实例
+    // 分批扇出，冷搜索超过上游网关超时（实测 HTTP 504 / 60s）。
+    setNumber("advPansouConc", pansou.conc ?? 0);
     setNumber("advPansouTimeout", pansou.timeout ?? 20);
     setChecked("advPansouRefresh", pansou.refresh, false);
     setChecked("advPansouAsyncPollEnabled", pansou.async_poll_enabled, true);
@@ -1747,7 +1749,7 @@ function collectAdvancedConfig() {
             cloud_types: cloudTypes,
             res: value("advPansouRes") || "merge",
             src: value("advPansouSrc") || "all",
-            conc: numberValue("advPansouConc", 10),
+            conc: numberValue("advPansouConc", 0),
             refresh: checked("advPansouRefresh"),
             channels: value("advPansouChannels"),
             plugins: value("advPansouPlugins"),
