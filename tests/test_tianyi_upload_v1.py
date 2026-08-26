@@ -417,6 +417,23 @@ class TianyiCloudUploaderTests(unittest.TestCase):
         self.assertEqual(verified.status, "missing")
         self.assertIn("size", verified.message)
 
+    def test_probe_file_name_is_not_hidden_from_openlist(self) -> None:
+        """A dot-prefixed probe name uploads fine but stays invisible over WebDAV.
+
+        The organizer half of the probe then fails on a file that is really
+        there, so the name must not start with a dot.
+        """
+
+        importer = _FakeDriveImporter()
+        uploader = TianyiCloudUploader(importer)  # type: ignore[arg-type]
+
+        uploader.probe_target(target_locator=self.target)
+
+        self.assertEqual(len(importer.upload_calls), 1)
+        target_name = str(importer.upload_calls[0]["target_name"])
+        self.assertFalse(target_name.startswith("."))
+        self.assertTrue(target_name.startswith("fnos-native-probe-"))
+
     def test_probe_cleanup_failure_fails_closed(self) -> None:
         importer = _FakeDriveImporter()
         importer.delete_ok = False

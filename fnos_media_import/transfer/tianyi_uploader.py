@@ -409,7 +409,10 @@ class TianyiCloudUploader:
     ) -> dict[str, Any]:
         """Upload, verify, observe OpenList mutation, and clean a tiny file."""
 
-        file_name = f".fnos-native-probe-{uuid.uuid4().hex}.txt"
+        # No leading dot: OpenList hides dotfiles, so a ``.fnos-native-probe``
+        # upload succeeds on Cloud189 and then stays invisible over WebDAV,
+        # failing the organizer mutation check for a file that is really there.
+        file_name = f"fnos-native-probe-{uuid.uuid4().hex}.txt"
         content = b"fnos-tianyi-native-upload-probe"
         uploaded: dict[str, Any] = {}
         observer_result: dict[str, Any] = {}
