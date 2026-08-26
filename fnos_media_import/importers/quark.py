@@ -422,7 +422,7 @@ class QuarkImporter:
             params=params or {},
             timeout=self.timeout,
         )
-        return self._validate_response(status, payload)
+        return self._validate_response(status, payload, path=path)
 
     def _post(
         self,
@@ -437,10 +437,15 @@ class QuarkImporter:
             params=params or {},
             timeout=self.timeout,
         )
-        return self._validate_response(status, value)
+        return self._validate_response(status, value, path=path)
 
     @staticmethod
-    def _validate_response(status: int, payload: Any) -> dict[str, Any]:
+    def _validate_response(
+        status: int,
+        payload: Any,
+        *,
+        path: str = "",
+    ) -> dict[str, Any]:
         if status in {401, 403}:
             raise QuarkApiError("夸克 Cookie 已失效")
         if status >= 400:
@@ -448,7 +453,17 @@ class QuarkImporter:
         if not isinstance(payload, dict):
             raise QuarkApiError("夸克 API 返回格式异常")
         code = payload.get("code")
-        if code in (40001, 10000, "40001", "10000"):
+        if code in (40001, "40001"):
+            raise QuarkApiError("夸克 Cookie 已失效，请重新扫码登录")
+        # ``10000`` is overloaded: on a ``/share/`` path it means the share is
+        # gone, everywhere else it means the cookie died.  Reporting a dead
+        # share as an expired cookie sends the operator off to re-scan a QR
+        # code that was never the problem.
+        if code in (41001, "41001", 41002, "41002", 41003, "41003") or (
+            code in (10000, "10000") and "/share/" in str(path or "")
+        ):
+            raise QuarkApiError("夸克分享不存在或已失效，请重新搜索资源")
+        if code in (10000, "10000"):
             raise QuarkApiError("夸克 Cookie 已失效，请重新扫码登录")
         # Quark's account endpoint uses the string ``OK`` for a successful
         # response, while other endpoints commonly use numeric ``0`` or a
