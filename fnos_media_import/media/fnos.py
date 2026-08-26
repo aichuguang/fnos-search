@@ -28,25 +28,25 @@ SIGN_MODE_AUTO = "auto"
 SIGN_MODE_PHP = "php"
 SIGN_MODE_FNV = "fnv"
 
-MSG_REFRESH_NOT_CONFIGURED = "\u98de\u725b\u5237\u65b0\u914d\u7f6e\u4e0d\u5b8c\u6574\uff0c\u8bf7\u914d\u7f6e FNOS_SERVER_URL / FNOS_API_KEY / FNOS_SECRET"
-MSG_LOGIN_NOT_CONFIGURED = "\u98de\u725b\u8d26\u53f7\u5bc6\u7801\u672a\u914d\u7f6e\uff0c\u65e0\u6cd5\u81ea\u52a8\u91cd\u65b0\u767b\u5f55"
-MSG_LOGIN_FAILED = "\u98de\u725b\u767b\u5f55\u5931\u8d25"
-MSG_LIBRARY_REQUIRED = "\u98de\u725b\u5a92\u4f53\u5e93\u540d\u79f0\u4e0d\u80fd\u4e3a\u7a7a"
-MSG_LIBRARY_LIST_FAILED = "\u98de\u725b\u5a92\u4f53\u5e93\u5217\u8868\u83b7\u53d6\u5931\u8d25"
-MSG_LIBRARY_NOT_FOUND = "\u672a\u627e\u5230\u5bf9\u5e94\u98de\u725b\u5a92\u4f53\u5e93"
-MSG_REFRESH_TRIGGERED = "\u5df2\u89e6\u53d1\u98de\u725b\u5a92\u4f53\u5e93\u5237\u65b0"
-MSG_DIR_REFRESH_TRIGGERED = "\u5df2\u89e6\u53d1\u98de\u725b\u5a92\u4f53\u5e93\u76ee\u5f55\u5237\u65b0"
-MSG_REFRESH_FAILED = "\u98de\u725b\u5a92\u4f53\u5e93\u5237\u65b0\u5931\u8d25"
-MSG_DUPLICATE_RESTART_FAILED = "\u98de\u725b\u91cd\u590d\u5237\u65b0\u4efb\u52a1\u505c\u6b62\u540e\u91cd\u8bd5\u5931\u8d25"
-MSG_REQUEST_FAILED = "\u98de\u725b API \u8bf7\u6c42\u5931\u8d25"
-MSG_AUTH_RETRY_EXHAUSTED = "\u98de\u725b token \u5931\u6548\uff0c\u91cd\u65b0\u767b\u5f55\u91cd\u8bd5 3 \u6b21\u540e\u4ecd\u5931\u8d25"
-MSG_GUID_REQUIRED = "\u98de\u725b\u5a92\u4f53\u5e93 GUID \u4e0d\u80fd\u4e3a\u7a7a"
-MSG_SUMMARY_FAILED = "\u98de\u725b\u5a92\u4f53\u5e93\u7edf\u8ba1\u83b7\u53d6\u5931\u8d25"
-MSG_RUNNING_FAILED = "\u98de\u725b\u5237\u65b0\u4efb\u52a1\u72b6\u6001\u83b7\u53d6\u5931\u8d25"
-MSG_SUMMARY_LOADED = "\u5df2\u83b7\u53d6\u98de\u725b\u5a92\u4f53\u5e93\u7edf\u8ba1"
-MSG_LIBRARY_LIST_LOADED = "\u5df2\u83b7\u53d6\u98de\u725b\u5a92\u4f53\u5e93\u5217\u8868"
-MSG_DIR_NOT_MATCHED = "\u672a\u5339\u914d\u5230\u98de\u725b\u5a92\u4f53\u5e93\u771f\u5b9e\u5237\u65b0\u76ee\u5f55\uff0c\u8bf7\u786e\u8ba4\u5165\u5e93\u76ee\u6807\u4e0e\u98de\u725b\u5a92\u4f53\u5e93 dir_list \u4e00\u81f4"
-MSG_DIR_LIST_REQUIRED = "\u98de\u725b\u5a92\u4f53\u5e93\u5237\u65b0\u5fc5\u987b\u643a\u5e26 dir_list\uff0c\u5df2\u62d2\u7edd\u6574\u5e93\u626b\u63cf"
+MSG_REFRESH_NOT_CONFIGURED = "飞牛刷新配置不完整，请配置 FNOS_SERVER_URL / FNOS_API_KEY / FNOS_SECRET"
+MSG_LOGIN_NOT_CONFIGURED = "飞牛账号密码未配置，无法自动重新登录"
+MSG_LOGIN_FAILED = "飞牛登录失败"
+MSG_LIBRARY_REQUIRED = "飞牛媒体库名称不能为空"
+MSG_LIBRARY_LIST_FAILED = "飞牛媒体库列表获取失败"
+MSG_LIBRARY_NOT_FOUND = "未找到对应飞牛媒体库"
+MSG_REFRESH_TRIGGERED = "已触发飞牛媒体库刷新"
+MSG_DIR_REFRESH_TRIGGERED = "已触发飞牛媒体库目录刷新"
+MSG_REFRESH_FAILED = "飞牛媒体库刷新失败"
+MSG_DUPLICATE_RESTART_FAILED = "飞牛重复刷新任务停止后重试失败"
+MSG_REQUEST_FAILED = "飞牛 API 请求失败"
+MSG_AUTH_RETRY_EXHAUSTED = "飞牛 token 失效，重新登录重试 3 次后仍失败"
+MSG_GUID_REQUIRED = "飞牛媒体库 GUID 不能为空"
+MSG_SUMMARY_FAILED = "飞牛媒体库统计获取失败"
+MSG_RUNNING_FAILED = "飞牛刷新任务状态获取失败"
+MSG_SUMMARY_LOADED = "已获取飞牛媒体库统计"
+MSG_LIBRARY_LIST_LOADED = "已获取飞牛媒体库列表"
+MSG_DIR_NOT_MATCHED = "未匹配到飞牛媒体库真实刷新目录，请确认入库目标与飞牛媒体库 dir_list 一致"
+MSG_DIR_LIST_REQUIRED = "飞牛媒体库刷新必须携带 dir_list，已拒绝整库扫描"
 
 
 class FnosMediaRefresher:
@@ -128,7 +128,7 @@ class FnosMediaRefresher:
             if not library_item:
                 return {
                     "success": False,
-                    "message": f"{MSG_LIBRARY_NOT_FOUND}\uff1a{library_name}",
+                    "message": f"{MSG_LIBRARY_NOT_FOUND}：{library_name}",
                     "library": library_name,
                     "dir_list": requested_dirs,
                     "available_libraries": _library_names(libraries_data),

@@ -47,31 +47,31 @@ def resolve_local_target(root: str, relative: str) -> str:
     while "//" in root_norm:
         root_norm = root_norm.replace("//", "/")
     if not root_norm.startswith("/"):
-        raise ValueError("root \u5fc5\u987b\u662f\u5bb9\u5668\u5185\u7edd\u5bf9\u8def\u5f84")
+        raise ValueError("root 必须是容器内绝对路径")
     root_norm = root_norm.rstrip("/")
     if not root_norm:
-        raise ValueError("root \u4e0d\u80fd\u662f\u6587\u4ef6\u7cfb\u7edf\u6839\u76ee\u5f55")
+        raise ValueError("root 不能是文件系统根目录")
     if "\x00" in root_norm or any(ord(char) < 32 for char in root_norm):
-        raise ValueError("root \u5305\u542b\u975e\u6cd5\u63a7\u5236\u5b57\u7b26")
+        raise ValueError("root 包含非法控制字符")
     if any(part in {"", ".", ".."} for part in root_norm.split("/")[1:]):
-        raise ValueError("root \u5305\u542b .. \u6216\u975e\u6cd5\u8def\u5f84\u6bb5")
+        raise ValueError("root 包含 .. 或非法路径段")
     if root_norm != "/storage-targets" and not root_norm.startswith(
         "/storage-targets/"
     ):
-        raise ValueError("root \u5fc5\u987b\u4f4d\u4e8e /storage-targets \u6302\u8f7d\u76ee\u5f55\u5185")
+        raise ValueError("root 必须位于 /storage-targets 挂载目录内")
 
     relative_text = str(relative or "").strip()
     if not relative_text:
-        raise ValueError("relative \u4e0d\u80fd\u4e3a\u7a7a")
+        raise ValueError("relative 不能为空")
     if relative_text.startswith(("/", "\\")):
-        raise ValueError("relative \u5fc5\u987b\u662f\u76f8\u5bf9\u8def\u5f84")
+        raise ValueError("relative 必须是相对路径")
     if "\x00" in relative_text or any(ord(char) < 32 for char in relative_text):
-        raise ValueError("relative \u5305\u542b\u975e\u6cd5\u63a7\u5236\u5b57\u7b26")
+        raise ValueError("relative 包含非法控制字符")
     relative_norm = normalize_storage_path(relative_text)
     if relative_norm in {"", ".", ".."} or any(
         part in {"", ".", ".."} for part in relative_norm.split("/")
     ):
-        raise ValueError("relative \u5305\u542b .. \u6216\u975e\u6cd5\u8def\u5f84\u6bb5")
+        raise ValueError("relative 包含 .. 或非法路径段")
     return f"{root_norm}/{relative_norm}"
 
 

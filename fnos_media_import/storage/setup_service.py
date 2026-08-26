@@ -325,7 +325,7 @@ class StorageSetupService:
             raise
         except Exception as exc:  # noqa: BLE001 - normalize composition failures
             raise StorageSetupError(
-                "Provider \u539f\u751f\u4e0a\u4f20\u5668\u521d\u59cb\u5316\u5931\u8d25",
+                "Provider 原生上传器初始化失败",
                 code="PROVIDER_UPLOAD_UNAVAILABLE",
                 status=503,
                 retryable=True,
@@ -353,7 +353,7 @@ class StorageSetupService:
         revision = int(getattr(account, "current_revision", 0) or 0)
         if not callable(self.provider_folder_resolver):
             raise StorageSetupError(
-                "Provider \u539f\u751f\u76ee\u5f55\u6d4f\u89c8\u8fd0\u884c\u65f6\u5c1a\u672a\u88c5\u914d",
+                "Provider 原生目录浏览运行时尚未装配",
                 code="PROVIDER_FOLDER_BROWSER_UNAVAILABLE",
                 status=503,
             )
@@ -365,7 +365,7 @@ class StorageSetupService:
             )
         except Exception as exc:  # noqa: BLE001 - normalize composition failures
             raise StorageSetupError(
-                "Provider \u539f\u751f\u76ee\u5f55\u6d4f\u89c8\u5668\u521d\u59cb\u5316\u5931\u8d25",
+                "Provider 原生目录浏览器初始化失败",
                 code="PROVIDER_FOLDER_BROWSER_UNAVAILABLE",
                 status=503,
                 retryable=True,
@@ -398,9 +398,9 @@ class StorageSetupService:
             } or provider_status in {401, 403}
             raise StorageSetupError(
                 (
-                    "\u4e91\u76d8\u8ba4\u8bc1\u5df2\u5931\u6548\uff0c\u8bf7\u5148\u91cd\u65b0\u767b\u5f55\u8d26\u53f7"
+                    "云盘认证已失效，请先重新登录账号"
                     if auth_failed
-                    else f"\u539f\u751f\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25\uff1a{exc}"
+                    else f"原生目录读取失败：{exc}"
                 ),
                 code=("PROVIDER_AUTH_EXPIRED" if auth_failed else "PROVIDER_FOLDER_LIST_FAILED"),
                 status=(401 if auth_failed else 503),
@@ -901,19 +901,19 @@ class StorageSetupService:
     ) -> str:
         if target_enabled and target_valid and remote_ready:
             if relay_upload_capable:
-                return "Provider \u539f\u751f\u76f4\u4f20\u4e0e OpenList \u6574\u7406\u94fe\u8def\u53ef\u7528"
+                return "Provider 原生直传与 OpenList 整理链路可用"
             if mount is not None and not mount.get("writable") and not webdav_write_required:
-                return "\u53ef\u4ee5\u63a5\u6536\u540c\u6e90\u539f\u751f\u8f6c\u5b58\uff1b\u8de8\u76d8 rclone \u5199\u5165\u4e0d\u53ef\u7528"
-            return "\u53ef\u4ee5\u63a5\u6536\u5165\u5e93\u4efb\u52a1"
+                return "可以接收同源原生转存；跨盘 rclone 写入不可用"
+            return "可以接收入库任务"
         if mount is not None and mount.get("identity_status") not in {"verified", "declared"}:
-            return "\u9700\u8981\u7ba1\u7406\u5458\u786e\u8ba4\u5b58\u50a8\u8eab\u4efd"
+            return "需要管理员确认存储身份"
         if mount is not None and not connection_ready:
-            return "OpenList \u8fde\u63a5\u5df2\u53d8\u5316\uff0c\u8bf7\u91cd\u65b0\u68c0\u6d4b\u76ee\u5f55"
+            return "OpenList 连接已变化，请重新检测目录"
         if relay_upload_capable and not native_upload_verified:
-            return "Provider \u539f\u751f\u4e0a\u4f20\u5c1a\u672a\u901a\u8fc7\u63a2\u6d4b"
+            return "Provider 原生上传尚未通过探测"
         if relay_upload_capable and not organizer_mutation_verified:
-            return "OpenList \u8bfb\u53d6\u3001MOVE \u6216 DELETE \u6574\u7406\u94fe\u8def\u5c1a\u672a\u901a\u8fc7\u63a2\u6d4b"
-        return "\u9700\u8981\u68c0\u67e5\u76ee\u5f55\u6216\u8fde\u63a5"
+            return "OpenList 读取、MOVE 或 DELETE 整理链路尚未通过探测"
+        return "需要检查目录或连接"
 
     def _route_view(self, matrix: dict[str, Any], locations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         location_by_id = {item["destination_id"]: item for item in locations}
@@ -1348,10 +1348,10 @@ class StorageSetupService:
                 or identity_status not in {"verified", "declared"}
             ) and not explicit_confirm:
                 raise StorageSetupError(
-                    "\u8bf7\u786e\u8ba4 OpenList \u76ee\u5f55\u786e\u5b9e\u5bf9\u5e94\u6240\u9009\u4e91\u76d8/\u5b58\u50a8\u8eab\u4efd",
+                    "请确认 OpenList 目录确实对应所选云盘/存储身份",
                     code="IDENTITY_CONFIRMATION_REQUIRED",
                     status=422,
-                    field_errors={"confirm_identity": "\u5fc5\u987b\u52fe\u9009\u786e\u8ba4"},
+                    field_errors={"confirm_identity": "必须勾选确认"},
                 )
             native_locator_payload = (
                 self._native_locator_with_probe(
@@ -1520,7 +1520,7 @@ class StorageSetupService:
             "destination_id": target.destination_id,
             "identity_status": (mount or {}).get("identity_status") if mount else None,
             "message": (
-                "\u4fdd\u5b58\u4f4d\u7f6e\u5df2\u521b\u5efa\uff0cProvider \u539f\u751f\u76f4\u4f20\u4e0e OpenList \u6574\u7406\u94fe\u8def\u5df2\u9a8c\u8bc1"
+                "保存位置已创建，Provider 原生直传与 OpenList 整理链路已验证"
                 if self._supports_relay_upload(provider_kind)
                 else "保存位置已创建并通过读写检测"
             ),
@@ -2114,15 +2114,15 @@ class StorageSetupService:
                         and organizer_mutation_ok
                     )
                 if not identity_ok:
-                    mount_message = "\u76ee\u5f55\u68c0\u6d4b\u901a\u8fc7\uff0c\u4f46\u5c1a\u672a\u786e\u8ba4\u5b58\u50a8\u8eab\u4efd"
+                    mount_message = "目录检测通过，但尚未确认存储身份"
                 elif relay_upload_capable and not native_upload_ok:
-                    mount_message = "Provider \u539f\u751f\u4e0a\u4f20\u63a2\u6d4b\u8bc1\u660e\u7f3a\u5931\uff0c\u8bf7\u91cd\u65b0\u4fdd\u5b58\u5e76\u68c0\u6d4b\u8be5\u4f4d\u7f6e"
+                    mount_message = "Provider 原生上传探测证明缺失，请重新保存并检测该位置"
                 elif relay_upload_capable and not organizer_mutation_ok:
-                    mount_message = "OpenList \u8bfb\u53d6\u3001MOVE \u6216 DELETE \u6574\u7406\u63a2\u6d4b\u8bc1\u660e\u7f3a\u5931"
+                    mount_message = "OpenList 读取、MOVE 或 DELETE 整理探测证明缺失"
                 else:
                     mount_message = _text(result.get("message"))
                 checks.append({
-                    "name": f"\u76ee\u5f55 {mount['name']}",
+                    "name": f"目录 {mount['name']}",
                     "ok": mount_ok,
                     "message": mount_message,
                 })

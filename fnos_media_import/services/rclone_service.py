@@ -758,15 +758,15 @@ class RcloneService:
             if not self.process_controller.is_active(self.process):
                 return {
                     "success": False,
-                    "message": "\u5f53\u524d\u6ca1\u6709\u8fd0\u884c\u4e2d\u7684 rclone \u642c\u8fd0\u4efb\u52a1",
+                    "message": "当前没有运行中的 rclone 搬运任务",
                     "status": self.status_locked(),
                 }
             self.run_queue.request_stop()
-            self._append_log("\u6536\u5230\u505c\u6b62\u8bf7\u6c42\uff0c\u6b63\u5728\u7ec8\u6b62 rclone \u642c\u8fd0\u811a\u672c")
+            self._append_log("收到停止请求，正在终止 rclone 搬运脚本")
             self.process_controller.terminate(self.process)
             return {
                 "success": True,
-                "message": "\u5df2\u53d1\u9001\u505c\u6b62\u4fe1\u53f7",
+                "message": "已发送停止信号",
                 "status": self.status_locked(),
             }
 

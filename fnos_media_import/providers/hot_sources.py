@@ -80,9 +80,9 @@ def _number(value: Any) -> float | None:
     if not match:
         return None
     number = float(match.group(0))
-    if "\u4e07" in text:
+    if "万" in text:
         number *= 10_000
-    elif "\u4ebf" in text:
+    elif "亿" in text:
         number *= 100_000_000
     return number
 
@@ -102,13 +102,13 @@ def _year(mapping: Mapping[str, Any]) -> int | None:
 def _infer_type(mapping: Mapping[str, Any], text: str = "") -> str:
     value = " ".join(_flatten_text(_first(mapping, key)) for key in ("mediaType", "media_type", "type", "category", "subType", "contentType", "tags", "lines"))
     value = f"{value} {text}".lower()
-    if any(token in value for token in ("\u7efc\u827a", "variety", "show")):
+    if any(token in value for token in ("综艺", "variety", "show")):
         return "variety"
-    if any(token in value for token in ("\u52a8\u6f2b", "\u52a8\u753b", "\u5c11\u513f", "anime", "cartoon")):
+    if any(token in value for token in ("动漫", "动画", "少儿", "anime", "cartoon")):
         return "anime"
-    if any(token in value for token in ("\u7535\u5f71", "movie", "film")):
+    if any(token in value for token in ("电影", "movie", "film")):
         return "movie"
-    if any(token in value for token in ("\u7535\u89c6\u5267", "\u7f51\u7edc\u5267", "\u5267\u96c6", "tv", "series", "drama")):
+    if any(token in value for token in ("电视剧", "网络剧", "剧集", "tv", "series", "drama")):
         return "tv"
     return "unknown"
 
@@ -158,7 +158,7 @@ def _candidate(mapping: Mapping[str, Any], *, source: str, marker: str = "") -> 
         heat_value = heat_tag
     tag_texts = _list_text(_first(mapping, "tags", "tag", "labels"))
     if heat_value is None:
-        heat_value = next((text for text in tag_texts if any(word in text for word in ("\u70ed\u5ea6", "hot"))), "")
+        heat_value = next((text for text in tag_texts if any(word in text for word in ("热度", "hot"))), "")
     heat = _number(heat_value)
     score_value = _first(mapping, "rating", "score", "doubanScore")
     if score_value is None:
@@ -172,7 +172,7 @@ def _candidate(mapping: Mapping[str, Any], *, source: str, marker: str = "") -> 
         )
     score = _number(score_value)
     if score is None:
-        score = _number(next((text for text in tag_texts if any(word in text for word in ("\u8bc4\u5206", "rating"))), ""))
+        score = _number(next((text for text in tag_texts if any(word in text for word in ("评分", "rating"))), ""))
     update = _flatten_text(_first(mapping, "updateText", "update_text", "updateInfo", "releaseInfo", "specialTag", "subtitle", "desc", "description", "lbTexts"))
     if not rank:
         top = re.search(r"(?:top|榜\s*第?)\s*[-#：:]?\s*(\d+)", f"{marker} {update}", re.I)
@@ -223,10 +223,10 @@ def _limited(items: Iterable[HotItem], limit: int | None) -> list[HotItem]:
 
 _TARGET_MEDIA_ORDER = ("tv", "movie", "variety", "anime")
 _TARGET_MEDIA_LABELS = {
-    "tv": "\u7535\u89c6\u5267",
-    "movie": "\u7535\u5f71",
-    "variety": "\u7efc\u827a",
-    "anime": "\u52a8\u6f2b",
+    "tv": "电视剧",
+    "movie": "电影",
+    "variety": "综艺",
+    "anime": "动漫",
 }
 
 
@@ -235,7 +235,7 @@ def _target_media_type(mapping: Mapping[str, Any], marker: str = "") -> str:
         _flatten_text(_first(mapping, key))
         for key in ("mediaType", "media_type", "type", "category", "subType", "contentType", "lines")
     ).lower()
-    if "\u5c11\u513f" in f"{classification} {marker}".lower():
+    if "少儿" in f"{classification} {marker}".lower():
         return ""
     media_type = _infer_type(mapping, marker)
     return media_type if media_type in _TARGET_MEDIA_ORDER else ""
@@ -301,7 +301,7 @@ def _tencent_rank_rows(payload: Any) -> list[dict[str, Any]]:
         rows = _rank_item_list(nav)
         tab_id = str(nav.get("tabId") or nav.get("tab_id") or "")
         tab_name = _text(_first(nav, "tabName", "tab_name", "title", "name"))
-        if tab_id == "0" or tab_name == "\u70ed\u641c":
+        if tab_id == "0" or tab_name == "热搜":
             overall_rows = rows
             continue
         media_type = _target_media_type(nav, tab_name)
@@ -529,11 +529,11 @@ def _html_text(fragment: str) -> str:
 
 
 _YOUKU_TARGET_RANK = re.compile(
-    r"(\u7535\u89c6\u5267|\u7535\u5f71|\u52a8\u6f2b|\u7efc\u827a)\u70ed\u5ea6\u699c\s*[\u00b7\u2022.:-]?\s*TOP\s*(\d+)",
+    r"(电视剧|电影|动漫|综艺)热度榜\s*[\u00b7\u2022.:-]?\s*TOP\s*(\d+)",
     re.I,
 )
-_YOUKU_CATEGORY_RANK = re.compile(r"(\u7535\u89c6\u5267|\u7535\u5f71|\u52a8\u6f2b|\u7efc\u827a)\u70ed\u5ea6\u699c", re.I)
-_YOUKU_TOP_RANK = re.compile(r"(?:TOP|\u7b2c)\s*[-#\uff1a:]?\s*(\d+)", re.I)
+_YOUKU_CATEGORY_RANK = re.compile(r"(电视剧|电影|动漫|综艺)热度榜", re.I)
+_YOUKU_TOP_RANK = re.compile(r"(?:TOP|第)\s*[-#：:]?\s*(\d+)", re.I)
 
 
 def _youku_item_rank_text(item: Mapping[str, Any]) -> str:
@@ -617,7 +617,7 @@ def _parse_youku_html_cards(html: str) -> list[HotItem]:
         if not title:
             continue
         source_match = re.search(r"(?:data-(?:id|vid)|video-id|id)=[\"']([^\"']+)[\"']", fragment, re.I)
-        update_match = re.search(r"(?:\u66f4\u65b0\u81f3\s*\d+\s*[\u96c6\u671f\u8bdd]|\d+\s*[\u96c6\u671f\u8bdd]\s*\u5168|\u5df2\u5b8c\u7ed3)", _html_text(fragment))
+        update_match = re.search(r"(?:更新至\s*\d+\s*[集期话]|\d+\s*[集期话]\s*全|已完结)", _html_text(fragment))
         marker = _html_text(fragment)
         mapping = {
             "id": source_match.group(1) if source_match else title,

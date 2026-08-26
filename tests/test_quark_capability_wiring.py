@@ -47,12 +47,12 @@ class QuarkCapabilityTests(unittest.TestCase):
 
     def test_public_config_fails_closed_when_sixpan_account_is_inactive(self) -> None:
         def unavailable():
-            raise ActiveProviderUnavailable("\u5f53\u524d\u516d\u76d8\u8d26\u53f7\u672a\u6fc0\u6d3b")
+            raise ActiveProviderUnavailable("当前六盘账号未激活")
 
         items = _public_adapter_capabilities(
             {},
             generic_importers={
-                "sixpan": ActiveProviderImporter("\u516d\u76d8", unavailable),
+                "sixpan": ActiveProviderImporter("六盘", unavailable),
             },
         )
 

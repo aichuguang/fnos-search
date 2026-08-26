@@ -107,11 +107,11 @@ def terminal_duplicate_status(*values: Any) -> bool:
         "failed",
         "unsupported",
         "skipped",
-        "\u53d6\u6d88",
-        "\u62d2\u7edd",
-        "\u672a\u901a\u8fc7",
-        "\u5931\u8d25",
-        "\u6682\u4e0d\u652f\u6301",
+        "取消",
+        "拒绝",
+        "未通过",
+        "失败",
+        "暂不支持",
     )
     return any(word in text for word in terminal_words)
 

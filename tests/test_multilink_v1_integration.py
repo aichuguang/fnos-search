@@ -116,7 +116,7 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
     def _tianyi_account(self) -> str:
         account = self.accounts.create_account(
             provider_kind="tianyi",
-            name="\u5929\u7ffc\u4e3b\u8d26\u53f7",
+            name="天翼主账号",
             config={"identity": "user"},
             credentials={
                 "session_key": "session-key",
@@ -289,12 +289,12 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
         account_id = self._tianyi_account()
         self.targets.create_target(
             destination_id="tianyi_main",
-            name="\u5929\u7ffc\u4e3b\u76d8",
+            name="天翼主盘",
             provider_kind="tianyi",
             categories={
                 "movie": TargetCategory(
                     category_key="movie",
-                    public_label="\u7535\u5f71",
+                    public_label="电影",
                     native_locator=NativeLocator("folder_id", "root-folder-id"),
                 )
             },
@@ -455,7 +455,7 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
             {
                 "mount_id": "quark_relay_source",
                 "connection_id": "ol_relay",
-                "name": "\u5938\u514b\u6765\u6e90",
+                "name": "夸克来源",
                 "webdav_root": "/quark",
                 "account_id": quark_account,
                 "provider_kind": "quark",
@@ -467,7 +467,7 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
             {
                 "mount_id": "tianyi_relay_target",
                 "connection_id": "ol_relay",
-                "name": "\u5929\u7ffc\u76ee\u6807",
+                "name": "天翼目标",
                 "webdav_root": "/tianyi",
                 "account_id": tianyi_account,
                 "provider_kind": "tianyi",
@@ -495,12 +495,12 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
         self.mounts.confirm_identity(destination_mount["mount_id"])
         self.targets.create_target(
             destination_id="tianyi_relay",
-            name="\u5929\u7ffc\u8de8\u76d8\u76ee\u6807",
+            name="天翼跨盘目标",
             provider_kind="tianyi",
             categories={
                 "movie": TargetCategory(
                     category_key="movie",
-                    public_label="\u7535\u5f71",
+                    public_label="电影",
                     native_locator=NativeLocator("folder_id", "root-folder-id"),
                     rclone_locator=RcloneLocator(
                         "ol_relay",

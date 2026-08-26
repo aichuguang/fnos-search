@@ -77,7 +77,7 @@ class TrendingInitialImportService:
         if not search_keyword:
             search_keyword = self.default_search_keyword(candidate.get("title"))
         if not search_keyword:
-            raise TrendingInitialImportError("\u70ed\u699c\u5019\u9009\u7f3a\u5c11\u6807\u9898")
+            raise TrendingInitialImportError("热榜候选缺少标题")
         trace_id = f"trending-{int(candidate_id)}-{secrets.token_hex(3)}"
         cache_keyword = f"trending:{int(candidate_id)}:{search_keyword}"
         options = {
@@ -116,7 +116,7 @@ class TrendingInitialImportService:
         resource = self._resolve_resource(candidate, payload)
         source_url = str(resource.get("url") or resource.get("source_url") or "").strip()
         if not source_url:
-            raise TrendingInitialImportError("\u6240\u9009\u8d44\u6e90\u7f3a\u5c11\u53ef\u5165\u5e93\u94fe\u63a5")
+            raise TrendingInitialImportError("所选资源缺少可入库链接")
         category = self._category(candidate, payload)
         submit_payload = self._import_payload(
             candidate=candidate, resource=resource, category=category, request_payload=payload
@@ -130,7 +130,7 @@ class TrendingInitialImportService:
         if not claimed:
             latest = self.repository.get_trending_candidate(int(candidate_id))
             if not latest:
-                raise TrendingInitialImportError("\u70ed\u699c\u5019\u9009\u4e0d\u5b58\u5728", 404)
+                raise TrendingInitialImportError("热榜候选不存在", 404)
             raise TrendingInitialImportError(self._not_importable_message(latest), 409)
         try:
             imports = self.import_service()
@@ -140,12 +140,12 @@ class TrendingInitialImportService:
             result = creator(submit_payload)
             job = result.get("job") if isinstance(result, dict) else None
             if not isinstance(job, dict) or not job.get("id"):
-                raise RuntimeError("\u5165\u5e93\u670d\u52a1\u672a\u8fd4\u56de\u4efb\u52a1")
+                raise RuntimeError("入库服务未返回任务")
             candidate_status = self._candidate_status_for_job(job)
             if not self.repository.bind_trending_candidate_initial_import_job(
                 int(candidate_id), int(job["id"]), status=candidate_status
             ):
-                raise RuntimeError("\u70ed\u699c\u5019\u9009\u4e0e\u5165\u5e93\u4efb\u52a1\u7ed1\u5b9a\u5931\u8d25")
+                raise RuntimeError("热榜候选与入库任务绑定失败")
             if self.start_import:
                 try:
                     result["rclone_start"] = self.start_import(
@@ -163,7 +163,7 @@ class TrendingInitialImportService:
             return {
                 "success": succeeded,
                 "created": bool(result.get("created", True)),
-                "message": result.get("message") or "\u5df2\u521b\u5efa\u70ed\u699c\u9996\u6b21\u5165\u5e93\u4efb\u52a1",
+                "message": result.get("message") or "已创建热榜首次入库任务",
                 "candidate": self.repository.get_trending_candidate(int(candidate_id)),
                 "job": latest_job,
             }
@@ -196,7 +196,7 @@ class TrendingInitialImportService:
                 str(request.get("public_id") or "").strip() == expected_public_id
             )
         if not same_resource:
-            raise TrendingInitialImportError("\u8be5\u70ed\u699c\u5019\u9009\u5df2\u7ed1\u5b9a\u5176\u4ed6\u5165\u5e93\u8d44\u6e90", 409)
+            raise TrendingInitialImportError("该热榜候选已绑定其他入库资源", 409)
         current_status = self._candidate_status_for_job(job)
         if current_status != status:
             self.repository.bind_trending_candidate_initial_import_job(
@@ -206,7 +206,7 @@ class TrendingInitialImportService:
         return {
             "success": current_status != "import_failed",
             "created": False,
-            "message": "\u8be5\u70ed\u699c\u5019\u9009\u5df2\u5b58\u5728\u76f8\u540c\u7684\u9996\u5165\u5e93\u4efb\u52a1",
+            "message": "该热榜候选已存在相同的首入库任务",
             "candidate": candidate,
             "job": dict(job),
         }
@@ -236,7 +236,7 @@ class TrendingInitialImportService:
     def _candidate(self, candidate_id: int) -> dict[str, Any]:
         candidate = self.repository.get_trending_candidate(int(candidate_id))
         if not candidate:
-            raise TrendingInitialImportError("\u70ed\u699c\u5019\u9009\u4e0d\u5b58\u5728", 404)
+            raise TrendingInitialImportError("热榜候选不存在", 404)
         return self.reconcile_candidate(candidate)
 
     def _resolve_resource(self, candidate: dict[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -247,26 +247,26 @@ class TrendingInitialImportService:
             raw = cached.get("raw_data") if isinstance(cached.get("raw_data"), Mapping) else {}
             source = str(raw.get("source") or raw.get("provider") or cached.get("source_type") or "").strip()
             if not source_url or not self.find_resource_by_url:
-                raise TrendingInitialImportError("\u8d44\u6e90\u6620\u5c04\u4e0d\u5b58\u5728\uff0c\u8bf7\u91cd\u65b0\u641c\u7d22", 404)
+                raise TrendingInitialImportError("资源映射不存在，请重新搜索", 404)
             resource = self.find_resource_by_url(source_url, source=source)
             if not resource:
-                raise TrendingInitialImportError("\u8d44\u6e90\u6620\u5c04\u4e0d\u5b58\u5728\uff0c\u8bf7\u91cd\u65b0\u641c\u7d22", 404)
+                raise TrendingInitialImportError("资源映射不存在，请重新搜索", 404)
             return {**resource, "_trending_public_id": public_id}
         resource_id = self._resource_id(payload.get("resource_id"))
         resource = self.get_resource(resource_id)
         if not resource:
-            raise TrendingInitialImportError("\u641c\u7d22\u8d44\u6e90\u4e0d\u5b58\u5728\uff0c\u8bf7\u91cd\u65b0\u641c\u7d22", 404)
+            raise TrendingInitialImportError("搜索资源不存在，请重新搜索", 404)
         return resource
 
     def _cached_resource(self, candidate: Mapping[str, Any], public_id: str) -> dict[str, Any]:
         public_id = str(public_id or "").strip()
         if not public_id or len(public_id) > 80:
-            raise TrendingInitialImportError("\u8d44\u6e90\u6807\u8bc6\u65e0\u6548")
+            raise TrendingInitialImportError("资源标识无效")
         if not self.get_cached_resource:
-            raise TrendingInitialImportError("\u8d44\u6e90\u7f13\u5b58\u670d\u52a1\u4e0d\u53ef\u7528", 503)
+            raise TrendingInitialImportError("资源缓存服务不可用", 503)
         resource = self.get_cached_resource(public_id)
         if not resource:
-            raise TrendingInitialImportError("\u8d44\u6e90\u8be6\u60c5\u4e0d\u5b58\u5728\u6216\u5df2\u8fc7\u671f\uff0c\u8bf7\u91cd\u65b0\u641c\u7d22", 404)
+            raise TrendingInitialImportError("资源详情不存在或已过期，请重新搜索", 404)
         stored_keyword = str(resource.get("keyword") or "")
         scoped_prefix = f"trending:{int(candidate['id'])}:"
         if stored_keyword.startswith("trending:"):
@@ -280,7 +280,7 @@ class TrendingInitialImportService:
             }
             belongs_to_candidate = bool(keyword_key and keyword_key in allowed)
         if not belongs_to_candidate:
-            raise TrendingInitialImportError("\u8d44\u6e90\u4e0d\u5c5e\u4e8e\u5f53\u524d\u70ed\u699c\u5019\u9009", 404)
+            raise TrendingInitialImportError("资源不属于当前热榜候选", 404)
         return resource
 
     def _category(self, candidate: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -288,7 +288,7 @@ class TrendingInitialImportService:
         explicit = str(payload.get("category") or "").strip().lower()
         if explicit:
             if explicit not in categories:
-                raise TrendingInitialImportError("\u5165\u5e93\u5206\u7c7b\u4e0d\u5b58\u5728")
+                raise TrendingInitialImportError("入库分类不存在")
             return explicit
         requested = str(candidate.get("media_type") or "").strip().lower()
         if requested in categories:
@@ -299,7 +299,7 @@ class TrendingInitialImportService:
             return "movie"
         if categories:
             return str(next(iter(categories)))
-        raise TrendingInitialImportError("\u7cfb\u7edf\u672a\u914d\u7f6e\u5165\u5e93\u5206\u7c7b", 503)
+        raise TrendingInitialImportError("系统未配置入库分类", 503)
 
     def _import_payload(
         self,
@@ -366,12 +366,12 @@ class TrendingInitialImportService:
     def default_search_keyword(value: Any) -> str:
         title = str(value or "").strip()
         without_season = re.sub(
-            r"\s*\u7b2c\s*(?:\d+|[\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343]+)\s*\u5b63\s*",
+            r"\s*第\s*(?:\d+|[一二两三四五六七八九十百千]+)\s*季\s*",
             " ",
             title,
             flags=re.I,
         )
-        normalized = re.sub(r"[\s\-\u2014_:\uFF1A\u00B7]+", " ", without_season).strip()
+        normalized = re.sub(r"[\s\-\u2014_:：\u00B7]+", " ", without_season).strip()
         return normalized or title
 
     @classmethod
@@ -388,22 +388,22 @@ class TrendingInitialImportService:
         try:
             resource_id = int(value)
         except (TypeError, ValueError) as exc:
-            raise TrendingInitialImportError("\u8bf7\u9009\u62e9\u8981\u5165\u5e93\u7684\u641c\u7d22\u8d44\u6e90") from exc
+            raise TrendingInitialImportError("请选择要入库的搜索资源") from exc
         if resource_id <= 0:
-            raise TrendingInitialImportError("\u8bf7\u9009\u62e9\u8981\u5165\u5e93\u7684\u641c\u7d22\u8d44\u6e90")
+            raise TrendingInitialImportError("请选择要入库的搜索资源")
         return resource_id
 
     @staticmethod
     def _not_importable_message(candidate: Mapping[str, Any]) -> str:
         status = str(candidate.get("status") or "")
         messages = {
-            "already_exists": "\u5a92\u4f53\u5e93\u5df2\u6709\u8be5\u5185\u5bb9\uff0c\u65e0\u9700\u91cd\u590d\u5165\u5e93",
-            "task_exists": "\u8be5\u5185\u5bb9\u5df2\u6709\u5165\u5e93\u6216\u8ffd\u66f4\u4efb\u52a1",
-            "ignored": "\u70ed\u699c\u5019\u9009\u5df2\u5ffd\u7565\uff0c\u8bf7\u5148\u6062\u590d",
-            "importing": "\u70ed\u699c\u5019\u9009\u5df2\u5728\u5165\u5e93",
-            "imported": "\u70ed\u699c\u5019\u9009\u5df2\u5b8c\u6210\u9996\u6b21\u5165\u5e93",
+            "already_exists": "媒体库已有该内容，无需重复入库",
+            "task_exists": "该内容已有入库或追更任务",
+            "ignored": "热榜候选已忽略，请先恢复",
+            "importing": "热榜候选已在入库",
+            "imported": "热榜候选已完成首次入库",
         }
-        return messages.get(status, "\u70ed\u699c\u5019\u9009\u5f53\u524d\u72b6\u6001\u4e0d\u5141\u8bb8\u5165\u5e93")
+        return messages.get(status, "热榜候选当前状态不允许入库")
 
 
 __all__ = ["TrendingInitialImportError", "TrendingInitialImportService"]

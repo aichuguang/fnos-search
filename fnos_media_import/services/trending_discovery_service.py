@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 
 MEDIA_TYPE_ALIASES = {
     "tv": "tv", "teleplay": "tv", "series": "tv",
-    "\u7535\u89c6\u5267": "tv", "\u5267\u96c6": "tv", "\u7f51\u7edc\u5267": "tv",
-    "movie": "movie", "film": "movie", "\u7535\u5f71": "movie", "\u7f51\u7edc\u7535\u5f71": "movie",
+    "电视剧": "tv", "剧集": "tv", "网络剧": "tv",
+    "movie": "movie", "film": "movie", "电影": "movie", "网络电影": "movie",
     "anime": "anime", "animation": "anime", "cartoon": "anime",
-    "\u52a8\u6f2b": "anime", "\u52a8\u753b": "anime", "\u56fd\u6f2b": "anime",
-    "variety": "variety", "show": "variety", "\u7efc\u827a": "variety", "\u771f\u4eba\u79c0": "variety",
+    "动漫": "anime", "动画": "anime", "国漫": "anime",
+    "variety": "variety", "show": "variety", "综艺": "variety", "真人秀": "variety",
 }
 
 

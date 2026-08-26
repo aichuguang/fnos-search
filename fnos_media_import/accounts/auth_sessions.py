@@ -476,7 +476,7 @@ class TianyiPasswordAuthHandler:
             return self._captcha_waiting(
                 {**common, "expires_at": expires_at},
                 result,
-                fallback_message="\u5929\u7ffc\u4e91\u8981\u6c42\u56fe\u7247\u9a8c\u8bc1\u7801\uff0c\u8bf7\u8bc6\u522b\u540e\u8f93\u5165",
+                fallback_message="天翼云要求图片验证码，请识别后输入",
             )
         return self._completed(common, result)
 
@@ -507,7 +507,7 @@ class TianyiPasswordAuthHandler:
             return self._captcha_waiting(
                 state,
                 result,
-                fallback_message="\u5df2\u66f4\u6362\u5929\u7ffc\u4e91\u56fe\u7247\u9a8c\u8bc1\u7801",
+                fallback_message="已更换天翼云图片验证码",
             )
 
         validate_code = str(payload.get("validate_code") or payload.get("captcha") or "").strip()
@@ -515,7 +515,7 @@ class TianyiPasswordAuthHandler:
             return self._captcha_waiting(
                 state,
                 {},
-                fallback_message="\u8bf7\u8f93\u5165\u56fe\u7247\u4e2d\u7684\u9a8c\u8bc1\u7801",
+                fallback_message="请输入图片中的验证码",
             )
         try:
             result = importer.complete_password_login(
@@ -534,7 +534,7 @@ class TianyiPasswordAuthHandler:
                 return self._captcha_waiting(
                     state,
                     refreshed,
-                    fallback_message="\u9a8c\u8bc1\u7801\u9519\u8bef\uff0c\u8bf7\u8f93\u5165\u65b0\u56fe\u4e2d\u7684\u5b57\u7b26",
+                    fallback_message="验证码错误，请输入新图中的字符",
                     error=_safe_provider_message(exc),
                 )
             raise AuthSessionError(
@@ -547,7 +547,7 @@ class TianyiPasswordAuthHandler:
             return self._captcha_waiting(
                 state,
                 result,
-                fallback_message="\u9a8c\u8bc1\u7801\u9519\u8bef\uff0c\u8bf7\u8f93\u5165\u65b0\u56fe\u4e2d\u7684\u5b57\u7b26",
+                fallback_message="验证码错误，请输入新图中的字符",
                 error=str(result.get("error") or ""),
             )
         return self._completed(state, result)
@@ -672,22 +672,22 @@ class QuarkQrAuthHandler:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            raise AuthSessionError("\u5938\u514b\u626b\u7801\u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528") from exc
+            raise AuthSessionError("夸克扫码服务暂时不可用") from exc
         data = self._json(response)
         token = self._nested(data, "data", "members", "token")
         if not token or self._status(data) not in {2000000, 200, 0, "2000000", "200", "0"}:
-            raise AuthSessionError("\u5938\u514b\u4e8c\u7ef4\u7801\u83b7\u53d6\u5931\u8d25")
+            raise AuthSessionError("夸克二维码获取失败")
         qr_url = self._qr_url(str(token))
         public = {"qr_url": qr_url, "qr_image": self._qr_image(qr_url), "interval": 2}
         expires_at = self._expires_at()
         return AuthStep(
             status="waiting",
-            message="\u8bf7\u4f7f\u7528\u5938\u514b APP \u626b\u63cf\u4e8c\u7ef4\u7801",
+            message="请使用夸克 APP 扫描二维码",
             public_data=public,
             private_state={
                 "qr_token": str(token),
                 "account_id": str(payload.get("account_id") or ""),
-                "name": str(payload.get("name") or "\u5938\u514b\u4e3b\u8d26\u53f7"),
+                "name": str(payload.get("name") or "夸克主账号"),
                 "config": dict(payload.get("config") or {}),
                 "expires_at": expires_at,
             },
@@ -697,7 +697,7 @@ class QuarkQrAuthHandler:
     def poll(self, state: dict[str, Any], payload: dict[str, Any]) -> AuthStep:
         del payload
         if self._expired(str(state.get("expires_at") or "")):
-            return AuthStep("failed", "\u4e8c\u7ef4\u7801\u5df2\u8fc7\u671f\uff0c\u8bf7\u91cd\u65b0\u767b\u5f55", expires_at=state.get("expires_at"))
+            return AuthStep("failed", "二维码已过期，请重新登录", expires_at=state.get("expires_at"))
         session = self._session()
         token = str(state.get("qr_token") or "").strip()
         try:
@@ -712,14 +712,14 @@ class QuarkQrAuthHandler:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            raise AuthSessionError("\u5938\u514b\u626b\u7801\u72b6\u6001\u67e5\u8be2\u6682\u65f6\u5931\u8d25") from exc
+            raise AuthSessionError("夸克扫码状态查询暂时失败") from exc
         data = self._json(response)
         ticket = self._nested(data, "data", "members", "service_ticket")
         if not ticket:
             status = self._status(data)
             if status in {50004002, "50004002"}:
-                return AuthStep("failed", "\u4e8c\u7ef4\u7801\u5df2\u8fc7\u671f\uff0c\u8bf7\u91cd\u65b0\u767b\u5f55", private_state=state, expires_at=state.get("expires_at"))
-            return AuthStep("waiting", "\u7b49\u5f85\u4f7f\u7528\u5938\u514b APP \u626b\u7801\u786e\u8ba4", private_state=state, expires_at=state.get("expires_at"))
+                return AuthStep("failed", "二维码已过期，请重新登录", private_state=state, expires_at=state.get("expires_at"))
+            return AuthStep("waiting", "等待使用夸克 APP 扫码确认", private_state=state, expires_at=state.get("expires_at"))
 
         try:
             account_response = session.get(
@@ -728,9 +728,9 @@ class QuarkQrAuthHandler:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            raise AuthSessionError("\u5938\u514b\u767b\u5f55\u6001\u4ea4\u6362\u6682\u65f6\u5931\u8d25") from exc
+            raise AuthSessionError("夸克登录态交换暂时失败") from exc
         if account_response.status_code >= 400:
-            return AuthStep("failed", "\u5938\u514b\u767b\u5f55\u4ea4\u6362 Cookie \u5931\u8d25", private_state=state)
+            return AuthStep("failed", "夸克登录交换 Cookie 失败", private_state=state)
         account_payload = self._json(account_response)
         account_info = (
             account_payload.get("data")
@@ -748,21 +748,21 @@ class QuarkQrAuthHandler:
         self._enrich_cookie(session)
         cookie = self._cookie_header(session)
         if not cookie or "__pus=" not in cookie:
-            return AuthStep("failed", "\u626b\u7801\u6210\u529f\uff0c\u4f46\u672a\u83b7\u53d6\u5230\u6709\u6548 Cookie", private_state=state)
+            return AuthStep("failed", "扫码成功，但未获取到有效 Cookie", private_state=state)
         config = dict(state.get("config") or {})
         try:
             test = self.account_tester("quark", {"cookie": cookie}, config)
         except Exception as exc:  # noqa: BLE001
-            return AuthStep("failed", f"\u5938\u514b Cookie \u68c0\u6d4b\u5f02\u5e38\uff1a{exc}", private_state=state)
+            return AuthStep("failed", f"夸克 Cookie 检测异常：{exc}", private_state=state)
         if not getattr(test, "ok", False):
-            return AuthStep("failed", str(getattr(test, "message", "") or "\u5938\u514b Cookie \u9a8c\u8bc1\u5931\u8d25"), private_state=state)
+            return AuthStep("failed", str(getattr(test, "message", "") or "夸克 Cookie 验证失败"), private_state=state)
         identity = str(getattr(test, "identity_hint", "") or account_identity)
         return AuthStep(
             status="completed",
-            message="\u5938\u514b\u626b\u7801\u767b\u5f55\u6210\u529f\uff0cCookie \u5df2\u9a8c\u8bc1\u5e76\u52a0\u5bc6\u4fdd\u5b58",
+            message="夸克扫码登录成功，Cookie 已验证并加密保存",
             account_data={
                 "account_id": str(state.get("account_id") or "") or None,
-                "name": str(state.get("name") or "\u5938\u514b\u4e3b\u8d26\u53f7"),
+                "name": str(state.get("name") or "夸克主账号"),
                 "config": config,
                 "credentials": {"cookie": cookie},
                 "identity_hint": identity,
@@ -789,7 +789,7 @@ class QuarkQrAuthHandler:
         try:
             value = response.json()
         except ValueError as exc:
-            raise AuthSessionError("\u5938\u514b\u767b\u5f55\u63a5\u53e3\u8fd4\u56de\u4e86\u65e0\u6548\u6570\u636e") from exc
+            raise AuthSessionError("夸克登录接口返回了无效数据") from exc
         return value if isinstance(value, dict) else {}
 
     @staticmethod

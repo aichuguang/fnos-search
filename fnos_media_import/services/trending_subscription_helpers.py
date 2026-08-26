@@ -136,7 +136,7 @@ def create_from_candidate(
     if not title:
         return {
             "success": False,
-            "message": "\u5019\u9009\u7f3a\u5c11\u6807\u9898\uff0c\u65e0\u6cd5\u521b\u5efa\u8ffd\u66f4\u8ba2\u9605",
+            "message": "候选缺少标题，无法创建追更订阅",
         }, 400
     raw_media_type = str(item.get("media_type") or "").strip().lower()
     category = (
@@ -148,19 +148,19 @@ def create_from_candidate(
     if not getattr(tmdb, "configured", False):
         return {
             "success": False,
-            "message": "TMDB \u672a\u914d\u7f6e\uff0c\u65e0\u6cd5\u81ea\u52a8\u5339\u914d\uff0c\u8bf7\u5230\u8ffd\u66f4\u9875\u624b\u52a8\u521b\u5efa\u8ba2\u9605",
+            "message": "TMDB 未配置，无法自动匹配，请到追更页手动创建订阅",
         }, 400
     try:
         rows = tmdb.search(title, media_type)
     except Exception:  # noqa: BLE001
         return {
             "success": False,
-            "message": "TMDB \u67e5\u8be2\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u6216\u5230\u8ffd\u66f4\u9875\u624b\u52a8\u521b\u5efa\u8ba2\u9605",
+            "message": "TMDB 查询失败，请稍后重试或到追更页手动创建订阅",
         }, 502
     if not rows:
         return {
             "success": False,
-            "message": "TMDB \u672a\u5339\u914d\u5230\u8be5\u5f71\u89c6\uff0c\u8bf7\u5230\u8ffd\u66f4\u9875\u624b\u52a8\u521b\u5efa\u8ba2\u9605",
+            "message": "TMDB 未匹配到该影视，请到追更页手动创建订阅",
         }, 400
     candidate_year = str(item.get("year") or "").strip()
     expected_titles = [
@@ -190,13 +190,13 @@ def create_from_candidate(
     if not scored or scored[0][0] < 85:
         return {
             "success": False,
-            "message": "TMDB \u5339\u914d\u7f6e\u4fe1\u5ea6\u4e0d\u8db3\uff0c\u5df2\u505c\u6b62\u81ea\u52a8\u521b\u5efa\uff0c\u8bf7\u5230\u8ffd\u66f4\u9875\u624b\u52a8\u9009\u62e9\u6b63\u786e\u5f71\u89c6",
+            "message": "TMDB 匹配置信度不足，已停止自动创建，请到追更页手动选择正确影视",
             "matches": match_preview,
         }, 409
     if len(scored) > 1 and scored[1][0] >= 75 and scored[0][0] - scored[1][0] < 8:
         return {
             "success": False,
-            "message": "TMDB \u5339\u914d\u7ed3\u679c\u5b58\u5728\u6b67\u4e49\uff0c\u5df2\u505c\u6b62\u81ea\u52a8\u521b\u5efa\uff0c\u8bf7\u5230\u8ffd\u66f4\u9875\u624b\u52a8\u9009\u62e9\u6b63\u786e\u5f71\u89c6",
+            "message": "TMDB 匹配结果存在歧义，已停止自动创建，请到追更页手动选择正确影视",
             "matches": match_preview,
         }, 409
     best = scored[0][1]
@@ -204,7 +204,7 @@ def create_from_candidate(
     if not tmdb_id:
         return {
             "success": False,
-            "message": "TMDB \u672a\u5339\u914d\u5230\u8be5\u5f71\u89c6\uff0c\u8bf7\u5230\u8ffd\u66f4\u9875\u624b\u52a8\u521b\u5efa\u8ba2\u9605",
+            "message": "TMDB 未匹配到该影视，请到追更页手动创建订阅",
         }, 400
     aliases = []
     for value in expected_titles + [str(best.get("original_title") or "").strip()]:
@@ -226,22 +226,22 @@ def create_from_candidate(
     except Exception:  # noqa: BLE001
         return {
             "success": False,
-            "message": "\u521b\u5efa\u8ffd\u66f4\u8ba2\u9605\u5931\u8d25",
+            "message": "创建追更订阅失败",
         }, 500
     subscription_id = int(subscription.get("id") or 0)
     if not subscription_id:
         return {
             "success": False,
-            "message": "\u521b\u5efa\u8ffd\u66f4\u8ba2\u9605\u5931\u8d25",
+            "message": "创建追更订阅失败",
         }, 500
     created = bool(subscription.get("_created", True))
     return {
         "success": True,
         "created": created,
         "message": (
-            "\u8ffd\u66f4\u8ba2\u9605\u5df2\u521b\u5efa"
+            "追更订阅已创建"
             if created
-            else f"\u5df2\u7ed1\u5b9a\u73b0\u6709\u8ffd\u66f4\u8ba2\u9605 #{subscription_id}"
+            else f"已绑定现有追更订阅 #{subscription_id}"
         ),
         "subscription_id": subscription_id,
     }, 200
@@ -298,7 +298,7 @@ def _normalize_tmdb_title(value: Any, year: str = "") -> str:
     expected_year = str(year or "").strip()
     if expected_year:
         text = re.sub(
-            rf"[\s._\-()\uff08\uff09\[\]\u3010\u3011]*{re.escape(expected_year)}[\s._\-()\uff08\uff09\[\]\u3010\u3011]*$",
+            rf"[\s._\-()（）\[\]【】]*{re.escape(expected_year)}[\s._\-()（）\[\]【】]*$",
             "",
             text,
         )

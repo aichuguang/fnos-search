@@ -1207,7 +1207,7 @@ class RelayProviderTests(unittest.TestCase):
             dest_kind="tianyi",
             strategy="relay_upload_provider",
             landing="/_fnos_ingress/job-1",
-            final="root-folder-id::\u7535\u5f71",
+            final="root-folder-id::电影",
             local_temp="/data/relay/job-1",
         )
         uploader = _FakeUploader(
@@ -1249,7 +1249,7 @@ class RelayProviderTests(unittest.TestCase):
             dest_kind="tianyi",
             strategy="relay_upload_provider",
             landing="/_fnos_ingress/job-1",
-            final="root-folder-id::\u7535\u5f71",
+            final="root-folder-id::电影",
             local_temp="/data/relay/job-1",
         )
         uploader = _FakeUploader(provider_kind="tianyi", event_prefix="tianyi")

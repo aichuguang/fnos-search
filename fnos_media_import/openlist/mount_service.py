@@ -895,10 +895,10 @@ class OpenListMountService:
             message = "mount 读写检测通过"
         elif ok and readable and not write_required:
             message = (
-                "mount \u8bfb\u53d6\u68c0\u6d4b\u901a\u8fc7\uff1bWebDAV "
-                "\u6587\u4ef6\u5199\u5165\u4e0d\u53ef\u7528\uff0c\u53ef\u7528\u4e8e Provider "
-                "\u539f\u751f\u94fe\u8def\uff0c\u4f46\u4e0d\u80fd\u4f5c\u4e3a\u8de8\u76d8 rclone "
-                "\u5199\u5165\u76ee\u6807"
+                "mount 读取检测通过；WebDAV "
+                "文件写入不可用，可用于 Provider "
+                "原生链路，但不能作为跨盘 rclone "
+                "写入目标"
             )
         else:
             message = "mount 读写检测未通过"

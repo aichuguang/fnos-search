@@ -91,10 +91,10 @@ class FakeProviderUploader(RepositoryFakeMixin):
         self.folder_calls: list[str] = []
         self.folders = {
             self.root_folder_id: [
-                {"folder_id": "root-folder-id", "name": "\u5a92\u4f53\u5e93", "parent_folder_id": self.root_folder_id},
+                {"folder_id": "root-folder-id", "name": "媒体库", "parent_folder_id": self.root_folder_id},
             ],
             "root-folder-id": [
-                {"folder_id": "movie-folder-id", "name": "\u7535\u5f71", "parent_folder_id": "root-folder-id"},
+                {"folder_id": "movie-folder-id", "name": "电影", "parent_folder_id": "root-folder-id"},
             ],
         }
 
@@ -186,22 +186,22 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.mobile_uploader = FakeProviderUploader(
             self.webdav,
             provider_kind="mobile",
-            display_name="\u79fb\u52a8\u4e91\u76d8",
-            webdav_root="/\u79fb\u52a8",
+            display_name="移动云盘",
+            webdav_root="/移动",
             root_folder_id="/",
         )
         self.quark_uploader = FakeProviderUploader(
             self.webdav,
             provider_kind="quark",
-            display_name="\u5938\u514b\u7f51\u76d8",
-            webdav_root="/\u5938\u514b",
+            display_name="夸克网盘",
+            webdav_root="/夸克",
             root_folder_id="0",
         )
         self.tianyi_uploader = FakeProviderUploader(
             self.webdav,
             provider_kind="tianyi",
-            display_name="\u5929\u7ffc\u4e91\u76d8",
-            webdav_root="/\u5929\u7ffc",
+            display_name="天翼云盘",
+            webdav_root="/天翼",
         )
         self.service.set_provider_uploader_resolver(
             lambda provider_kind, _account_id, _revision: (
@@ -494,30 +494,30 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(self.targets.list_targets(), [])
 
     def test_mobile_put_405_creates_native_only_location(self) -> None:
-        mobile = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
-        self.webdav.dirs.add("/\u79fb\u52a8")
+        mobile = self._account("mobile", "移动云主账号")
+        self.webdav.dirs.add("/移动")
         self.service.save_openlist(
             {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
         )
 
         def reject_put(_path: str, _content: bytes) -> None:
-            raise RuntimeError("\u5199\u5165\u6587\u4ef6\u5931\u8d25\uff1aHTTP 405")
+            raise RuntimeError("写入文件失败：HTTP 405")
 
         self.webdav.put_bytes = reject_put
         result = self.service.save_location(
             {
-                "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                "name": "移动云主盘",
                 "kind": "provider",
                 "account_id": mobile,
                 "connection_id": "openlist_main",
-                "webdav_root": "/\u79fb\u52a8",
+                "webdav_root": "/移动",
                 "native_root": "root-folder-id",
-                "native_root_name": "/\u5a92\u4f53\u5e93",
+                "native_root_name": "/媒体库",
                 "confirm_identity": True,
             }
         )
 
-        self.assertIn("Provider \u539f\u751f\u76f4\u4f20", result["message"])
+        self.assertIn("Provider 原生直传", result["message"])
         target = self.targets.get_target(result["destination_id"])
         mount_id = self.service._target_mount_id(target)
         mount = self.mounts.get_mount(mount_id)
@@ -526,7 +526,7 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(mount["identity_status"], "declared")
         self.assertTrue(mount["native_locator"]["upload_verified"])
         self.assertTrue(mount["native_locator"]["organizer_mutation_verified"])
-        self.assertEqual(mount["native_locator"]["display_name"], "/\u5a92\u4f53\u5e93")
+        self.assertEqual(mount["native_locator"]["display_name"], "/媒体库")
         self.assertTrue(mount["native_locator"]["probe_fingerprint"])
 
         probe = self.mounts.probe_mount(mount_id, persist_result=False)
@@ -534,7 +534,7 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertFalse(probe["webdav_file_write_required"])
         self.assertFalse(probe["writable"])
         create_check = next(
-            item for item in probe["checks"] if item["name"] == "\u4e34\u65f6\u76ee\u5f55\u4e0e\u6587\u4ef6\u521b\u5efa"
+            item for item in probe["checks"] if item["name"] == "临时目录与文件创建"
         )
         self.assertFalse(create_check["required"])
 
@@ -547,12 +547,12 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertIn("mobile", location["eligible_source_ids"])
         self.assertIn("tianyi", location["eligible_source_ids"])
         self.assertIn("quark", location["eligible_source_ids"])
-        self.assertEqual(location["native_root_name"], "/\u5a92\u4f53\u5e93")
+        self.assertEqual(location["native_root_name"], "/媒体库")
         self.assertEqual(len(self.mobile_uploader.probe_calls), 1)
 
     def test_mobile_native_probe_failure_leaves_no_location(self) -> None:
-        account_id = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
-        self.webdav.dirs.add("/\u79fb\u52a8")
+        account_id = self._account("mobile", "移动云主账号")
+        self.webdav.dirs.add("/移动")
         self.service.save_openlist(
             {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
         )
@@ -561,11 +561,11 @@ class StorageSetupV1Tests(unittest.TestCase):
         with self.assertRaises(StorageSetupError) as raised:
             self.service.save_location(
                 {
-                    "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                    "name": "移动云主盘",
                     "kind": "provider",
                     "account_id": account_id,
                     "connection_id": "openlist_main",
-                    "webdav_root": "/\u79fb\u52a8",
+                    "webdav_root": "/移动",
                     "native_root": "root-folder-id",
                     "confirm_identity": True,
                 }
@@ -638,30 +638,30 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertIn("空间", str(raised.exception))
 
     def test_tianyi_put_405_creates_provider_relay_location(self) -> None:
-        account_id = self._account("tianyi", "\u5929\u7ffc\u4e91\u4e3b\u8d26\u53f7")
-        self.webdav.dirs.add("/\u5929\u7ffc")
+        account_id = self._account("tianyi", "天翼云主账号")
+        self.webdav.dirs.add("/天翼")
         self.service.save_openlist(
             {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
         )
 
         def reject_put(_path: str, _content: bytes) -> None:
-            raise RuntimeError("\u5199\u5165\u6587\u4ef6\u5931\u8d25\uff1aHTTP 405")
+            raise RuntimeError("写入文件失败：HTTP 405")
 
         self.webdav.put_bytes = reject_put
         result = self.service.save_location(
             {
-                "name": "\u5929\u7ffc\u4e91\u4e3b\u76d8",
+                "name": "天翼云主盘",
                 "kind": "provider",
                 "account_id": account_id,
                 "connection_id": "openlist_main",
-                "webdav_root": "/\u5929\u7ffc",
+                "webdav_root": "/天翼",
                 "native_root": "root-folder-id",
-                "native_root_name": "/\u5a92\u4f53\u5e93",
+                "native_root_name": "/媒体库",
                 "confirm_identity": True,
             }
         )
 
-        self.assertIn("Provider \u539f\u751f\u76f4\u4f20", result["message"])
+        self.assertIn("Provider 原生直传", result["message"])
         target = self.targets.get_target(result["destination_id"])
         mount_id = self.service._target_mount_id(target)
         mount = self.mounts.get_mount(mount_id)
@@ -698,22 +698,22 @@ class StorageSetupV1Tests(unittest.TestCase):
             )
         preflight = self.service.preflight()
         directory_check = next(
-            item for item in preflight["checks"] if item["name"] == f"\u76ee\u5f55 {mount['name']}"
+            item for item in preflight["checks"] if item["name"] == f"目录 {mount['name']}"
         )
         self.assertTrue(directory_check["ok"], directory_check)
 
     def test_tianyi_relay_requires_upload_and_organizer_proofs(self) -> None:
-        account_id = self._account("tianyi", "\u5929\u7ffc\u4e91\u4e3b\u8d26\u53f7")
-        self.webdav.dirs.add("/\u5929\u7ffc")
+        account_id = self._account("tianyi", "天翼云主账号")
+        self.webdav.dirs.add("/天翼")
         self.service.save_openlist(
             {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
         )
         payload = {
-            "name": "\u5929\u7ffc\u4e91\u4e3b\u76d8",
+            "name": "天翼云主盘",
             "kind": "provider",
             "account_id": account_id,
             "connection_id": "openlist_main",
-            "webdav_root": "/\u5929\u7ffc",
+            "webdav_root": "/天翼",
             "native_root": "root-folder-id",
             "confirm_identity": True,
         }
@@ -751,8 +751,8 @@ class StorageSetupV1Tests(unittest.TestCase):
         )
 
     def test_mobile_organizer_probe_failure_leaves_no_location(self) -> None:
-        account_id = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
-        self.webdav.dirs.add("/\u79fb\u52a8")
+        account_id = self._account("mobile", "移动云主账号")
+        self.webdav.dirs.add("/移动")
         self.service.save_openlist(
             {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
         )
@@ -761,11 +761,11 @@ class StorageSetupV1Tests(unittest.TestCase):
         with self.assertRaises(StorageSetupError) as raised:
             self.service.save_location(
                 {
-                    "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                    "name": "移动云主盘",
                     "kind": "provider",
                     "account_id": account_id,
                     "connection_id": "openlist_main",
-                    "webdav_root": "/\u79fb\u52a8",
+                    "webdav_root": "/移动",
                     "native_root": "root-folder-id",
                     "confirm_identity": True,
                 }
@@ -812,8 +812,8 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertTrue(mount["native_locator"]["organizer_mutation_verified"])
 
     def test_identity_confirmation_is_checked_before_native_probe(self) -> None:
-        account_id = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
-        self.webdav.dirs.add("/\u79fb\u52a8")
+        account_id = self._account("mobile", "移动云主账号")
+        self.webdav.dirs.add("/移动")
         self.service.save_openlist(
             {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
         )
@@ -821,11 +821,11 @@ class StorageSetupV1Tests(unittest.TestCase):
         with self.assertRaises(StorageSetupError) as raised:
             self.service.save_location(
                 {
-                    "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                    "name": "移动云主盘",
                     "kind": "provider",
                     "account_id": account_id,
                     "connection_id": "openlist_main",
-                    "webdav_root": "/\u79fb\u52a8",
+                    "webdav_root": "/移动",
                     "native_root": "root-folder-id",
                 }
             )
@@ -834,20 +834,20 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(self.mobile_uploader.probe_calls, [])
 
     def test_unchanged_mobile_location_reuses_native_probe_proof(self) -> None:
-        account_id = self._account("mobile", "\u79fb\u52a8\u4e91\u4e3b\u8d26\u53f7")
-        self.webdav.dirs.add("/\u79fb\u52a8")
+        account_id = self._account("mobile", "移动云主账号")
+        self.webdav.dirs.add("/移动")
         self.service.save_openlist(
             {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
         )
         location = self.service.save_location(
             {
-                "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                "name": "移动云主盘",
                 "kind": "provider",
                 "account_id": account_id,
                 "connection_id": "openlist_main",
-                "webdav_root": "/\u79fb\u52a8",
+                "webdav_root": "/移动",
                 "native_root": "root-folder-id",
-                "native_root_name": "/\u5a92\u4f53\u5e93",
+                "native_root_name": "/媒体库",
                 "confirm_identity": True,
             }
         )
@@ -855,13 +855,13 @@ class StorageSetupV1Tests(unittest.TestCase):
 
         self.service.save_location(
             {
-                "name": "\u79fb\u52a8\u4e91\u4e3b\u76d8",
+                "name": "移动云主盘",
                 "kind": "provider",
                 "account_id": account_id,
                 "connection_id": "openlist_main",
-                "webdav_root": "/\u79fb\u52a8",
+                "webdav_root": "/移动",
                 "native_root": "root-folder-id",
-                "native_root_name": "/\u5a92\u4f53\u5e93",
+                "native_root_name": "/媒体库",
                 "expected_revision": target.current_revision,
             },
             location["destination_id"],
@@ -870,7 +870,7 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(len(self.mobile_uploader.probe_calls), 1)
 
     def test_tianyi_native_folder_browser_service_and_api(self) -> None:
-        account_id = self._account("tianyi", "\u5929\u7ffc\u4e3b\u8d26\u53f7")
+        account_id = self._account("tianyi", "天翼主账号")
         root = self.service.list_account_folders(account_id)
         self.assertEqual(root["parent_id"], "-11")
         self.assertEqual(root["items"][0]["folder_id"], "root-folder-id")
@@ -927,24 +927,24 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(self.mobile_uploader.folder_calls, ["/", "root-folder-id"])
 
     def test_non_relay_provider_put_405_still_fails_closed(self) -> None:
-        quark = self._account("quark", "\u5938\u514b\u4e3b\u8d26\u53f7")
+        quark = self._account("quark", "夸克主账号")
         self.service.save_openlist(
             {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
         )
 
         def reject_put(_path: str, _content: bytes) -> None:
-            raise RuntimeError("\u5199\u5165\u6587\u4ef6\u5931\u8d25\uff1aHTTP 405")
+            raise RuntimeError("写入文件失败：HTTP 405")
 
         self.webdav.put_bytes = reject_put
         with self.assertRaises(StorageSetupError) as raised:
             self.service.save_location(
                 {
-                    "name": "\u5938\u514b\u4e3b\u76d8",
+                    "name": "夸克主盘",
                     "kind": "provider",
                     "account_id": quark,
                     "connection_id": "openlist_main",
-                    "webdav_root": "/\u5938\u514b",
-                    "native_root": "/\u5a92\u4f53\u5e93",
+                    "webdav_root": "/夸克",
+                    "native_root": "/媒体库",
                     "confirm_identity": True,
                 }
             )

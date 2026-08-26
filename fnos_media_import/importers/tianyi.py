@@ -30,9 +30,9 @@ from .base import AdapterCheckResult, ImportResult
 logger = logging.getLogger("fnos_media_import.provider_auth")
 
 TIANYI_SESSION_IP_MISMATCH_MESSAGE = (
-    "\u5929\u7ffc\u4e91\u62d2\u7edd\u4e86\u5f53\u524d\u4e1a\u52a1 Session\u3002"
-    "\u7cfb\u7edf\u5df2\u6309\u5929\u7ffc\u4e91\u76d8\u5ba2\u6237\u7aef\u534f\u8bae\u5237\u65b0\u4f1a\u8bdd\uff0c\u4f46\u4e1a\u52a1\u8bf7\u6c42\u4ecd\u88ab\u62d2\u7edd\u3002"
-    "\u8bf7\u5728\u8d26\u53f7\u9875\u91cd\u65b0\u767b\u5f55\u3002"
+    "天翼云拒绝了当前业务 Session。"
+    "系统已按天翼云盘客户端协议刷新会话，但业务请求仍被拒绝。"
+    "请在账号页重新登录。"
 )
 
 
@@ -376,14 +376,14 @@ class TianyiImporter:
             return AdapterCheckResult(
                 True,
                 "ready",
-                f"\u5929\u7ffc\u4e91\u8d26\u53f7\u68c0\u6d4b\u901a\u8fc7{suffix}",
+                f"天翼云账号检测通过{suffix}",
                 {"identity_hint": identity} if identity else {},
             )
         except Exception as exc:  # noqa: BLE001
             return AdapterCheckResult(
                 False,
                 "probe_failed",
-                f"\u5929\u7ffc\u4e91\u8d26\u53f7\u68c0\u6d4b\u5931\u8d25\uff1a{exc}",
+                f"天翼云账号检测失败：{exc}",
             )
 
     def check_share(
@@ -2156,7 +2156,7 @@ class TianyiImporter:
             if captcha_error:
                 return self._captcha_challenge(
                     state,
-                    message="\u5929\u7ffc\u4e91\u9a8c\u8bc1\u7801\u9519\u8bef\uff0c\u8bf7\u8f93\u5165\u65b0\u56fe\u4e2d\u7684\u5b57\u7b26",
+                    message="天翼云验证码错误，请输入新图中的字符",
                     error=message,
                 )
             raise TianyiApiError(message, code=code, stage="login_submit", http_status=response.status_code)
@@ -2462,8 +2462,8 @@ class TianyiImporter:
             for marker in (
                 "captcha",
                 "validatecode",
-                "\u9a8c\u8bc1\u7801",
-                "\u6821\u9a8c\u7801",
+                "验证码",
+                "校验码",
             )
         )
 

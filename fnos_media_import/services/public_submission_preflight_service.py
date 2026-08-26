@@ -66,7 +66,7 @@ class PublicSubmissionPreflightService:
             summary = self.tianyi_summary
             configured = self._configured(tianyi_importer)
             if not configured:
-                message = "\u5929\u7ffc\u4e91\u8d26\u53f7\u672a\u914d\u7f6e\u6216\u672a\u6fc0\u6d3b\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458"
+                message = "天翼云账号未配置或未激活，请联系管理员"
                 inspection = (
                     summary(False, {"success": False, "message": message}, fallback_size=fallback_size)
                     if callable(summary)
@@ -90,7 +90,7 @@ class PublicSubmissionPreflightService:
                     "allowed": False,
                     "checked": False,
                     "provider": "tianyi",
-                    "message": f"\u63d0\u4ea4\u524d\u68c0\u6d4b\u5931\u8d25\uff1a{message}",
+                    "message": f"提交前检测失败：{message}",
                     "inspection": inspection,
                 }
             try:
@@ -115,9 +115,9 @@ class PublicSubmissionPreflightService:
                 }
             )
             message = inspection.get("message") or (
-                "\u5929\u7ffc\u4e91\u8d44\u6e90\u6709\u6548"
+                "天翼云资源有效"
                 if ok
-                else "\u5929\u7ffc\u4e91\u8d44\u6e90\u65e0\u6548\u6216\u5df2\u5931\u6548"
+                else "天翼云资源无效或已失效"
             )
             return self._checked("tianyi", ok, message, inspection)
         if source == "sixpan" and not bool(

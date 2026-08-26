@@ -299,7 +299,7 @@ class ConfigExportImportV1Tests(unittest.TestCase):
                 "rclone": {"staging_retry_delay_seconds": 30},
             },
         )
-        with self.assertRaisesRegex(ValueError, "\u65e7\u7248\u5b57\u6bb5"):
+        with self.assertRaisesRegex(ValueError, "旧版字段"):
             persisted_config_from_settings({"advanced_config": raw})
         self.assertIn("quark", removed)
         self.assertIn("openlist.base_url", removed)
@@ -312,7 +312,7 @@ class ConfigExportImportV1Tests(unittest.TestCase):
             )
 
     def test_current_database_value_is_strict_even_for_replace(self) -> None:
-        with self.assertRaisesRegex(ValueError, "\u65e7\u7248\u5b57\u6bb5"):
+        with self.assertRaisesRegex(ValueError, "旧版字段"):
             normalize_advanced_config_payload(
                 _payload({"pansou": {"timeout": 45}}, mode="replace"),
                 current_stored={

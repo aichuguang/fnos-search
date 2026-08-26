@@ -632,7 +632,7 @@ def _public_resource_child_files(
         if not _importer_configured(tianyi_importer):
             return {
                 "success": False,
-                "message": "\u5929\u7ffc\u4e91\u8d26\u53f7\u672a\u914d\u7f6e\u6216\u672a\u6fc0\u6d3b\uff0c\u65e0\u6cd5\u8bfb\u53d6\u76ee\u5f55",
+                "message": "天翼云账号未配置或未激活，无法读取目录",
                 "items": [],
             }
         try:
@@ -652,7 +652,7 @@ def _public_resource_child_files(
             return {
                 "success": False,
                 "message": inspection.get("message")
-                or "\u5929\u7ffc\u4e91\u8d44\u6e90\u68c0\u6d4b\u5931\u8d25\uff0c\u65e0\u6cd5\u5c55\u5f00\u76ee\u5f55",
+                or "天翼云资源检测失败，无法展开目录",
                 "items": [],
                 "inspection": inspection,
             }
@@ -661,7 +661,7 @@ def _public_resource_child_files(
         if not share_id:
             return {
                 "success": False,
-                "message": "\u5929\u7ffc\u4e91\u5206\u4eab\u4fe1\u606f\u7f3a\u5c11 share_id\uff0c\u65e0\u6cd5\u5c55\u5f00\u76ee\u5f55",
+                "message": "天翼云分享信息缺少 share_id，无法展开目录",
                 "items": [],
             }
         data = tianyi_importer.list_files(
@@ -675,7 +675,7 @@ def _public_resource_child_files(
         return {
             "success": success,
             "message": summary.get("message")
-            or ("\u76ee\u5f55\u8bfb\u53d6\u5b8c\u6210" if success else "\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25"),
+            or ("目录读取完成" if success else "目录读取失败"),
             "items": summary.get("items") or [],
             "summary": summary.get("summary") or {},
         }
@@ -729,9 +729,9 @@ def _detail_capability_for_source(
             "provider": "tianyi",
             "reserved": not configured,
             "message": (
-                "\u6b63\u5728\u8bfb\u53d6\u5929\u7ffc\u4e91\u5206\u4eab\u5185\u5bb9"
+                "正在读取天翼云分享内容"
                 if configured
-                else "\u5929\u7ffc\u4e91\u8d26\u53f7\u672a\u914d\u7f6e\u6216\u672a\u6fc0\u6d3b\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458"
+                else "天翼云账号未配置或未激活，请联系管理员"
             ),
         }
     if source == "sixpan":
@@ -952,9 +952,9 @@ def _tianyi_inspection_summary(ok: bool, data: Any, fallback_size: Any = "") -> 
     message = str(payload.get("message") or payload.get("msg") or "").strip()
     if not message:
         message = (
-            "\u5929\u7ffc\u4e91\u8d44\u6e90\u6709\u6548\uff0c\u53ef\u7ee7\u7eed\u63d0\u4ea4"
+            "天翼云资源有效，可继续提交"
             if ok
-            else "\u5929\u7ffc\u4e91\u8d44\u6e90\u53ef\u80fd\u5df2\u5931\u6548\uff0c\u8bf7\u68c0\u67e5\u5206\u4eab\u94fe\u63a5\u548c\u63d0\u53d6\u7801"
+            else "天翼云资源可能已失效，请检查分享链接和提取码"
         )
     return {
         "provider": "tianyi",

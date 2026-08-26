@@ -2463,14 +2463,14 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 sources=sources,
                 token=token,
                 refresh=_payload_bool(payload, "refresh", False),
-                keyword=_limited_text(payload.get("keyword"), "\u641c\u7d22\u5173\u952e\u8bcd", 300),
+                keyword=_limited_text(payload.get("keyword"), "搜索关键词", 300),
             )
             return jsonify(result)
         except (TrendingInitialImportError, PublicInputError) as exc:
             return jsonify({"success": False, "message": str(exc)}), getattr(exc, "status_code", 400)
         except Exception:  # noqa: BLE001
             app.logger.exception("trending candidate search failed: candidate_id=%s", candidate_id)
-            return jsonify({"success": False, "message": "\u641c\u7d22\u8d44\u6e90\u5931\u8d25"}), 502
+            return jsonify({"success": False, "message": "搜索资源失败"}), 502
 
     def api_admin_trending_candidate_resource_detail(candidate_id: int, public_id: str):
         try:
@@ -2483,7 +2483,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def api_admin_trending_candidate_resource_files(candidate_id: int, public_id: str):
         try:
             trending_initial_import_service.cached_resource_for_candidate(candidate_id, public_id)
-            fid = _limited_text(request.args.get("fid"), "\u76ee\u5f55 ID", 256, required=True)
+            fid = _limited_text(request.args.get("fid"), "目录 ID", 256, required=True)
         except (TrendingInitialImportError, PublicInputError) as exc:
             return jsonify({"success": False, "message": str(exc)}), getattr(exc, "status_code", 400)
         result, status_code = _public_resource_application().files(public_id, fid=fid)
@@ -2508,7 +2508,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             return jsonify({"success": False, "message": str(exc)}), exc.status_code
         except Exception:  # noqa: BLE001
             app.logger.exception("trending candidate initial import failed: candidate_id=%s", candidate_id)
-            return jsonify({"success": False, "message": "\u521b\u5efa\u70ed\u699c\u9996\u6b21\u5165\u5e93\u4efb\u52a1\u5931\u8d25"}), 500
+            return jsonify({"success": False, "message": "创建热榜首次入库任务失败"}), 500
 
     def api_admin_trending_candidate_ignore(candidate_id: int):
         item = db.trending.get_candidate(candidate_id)
@@ -3191,7 +3191,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 "sources": source_rows,
                 "platform_ranks": item.get("platform_ranks") if isinstance(item.get("platform_ranks"), dict) else raw_data.get("platform_ranks") or {},
                 "media_exists": media_exists,
-                "availability_text": "\u5df2\u7ecf\u53ef\u4ee5\u89c2\u770b\u4e86" if media_exists else "\u641c\u7d22\u8d44\u6e90",
+                "availability_text": "已经可以观看了" if media_exists else "搜索资源",
             }
 
         public_groups: dict[str, dict[str, Any]] = {}

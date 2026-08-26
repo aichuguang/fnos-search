@@ -37,7 +37,7 @@ class TianyiCloudUploader:
     """Upload a local directory through Tianyi's 189CloudPC API."""
 
     provider_kind = "tianyi"
-    display_name = "\u5929\u7ffc\u4e91\u76d8"
+    display_name = "天翼云盘"
 
     def __init__(self, importer: TianyiImporter) -> None:
         self.importer = importer
@@ -177,7 +177,7 @@ class TianyiCloudUploader:
         elif str(manifest.get("status") or "").lower() == "uploading":
             return UploadOutcome(
                 "unknown",
-                "\u5929\u7ffc\u4e91\u4e0a\u4f20 fence \u5b58\u5728\u4f46\u7ed3\u679c\u672a\u77e5",
+                "天翼云上传 fence 存在但结果未知",
                 error_code=ErrorCode.RESULT_UNKNOWN,
             )
 
@@ -188,7 +188,7 @@ class TianyiCloudUploader:
         if not self._write_operation_manifest(manifest_path, manifest):
             return UploadOutcome(
                 "unknown",
-                "\u65e0\u6cd5\u6301\u4e45\u5316\u5929\u7ffc\u4e91\u4e0a\u4f20 fence",
+                "无法持久化天翼云上传 fence",
                 error_code=ErrorCode.RESULT_UNKNOWN,
             )
 
@@ -264,7 +264,7 @@ class TianyiCloudUploader:
             if not self._write_operation_manifest(manifest_path, manifest):
                 return UploadOutcome(
                     "unknown",
-                    "\u65e0\u6cd5\u6301\u4e45\u5316\u5929\u7ffc\u4e91\u9010\u6587\u4ef6\u56de\u6267",
+                    "无法持久化天翼云逐文件回执",
                     file_count=uploaded_count,
                     total_size=uploaded_size,
                     error_code=ErrorCode.RESULT_UNKNOWN,
@@ -284,14 +284,14 @@ class TianyiCloudUploader:
         if not self._write_operation_manifest(manifest_path, manifest):
             return UploadOutcome(
                 "unknown",
-                "\u65e0\u6cd5\u6301\u4e45\u5316\u5929\u7ffc\u4e91\u5b8c\u6210\u56de\u6267",
+                "无法持久化天翼云完成回执",
                 file_count=uploaded_count,
                 total_size=uploaded_size,
                 error_code=ErrorCode.RESULT_UNKNOWN,
             )
         return UploadOutcome(
             "done",
-            "\u5929\u7ffc\u4e91\u539f\u751f\u4e0a\u4f20\u5b8c\u6210",
+            "天翼云原生上传完成",
             file_count=uploaded_count,
             total_size=uploaded_size,
         )
@@ -331,7 +331,7 @@ class TianyiCloudUploader:
             if not folder_id:
                 return TransferVerifyResult(
                     "missing",
-                    "\u5929\u7ffc\u4e91\u76ee\u6807\u76ee\u5f55\u4e0d\u5b58\u5728",
+                    "天翼云目标目录不存在",
                     code=ErrorCode.VERIFY_MISMATCH,
                 )
             actual = self._walk_files(folder_id)
@@ -339,7 +339,7 @@ class TianyiCloudUploader:
             if exc.code in _AUTH_ERROR_CODES:
                 return TransferVerifyResult(
                     "unknown",
-                    "\u5929\u7ffc\u4e91\u8ba4\u8bc1\u5df2\u5931\u6548\uff0c\u65e0\u6cd5\u6821\u9a8c\u76ee\u6807",
+                    "天翼云认证已失效，无法校验目标",
                     code=ErrorCode.RESULT_UNKNOWN,
                 )
             return TransferVerifyResult(
@@ -394,7 +394,7 @@ class TianyiCloudUploader:
             )
         return TransferVerifyResult(
             "ok",
-            "\u5929\u7ffc\u4e91\u539f\u751f\u4e0a\u4f20\u76ee\u6807\u6821\u9a8c\u901a\u8fc7",
+            "天翼云原生上传目标校验通过",
             file_count=len(expected_records),
             total_size=manifest_size,
             expected_file_count=expected_file_count,
@@ -479,9 +479,9 @@ class TianyiCloudUploader:
                     "upload_verified": True,
                     "organizer_mutation_verified": organizer_verified,
                     "message": (
-                        "\u5929\u7ffc\u4e91\u539f\u751f\u4e0a\u4f20\u53ca OpenList \u6574\u7406\u94fe\u8def\u68c0\u6d4b\u901a\u8fc7"
+                        "天翼云原生上传及 OpenList 整理链路检测通过"
                         if organizer_verified
-                        else "\u5929\u7ffc\u4e91\u539f\u751f\u4e0a\u4f20\u68c0\u6d4b\u901a\u8fc7"
+                        else "天翼云原生上传检测通过"
                     ),
                 }
         except TianyiApiError as exc:
@@ -603,7 +603,7 @@ class TianyiCloudUploader:
         if code in _AUTH_ERROR_CODES or exc.http_status in frozenset({401, 403}):
             return UploadOutcome(
                 "auth_expired",
-                "\u5929\u7ffc\u4e91\u8ba4\u8bc1\u5df2\u5931\u6548\uff0c\u8bf7\u91cd\u65b0\u767b\u5f55",
+                "天翼云认证已失效，请重新登录",
                 error_code=ErrorCode.AUTH_EXPIRED,
             )
         retryable = code.startswith("HTTP_5") or code in frozenset(

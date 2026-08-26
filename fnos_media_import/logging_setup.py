@@ -49,7 +49,7 @@ def install_file_log_handler(root_logger: logging.Logger, base_dir: Path) -> Non
                 pass
         try:
             root_logger.warning(
-                "\u6301\u4e45\u65e5\u5fd7\u4e0d\u53ef\u7528\uff0c\u5df2\u964d\u7ea7\u4e3a\u63a7\u5236\u53f0/\u5185\u5b58\u65e5\u5fd7\uff1a%s\uff08%s\uff09",
+                "持久日志不可用，已降级为控制台/内存日志：%s（%s）",
                 log_path,
                 exc,
             )

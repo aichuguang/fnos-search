@@ -207,7 +207,7 @@
                 <div class="storage-setup-title">
                     <span class="storage-setup-kicker">网盘入库</span>
                     <h3>多链路入库</h3>
-                    <p>\u4fdd\u5b58\u4f4d\u7f6e\u7531\u7ba1\u7406\u5458\u7edf\u4e00\u8bbe\u7f6e\uff0c\u7cfb\u7edf\u81ea\u52a8\u9009\u62e9\u540c\u6e90\u76f4\u8f6c\u3001rclone \u6216 Provider \u539f\u751f\u4e2d\u7ee7\u4e0a\u4f20\u3002</p>
+                    <p>保存位置由管理员统一设置，系统自动选择同源直转、rclone 或 Provider 原生中继上传。</p>
                 </div>
                 <div class="storage-setup-header-actions">
                     <span class="storage-progress-label ${progress.ready ? "is-ready" : ""}">${progress.ready ? "已就绪" : `${progress.completed}/${progress.total} 已完成`}</span>
@@ -279,17 +279,17 @@
     function renderNativeDirectoryBrowser(values, locatorField) {
         const selectedName = values.native_root_name || (values.native_root ? `ID: ${values.native_root}` : "");
         const root = state.nativeRoot || nativeBrowseRoot();
-        return `<section class="storage-native-browser span-2" aria-label="${esc(locatorField?.label || "\u4e91\u76d8\u539f\u751f\u76ee\u5f55")}">
+        return `<section class="storage-native-browser span-2" aria-label="${esc(locatorField?.label || "云盘原生目录")}">
             <input type="hidden" name="native_root" value="${esc(values.native_root || "")}">
             <input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}">
             <header>
-                <div><strong>${esc(locatorField?.label || "\u4e91\u76d8\u4fdd\u5b58\u6839\u76ee\u5f55")}</strong><small>${selectedName ? `\u5df2\u9009\uff1a${esc(selectedName)}` : "\u8bf7\u4ece\u4e0b\u65b9\u76ee\u5f55\u6811\u4e2d\u9009\u62e9"}</small></div>
+                <div><strong>${esc(locatorField?.label || "云盘保存根目录")}</strong><small>${selectedName ? `已选：${esc(selectedName)}` : "请从下方目录树中选择"}</small></div>
             </header>
             <div class="storage-native-tree">
-                ${state.nativeTree[root] ? renderNativeTreeNodes(root, 0) : '<div class="storage-tree-row storage-tree-note">\u52a0\u8f7d\u4e2d\u2026</div>'}
+                ${state.nativeTree[root] ? renderNativeTreeNodes(root, 0) : '<div class="storage-tree-row storage-tree-note">加载中\u2026</div>'}
             </div>
             ${state.nativeDirectoryError ? `<div class="storage-inline-error" role="alert">${esc(state.nativeDirectoryError)}</div>` : ""}
-            <label class="storage-native-selection"><span>\u5df2\u9009\u539f\u751f\u76ee\u5f55</span><input name="native_root_selection" required readonly value="${esc(selectedName)}" placeholder="\u8bf7\u9009\u62e9\u4e00\u4e2a\u4e91\u76d8\u76ee\u5f55"></label>
+            <label class="storage-native-selection"><span>已选原生目录</span><input name="native_root_selection" required readonly value="${esc(selectedName)}" placeholder="请选择一个云盘目录"></label>
         </section>`;
     }
 
@@ -299,21 +299,21 @@
         const indent = depth * 18;
         const chevron = node.loading ? "\u2026" : (node.expanded ? "\u25be" : "\u25b8");
         const row = `<div class="storage-tree-row" style="padding-left:${indent}px">
-            <button type="button" class="storage-tree-toggle" data-native-tree-action="toggle" data-folder-id="${esc(node.folder_id)}" ${node.loading ? "disabled" : ""} aria-label="\u5c55\u5f00\u6216\u6298\u53e0">${chevron}</button>
+            <button type="button" class="storage-tree-toggle" data-native-tree-action="toggle" data-folder-id="${esc(node.folder_id)}" ${node.loading ? "disabled" : ""} aria-label="展开或折叠">${chevron}</button>
             <span class="icon-slot icon-folder" aria-hidden="true"></span>
             <button type="button" class="storage-tree-label" data-native-tree-action="select" data-folder-id="${esc(node.folder_id)}" title="${esc(node.path || node.name)}">${esc(node.name)}</button>
-            <button type="button" class="secondary mini" data-native-tree-action="select" data-folder-id="${esc(node.folder_id)}">\u9009\u62e9</button>
+            <button type="button" class="secondary mini" data-native-tree-action="select" data-folder-id="${esc(node.folder_id)}">选择</button>
         </div>`;
         let body = row;
         if (node.loading) {
-            body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">\u52a0\u8f7d\u4e2d\u2026</div>`;
+            body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">加载中\u2026</div>`;
         }
         if (node.error) {
             body += `<div class="storage-tree-row storage-tree-note storage-tree-error" style="padding-left:${indent + 18}px" role="alert">${esc(node.error)}</div>`;
         }
         if (node.expanded && node.loaded) {
             if (!node.children.length) {
-                body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">\u6b64\u76ee\u5f55\u6ca1\u6709\u5b50\u76ee\u5f55</div>`;
+                body += `<div class="storage-tree-row storage-tree-note" style="padding-left:${indent + 18}px">此目录没有子目录</div>`;
             } else {
                 body += node.children.map((childId) => renderNativeTreeNodes(childId, depth + 1)).join("");
             }
@@ -399,7 +399,7 @@
         return `
             <div class="storage-section-heading">
                 <div><h4>保存位置</h4><p>先维护 OpenList 连接，再把账号或通用网盘映射为保存位置。</p></div>
-                <div class="storage-heading-actions">${connections.length ? "" : '<button type="button" class="secondary" data-openlist-action="add">\u6dfb\u52a0 OpenList</button>'}<button type="button" data-location-action="add">添加保存位置</button></div>
+                <div class="storage-heading-actions">${connections.length ? "" : '<button type="button" class="secondary" data-openlist-action="add">添加 OpenList</button>'}<button type="button" data-location-action="add">添加保存位置</button></div>
             </div>
             <div class="storage-openlist-list">
                 ${connections.length ? connections.map(renderOpenListConnectionRow).join("") : `<div class="storage-empty-state"><strong>尚未连接 OpenList</strong><p>本地位置可以直接创建；云盘位置需要先添加 WebDAV 连接。</p></div>`}
@@ -425,16 +425,16 @@
         const typeLabel = location.kind === "local" ? "本地目录" : location.kind === "generic" ? "OpenList 通用盘" : provider?.display_name || location.provider_kind;
         const nativeStatus = location.native_upload_capable ? `
             <div class="storage-capability-list">
-                <span class="${location.native_upload_verified ? "is-success" : "is-warning"}">${location.native_upload_verified ? "\u539f\u751f\u4e0a\u4f20\u5df2\u9a8c\u8bc1" : "\u539f\u751f\u4e0a\u4f20\u5f85\u9a8c\u8bc1"}</span>
-                <span class="${location.organizer_mutation_verified ? "is-success" : "is-warning"}">${location.organizer_mutation_verified ? "OpenList \u6574\u7406\u5df2\u9a8c\u8bc1" : "OpenList \u6574\u7406\u5f85\u9a8c\u8bc1"}</span>
-                ${location.native_only ? '<span class="is-neutral">WebDAV \u53ea\u8bfb</span>' : ""}
+                <span class="${location.native_upload_verified ? "is-success" : "is-warning"}">${location.native_upload_verified ? "原生上传已验证" : "原生上传待验证"}</span>
+                <span class="${location.organizer_mutation_verified ? "is-success" : "is-warning"}">${location.organizer_mutation_verified ? "OpenList 整理已验证" : "OpenList 整理待验证"}</span>
+                ${location.native_only ? '<span class="is-neutral">WebDAV 只读</span>' : ""}
             </div>` : "";
         return `<article class="storage-location-row">
             <span class="storage-provider-mark kind-${esc(location.provider_kind)}">${esc(provider?.icon_text || (location.kind === "local" ? "本" : "盘"))}</span>
             <div class="storage-record-main">
                 <div class="storage-record-title"><strong>${esc(location.name)}</strong><span class="storage-status ${location.ready ? "is-success" : "is-warning"}">${location.ready ? "可用" : "待检查"}</span></div>
                 <p>${esc(typeLabel)}${location.account_name ? ` · ${esc(location.account_name)}` : ""}${location.webdav_root ? ` · ${esc(location.webdav_root)}` : ""}</p>
-                ${location.native_root_name ? `<small>\u539f\u751f\u76ee\u5f55\uff1a${esc(location.native_root_name)}</small>` : ""}
+                ${location.native_root_name ? `<small>原生目录：${esc(location.native_root_name)}</small>` : ""}
                 ${nativeStatus}
                 <small>${esc(location.status_message)}</small>
             </div>
@@ -452,7 +452,7 @@
                 <label><span>用户名</span><input name="username" required value="${esc(values.username || "")}" autocomplete="username"></label>
                 <label><span>密码</span><input name="password" type="password" ${values.connection_id ? "" : "required"} placeholder="${values.connection_id ? "已保存，留空保持不变" : "WebDAV 密码"}" autocomplete="new-password"></label>
             </div>
-            <div class="storage-form-actions"><button type="submit" data-loading-label="\u6b63\u5728\u4fdd\u5b58\u5e76\u68c0\u6d4b\u8fde\u63a5\u2026">保存并检测</button><button type="button" class="secondary" data-setup-action="cancel-editor">取消</button></div>
+            <div class="storage-form-actions"><button type="submit" data-loading-label="正在保存并检测连接\u2026">保存并检测</button><button type="button" class="secondary" data-setup-action="cancel-editor">取消</button></div>
         </form>`;
     }
 
@@ -470,8 +470,8 @@
             options.unshift({ path: selectedPath, name: selectedPath });
         }
         const placeholder = options.length
-            ? "\u8bf7\u9009\u62e9 OpenList \u76ee\u5f55"
-            : "\u6682\u65e0\u53ef\u9009\u7684 OpenList \u76ee\u5f55";
+            ? "请选择 OpenList 目录"
+            : "暂无可选的 OpenList 目录";
         return `<option value="" ${selectedPath ? "" : "selected"} disabled>${placeholder}</option>${options.map((item) => {
             const label = item.name !== item.path ? `${item.name} \u00b7 ${item.path}` : item.path;
             return `<option value="${esc(item.path)}" ${item.path === selectedPath ? "selected" : ""}>${esc(label)}</option>`;
@@ -500,13 +500,13 @@
                 <label class="span-2"><span>OpenList 中的目录</span><select name="webdav_root" required>${renderOpenListDirectoryOptions(values.webdav_root)}</select></label>` : ""}
                 ${kind === "provider" ? (nativeBrowser
                     ? renderNativeDirectoryBrowser(values, locatorField)
-                    : `<label class="span-2"><span>${esc(locatorField?.label || "\u4e91\u76d8\u4fdd\u5b58\u6839\u76ee\u5f55")}</span><input name="native_root" required value="${esc(values.native_root || "")}" placeholder="\u540c\u6e90\u76f4\u8f6c\u548c\u8de8\u76d8\u843d\u5730\u4f7f\u7528"><input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}"></label>`)
+                    : `<label class="span-2"><span>${esc(locatorField?.label || "云盘保存根目录")}</span><input name="native_root" required value="${esc(values.native_root || "")}" placeholder="同源直转和跨盘落地使用"><input type="hidden" name="native_root_name" value="${esc(values.native_root_name || "")}"></label>`)
                     : ""}
                 ${kind !== "local" ? `<label class="span-2 storage-identity-confirm"><input name="confirm_identity" type="checkbox" value="true" required ${values.confirm_identity === true || values.confirm_identity === "true" ? "checked" : ""}><span>我确认该 OpenList 目录确实对应上面选择的账号或存储位置。修改目录、账号或挂载关系时会重新确认。</span></label>` : ""}
             </div>
             ${state.directoryError ? `<div class="storage-inline-error" role="alert">${esc(state.directoryError)}</div>` : ""}
             <div class="storage-path-note">电影、电视剧、动漫等目录由系统自动生成，不再单独配置分类路径。</div>
-            <div class="storage-form-actions"><button type="submit" data-loading-label="\u6b63\u5728\u4fdd\u5b58\u5e76\u68c0\u6d4b\u76ee\u5f55\u2026">保存并检测目录</button><button type="button" class="secondary" data-setup-action="cancel-editor">取消</button></div>
+            <div class="storage-form-actions"><button type="submit" data-loading-label="正在保存并检测目录\u2026">保存并检测目录</button><button type="button" class="secondary" data-setup-action="cancel-editor">取消</button></div>
         </form>`;
     }
 
@@ -541,7 +541,7 @@
         if (!location) return "尚未设置保存位置";
         if (sourceId === "sixpan_magnet") return "六盘离线后直接入库";
         if (route?.provider_kind === location.provider_kind) return "同源直转，不经过本地";
-        if (location.native_upload_capable) return "\u6765\u6e90\u843d\u5730\u540e\u4e0b\u8f7d\u5230\u672c\u5730\uff0c\u518d\u7531\u76ee\u6807\u4e91\u76d8\u539f\u751f API \u4e0a\u4f20";
+        if (location.native_upload_capable) return "来源落地后下载到本地，再由目标云盘原生 API 上传";
         if (location.kind === "local") return "来源落地后通过 rclone 下载到本地";
         return "来源落地后通过 rclone 搬运到目标网盘";
     }
@@ -729,7 +729,7 @@
         }
         state.editor = null;
         await load();
-        setNotice("OpenList WebDAV \u4e0e rclone Remote \u5df2\u4fdd\u5b58\u5e76\u68c0\u6d4b\u6210\u529f\u3002", "is-success");
+        setNotice("OpenList WebDAV 与 rclone Remote 已保存并检测成功。", "is-success");
     }
 
     async function submitLocation(form) {
@@ -753,7 +753,7 @@
             && usesNativeFolderBrowser(selectedProvider)
             && !payload.native_root
         ) {
-            throw new Error("\u8bf7\u9009\u62e9\u4e91\u76d8\u539f\u751f\u4fdd\u5b58\u76ee\u5f55");
+            throw new Error("请选择云盘原生保存目录");
         }
         const path = values.destination_id ? `/api/admin/storage-setup/locations/${values.destination_id}` : "/api/admin/storage-setup/locations";
         try {
@@ -1008,7 +1008,7 @@
         state.nativeRoot = root;
         state.nativeTree[root] = {
             folder_id: root,
-            name: "\u6839\u76ee\u5f55",
+            name: "根目录",
             path: "/",
             parent_id: "",
             children: [],
@@ -1047,7 +1047,7 @@
             }
             node.loaded = true;
         } catch (error) {
-            node.error = error.message || "\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25";
+            node.error = error.message || "目录读取失败";
         } finally {
             node.loading = false;
         }
@@ -1198,7 +1198,7 @@
             syncLocationEditorValues(button.closest("#storageLocationForm"));
             const accountId = state.editor?.values?.account_id || "";
             if (!accountId) {
-                state.nativeDirectoryError = "\u8bf7\u5148\u9009\u62e9\u4e91\u76d8\u8d26\u53f7";
+                state.nativeDirectoryError = "请先选择云盘账号";
                 render();
                 return;
             }

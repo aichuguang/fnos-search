@@ -306,12 +306,12 @@ class OrganizerPassthroughSkipTests(unittest.TestCase):
             evidence={"completion_confirmation": {"success": True, "confirmed_count": 3}},
         )
 
-        blocked_root = "/\u6682\u5b58/\u7535\u5f71/job-unconfirmed"
+        blocked_root = "/暂存/电影/job-unconfirmed"
         blocked_job_id, blocked_plan = self._create_v1_job(
-            title="\u4ecd\u5728\u6682\u5b58\u533a\u7684\u5408\u96c6",
+            title="仍在暂存区的合集",
             status="review",
             organizer_root=blocked_root,
-            destination_final="/\u5a92\u4f53/\u7535\u5f71",
+            destination_final="/媒体/电影",
         )
         self.database.organizer.create_organizer_task(
             job_id=blocked_job_id,

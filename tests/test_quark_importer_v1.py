@@ -66,9 +66,9 @@ class QuarkImporterV1Tests(unittest.TestCase):
 
     def test_optional_method_lookup_fails_closed_for_inactive_provider(self) -> None:
         def unavailable():
-            raise ActiveProviderUnavailable("\u5f53\u524d\u516d\u76d8\u8d26\u53f7\u672a\u6fc0\u6d3b")
+            raise ActiveProviderUnavailable("当前六盘账号未激活")
 
-        wrapper = ActiveProviderImporter("\u516d\u76d8", unavailable)
+        wrapper = ActiveProviderImporter("六盘", unavailable)
 
         self.assertIsNone(get_optional_provider_method(wrapper, "describe"))
         self.assertIsNone(get_optional_provider_method(wrapper, "probe"))

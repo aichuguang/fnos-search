@@ -132,8 +132,8 @@ QUARK_MANIFEST = manifest(
     auth_methods=[
         {
             "kind": "qrcode",
-            "label": "\u626b\u7801\u767b\u5f55",
-            "description": "\u4f7f\u7528\u5938\u514b APP \u626b\u7801\uff0c\u7cfb\u7edf\u81ea\u52a8\u83b7\u53d6\u5e76\u9a8c\u8bc1 Cookie",
+            "label": "扫码登录",
+            "description": "使用夸克 APP 扫码，系统自动获取并验证 Cookie",
             "interactive": True,
         },
     ],

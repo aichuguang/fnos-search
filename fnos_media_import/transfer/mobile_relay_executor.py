@@ -41,7 +41,7 @@ class CmccMobileUploader:
     """
 
     provider_kind = "mobile"
-    display_name = "\u79fb\u52a8\u4e91\u76d8"
+    display_name = "移动云盘"
 
     def __init__(
         self,
@@ -287,7 +287,7 @@ class CmccMobileUploader:
         if not parent_id:
             parent_id = self._resolve_readonly(target_path)
         if not parent_id:
-            return TransferVerifyResult("missing", f"\u79fb\u52a8\u4e91\u76ee\u6807\u76ee\u5f55\u4e0d\u5b58\u5728\uff1a{target_path}", code=ErrorCode.VERIFY_MISMATCH)
+            return TransferVerifyResult("missing", f"移动云目标目录不存在：{target_path}", code=ErrorCode.VERIFY_MISMATCH)
         operation_key = str(idempotency_key or "").strip()
         manifest = (
             self._read_operation_manifest(
@@ -299,7 +299,7 @@ class CmccMobileUploader:
         if str(manifest.get("status") or "").lower() != "completed":
             return TransferVerifyResult(
                 "unknown",
-                "\u79fb\u52a8\u4e91\u4e0a\u4f20 manifest \u7f3a\u5931\u6216\u672a\u5b8c\u6210",
+                "移动云上传 manifest 缺失或未完成",
                 code=ErrorCode.RESULT_UNKNOWN,
             )
         records = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
@@ -311,11 +311,11 @@ class CmccMobileUploader:
         try:
             items = self._list_all_files(parent_id)
         except CmccAuthExpired:
-            return TransferVerifyResult("unknown", "\u79fb\u52a8\u4e91\u8ba4\u8bc1\u5df2\u8fc7\u671f\uff0c\u65e0\u6cd5\u786e\u8ba4\u76ee\u6807", code=ErrorCode.RESULT_UNKNOWN)
+            return TransferVerifyResult("unknown", "移动云认证已过期，无法确认目标", code=ErrorCode.RESULT_UNKNOWN)
         except CmccApiError as exc:
             return TransferVerifyResult(
                 "unknown" if exc.auth_expired else "unknown",
-                f"\u79fb\u52a8\u4e91\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25\uff1a{exc}",
+                f"移动云目录读取失败：{exc}",
                 code=ErrorCode.RESULT_UNKNOWN,
             )
         files = [item for item in items if not _item_is_dir(item)]
@@ -367,7 +367,7 @@ class CmccMobileUploader:
             )
         return TransferVerifyResult(
             "ok",
-            "\u79fb\u52a8\u4e91\u76ee\u6807\u6821\u9a8c\u901a\u8fc7",
+            "移动云目标校验通过",
             file_count=len(expected_records),
             total_size=manifest_size,
             expected_file_count=expected_file_count,
@@ -460,7 +460,7 @@ class CmccMobileUploader:
                 "ok": True,
                 "upload_verified": True,
                 "organizer_mutation_verified": organizer_verified,
-                "message": "\u79fb\u52a8\u4e91\u76d8\u539f\u751f\u4e0a\u4f20\u4e0e OpenList \u6574\u7406\u94fe\u8def\u68c0\u6d4b\u901a\u8fc7",
+                "message": "移动云盘原生上传与 OpenList 整理链路检测通过",
             }
         except CmccAuthExpired:
             return {
@@ -468,7 +468,7 @@ class CmccMobileUploader:
                 "upload_verified": False,
                 "organizer_mutation_verified": False,
                 "code": "AUTH_EXPIRED",
-                "message": "\u79fb\u52a8\u4e91\u76d8\u8ba4\u8bc1\u5df2\u8fc7\u671f",
+                "message": "移动云盘认证已过期",
             }
         except (CmccAuthConfigError, CmccApiError) as exc:
             return {

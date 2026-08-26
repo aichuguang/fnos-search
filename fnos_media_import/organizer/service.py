@@ -5090,7 +5090,7 @@ class OrganizerService:
         refresh_prefix: str = "",
     ) -> dict[str, Any]:
         if not self.organizer_config.get("strm_cleanup_old_before_refresh"):
-            return {"enabled": False, "skipped": True, "message": "\u65e7 STRM \u76ee\u5f55\u6e05\u7406\u672a\u542f\u7528"}
+            return {"enabled": False, "skipped": True, "message": "旧 STRM 目录清理未启用"}
         old_name = self._old_strm_resource_name(task)
         if not old_name:
             old_name = self._job_scoped_strm_resource_name(task)
@@ -5102,7 +5102,7 @@ class OrganizerService:
                 "message": "未能从任务源路径唯一识别旧 STRM 资源目录，已跳过清理",
             }
         if old_name in set(final_names):
-            return {"enabled": True, "skipped": True, "old_name": old_name, "message": "\u65e7\u540d\u4e0e\u6700\u7ec8\u540d\u4e00\u81f4\uff0c\u65e0\u9700\u6e05\u7406\u65e7 STRM \u76ee\u5f55"}
+            return {"enabled": True, "skipped": True, "old_name": old_name, "message": "旧名与最终名一致，无需清理旧 STRM 目录"}
 
         openlist_cleanup = self._cleanup_old_openlist_strm_dir(
             old_name,
@@ -5201,25 +5201,25 @@ class OrganizerService:
     ) -> dict[str, Any]:
         prefix = normalize_path(prefix) if str(prefix or "").strip() else self._strm_refresh_prefix(normalized_category)
         if not prefix:
-            return {"enabled": True, "skipped": True, "old_name": old_name, "message": "\u672a\u914d\u7f6e STRM \u5206\u7c7b\u524d\u7f00\uff0c\u8df3\u8fc7 OpenList \u65e7\u76ee\u5f55\u6e05\u7406"}
+            return {"enabled": True, "skipped": True, "old_name": old_name, "message": "未配置 STRM 分类前缀，跳过 OpenList 旧目录清理"}
         old_path = join_path(prefix, old_name)
         if not _is_child_path(old_path, prefix):
-            return {"enabled": True, "skipped": True, "old_name": old_name, "path": old_path, "message": "OpenList \u65e7 STRM \u8def\u5f84\u4e0d\u5728\u914d\u7f6e\u524d\u7f00\u4e0b\uff0c\u62d2\u7edd\u5220\u9664"}
+            return {"enabled": True, "skipped": True, "old_name": old_name, "path": old_path, "message": "OpenList 旧 STRM 路径不在配置前缀下，拒绝删除"}
         try:
             if not self.openlist.exists(old_path):
-                return {"enabled": True, "skipped": True, "old_name": old_name, "path": old_path, "message": "OpenList \u65e7 STRM \u76ee\u5f55\u4e0d\u5b58\u5728\uff0c\u8df3\u8fc7"}
+                return {"enabled": True, "skipped": True, "old_name": old_name, "path": old_path, "message": "OpenList 旧 STRM 目录不存在，跳过"}
             self.openlist.remove_path(old_path)
-            return {"enabled": True, "success": True, "old_name": old_name, "path": old_path, "message": "\u5df2\u5220\u9664 OpenList \u65e7 STRM \u76ee\u5f55"}
+            return {"enabled": True, "success": True, "old_name": old_name, "path": old_path, "message": "已删除 OpenList 旧 STRM 目录"}
         except Exception as exc:  # noqa: BLE001
-            return {"enabled": True, "success": False, "failed": True, "old_name": old_name, "path": old_path, "message": f"OpenList \u65e7 STRM \u76ee\u5f55\u5220\u9664\u5931\u8d25\uff1a{exc}"}
+            return {"enabled": True, "success": False, "failed": True, "old_name": old_name, "path": old_path, "message": f"OpenList 旧 STRM 目录删除失败：{exc}"}
 
     def _cleanup_old_local_strm_dir(self, old_name: str, normalized_category: str) -> dict[str, Any]:
         root = str(self.organizer_config.get("local_strm_root") or "").strip()
         if not root:
-            return {"enabled": False, "skipped": True, "old_name": old_name, "message": "\u672a\u914d\u7f6e\u672c\u5730 STRM \u6839\u76ee\u5f55\uff0c\u8df3\u8fc7\u672c\u5730\u65e7\u76ee\u5f55\u6e05\u7406"}
+            return {"enabled": False, "skipped": True, "old_name": old_name, "message": "未配置本地 STRM 根目录，跳过本地旧目录清理"}
         category_dir = self._local_strm_category_dir(normalized_category)
         if not category_dir:
-            return {"enabled": True, "skipped": True, "old_name": old_name, "message": "\u672a\u8bc6\u522b\u672c\u5730 STRM \u5206\u7c7b\u76ee\u5f55\u540d\uff0c\u8df3\u8fc7\u672c\u5730\u65e7\u76ee\u5f55\u6e05\u7406"}
+            return {"enabled": True, "skipped": True, "old_name": old_name, "message": "未识别本地 STRM 分类目录名，跳过本地旧目录清理"}
         checked: list[str] = []
         openlist_checked: list[str] = []
         errors: list[str] = []
@@ -5251,7 +5251,7 @@ class OrganizerService:
                                 "path": str(target),
                                 "checked_paths": checked,
                                 "exists_after": exists_after,
-                                "message": "\u5df2\u5220\u9664\u672c\u5730\u65e7 STRM \u76ee\u5f55" if not exists_after else "\u672c\u5730\u65e7 STRM \u76ee\u5f55\u5220\u9664\u540e\u4ecd\u5b58\u5728",
+                                "message": "已删除本地旧 STRM 目录" if not exists_after else "本地旧 STRM 目录删除后仍存在",
                             }
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"{target}: {exc}")
@@ -5276,7 +5276,7 @@ class OrganizerService:
                     "checked_paths": checked,
                     "openlist_checked_paths": openlist_checked,
                     "exists_after": exists_after,
-                    "message": "\u5df2\u5220\u9664 OpenList \u6302\u8f7d\u7684\u672c\u5730\u65e7 STRM \u76ee\u5f55" if not exists_after else "OpenList \u6302\u8f7d\u7684\u672c\u5730\u65e7 STRM \u76ee\u5f55\u5220\u9664\u540e\u4ecd\u5b58\u5728",
+                    "message": "已删除 OpenList 挂载的本地旧 STRM 目录" if not exists_after else "OpenList 挂载的本地旧 STRM 目录删除后仍存在",
                 }
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{openlist_target}: {exc}")
@@ -5289,7 +5289,7 @@ class OrganizerService:
             "openlist_checked_paths": openlist_checked,
             "errors": errors[:5],
             "exists_after": False,
-            "message": "\u672c\u5730\u65e7 STRM \u76ee\u5f55\u4e0d\u5b58\u5728\uff0c\u5df2\u540c\u65f6\u68c0\u67e5\u672c\u673a\u6302\u8f7d\u548c OpenList \u6302\u8f7d\u8def\u5f84" if not errors else f"\u672c\u5730\u65e7 STRM \u76ee\u5f55\u5220\u9664\u5931\u8d25\uff1a{errors[0]}",
+            "message": "本地旧 STRM 目录不存在，已同时检查本机挂载和 OpenList 挂载路径" if not errors else f"本地旧 STRM 目录删除失败：{errors[0]}",
         }
 
     def _local_strm_category_dir(self, normalized_category: str) -> str:
@@ -5307,9 +5307,9 @@ class OrganizerService:
         clean_old_name = str(old_name or "").strip().replace("\\", "/")
         clean_category = str(category_dir or "").strip().replace("\\", "/").strip("/")
         if not clean_old_name or clean_old_name in {".", ".."} or "/" in clean_old_name:
-            raise ValueError("\u65e7\u76ee\u5f55\u540d\u975e\u6cd5")
+            raise ValueError("旧目录名非法")
         if not clean_category or clean_category in {".", ".."} or "/" in clean_category:
-            raise ValueError("\u5206\u7c7b\u76ee\u5f55\u540d\u975e\u6cd5")
+            raise ValueError("分类目录名非法")
         root_path = Path(root).expanduser()
         category_path = root_path / clean_category
         target = category_path / clean_old_name
@@ -5317,13 +5317,13 @@ class OrganizerService:
         category_resolved = category_path.resolve(strict=False)
         target_resolved = target.resolve(strict=False)
         if category_resolved == root_resolved:
-            raise ValueError("\u5206\u7c7b\u76ee\u5f55\u4e0d\u80fd\u7b49\u4e8e\u672c\u5730 STRM \u6839\u76ee\u5f55")
+            raise ValueError("分类目录不能等于本地 STRM 根目录")
         if not _path_is_relative_to(category_resolved, root_resolved):
-            raise ValueError("\u5206\u7c7b\u76ee\u5f55\u4e0d\u5728\u672c\u5730 STRM \u6839\u76ee\u5f55\u5185")
+            raise ValueError("分类目录不在本地 STRM 根目录内")
         if not _path_is_relative_to(target_resolved, category_resolved):
-            raise ValueError("\u76ee\u6807\u76ee\u5f55\u4e0d\u5728\u672c\u5730 STRM \u5206\u7c7b\u76ee\u5f55\u5185")
+            raise ValueError("目标目录不在本地 STRM 分类目录内")
         if target_resolved in {root_resolved, category_resolved}:
-            raise ValueError("\u62d2\u7edd\u5220\u9664\u672c\u5730 STRM \u6839\u76ee\u5f55\u6216\u5206\u7c7b\u76ee\u5f55")
+            raise ValueError("拒绝删除本地 STRM 根目录或分类目录")
         return target
 
     @staticmethod
@@ -5332,18 +5332,18 @@ class OrganizerService:
         clean_old_name = str(old_name or "").strip().replace("\\", "/")
         clean_category = str(category_dir or "").strip().replace("\\", "/").strip("/")
         if not clean_root or "://" in clean_root or re.match(r"^[A-Za-z]:/", clean_root):
-            raise ValueError("\u672c\u5730 STRM \u6839\u76ee\u5f55\u4e0d\u662f OpenList \u865a\u62df\u8def\u5f84")
+            raise ValueError("本地 STRM 根目录不是 OpenList 虚拟路径")
         if not clean_old_name or clean_old_name in {".", ".."} or "/" in clean_old_name:
-            raise ValueError("\u65e7\u76ee\u5f55\u540d\u975e\u6cd5")
+            raise ValueError("旧目录名非法")
         if not clean_category or clean_category in {".", ".."} or "/" in clean_category:
-            raise ValueError("\u5206\u7c7b\u76ee\u5f55\u540d\u975e\u6cd5")
+            raise ValueError("分类目录名非法")
         root_path = normalize_path(clean_root)
         if root_path == "/":
-            raise ValueError("\u672c\u5730 STRM \u6839\u76ee\u5f55\u4e0d\u80fd\u662f OpenList \u6839\u76ee\u5f55")
+            raise ValueError("本地 STRM 根目录不能是 OpenList 根目录")
         category_path = join_path(root_path, clean_category)
         target = join_path(category_path, clean_old_name)
         if not _is_child_path(target, category_path):
-            raise ValueError("\u76ee\u6807\u76ee\u5f55\u4e0d\u5728 OpenList \u672c\u5730 STRM \u5206\u7c7b\u76ee\u5f55\u5185")
+            raise ValueError("目标目录不在 OpenList 本地 STRM 分类目录内")
         return target
 
     def _check_old_local_strm_after_refresh(self, old_name: Any, normalized_category: str) -> dict[str, Any]:
@@ -5358,15 +5358,15 @@ class OrganizerService:
                 target = self._safe_local_strm_child(root, category_dir, candidate_name)
                 checked.append(str(target))
                 if target.exists() or target.is_symlink():
-                    return {"enabled": True, "path": str(target), "checked_paths": checked, "openlist_checked_paths": openlist_checked, "exists": True, "message": "\u672c\u5730\u65e7 STRM \u76ee\u5f55\u4ecd\u5b58\u5728"}
+                    return {"enabled": True, "path": str(target), "checked_paths": checked, "openlist_checked_paths": openlist_checked, "exists": True, "message": "本地旧 STRM 目录仍存在"}
                 try:
                     openlist_target = self._safe_openlist_local_strm_child(root, category_dir, candidate_name)
                     openlist_checked.append(openlist_target)
                     if self.openlist.exists(openlist_target):
-                        return {"enabled": True, "path": openlist_target, "checked_paths": checked, "openlist_checked_paths": openlist_checked, "exists": True, "message": "OpenList \u6302\u8f7d\u7684\u672c\u5730\u65e7 STRM \u76ee\u5f55\u4ecd\u5b58\u5728"}
+                        return {"enabled": True, "path": openlist_target, "checked_paths": checked, "openlist_checked_paths": openlist_checked, "exists": True, "message": "OpenList 挂载的本地旧 STRM 目录仍存在"}
                 except Exception:
                     pass
-            return {"enabled": True, "checked_paths": checked, "openlist_checked_paths": openlist_checked, "exists": False, "message": "\u672c\u5730\u65e7 STRM \u76ee\u5f55\u5df2\u4e0d\u5b58\u5728"}
+            return {"enabled": True, "checked_paths": checked, "openlist_checked_paths": openlist_checked, "exists": False, "message": "本地旧 STRM 目录已不存在"}
         except Exception as exc:  # noqa: BLE001
             return {"enabled": True, "failed": True, "checked_paths": checked, "openlist_checked_paths": openlist_checked, "message": str(exc)}
 
@@ -7283,7 +7283,7 @@ def _strm_cleanup_message(openlist_cleanup: dict[str, Any], local_cleanup: dict[
         message = str(item.get("message") or "").strip()
         if message:
             parts.append(message)
-    return "\uff1b".join(parts) if parts else "\u65e7 STRM \u76ee\u5f55\u6e05\u7406\u5b8c\u6210"
+    return "；".join(parts) if parts else "旧 STRM 目录清理完成"
 
 
 def _confidence_percent(value: Any) -> float:
