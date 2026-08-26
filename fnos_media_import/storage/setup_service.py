@@ -1954,15 +1954,25 @@ class StorageSetupService:
             )
         for source_id in sources:
             route = route_by_source.get(source_id)
+            # 入库规则允许部分配置：只接入了部分网盘时，未配置的来源保持未分配，
+            # 而不是逼着管理员为每个来源都选一个目标。留空等于取消该来源的分配，
+            # ``assignments.replace`` 是全量替换，未出现的键会被删除。访客从未
+            # 分配的来源提交时，DestinationResolver 仍会返回 None 阻止提交。
             if route is None:
-                raise StorageSetupError(f"请设置 {sources[source_id]['label']} 的保存位置")
+                continue
             default_id = _text(route.get("default_destination_id"))
-            if not default_id:
-                raise StorageSetupError(f"请设置 {sources[source_id]['label']} 的默认保存位置")
             overrides = dict(route.get("overrides") or {})
+            if not default_id and not any(
+                _text(overrides.get(key)) for key in CATEGORY_KEYS
+            ):
+                continue
             expected_revisions = dict(route.get("assignment_revisions") or {})
             for category_key in CATEGORY_KEYS:
                 destination_id = _text(overrides.get(category_key)) or default_id
+                # 默认目标留空、只设了部分分类覆盖时，其余分类保持未分配，
+                # 而不是继承一个空的 destination_id。
+                if not destination_id:
+                    continue
                 target = self.targets.get_target(destination_id)
                 if target is None:
                     raise StorageSetupError(

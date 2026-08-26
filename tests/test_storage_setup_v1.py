@@ -468,6 +468,67 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertEqual(revisions_after_second, revisions_after_first)
         self.assertEqual(history_after_second, history_after_first)
 
+    def test_routes_allow_partial_configuration_and_blank_cancels_assignment(self) -> None:
+        tianyi = self._account("tianyi", "天翼云主账号")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        tianyi_location = self.service.save_location(
+            {
+                "name": "天翼云主盘",
+                "kind": "provider",
+                "account_id": tianyi,
+                "connection_id": "openlist_main",
+                "webdav_root": "/天翼",
+                "native_root": "root-folder-id",
+                "native_root_name": "/媒体库",
+                "confirm_identity": True,
+            }
+        )
+        destination_id = tianyi_location["destination_id"]
+
+        # 只接入了天翼一个网盘时，只提交天翼规则也必须能保存，其余来源保持未分配。
+        self.service.save_routes(
+            {"routes": [{"search_source_id": "tianyi", "default_destination_id": destination_id}]}
+        )
+        assigned = self.assignments.list_assignments()
+        self.assertEqual({item.search_source_id for item in assigned}, {"tianyi"})
+        self.assertEqual(
+            {item.category_key for item in assigned},
+            set(CATEGORY_KEYS),
+        )
+        snapshot = self.service.snapshot()
+        unassigned = [
+            route for route in snapshot["routes"] if route["search_source_id"] != "tianyi"
+        ]
+        self.assertTrue(unassigned)
+        self.assertTrue(all(route["default_destination_id"] is None for route in unassigned))
+        self.assertTrue(all(route["overrides"] == {} for route in unassigned))
+
+        # 留空等于取消该来源的分配。
+        self.service.save_routes(
+            {"routes": [{"search_source_id": "tianyi", "default_destination_id": ""}]}
+        )
+        self.assertEqual(self.assignments.list_assignments(), [])
+
+        # 默认目标留空、只设了单个分类覆盖时，只写入被覆盖的分类。
+        self.service.save_routes(
+            {
+                "routes": [
+                    {
+                        "search_source_id": "tianyi",
+                        "default_destination_id": "",
+                        "overrides": {"movie": destination_id},
+                    }
+                ]
+            }
+        )
+        partial = self.assignments.list_assignments()
+        self.assertEqual(
+            [(item.search_source_id, item.category_key, item.destination_id) for item in partial],
+            [("tianyi", "movie", destination_id)],
+        )
+
     def test_location_rejects_removed_category_path_configuration(self) -> None:
         with self.assertRaisesRegex(ValueError, "分类目录由系统统一生成"):
             self.service.save_location(
