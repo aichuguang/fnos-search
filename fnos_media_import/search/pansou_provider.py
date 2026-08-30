@@ -14,6 +14,13 @@ class PanSouProvider:
         self.client = client
         self.config = config or SearchProviderConfig(key=self.key, name=self.name)
         self.priority = int(self.config.priority)
+        self.result_provider_priority = list(
+            getattr(client, "result_provider_priority", ["quark", "mobile", "tianyi", "magnet"])
+        )
+        self._result_provider_positions = {
+            provider_kind: index
+            for index, provider_kind in enumerate(self.result_provider_priority, start=1)
+        }
 
     def is_enabled(self) -> bool:
         return bool(self.config.enabled)
@@ -37,6 +44,7 @@ class PanSouProvider:
                 "requires_token": True,
                 "alias_expansion": True,
                 "cloud_types": list(getattr(self.client, "cloud_types", [])),
+                "result_provider_priority": list(self.result_provider_priority),
                 "async_poll": bool(getattr(self.client, "async_poll_enabled", False)),
                 "result_type": getattr(self.client, "result_type", "merge"),
                 "source_scope": getattr(self.client, "source_scope", "all"),
@@ -56,6 +64,24 @@ class PanSouProvider:
             normalized.setdefault("provider", self.key)
             normalized.setdefault("provider_name", self.name)
             normalized["provider_priority"] = self.priority
+            provider_kind = _result_provider_kind(normalized)
+            result_priority = self._result_provider_positions.get(provider_kind, 999)
+            normalized["result_provider_priority"] = result_priority
+            normalized["result_provider_priority_bonus"] = {1: 10, 2: 5, 3: 2}.get(
+                result_priority,
+                0,
+            )
             normalized["matched_keyword"] = keyword
             items.append(normalized)
         return {"items": items, "raw": result.get("raw"), "provider": self.key}
+
+
+def _result_provider_kind(item: dict[str, Any]) -> str:
+    provider_kind = str(item.get("provider_kind") or "").strip().lower()
+    source_form = str(item.get("source_form") or "").strip().lower()
+    source_type = str(item.get("source_type") or "").strip().lower()
+    if provider_kind in {"quark", "mobile", "tianyi"}:
+        return provider_kind
+    if source_form == "magnet" or source_type in {"magnet", "torrent"}:
+        return "magnet"
+    return ""

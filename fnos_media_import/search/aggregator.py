@@ -148,7 +148,8 @@ class SearchAggregator:
         normalized.setdefault("matched_keyword", matched_keyword)
         normalized["original_keyword"] = original_keyword
         normalized["dedupe_keys"] = _dedupe_keys(normalized)
-        normalized["quality_tags"] = _quality_tags(str(normalized.get("title") or ""))
+        raw_title = str(normalized.get("title") or "")
+        normalized["quality_tags"] = _quality_tags(_clean_title(raw_title) or raw_title)
         return normalized
 
     @staticmethod
@@ -211,9 +212,32 @@ def _relevance_score(item: dict[str, Any], keyword: str) -> int:
 
 def _query_title_relevance(keyword: str, title: str) -> int:
     normalized_keyword = _normalize_text(keyword)
-    normalized_title = _normalize_text(title)
-    if not normalized_keyword or not normalized_title:
+    if not normalized_keyword or not str(title or "").strip():
         return 0
+    variants = _title_variants(title)
+    # A fully bracketed release name keeps its real title inside one of the
+    # blocks ("资源名称：[流浪地球2][意大利版原盘…]"); promote the block that
+    # actually contains the keyword.
+    for match in _NOISY_BRACKET_RE.finditer(str(title)):
+        inner = (match.group(1) or "").strip()
+        if inner and inner not in variants and normalized_keyword in _normalize_text(inner):
+            variants.append(inner)
+    best = 0
+    for variant in variants:
+        normalized_title = _normalize_text(variant)
+        if not normalized_title:
+            continue
+        score = _pair_relevance(normalized_keyword, keyword, normalized_title, variant)
+        # 合集垃圾（微信引流、几十部剧打包）靠关键词子串混进高档位；
+        # 封顶到 59 让它掉出"相关"档。广告壳资源不受影响：信号在壳上，
+        # 剥壳后的干净变体照常拿高分。
+        if _is_junk_collection_title(variant):
+            score = min(score, 59)
+        best = max(best, score)
+    return best if best > 0 else 5
+
+
+def _pair_relevance(normalized_keyword: str, raw_keyword: str, normalized_title: str, raw_title: str) -> int:
     if normalized_title == normalized_keyword:
         return 100
 
@@ -223,7 +247,7 @@ def _query_title_relevance(keyword: str, title: str) -> int:
         position_ratio = position / max(1, len(normalized_title) - len(normalized_keyword))
         prefix_bonus = 15 if position == 0 else max(0, round(10 * (1 - position_ratio)))
         density_bonus = min(19, round(30 * density))
-        score = min(99, 65 + prefix_bonus + density_bonus)
+        score = min(99, 70 + prefix_bonus + density_bonus)
 
         # A complete, reasonably specific Chinese title remains strong evidence
         # even when a release name adds a site prefix and lengthy media tags.
@@ -233,30 +257,57 @@ def _query_title_relevance(keyword: str, title: str) -> int:
             score = max(score, long_title_floor)
         return score
 
+    # The title being the clean core of a longer query (e.g. title "\u4e09\u4f53" for
+    # keyword "\u4e09\u4f53 \u5218\u6148\u6b23") is strong evidence, but sequel numbers must agree \u2014
+    # "\u6c99\u4e18" must not match a "\u6c99\u4e182" query just because it is a prefix.
+    if (
+        len(normalized_title) >= 2
+        and normalized_keyword.find(normalized_title) >= 0
+        and bool(_DIGIT_RE.search(normalized_title)) == bool(_DIGIT_RE.search(normalized_keyword))
+    ):
+        return 85
+
     # Token matching must use the original keyword. ``_normalize_text`` removes
     # spaces and punctuation, so normalized input would turn an English query
     # into one long token and lose useful partial matches.
-    token_score = _keyword_token_hit_score(keyword, title)
+    token_score = _keyword_token_hit_score(raw_keyword, raw_title)
     if token_score:
-        return min(79, max(10, round(token_score * 0.9)))
-    return 5
+        return min(88, max(10, round(token_score * 1.1)))
+    return 0
 
 
 def _ranking_score(item: dict[str, Any], relevance_score: int) -> int:
     relevance = max(0, min(100, int(relevance_score)))
+    try:
+        preference_bonus = max(
+            0,
+            min(10, int(item.get("result_provider_priority_bonus") or 0)),
+        )
+    except (TypeError, ValueError):
+        preference_bonus = 0
+
+    # 网盘资源标题噪声极大（广告壳、译名差异、发行命名随意），精细的相关度
+    # 分差并不可靠。相关度只压缩成粗档位，用来把特别低相关的结果挡在后面；
+    # 档位之内由来源优先级决定先后，同优先级再按原始相关度和质量细分。
+    if relevance >= 60:
+        relevance_bucket = 2
+    elif relevance >= 25:
+        relevance_bucket = 1
+    else:
+        relevance_bucket = 0
 
     quality = item.get("quality_tags") or _quality_tags(str(item.get("title") or ""))
     quality_score = 0
     if "8k" in quality:
-        quality_score += 28
-    elif "4k" in quality:
         quality_score += 22
+    elif "4k" in quality:
+        quality_score += 16
     elif "1080p" in quality:
-        quality_score += 14
+        quality_score += 10
     elif "720p" in quality:
-        quality_score += 6
+        quality_score += 5
     if "hdr" in quality:
-        quality_score += 8
+        quality_score += 6
 
     provider_bonus = max(0, 20 - int(item.get("provider_priority") or 100))
     duplicate_bonus = min(20, (int(item.get("duplicate_count") or 1) - 1) * 5)
@@ -267,9 +318,10 @@ def _ranking_score(item: dict[str, Any], relevance_score: int) -> int:
     # destination are unknown until the server freezes an execution plan, so
     # search ranking must never infer route convenience.
     return (
-        relevance * 1_000_000
-        + int(bool(item.get("supported"))) * 100_000
-        + relevance * 100
+        relevance_bucket * 1_000_000_000
+        + preference_bonus * 10_000_000
+        + int(bool(item.get("supported"))) * 1_000_000
+        + relevance * 1_000
         + tie_breaker
     )
 
@@ -351,8 +403,43 @@ def _normalize_url(url: str) -> str:
     return f"{scheme}://{host}{path}" + (f"?{query}" if query else "")
 
 
+_FULLWIDTH_FOLD = {code: code - 0xFEE0 for code in range(0xFF01, 0xFF5F)}
+_FULLWIDTH_FOLD[0x3000] = 0x20
+_UNICODE_ROMAN_FOLD = {
+    ord("\u2170"): "1", ord("\u2171"): "2", ord("\u2172"): "3", ord("\u2173"): "4", ord("\u2174"): "5", ord("\u2175"): "6",
+    ord("\u2176"): "7", ord("\u2177"): "8", ord("\u2178"): "9", ord("\u2179"): "10", ord("\u217a"): "11", ord("\u217b"): "12",
+}
+_CN_DIGIT_FOLD = {
+    "\u4e00": "1", "\u4e8c": "2", "\u4e24": "2", "\u4e09": "3", "\u56db": "4", "\u4e94": "5",
+    "\u516d": "6", "\u4e03": "7", "\u516b": "8", "\u4e5d": "9", "\u5341": "10",
+}
+_SEASON_CN_RE = re.compile(r"\u7b2c([0-9\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341]{1,3})[\u5b63\u90e8\u96c6]")
+_ROMAN_AFTER_CJK_RE = re.compile(r"(?<=[\u4e00-\u9fff])(?:viii|vii|xii|vi|iii|ii|iv|ix|xi)(?![a-z])")
+_ROMAN_VALUE = {
+    "ii": "2", "iii": "3", "iv": "4", "vi": "6", "vii": "7",
+    "viii": "8", "ix": "9", "xi": "11", "xii": "12",
+}
+_DIGIT_RE = re.compile(r"[0-9]")
+
+
+def _season_repl(match: re.Match) -> str:
+    raw = match.group(1)
+    if raw.isdigit():
+        return raw
+    if len(raw) == 1 and raw in _CN_DIGIT_FOLD:
+        return _CN_DIGIT_FOLD[raw]
+    return match.group(0)
+
+
+def _roman_repl(match: re.Match) -> str:
+    return _ROMAN_VALUE[match.group(0)]
+
+
 def _normalize_text(value: str) -> str:
-    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(value or "")).lower()
+    text = str(value or "").lower().translate(_FULLWIDTH_FOLD).translate(_UNICODE_ROMAN_FOLD)
+    text = _SEASON_CN_RE.sub(_season_repl, text)
+    text = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
+    return _ROMAN_AFTER_CJK_RE.sub(_roman_repl, text)
 
 
 def _elapsed_ms(start: float) -> float:
@@ -392,13 +479,76 @@ def _keyword_token_hit_score(keyword: str, title: str) -> int:
     if not keyword or not title:
         return 0
     normalized_title = _normalize_text(title)
-    tokens = [
-        _normalize_text(token)
-        for token in re.findall(r"[0-9a-zA-Z]+|[\u4e00-\u9fff]+", str(keyword or "").lower())
-    ]
-    tokens = list(dict.fromkeys(token for token in tokens if len(token) >= 2))
-    if not tokens:
+    if not normalized_title:
         return 0
-    matched_weight = sum(len(token) for token in tokens if token in normalized_title)
-    total_weight = sum(len(token) for token in tokens)
+    # CJK runs are scored by 2-gram coverage instead of whole-block equality,
+    # so translation variants like "\u6c99\u4e18\uff1a\u7b2c\u4e8c\u90e8" vs "\u6c99\u4e182" keep partial credit.
+    weights: dict[str, int] = {}
+    for part in re.findall(r"[0-9a-z]+|[\u4e00-\u9fff]+", str(keyword).lower()):
+        if len(part) >= 2 and part.isascii():
+            weights[part] = len(part)
+        elif len(part) >= 2:
+            for gram in {part[i : i + 2] for i in range(len(part) - 1)}:
+                weights[gram] = 2
+        elif part.isdigit():
+            weights[part] = 1
+    if not weights:
+        return 0
+    matched_weight = sum(weight for token, weight in weights.items() if token in normalized_title)
+    total_weight = sum(weights.values())
     return int(80 * matched_weight / total_weight) if total_weight else 0
+
+
+_URL_RE = re.compile(
+    r"(?:https?://|www\.)[\w\-./?=&%#:~+]+|\b[\w-]+\.(?:com|net|org|cc|xyz|me|top|club|vip|icu|info|site|online)(?:/[\w\-./?=&%#:~+]*)?",
+    re.IGNORECASE,
+)
+_NOISY_BRACKET_RE = re.compile(r"[\u3010\[]([^\u3010\[\]\u3011]*)[\u3011\]]")
+_BRACKET_NOISE_HINT_RE = re.compile(
+    r"(?:www\.|https?://|\.com|\.net|\.cc|\.xyz|\u53d1\u5e03|\u5e7f\u544a|\u5b98\u7f51|\u57df\u540d|\u9632\u8d70\u4e22|\u6c38\u4e45|\u9ad8\u6e05\u5f71\u89c6|\u5f71\u89c6\u4e4b\u5bb6|\u8d44\u6e90\u7ad9)",
+    re.IGNORECASE,
+)
+_PREFIX_LABEL_RE = re.compile(r"^\s*\u8d44\u6e90\u540d\u79f0\s*[\uff1a:]\s*")
+
+# \u5f3a\u5783\u573e\u4fe1\u53f7\uff1a\u5fae\u4fe1\u5f15\u6d41\u8bdd\u672f\uff1b\u4e09\u4e2a\u4ee5\u4e0a"\uff08N\u96c6\uff09"\u6bb5\u843d\u8bf4\u660e\u662f\u591a\u5267\u5408\u96c6\u6253\u5305\u3002
+_JUNK_PROMO_RE = re.compile(r"(?:\u6dfb\u52a0\u5fae\u4fe1|\u5fae\u4fe1\u53f7|\u52a0\u5fae\u4fe1|\u673a\u5668\u4eba\u7fa4)")
+_EPISODE_COUNT_RE = re.compile(r"[\uff08(]\s*\d{1,4}\s*[\u96c6\u8bdd\u56de]\s*[\uff09)]")
+
+
+def _is_junk_collection_title(variant: str) -> bool:
+    text = str(variant or "")
+    if _JUNK_PROMO_RE.search(text):
+        return True
+    return len(_EPISODE_COUNT_RE.findall(text)) >= 3
+
+
+def _clean_title(title: str) -> str:
+    """Strip ad shells (site prefix blocks, domains, "\u8d44\u6e90\u540d\u79f0\uff1a" labels) from a release name."""
+    text = _PREFIX_LABEL_RE.sub("", str(title or "").strip())
+    text = _URL_RE.sub(" ", text)
+
+    def _drop_noisy(match: re.Match) -> str:
+        inner = match.group(1) or ""
+        return " " if _BRACKET_NOISE_HINT_RE.search(inner) else match.group(0)
+
+    text = _NOISY_BRACKET_RE.sub(_drop_noisy, text)
+    return re.sub(r"\s+", " ", text).strip(" \t-_|\u00b7\u2022\uff0c,")
+
+
+def _strip_title(title: str) -> str:
+    """Aggressively drop every bracketed block and URL, leaving the bare core title."""
+    text = _PREFIX_LABEL_RE.sub("", str(title or "").strip())
+    text = _URL_RE.sub(" ", text)
+    text = _NOISY_BRACKET_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip(" \t-_|·•，,")
+
+
+def _title_variants(title: str) -> list[str]:
+    text = str(title or "").strip()
+    if not text:
+        return []
+    variants = [text]
+    for candidate in (_clean_title(text), _strip_title(text)):
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants

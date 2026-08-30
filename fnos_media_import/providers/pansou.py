@@ -9,9 +9,11 @@ from typing import Any
 import requests
 
 from ..classifiers.link_classifier import detect_link
+from ..http_client import HttpClient, HttpJsonDecodeError
 
 
 DEFAULT_CLOUD_TYPES = ["quark", "tianyi", "mobile", "magnet"]
+DEFAULT_RESULT_PROVIDER_PRIORITY = ["quark", "mobile", "tianyi", "magnet"]
 # ``0`` means PanSou picks its own configured concurrency, and ``_search_payload``
 # then omits ``conc`` entirely. A pinned value of 10 makes instances with many
 # plugins process the search in batches: measured against a live PanSou, a cold
@@ -26,12 +28,27 @@ class PanSouAuthError(RuntimeError):
 
 
 class PanSouTokenManager:
-    def __init__(self, base_url: str, username: str = "", password: str = "", default_token: str = "", timeout: int = 15, verify_tls: bool = True):
+    def __init__(
+        self,
+        base_url: str,
+        username: str = "",
+        password: str = "",
+        default_token: str = "",
+        timeout: float = 15,
+        verify_tls: bool = True,
+        *,
+        connect_timeout: float = 5,
+        request_retries: int = 2,
+        retry_delay_seconds: float = 0.2,
+    ):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
         self.token = default_token
         self.timeout = timeout
+        self.connect_timeout = connect_timeout
+        self.request_retries = request_retries
+        self.retry_delay_seconds = retry_delay_seconds
         self.verify_tls = verify_tls
         self.expires_at = self._extract_exp(default_token)
 
@@ -52,19 +69,19 @@ class PanSouTokenManager:
             return False
         url = f"{self.base_url}/api/auth/login"
         try:
-            response = _post_json_no_env_proxy(
+            status_code, data = _post_json_no_env_proxy(
                 url,
-                json={"username": self.username, "password": self.password},
-                timeout=self.timeout,
-                verify=self.verify_tls,
+                {"username": self.username, "password": self.password},
+                connect_timeout=self.connect_timeout,
+                read_timeout=self.timeout,
+                request_retries=self.request_retries,
+                retry_delay_seconds=self.retry_delay_seconds,
+                verify_tls=self.verify_tls,
+                read_only=False,
             )
-        except requests.RequestException:
+        except (requests.RequestException, HttpJsonDecodeError):
             return False
-        if response.status_code != 200:
-            return False
-        try:
-            data = response.json()
-        except ValueError:
+        if status_code != 200 or not isinstance(data, dict):
             return False
         token = data.get("token") or data.get("data", {}).get("token")
         if not token:
@@ -85,9 +102,25 @@ class PanSouTokenManager:
 class PanSouClient:
     def __init__(self, config: dict[str, Any]):
         self.base_url = str(config.get("base_url", "")).rstrip("/")
-        self.timeout = _bounded_int(config.get("timeout"), 20, 1, 300)
+        legacy_timeout = _bounded_float(config.get("timeout"), 20, 1, 300)
+        self.read_timeout = _bounded_float(config.get("read_timeout"), legacy_timeout, 1, 300)
+        self.connect_timeout = _bounded_float(
+            config.get("connect_timeout"),
+            min(5.0, self.read_timeout),
+            0.1,
+            60,
+        )
+        self.timeout = self.read_timeout
+        self.request_retries = _bounded_int(config.get("request_retries"), 2, 0, 5)
+        self.retry_delay_seconds = _bounded_float(
+            config.get("retry_delay_seconds"), 0.2, 0, 10
+        )
         self.verify_tls = _as_bool(config.get("verify_tls"), True)
         self.cloud_types = _normalize_cloud_types(config.get("cloud_types"), DEFAULT_CLOUD_TYPES)
+        self.result_provider_priority = _normalize_provider_priority(
+            config.get("result_provider_priority"),
+            DEFAULT_RESULT_PROVIDER_PRIORITY,
+        )
         self.result_type = _normalize_choice(config.get("res"), {"all", "results", "merge"}, "merge")
         self.source_scope = _normalize_choice(config.get("src"), {"all", "tg", "plugin"}, "all")
         self.conc = _bounded_int(config.get("conc"), DEFAULT_CONCURRENCY, 0, 100)
@@ -108,6 +141,9 @@ class PanSouClient:
             default_token=str(config.get("default_token", "")),
             timeout=self.timeout,
             verify_tls=self.verify_tls,
+            connect_timeout=self.connect_timeout,
+            request_retries=self.request_retries,
+            retry_delay_seconds=self.retry_delay_seconds,
         )
 
     def search(self, keyword: str, sources: list[str] | None = None, token: str = "", options: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -124,6 +160,27 @@ class PanSouClient:
         async_poll_interval = _bounded_float(runtime_options.get("async_poll_interval_seconds"), self.async_poll_interval_seconds, 0.2, 10.0) if "async_poll_interval_seconds" in runtime_options else self.async_poll_interval_seconds
         async_poll_max_rounds = _bounded_int(runtime_options.get("async_poll_max_rounds"), self.async_poll_max_rounds, 0, 30) if "async_poll_max_rounds" in runtime_options else self.async_poll_max_rounds
         async_poll_stable_rounds = _bounded_int(runtime_options.get("async_poll_stable_rounds"), self.async_poll_stable_rounds, 1, 10) if "async_poll_stable_rounds" in runtime_options else self.async_poll_stable_rounds
+
+        if not self.cloud_types:
+            logger.info(
+                "search_trace=%s stage=pansou_skipped reason=no_enabled_cloud_types keyword=%r",
+                trace_id,
+                _short_text(keyword),
+            )
+            return {
+                "raw": {
+                    "latest": {},
+                    "snapshots": [],
+                    "async_poll": {
+                        "enabled": False,
+                        "interval_seconds": async_poll_interval,
+                        "max_rounds": async_poll_max_rounds,
+                        "stable_rounds": async_poll_stable_rounds,
+                        "elapsed_hint_seconds": 0,
+                    },
+                },
+                "items": [],
+            }
 
         logger.info(
             "search_trace=%s stage=pansou_start keyword=%r res=%s src=%s conc=%s refresh=%s async_poll=%s cloud_types=%s",
@@ -218,12 +275,17 @@ class PanSouClient:
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        response = _post_json_no_env_proxy(url, json=payload, headers=headers, timeout=self.timeout, verify=self.verify_tls)
-        try:
-            data = response.json()
-        except ValueError:
-            data = {"text": response.text}
-        return response.status_code, data
+        return _post_json_no_env_proxy(
+            url,
+            payload,
+            headers=headers,
+            connect_timeout=self.connect_timeout,
+            read_timeout=self.read_timeout,
+            request_retries=self.request_retries,
+            retry_delay_seconds=self.retry_delay_seconds,
+            verify_tls=self.verify_tls,
+            read_only=True,
+        )
 
     def _recover_auth_failure(
         self,
@@ -392,6 +454,8 @@ class PanSouClient:
 
 def _normalize_cloud_types(value: Any, default: list[str]) -> list[str]:
     allowed = {"quark", "tianyi", "mobile", "magnet"}
+    if value is None:
+        return list(default)
     if isinstance(value, str):
         candidates = [item.strip().lower() for item in value.split(",")]
     elif isinstance(value, (list, tuple, set)):
@@ -402,7 +466,23 @@ def _normalize_cloud_types(value: Any, default: list[str]) -> list[str]:
     for item in candidates:
         if item in allowed and item not in result:
             result.append(item)
-    return result or list(default)
+    return result
+
+
+def _normalize_provider_priority(value: Any, default: list[str]) -> list[str]:
+    if isinstance(value, str):
+        candidates = [item.strip().lower() for item in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        candidates = [str(item).strip().lower() for item in value]
+    else:
+        candidates = []
+    allowed = set(default)
+    result: list[str] = []
+    for item in candidates:
+        if item in allowed and item not in result:
+            result.append(item)
+    result.extend(item for item in default if item not in result)
+    return result
 
 
 def _normalize_choice(value: Any, allowed: set[str], default: str) -> str:
@@ -445,12 +525,38 @@ def _short_text(value: Any, limit: int = 40) -> str:
     return text[:limit] + "…"
 
 
-def _post_json_no_env_proxy(url: str, **kwargs: Any) -> requests.Response:
+def _post_json_no_env_proxy(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+    connect_timeout: float,
+    read_timeout: float,
+    request_retries: int,
+    retry_delay_seconds: float,
+    verify_tls: bool,
+    read_only: bool,
+) -> tuple[int, Any]:
     """调用内网/自建 PanSou 时不继承系统代理，避免被 127.0.0.1:7890 等代理劫持超时。"""
 
-    with requests.Session() as session:
-        session.trust_env = False
-        return session.post(url, **kwargs)
+    client = HttpClient(
+        timeout=read_timeout,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        request_retries=request_retries,
+        retry_delay_seconds=retry_delay_seconds,
+        verify_tls=verify_tls,
+        trust_env=False,
+    )
+    try:
+        return client.post_json(
+            url,
+            payload,
+            headers=headers,
+            read_only=read_only,
+        )
+    finally:
+        client.close()
 
 
 def _normalize_string_list(value: Any) -> list[str]:

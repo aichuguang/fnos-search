@@ -100,7 +100,9 @@ def _to_bool(value: Any, default: bool) -> bool:
 
 
 def _normalize_text(value: str) -> str:
-    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(value or "")).lower()
+    from ..search.aggregator import _normalize_text as _aggregator_normalize_text
+
+    return _aggregator_normalize_text(value)
 
 
 def _elapsed_ms(start: float) -> float:

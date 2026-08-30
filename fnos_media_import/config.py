@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 CMCC_DEFAULT_HOST = "https://personal-kd-njs.yun.139.com/hcy"
 
 CATEGORY_KEYS = (CATEGORY_MOVIE, CATEGORY_TV, CATEGORY_ANIME, CATEGORY_VARIETY, CATEGORY_OTHER)
+
+PANSOU_PROVIDER_KEYS = ("quark", "mobile", "tianyi", "magnet")
+DEFAULT_RESULT_PROVIDER_BADGES: dict[str, dict[str, Any]] = {
+    "quark": {"enabled": False, "text": ""},
+    "mobile": {"enabled": False, "text": "秒入库"},
+    "tianyi": {"enabled": False, "text": ""},
+    "magnet": {"enabled": False, "text": "快速入库"},
+}
 
 _REMOVED_CONFIG_SECTIONS = frozenset({"quark", "cloud189", "cloud139", "cmcc_upload", "routes"})
 _REMOVED_APP_FIELDS = frozenset({"secret_key"})
@@ -131,17 +140,113 @@ def _env_csv(name: str, default: list[str] | None = None) -> list[str]:
 
 def _cloud_type_values(value: Any, default: list[str] | None = None) -> list[str]:
     allowed = {"quark", "tianyi", "mobile", "magnet"}
+    if value is None:
+        return list(default or ["quark", "tianyi", "mobile", "magnet"])
     items = value if isinstance(value, list) else str(value or "").split(",")
     result = []
     for item in items:
         text = str(item or "").strip().lower()
         if text in allowed and text not in result:
             result.append(text)
-    return result or list(default or ["quark", "tianyi", "mobile", "magnet"])
+    return result
 
 
 def _env_cloud_types(name: str, default: list[str] | None = None) -> list[str]:
     return _cloud_type_values(_env_csv(name, default), default)
+
+
+def _result_provider_priority_values(
+    value: Any,
+    default: list[str] | None = None,
+) -> list[str]:
+    fallback = list(default or ["quark", "mobile", "tianyi", "magnet"])
+    allowed = set(fallback)
+    items = value if isinstance(value, list) else str(value or "").split(",")
+    result: list[str] = []
+    for item in items:
+        text = str(item or "").strip().lower()
+        if text in allowed and text not in result:
+            result.append(text)
+    result.extend(item for item in fallback if item not in result)
+    return result
+
+
+def normalize_result_provider_badges(
+    value: Any,
+    *,
+    strict: bool = False,
+    coerce_invalid_text: bool = False,
+) -> dict[str, dict[str, Any]]:
+    result = {
+        provider: {
+            "enabled": bool(settings.get("enabled", False)),
+            "text": str(settings.get("text") or "").strip(),
+        }
+        for provider, settings in DEFAULT_RESULT_PROVIDER_BADGES.items()
+    }
+    if value is None:
+        return result
+    if not isinstance(value, dict):
+        if strict:
+            raise ValueError("网盘角标配置必须是对象")
+        return result
+
+    unknown_providers = sorted(str(key) for key in value if str(key) not in PANSOU_PROVIDER_KEYS)
+    if strict and unknown_providers:
+        raise ValueError(f"网盘角标包含不支持的来源：{'、'.join(unknown_providers)}")
+
+    for provider in PANSOU_PROVIDER_KEYS:
+        if provider not in value:
+            continue
+        raw = value.get(provider)
+        if not isinstance(raw, dict):
+            if strict:
+                raise ValueError(f"{provider} 角标配置必须是对象")
+            continue
+        unknown_fields = sorted(str(key) for key in raw if str(key) not in {"enabled", "text"})
+        if strict and unknown_fields:
+            raise ValueError(f"{provider} 角标包含不支持的字段：{'、'.join(unknown_fields)}")
+
+        enabled_raw = raw.get("enabled", False)
+        if strict and not isinstance(enabled_raw, bool):
+            raise ValueError(f"{provider} 角标开关必须是布尔值")
+        enabled = (
+            enabled_raw
+            if isinstance(enabled_raw, bool)
+            else str(enabled_raw or "").strip().lower() in {"1", "true", "yes", "on", "y", "是", "启用"}
+        )
+        text = str(raw.get("text") or "").strip()
+        valid_text = bool(re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,5}", text))
+        if text and not valid_text:
+            if strict and not coerce_invalid_text:
+                raise ValueError(f"{provider} 角标文案必须为 2-5 个中文字符")
+            text = result[provider]["text"]
+            enabled = False
+            valid_text = bool(re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,5}", text))
+        if enabled and not valid_text:
+            if strict and not coerce_invalid_text:
+                raise ValueError(f"{provider} 启用角标时必须填写 2-5 个中文字符")
+            enabled = False
+        result[provider] = {"enabled": bool(enabled), "text": text}
+    return result
+
+
+def _ensure_pansou_preferences(raw: dict[str, Any]) -> None:
+    pansou = raw.setdefault("pansou", {})
+    if not isinstance(pansou, dict):
+        pansou = {}
+        raw["pansou"] = pansou
+    pansou["cloud_types"] = _cloud_type_values(
+        pansou.get("cloud_types"),
+        ["quark", "tianyi", "mobile", "magnet"],
+    )
+    pansou["result_provider_priority"] = _result_provider_priority_values(
+        pansou.get("result_provider_priority"),
+        ["quark", "mobile", "tianyi", "magnet"],
+    )
+    pansou["result_provider_badges"] = normalize_result_provider_badges(
+        pansou.get("result_provider_badges")
+    )
 
 
 def _load_dotenv(path: Path) -> None:
@@ -241,6 +346,7 @@ def _default_config() -> dict[str, Any]:
             "rate_limit_enabled": _env_bool("SECURITY_RATE_LIMIT_ENABLED", True),
             "rate_limit_window_seconds": _env_int("SECURITY_RATE_LIMIT_WINDOW_SECONDS", 60),
             "public_search_rate_limit": _env_int("SECURITY_PUBLIC_SEARCH_RATE_LIMIT", 20),
+            "public_tmdb_search_rate_limit": _env_int("SECURITY_PUBLIC_TMDB_SEARCH_RATE_LIMIT", 20),
             "public_detect_rate_limit": _env_int("SECURITY_PUBLIC_DETECT_RATE_LIMIT", 40),
             "public_submit_rate_limit": _env_int("SECURITY_PUBLIC_SUBMIT_RATE_LIMIT", 10),
             "public_request_rate_limit": _env_int("SECURITY_PUBLIC_REQUEST_RATE_LIMIT", 60),
@@ -268,6 +374,11 @@ def _default_config() -> dict[str, Any]:
             "password": os.getenv("PANSOU_PASSWORD", ""),
             "default_token": os.getenv("PANSOU_DEFAULT_TOKEN", ""),
             "cloud_types": _env_cloud_types("PANSOU_CLOUD_TYPES", ["quark", "tianyi", "mobile", "magnet"]),
+            "result_provider_priority": _result_provider_priority_values(
+                os.getenv("PANSOU_RESULT_PROVIDER_PRIORITY", ""),
+                ["quark", "mobile", "tianyi", "magnet"],
+            ),
+            "result_provider_badges": normalize_result_provider_badges(None),
             "res": os.getenv("PANSOU_RES", "merge"),
             "src": os.getenv("PANSOU_SRC", "all"),
             # ``0`` delegates concurrency to PanSou's own configuration. Pinning
@@ -284,6 +395,9 @@ def _default_config() -> dict[str, Any]:
             "async_poll_max_rounds": _env_int("PANSOU_ASYNC_POLL_MAX_ROUNDS", 2),
             "async_poll_stable_rounds": _env_int("PANSOU_ASYNC_POLL_STABLE_ROUNDS", 1),
             "timeout": _env_int("PANSOU_TIMEOUT", 20),
+            "connect_timeout": _env_float("PANSOU_CONNECT_TIMEOUT", 5.0),
+            "request_retries": _env_int("PANSOU_REQUEST_RETRIES", 2),
+            "retry_delay_seconds": _env_float("PANSOU_RETRY_DELAY_SECONDS", 0.2),
             "verify_tls": _env_bool("PANSOU_VERIFY_TLS", True),
         },
         "btbtla": {
@@ -549,6 +663,7 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
         ("pansou", "password"): "PANSOU_PASSWORD",
         ("pansou", "default_token"): "PANSOU_DEFAULT_TOKEN",
         ("pansou", "cloud_types"): "PANSOU_CLOUD_TYPES",
+        ("pansou", "result_provider_priority"): "PANSOU_RESULT_PROVIDER_PRIORITY",
         ("pansou", "res"): "PANSOU_RES",
         ("pansou", "src"): "PANSOU_SRC",
         ("pansou", "conc"): "PANSOU_CONC",
@@ -562,6 +677,10 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
         ("pansou", "async_poll_max_rounds"): "PANSOU_ASYNC_POLL_MAX_ROUNDS",
         ("pansou", "async_poll_stable_rounds"): "PANSOU_ASYNC_POLL_STABLE_ROUNDS",
         ("pansou", "timeout"): "PANSOU_TIMEOUT",
+        ("pansou", "connect_timeout"): "PANSOU_CONNECT_TIMEOUT",
+        ("pansou", "read_timeout"): "PANSOU_READ_TIMEOUT",
+        ("pansou", "request_retries"): "PANSOU_REQUEST_RETRIES",
+        ("pansou", "retry_delay_seconds"): "PANSOU_RETRY_DELAY_SECONDS",
         ("pansou", "verify_tls"): "PANSOU_VERIFY_TLS",
         ("btbtla", "base_url"): "BTBTLA_BASE_URL",
         ("btbtla", "timeout"): "BTBTLA_TIMEOUT",
@@ -694,6 +813,7 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
         ("security", "rate_limit_enabled"): "SECURITY_RATE_LIMIT_ENABLED",
         ("security", "rate_limit_window_seconds"): "SECURITY_RATE_LIMIT_WINDOW_SECONDS",
         ("security", "public_search_rate_limit"): "SECURITY_PUBLIC_SEARCH_RATE_LIMIT",
+        ("security", "public_tmdb_search_rate_limit"): "SECURITY_PUBLIC_TMDB_SEARCH_RATE_LIMIT",
         ("security", "public_detect_rate_limit"): "SECURITY_PUBLIC_DETECT_RATE_LIMIT",
         ("security", "public_submit_rate_limit"): "SECURITY_PUBLIC_SUBMIT_RATE_LIMIT",
         ("security", "public_request_rate_limit"): "SECURITY_PUBLIC_REQUEST_RATE_LIMIT",
@@ -763,7 +883,12 @@ def _apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
             current = config
             for section in path[:-1]:
                 current = current.setdefault(section, {})
-            current[path[-1]] = _cloud_type_values(value) if env_name == "PANSOU_CLOUD_TYPES" else value
+            if env_name == "PANSOU_CLOUD_TYPES":
+                current[path[-1]] = _cloud_type_values(value)
+            elif env_name == "PANSOU_RESULT_PROVIDER_PRIORITY":
+                current[path[-1]] = _result_provider_priority_values(value)
+            else:
+                current[path[-1]] = value
     # Provider credentials, OpenList connection identity and storage target
     # paths are deliberately *not* read from environment aliases.  They are
     # owned by the account/target databases and are resolved from frozen
@@ -910,5 +1035,6 @@ def load_config(config_path: str | os.PathLike[str] | None = None) -> AppConfig:
         merged.setdefault("rclone", {})["app_callback_url"] = f"http://127.0.0.1:{port}/api/callback/rclone"
 
     _ensure_storage_config(merged)
+    _ensure_pansou_preferences(merged)
 
     return AppConfig(raw=merged)

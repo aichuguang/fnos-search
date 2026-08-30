@@ -187,6 +187,129 @@ class ConfigExportImportV1Tests(unittest.TestCase):
         self.assertEqual(merged["pansou"]["base_url"], "")
         self.assertEqual(merged["pansou"]["channels"], [])
 
+    def test_provider_priority_is_normalized_without_filtering_missing_types(self) -> None:
+        normalized = normalize_advanced_config_payload(
+            _payload(
+                {
+                    "pansou": {
+                        "result_provider_priority": [
+                            "mobile",
+                            "invalid",
+                            "mobile",
+                            "quark",
+                        ]
+                    }
+                },
+                mode="replace",
+            )
+        )
+
+        self.assertEqual(
+            normalized["pansou"]["result_provider_priority"],
+            ["mobile", "quark", "tianyi", "magnet"],
+        )
+
+    def test_provider_badges_are_normalized_and_validated(self) -> None:
+        normalized = normalize_advanced_config_payload(
+            _payload(
+                {
+                    "pansou": {
+                        "cloud_types": [],
+                        "result_provider_badges": {
+                            "mobile": {"enabled": True, "text": "秒入库"},
+                            "magnet": {"enabled": True, "text": "快速入库"},
+                        },
+                    }
+                }
+            )
+        )
+
+        self.assertEqual(normalized["pansou"]["cloud_types"], [])
+        self.assertEqual(
+            normalized["pansou"]["result_provider_badges"],
+            {
+                "quark": {"enabled": False, "text": ""},
+                "mobile": {"enabled": True, "text": "秒入库"},
+                "tianyi": {"enabled": False, "text": ""},
+                "magnet": {"enabled": True, "text": "快速入库"},
+            },
+        )
+
+        for badges in (
+            {"mobile": {"enabled": True, "text": "秒"}},
+            {"mobile": {"enabled": True, "text": "超过五个字符"}},
+            {"mobile": {"enabled": True, "text": ""}},
+            {"mobile": {"enabled": True, "text": "fast"}},
+            {"mobile": {"enabled": True, "text": "秒save"}},
+            {"unknown": {"enabled": True, "text": "测试角标"}},
+        ):
+            with self.subTest(badges=badges), self.assertRaises(ValueError):
+                normalize_advanced_config_payload(
+                    _payload({"pansou": {"result_provider_badges": badges}})
+                )
+
+    def test_legacy_non_chinese_provider_badge_does_not_block_startup(self) -> None:
+        normalized = persisted_config_from_settings(
+            {
+                "advanced_config": {
+                    "pansou": {
+                        "result_provider_badges": {
+                            "quark": {"enabled": True, "text": "FAST"},
+                            "mobile": {"enabled": True, "text": "SAVE"},
+                        }
+                    }
+                }
+            }
+        )
+
+        badges = normalized["pansou"]["result_provider_badges"]
+        self.assertEqual(badges["quark"], {"enabled": False, "text": ""})
+        self.assertEqual(badges["mobile"], {"enabled": False, "text": "秒入库"})
+
+        merged = normalize_advanced_config_payload(
+            _payload({"pansou": {"timeout": 45}}),
+            current_stored={
+                "pansou": {
+                    "result_provider_badges": {
+                        "quark": {"enabled": True, "text": "FAST"},
+                    }
+                }
+            },
+        )
+        self.assertEqual(
+            merged["pansou"]["result_provider_badges"]["quark"],
+            {"enabled": False, "text": ""},
+        )
+
+    def test_provider_badge_update_persists_and_triggers_runtime_reload(self) -> None:
+        db = _FakeDb({})
+        reload_calls = 0
+
+        def reload_runtime() -> dict[str, Any]:
+            nonlocal reload_calls
+            reload_calls += 1
+            return {"reloaded": True}
+
+        service = _service(db, raw_config={}, reload_runtime=reload_runtime)
+        result, status = service.update_advanced(
+            _payload(
+                {
+                    "pansou": {
+                        "result_provider_badges": {
+                            "mobile": {"enabled": True, "text": "秒入库"},
+                        }
+                    }
+                }
+            )
+        )
+
+        self.assertEqual(status, 200, result)
+        self.assertEqual(reload_calls, 1)
+        self.assertEqual(
+            db.app_settings.get_all()["advanced_config"]["pansou"]["result_provider_badges"]["mobile"],
+            {"enabled": True, "text": "秒入库"},
+        )
+
     def test_merge_preserves_secret_and_clear_secret_removes_only_requested_value(self) -> None:
         current = {
             "pansou": {"password": "old-secret", "base_url": "http://old"},

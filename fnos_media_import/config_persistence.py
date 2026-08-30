@@ -5,7 +5,13 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from .config import AppConfig, _deep_merge, _ensure_storage_config
+from .config import (
+    AppConfig,
+    _deep_merge,
+    _ensure_pansou_preferences,
+    _ensure_storage_config,
+    normalize_result_provider_badges,
+)
 from .constants import (
     CATEGORY_ANIME,
     CATEGORY_MOVIE,
@@ -108,6 +114,8 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "password": "secret",
         "default_token": "secret",
         "cloud_types": "cloud_types",
+        "result_provider_priority": "provider_priority",
+        "result_provider_badges": "provider_badges",
         "res": "str",
         "src": "str",
         "conc": "int",
@@ -121,6 +129,10 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "async_poll_max_rounds": "int",
         "async_poll_stable_rounds": "int",
         "timeout": "int",
+        "connect_timeout": "float",
+        "read_timeout": "float",
+        "request_retries": "int",
+        "retry_delay_seconds": "float",
     },
     "update_scheduler": {
         "enabled": "bool",
@@ -289,6 +301,7 @@ def apply_persisted_config(app_config: AppConfig, settings: dict[str, Any]) -> A
         return app_config
     merged = _deep_merge(copy.deepcopy(app_config.raw), persisted)
     _ensure_storage_config(merged)
+    _ensure_pansou_preferences(merged)
     return AppConfig(raw=merged, base_dir=app_config.base_dir)
 
 
@@ -306,8 +319,20 @@ def persisted_config_from_settings(settings: dict[str, Any]) -> dict[str, Any]:
         )
     _reject_deprecated_advanced_paths(raw)
     _reject_unknown_advanced_paths(raw)
+    canonical = copy.deepcopy(raw)
+    pansou = canonical.get("pansou")
+    if isinstance(pansou, dict) and "result_provider_badges" in pansou:
+        # A short-lived frontend build accepted arbitrary 2-5 character badge
+        # labels. Keep startup compatible with those already stored values,
+        # but disable the badge and fall back to a safe Chinese default. New
+        # update/import payloads remain strict and reject the same value.
+        pansou["result_provider_badges"] = normalize_result_provider_badges(
+            pansou.get("result_provider_badges"),
+            strict=True,
+            coerce_invalid_text=True,
+        )
     return sanitize_advanced_config(
-        raw,
+        canonical,
         current={},
         preserve_secret_placeholders=False,
     )
@@ -357,6 +382,8 @@ def normalize_advanced_config_payload(payload: dict[str, Any], current_stored: d
         raise ValueError("数据库高级配置必须是对象")
     _reject_deprecated_advanced_paths(current)
     _reject_unknown_advanced_paths(current)
+    if current:
+        current = persisted_config_from_settings({ADVANCED_CONFIG_KEY: current})
     requested_mode = str(payload.get("mode") or "").strip().lower()
     # Imports and updates use one versioned document shape.  Bare section
     # dictionaries were accepted by the pre-V1 UI and are intentionally
@@ -809,6 +836,10 @@ def _convert_value(value: Any, field_type: str, preserve_secret_placeholders: bo
         return _to_list(value), True
     if field_type == "cloud_types":
         return _to_cloud_types(value), True
+    if field_type == "provider_priority":
+        return _to_provider_priority(value), True
+    if field_type == "provider_badges":
+        return normalize_result_provider_badges(value, strict=True), True
     if field_type == "daily_time":
         text = str(value or "").strip()
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text):
@@ -856,7 +887,16 @@ def _to_cloud_types(value: Any) -> list[str]:
     allowed = {"quark", "tianyi", "mobile", "magnet"}
     values = _to_list(value)
     result = [item.lower() for item in values if item.lower() in allowed]
-    return result or ["quark", "tianyi", "mobile", "magnet"]
+    return list(dict.fromkeys(result))
+
+
+def _to_provider_priority(value: Any) -> list[str]:
+    fallback = ["quark", "mobile", "tianyi", "magnet"]
+    values = _to_list(value)
+    result = [item.lower() for item in values if item.lower() in fallback]
+    result = list(dict.fromkeys(result))
+    result.extend(item for item in fallback if item not in result)
+    return result
 
 
 def _prune_empty_sections(config: dict[str, Any]) -> dict[str, Any]:

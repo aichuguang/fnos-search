@@ -13,6 +13,8 @@
             publicMessageForDisplay,
             showGlobalLoading,
             hideGlobalLoading,
+            showPublicSearchTransition,
+            hidePublicSearchTransition,
             resetNoticeBox,
             setPublicSearchStatus,
             loadSixpanParseForPublic,
@@ -33,6 +35,163 @@
         const SEARCH_SOURCE_META = searchSourceMetaDefaults;
         const workbench = window.FnosResourceSearchWorkbench;
         let publicSupplementController = null;
+
+        function tmdbPanel() {
+            return $("publicTmdbPanel");
+        }
+
+        function setTmdbPanelVisibility(visible) {
+            const panel = tmdbPanel();
+            if (!panel) return;
+            panel.classList.toggle("hidden", !visible);
+            document.body.classList.toggle("public-tmdb-modal-open", Boolean(visible));
+            document.documentElement.classList.toggle("is-tmdb-modal-open", Boolean(visible));
+        }
+
+        function hideTmdbPanel() {
+            setTmdbPanelVisibility(false);
+            const candidates = $("publicTmdbCandidates");
+            if (candidates) candidates.innerHTML = "";
+        }
+
+        function setTmdbPanelState(state, title) {
+            const panel = tmdbPanel();
+            if (!panel) return;
+            panel.dataset.state = state || "";
+            if ($("publicTmdbTitle")) $("publicTmdbTitle").textContent = title || "请选择匹配的影视";
+        }
+
+        function renderTmdbCandidates(items) {
+            const panel = tmdbPanel();
+            const box = $("publicTmdbCandidates");
+            if (!panel || !box) return;
+            setTmdbPanelState("ready", "请选择匹配的影视");
+            box.innerHTML = (Array.isArray(items) ? items : []).map((item, index) => {
+                const title = String(item?.title || "未命名影视");
+                const poster = String(item?.poster_url || "").trim();
+                const type = item?.media_type === "tv" ? "电视剧" : "电影";
+                const year = String(item?.year || "").trim();
+                const overview = String(item?.overview || "").trim();
+                const score = Number(item?.vote_average || 0);
+                const scoreText = Number.isFinite(score) && score > 0 ? score.toFixed(1) : "";
+                return `<button class="public-tmdb-candidate" type="button" data-tmdb-index="${index}" aria-label="选择 ${escapeHtml(title)}">
+                    <span class="public-tmdb-candidate-poster${poster ? " has-poster" : ""}">
+                        ${poster ? `<img src="${escapeHtml(poster)}" alt="${escapeHtml(title)}" loading="lazy">` : `<span>${escapeHtml(title.slice(0, 1))}</span>`}
+                        <span class="public-tmdb-select-mark" aria-hidden="true"><span class="icon-slot icon-check"></span></span>
+                    </span>
+                    <span class="public-tmdb-candidate-copy">
+                        <span class="public-tmdb-candidate-meta"><small>${escapeHtml(type)}</small>${year ? `<small>${escapeHtml(year)}</small>` : ""}${scoreText ? `<small class="is-score">★ ${escapeHtml(scoreText)}</small>` : ""}</span>
+                        <strong class="public-tmdb-candidate-title">${escapeHtml(title)}</strong>
+                        ${item?.original_title && item.original_title !== title ? `<em>${escapeHtml(item.original_title)}</em>` : ""}
+                        <span class="public-tmdb-candidate-overview${overview ? "" : " is-empty"}">${escapeHtml(overview || "暂无剧情简介，可根据海报、年份和类型确认。")}</span>
+                    </span>
+                </button>`;
+            }).join("");
+            setTmdbPanelVisibility(true);
+            const modal = tmdbPanel();
+            if (modal) modal.dataset.state = "ready";
+        }
+
+        function renderTmdbManualState({ title, message, tone = "info", detail }) {
+            const panel = tmdbPanel();
+            const box = $("publicTmdbCandidates");
+            if (!panel || !box) return;
+            setTmdbPanelState("empty", title);
+            setTmdbStatus(message, tone);
+            box.innerHTML = `<div class="public-tmdb-empty">
+                <span class="public-tmdb-empty-icon" aria-hidden="true"><span class="icon-slot icon-search"></span></span>
+                <span class="public-tmdb-empty-copy">
+                    <strong>继续搜索原关键词</strong>
+                    <span>${escapeHtml(detail)}</span>
+                </span>
+                <button class="public-tmdb-manual-action" type="button" data-tmdb-action="manual">搜索资源</button>
+            </div>`;
+            setTmdbPanelVisibility(true);
+        }
+
+        function setTmdbStatus(message, tone = "") {
+            const box = $("publicTmdbStatus");
+            if (!box) return;
+            box.className = `public-tmdb-status${tone ? ` status-${tone}` : ""}`;
+            box.textContent = message || "";
+        }
+
+        async function searchTmdbCandidates(keyword) {
+            const sequence = (publicState.tmdbSearchSequence || 0) + 1;
+            publicState.tmdbSearchSequence = sequence;
+            publicState.tmdbQuery = keyword;
+            publicState.tmdbSelection = null;
+            publicState.tmdbDecision = "pending";
+            stopPublicSearchSupplement();
+            publicState.searchSequence = (publicState.searchSequence || 0) + 1;
+            publicState.results = [];
+            publicState.details = {};
+            publicState.filePreviews = {};
+            publicState.selectedPublicId = "";
+            if ($("publicResults")) $("publicResults").innerHTML = "";
+            setPublicSearchStatus("正在识别影视，随后开始搜索资源...", { tone: "info" });
+            setTmdbPanelState("loading", "正在识别影视");
+            setTmdbStatus("正在匹配影视信息...");
+            const panel = tmdbPanel();
+            setTmdbPanelVisibility(true);
+            const box = $("publicTmdbCandidates");
+            if (box) box.innerHTML = `<div class="public-tmdb-loading">正在查询 TMDB...</div>`;
+            try {
+                const data = await api(`/api/public/tmdb/search?q=${encodeURIComponent(keyword)}`, { allowFailure: true });
+                if (sequence !== publicState.tmdbSearchSequence) return false;
+                const status = String(data.status || "empty");
+                publicState.tmdbCandidates = Array.isArray(data.items) ? data.items : [];
+                if (status === "ready" && publicState.tmdbCandidates.length) {
+                    setTmdbStatus("");
+                    renderTmdbCandidates(publicState.tmdbCandidates);
+                } else if (status === "not_configured") {
+                    renderTmdbManualState({
+                        title: "影视识别暂未启用",
+                        message: "当前未配置 TMDB，不影响继续查找资源。",
+                        detail: "系统会直接使用你输入的片名查找网盘与磁链资源。",
+                    });
+                } else if (status === "unavailable") {
+                    renderTmdbManualState({
+                        title: "影视识别暂时不可用",
+                        message: "TMDB 服务暂时没有响应，资源搜索仍可正常使用。",
+                        tone: "error",
+                        detail: "跳过影视识别，直接按当前关键词继续搜索。",
+                    });
+                } else {
+                    renderTmdbManualState({
+                        title: "没有找到匹配的影视",
+                        message: "TMDB 中暂无匹配条目，你仍可以继续搜索资源。",
+                        detail: "将保留当前关键词，不会因为缺少影视信息阻断搜索。",
+                    });
+                }
+                return true;
+            } catch (error) {
+                if (sequence !== publicState.tmdbSearchSequence) return false;
+                renderTmdbManualState({
+                    title: "影视识别暂时不可用",
+                    message: "TMDB 服务暂时没有响应，资源搜索仍可正常使用。",
+                    tone: "error",
+                    detail: "跳过影视识别，直接按当前关键词继续搜索。",
+                });
+                return false;
+            }
+        }
+
+        async function beginResourceSearch(keyword, candidate = null) {
+            const item = candidate && typeof candidate === "object" ? candidate : null;
+            // 只用 TMDB 的标准片名检索：PanSou 按资源标题做字面匹配，拼上年份会让命中数急剧下降。
+            // 影视消歧仍由提交阶段的 tmdb_selection_token 承担，不依赖搜索词里的年份。
+            const effectiveKeyword = String(item?.title || keyword || "").trim();
+            publicState.resourceSearchKeyword = effectiveKeyword;
+            hideTmdbPanel();
+            showPublicSearchTransition(item || { title: keyword }, item ? "正在使用标准片名匹配资源..." : "正在按原关键词匹配资源...");
+            try {
+                await performResourceSearch(effectiveKeyword.trim() || keyword);
+            } finally {
+                await new Promise((resolve) => window.setTimeout(resolve, 850));
+                hidePublicSearchTransition();
+            }
+        }
 
         function selectedSearchSource() {
             const checked = document.querySelector('input[name="publicSearchSource"]:checked');
@@ -134,17 +293,63 @@
             return {
                 providerKind: String(item?.provider_kind || link.provider_kind || "").toLowerCase(),
                 sourceForm: String(item?.source_form || link.source_form || "").toLowerCase(),
+                sourceType: String(item?.source_type || link.source_type || "").toLowerCase(),
                 searchSourceId: String(item?.search_source_id || link.search_source_id || "").toLowerCase(),
             };
         }
 
         function sourceIconKey(item) {
             const source = sourceDescriptor(item);
-            if (source.providerKind === "mobile") return "cloud139";
-            if (source.providerKind === "tianyi") return "cloud189";
-            if (source.providerKind === "sixpan" || source.sourceForm === "magnet" || source.providerKind === "btbtla") return "bt";
+            if (source.providerKind === "mobile" || source.sourceType === "cloud139") return "cloud139";
+            if (source.providerKind === "tianyi" || source.sourceType === "cloud189") return "cloud189";
+            if (source.providerKind === "sixpan" || source.sourceForm === "magnet" || source.providerKind === "btbtla" || ["magnet", "torrent"].includes(source.sourceType)) return "bt";
             if (source.providerKind === "quark") return "quark";
             return "other";
+        }
+
+        function sourceTagMeta(item) {
+            const source = sourceDescriptor(item);
+            if (source.providerKind === "quark" || source.sourceType === "quark") return { label: "夸克网盘", className: "tag-source-quark" };
+            if (source.providerKind === "mobile" || source.sourceType === "cloud139") return { label: "移动云", className: "tag-source-mobile" };
+            if (source.providerKind === "tianyi" || source.sourceType === "cloud189") return { label: "天翼云盘", className: "tag-source-tianyi" };
+            if (source.providerKind === "btbtla" || source.providerKind === "sixpan" || source.sourceForm === "magnet" || ["magnet", "torrent"].includes(source.sourceType)) {
+                return { label: "磁链 / BT", className: "tag-source-bt" };
+            }
+            return {
+                label: sourceLabel(source.providerKind || source.searchSourceId),
+                className: "tag-source-unknown",
+            };
+        }
+
+        function resultProviderBadgeKey(item) {
+            const source = sourceDescriptor(item);
+            if (source.providerKind === "quark" || source.sourceType === "quark") return "quark";
+            if (source.providerKind === "mobile" || source.sourceType === "cloud139") return "mobile";
+            if (source.providerKind === "tianyi" || source.sourceType === "cloud189") return "tianyi";
+            if (
+                source.providerKind === "btbtla"
+                || source.providerKind === "sixpan"
+                || source.providerKind === "magnet"
+                || source.sourceForm === "magnet"
+                || ["magnet", "torrent"].includes(source.sourceType)
+            ) return "magnet";
+            return "";
+        }
+
+        function resultProviderBadgeMeta(item, options = {}) {
+            if (isResourceInvalid(item)) return null;
+            const provider = resultProviderBadgeKey(item);
+            if (!provider) return null;
+            const badges = publicState.resultProviderBadges && typeof publicState.resultProviderBadges === "object"
+                ? publicState.resultProviderBadges
+                : {};
+            const config = badges[provider] && typeof badges[provider] === "object" ? badges[provider] : {};
+            const text = String(config.text || "").trim();
+            if (config.enabled !== true || !/^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,5}$/u.test(text)) return null;
+            if (options.slowImport) {
+                return { provider: "magnet", text: "慢速入库", className: "tag-source-bt" };
+            }
+            return { provider, text, className: sourceTagMeta(item).className };
         }
 
         function publicPosterUrl(item = {}) {
@@ -200,6 +405,11 @@
 
         function isCloud139Candidate(item) {
             return sourceDescriptor(item).providerKind === "mobile";
+        }
+
+        function isInstantImportResource(item) {
+            const sourceType = String(item?.source_type || "").trim().toLowerCase();
+            return item?.instant_import === true || isCloud139Candidate(item) || sourceType === "cloud139";
         }
 
         function isTianyiCandidate(item) {
@@ -412,7 +622,11 @@
                     label: "资源失效",
                     className: "secondary",
                     disabled: true,
-                    title: item?.availability_message || "详情检测未通过，当前资源不可提交",
+                    title: publicMessageForDisplay(
+                        item?.availability_message || "详情检测未通过，当前资源不可提交",
+                        item?.availability_status || "invalid",
+                        "分享链接已失效",
+                    ),
                 };
             }
             if (!item?.supported) {
@@ -437,8 +651,7 @@
             return { label: "提交入库", className: "", disabled: false, title: "" };
         }
 
-        async function searchPublicResources() {
-            const keyword = $("publicKeywordInput")?.value.trim() || "";
+        async function performResourceSearch(keyword) {
             const searchSource = selectedSearchSource();
             const sources = searchSourcePayload(searchSource);
             const resultsBox = $("publicResults");
@@ -467,8 +680,6 @@
             if (resultsBox) resultsBox.innerHTML = "";
             let loadingVisible = false;
             try {
-                showGlobalLoading("正在搜索资源...");
-                loadingVisible = true;
                 const data = await api("/api/public/search", {
                     method: "POST",
                     body: JSON.stringify({ keyword, sources, async_poll: false }),
@@ -482,8 +693,6 @@
                 setPublicSearchStatus(statusHtml, { html: true, tone: publicState.results.length ? "ok" : "info" });
                 renderPublicResults();
                 bindSearchSourceSwitchActions($("publicSearchStatus"));
-                hideGlobalLoading();
-                loadingVisible = false;
                 if (searchSource === "pansou") {
                     startPublicSearchSupplement(keyword, sequence, data.expires_in_minutes || 60, sources);
                 }
@@ -493,6 +702,38 @@
             } finally {
                 if (loadingVisible) hideGlobalLoading();
             }
+        }
+
+        async function searchPublicResources() {
+            const keyword = $("publicKeywordInput")?.value.trim() || "";
+            if (!keyword) {
+                setPublicSearchStatus("请输入搜索关键词。", { tone: "error" });
+                $("publicKeywordInput")?.focus();
+                toast("请输入搜索关键词", "error");
+                return;
+            }
+            if (publicState.tmdbQuery !== keyword || !["selected", "manual"].includes(publicState.tmdbDecision)) {
+                await searchTmdbCandidates(keyword);
+                return;
+            }
+            await beginResourceSearch(keyword, publicState.tmdbSelection);
+        }
+
+        function handleTmdbAction(target) {
+            const action = target?.dataset?.tmdbAction || "";
+            if (action === "manual") {
+                publicState.tmdbDecision = "manual";
+                publicState.tmdbSelection = null;
+                const keyword = $("publicKeywordInput")?.value.trim() || publicState.tmdbQuery || "";
+                if (keyword) beginResourceSearch(keyword).catch((error) => toast(error.message, "error"));
+                return;
+            }
+            const index = Number(target?.dataset?.tmdbIndex);
+            if (!Number.isInteger(index) || !publicState.tmdbCandidates?.[index]) return;
+            publicState.tmdbDecision = "selected";
+            publicState.tmdbSelection = publicState.tmdbCandidates[index];
+            const keyword = $("publicKeywordInput")?.value.trim() || publicState.tmdbQuery || "";
+            beginResourceSearch(keyword, publicState.tmdbSelection).catch((error) => toast(error.message, "error"));
         }
 
         function bindSearchSourceSwitchActions(root) {
@@ -574,7 +815,9 @@
             const resultsBox = $("publicResults");
             if (!resultsBox) return;
             if (!publicState.results.length) {
-                resultsBox.innerHTML = `<div class="empty glass-panel soft">暂无结果，可尝试更换关键词或直接粘贴链接提交。</div>`;
+                const canFallback = Boolean(publicState.tmdbSelection && publicState.tmdbQuery);
+                resultsBox.innerHTML = `<div class="empty glass-panel soft">暂无结果，可尝试更换关键词或直接粘贴链接提交。${canFallback ? `<div><button class="link-button" type="button" data-tmdb-action="manual">使用原关键词“${escapeHtml(publicState.tmdbQuery)}”重新搜索</button></div>` : ""}</div>`;
+                resultsBox.querySelector("[data-tmdb-action='manual']")?.addEventListener("click", (event) => handleTmdbAction(event.currentTarget));
                 return;
             }
             resultsBox.innerHTML = publicState.results
@@ -671,24 +914,35 @@
         }
 
         function renderPublicResultItem(item, index) {
-            const supported = Boolean(item.supported);
             const selected = publicState.selectedPublicId === item.public_id;
             const sourceIcon = sourceIconKey(item);
             const quality = item.quality || inferQuality(item.title);
-            const descriptor = sourceDescriptor(item);
-            const source = sourceLabel(descriptor.providerKind || descriptor.searchSourceId);
+            const sourceTag = sourceTagMeta(item);
             const updatedAt = formatDate(item.datetime || item.created_at);
             const size = knownSizeText(item.size_text, item.size);
             const detailState = publicState.details[item.public_id];
             const sixpanCandidate = isSixpanCandidate(item);
             const sixpanSpeed = sixpanSubmitSpeed(item.public_id);
             const slowImport = sixpanCandidate && sixpanSpeed === "slow";
-            const fastImport = sixpanCandidate && !slowImport;
             const invalid = isResourceInvalid(item);
+            const providerBadge = resultProviderBadgeMeta(item, { slowImport });
             const stateTag = resourceStateTag(item);
             const submitMeta = publicSubmitButtonMeta(item);
             const poster = publicPosterUrl(item);
             const sourceOrigin = publicSourceOrigin(item);
+            const instantImport = !invalid && isInstantImportResource(item);
+            const fastImport = !invalid && sixpanCandidate && !slowImport;
+            const slowImportHighlight = !invalid && sixpanCandidate && slowImport;
+            // 来源色边框优先：配置了来源角标就用自己 tag 的颜色描边；
+            // 角标全部关闭时才退回能力态（秒入库/快速入库/慢速入库）配色。
+            const capabilityClasses = providerBadge ? [] : [
+                instantImport ? "is-instant-import" : "",
+                fastImport ? "is-fast-import" : "",
+                slowImportHighlight ? "is-slow-import" : "",
+            ].filter(Boolean);
+            const providerHighlightClass = providerBadge
+                ? `has-provider-highlight provider-highlight-${providerBadge.provider}`
+                : "";
             return workbench.renderCard({
                 id: item.public_id,
                 attributes: `data-resource-public-id="${escapeHtml(item.public_id)}"`,
@@ -699,9 +953,16 @@
                 posterAlt: item.title || "资源封面",
                 iconClass: `tile-source-${escapeHtml(sourceIcon)}`,
                 iconHtml: icon(sourceIcon),
-                classes: [poster ? "has-poster" : "", selected ? "selected" : "", fastImport ? "is-fast-import" : "", slowImport ? "is-slow-import" : "", invalid ? "is-invalid-resource" : ""],
-                badgesHtml: `${fastImport ? '<div class="fast-import-badge">内容可选</div>' : ""}${slowImport ? '<div class="slow-import-badge">完整资源</div>' : ""}`,
-                tagsHtml: `<span class="tag tag-blue">${escapeHtml(source)}</span>${quality ? `<span class="tag tag-gold">${escapeHtml(quality)}</span>` : ""}${stateTag}`,
+                classes: [
+                    poster ? "has-poster" : "",
+                    selected ? "selected" : "",
+                    providerBadge ? "has-provider-badge" : "",
+                    ...capabilityClasses,
+                    providerHighlightClass,
+                    invalid ? "is-invalid-resource" : "",
+                ],
+                badgesHtml: providerBadge ? `<div class="provider-capability-badge ${escapeHtml(providerBadge.className)}">${escapeHtml(providerBadge.text)}</div>` : "",
+                tagsHtml: `<span class="tag tag-source ${escapeHtml(sourceTag.className)}">${escapeHtml(sourceTag.label)}</span>${quality ? `<span class="tag tag-gold">${escapeHtml(quality)}</span>` : ""}${stateTag}`,
                 metaHtml: `${size ? `<span>文件大小：${escapeHtml(size)}</span>` : ""}<span>更新时间：${escapeHtml(updatedAt)}</span>${invalid ? `<span class="resource-invalid-message">${escapeHtml(publicMessageForDisplay(item.availability_message || "详情检测未通过", item.availability_status || "详情检测未通过", "详情检测未通过"))}</span>` : ""}`,
                 actionsHtml: `<button class="secondary detail-trigger" type="button" data-detail-public-id="${escapeHtml(item.public_id)}">${publicDetailButtonLabel(selected, detailState)}</button><button type="button" class="${escapeHtml(submitMeta.className)}" data-submit-public-id="${escapeHtml(item.public_id)}" ${submitMeta.disabled ? "disabled" : ""} title="${escapeHtml(submitMeta.title)}">${escapeHtml(submitMeta.label)}</button>`,
                 detailHtml: renderPublicResourceDetail(detailState),
@@ -735,6 +996,9 @@
             syncSearchSourceOptions,
             updateSearchSourceActiveState,
             sourceIconKey,
+            sourceTagMeta,
+            resultProviderBadgeKey,
+            resultProviderBadgeMeta,
             publicPosterUrl,
             normalizePublicPosterUrl,
             publicSourceOrigin,
@@ -742,6 +1006,7 @@
             isBtbtlaCandidate,
             isQuarkCandidate,
             isCloud139Candidate,
+            isInstantImportResource,
             isTianyiCandidate,
             sortPublicResources,
             inferQuality,
@@ -760,6 +1025,9 @@
             sixpanHasSelectableFiles,
             sixpanSubmitSpeed,
             publicSubmitButtonMeta,
+            searchTmdbCandidates,
+            beginResourceSearch,
+            handleTmdbAction,
             searchPublicResources,
             bindSearchSourceSwitchActions,
             setSearchSupplementStatus,
