@@ -344,6 +344,28 @@ body[data-page="submit"].public-modal-open {
         min-width: 0;
     }
 
+    body[data-page="submit"] .resource-card.has-provider-badge .resource-main {
+        padding-right: 66px;
+    }
+
+    body[data-page="submit"] .resource-card.has-provider-badge .card-actions {
+        padding-top: 0;
+    }
+
+    body[data-page="submit"] .resource-card.has-provider-highlight {
+        background:
+            radial-gradient(circle at top right, rgba(var(--provider-highlight-rgb), .20), transparent 38%),
+            linear-gradient(135deg, rgba(var(--provider-highlight-rgb), .16), rgba(13, 30, 63, .84));
+    }
+
+    body[data-page="submit"] .provider-capability-badge {
+        top: 8px;
+        right: -7px;
+        max-width: none;
+        padding: 5px 9px 6px;
+        font-size: 10px;
+    }
+
     body[data-page="submit"] .resource-title,
     body[data-page="submit"] .resource-card.resource-row.has-poster .resource-title {
         display: -webkit-box;
@@ -1039,5 +1061,15 @@ body[data-page="submit"].public-modal-open {
     body[data-page="submit"] .global-loading-orbit {
         animation-duration: 1.15s !important;
         animation-iteration-count: infinite !important;
+    }
+
+    body[data-page="submit"] .public-search-transition-bg img {
+        animation: publicSearchBgKenburns 8s ease-in-out infinite !important;
+    }
+    body[data-page="submit"] .public-search-transition-bg::before {
+        animation: publicSearchBgBreathe 3s ease-in-out infinite !important;
+    }
+    body[data-page="submit"] .public-search-transition-poster {
+        animation: publicSearchPosterBreathe 2.2s ease-in-out infinite !important;
     }
 }

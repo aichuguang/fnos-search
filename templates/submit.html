@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>访客提交 - {{ app_name }}</title>
     <link rel="stylesheet" href="/static/styles.css?v=20260805-notifications-v006">
-    <link rel="stylesheet" href="/static/product.css?v=20260804-config-center-v011">
-    <link rel="stylesheet" href="/static/public-mobile.css?v=20260728-public-h5-v006">
+    <link rel="stylesheet" href="/static/product.css?v=20260830-provider-highlight-v002">
+    <link rel="stylesheet" href="/static/public-mobile.css?v=20260826-tmdb-modal-v001">
     {% if site_logo_url %}<style>:root { --site-logo-bg: url("{{ site_logo_url }}"); }</style>{% endif %}
 </head>
 <body class="ui-dark" data-page="submit">
@@ -72,6 +72,22 @@
                         </div>
                     </div>
                     <div id="publicSearchStatus" class="notice-box search-primary-status hidden" role="status" aria-live="polite"></div>
+                    <section id="publicTmdbPanel" class="public-tmdb-modal public-tmdb-panel hidden" aria-live="polite" role="dialog" aria-modal="true" aria-labelledby="publicTmdbTitle">
+                        <div class="public-tmdb-dialog">
+                            <div class="public-tmdb-panel-head">
+                                <div class="public-tmdb-heading-copy">
+                                    <span class="public-tmdb-eyebrow">影视识别</span>
+                                    <h2 id="publicTmdbTitle">请选择匹配的影视</h2>
+                                </div>
+                                <div class="public-tmdb-head-actions">
+                                    <button id="publicTmdbSkipBtn" class="secondary mini public-tmdb-skip" type="button">没有找到影视？直接搜索</button>
+                                    <button id="publicTmdbCloseBtn" class="public-tmdb-close" type="button" aria-label="关闭影视识别"><span aria-hidden="true"></span></button>
+                                </div>
+                            </div>
+                            <div id="publicTmdbStatus" class="public-tmdb-status"></div>
+                            <div id="publicTmdbCandidates" class="public-tmdb-candidates"></div>
+                        </div>
+                    </section>
                     <div id="publicSearchSupplementStatus" class="search-supplement-status hidden" role="status" aria-live="polite">正在补充搜索资源中...</div>
                     <div class="category-chips search-filter-chips" aria-label="资源分类" hidden>
                         <!-- <button class="chip active" type="button" data-category-chip="movie">
@@ -316,15 +332,32 @@
         </div>
     </div>
 
+    <div id="publicSearchTransition" class="public-search-transition hidden" role="dialog" aria-modal="true" aria-label="正在搜索资源">
+        <div class="public-search-transition-bg"><img id="publicSearchTransitionBg" alt="" aria-hidden="true"></div>
+        <div class="public-search-transition-content">
+            <div class="public-search-transition-poster" id="publicSearchTransitionPosterBox">
+                <img id="publicSearchTransitionPoster" alt="">
+                <span id="publicSearchTransitionFallback">影</span>
+                <span id="publicSearchTransitionBadge" class="public-search-transition-badge hidden"></span>
+            </div>
+            <p class="public-search-transition-heading">正在进入影视世界</p>
+            <h2 class="public-search-transition-title">
+                <span id="publicSearchTransitionTitle"></span>
+                <span id="publicSearchTransitionYear" class="public-search-transition-year"></span>
+            </h2>
+            <p id="publicSearchTransitionMessage">正在匹配网盘和磁链资源，请稍候...</p>
+        </div>
+    </div>
+
     <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
     <script src="/static/ui-core.js?v=20260808-request-core-v015"></script>
     <script src="/static/resource-search-workbench.js?v=20260809-v1-cutover-v001"></script>
-    <script src="/static/public-search.js?v=20260809-v1-cutover-v001"></script>
+    <script src="/static/public-search.js?v=20260830-provider-highlight-v003"></script>
     <script src="/static/public-submit.js?v=20260809-v1-cutover-v001"></script>
     <script src="/static/public-trending.js?v=20260804-config-center-v004"></script>
-    <script src="/static/public-bootstrap.js?v=20260804-notifications-v018"></script>
+    <script src="/static/public-bootstrap.js?v=20260826-tmdb-modal-v002"></script>
     <script src="/static/ui-select.js?v=20260711-public-bootstrap-v014"></script>
     <script src="/static/ui-dialog.js?v=20260615-v001"></script>
-    <script src="/static/public.js?v=20260809-v1-cutover-v001"></script>
+    <script src="/static/public.js?v=20260826-tmdb-picker-v001"></script>
 </body>
 </html>

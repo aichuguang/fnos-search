@@ -25,6 +25,12 @@ const publicState = {
     supplementing: false,
     searchSource: "pansou",
     searchProviders: [],
+    resultProviderBadges: {},
+    tmdbCandidates: [],
+    tmdbSelection: null,
+    tmdbQuery: "",
+    tmdbSearchSequence: 0,
+    publicSearchTransitionOpen: false,
     notifications: {},
 };
 
@@ -68,6 +74,9 @@ const SEARCH_SOURCE_META = {
     },
 };
 
+let publicSearchTransitionTimer = null;
+let publicSearchTransitionOpenedAt = 0;
+
 const $ = (id) => document.getElementById(id);
 
 function icon(name, className = "icon") {
@@ -81,6 +90,8 @@ function escapeHtml(value) {
 }
 
 const PUBLIC_DETAIL_TEXT_PATTERN = /(OpenList|Organizer|rclone|WebDAV|CMCC|STRM|官方直转|标准目录|保存位置|可见路径|扫描路径|标准化|中转目录|搬运目标|离线\/搬运|最终完成)/i;
+const PUBLIC_SHARE_FAILURE_PATTERN = /(shareUserRightcheck|share\s+(?:not\s+found|invalid)|file\s+not\s+found|分享(?:链接|资源)?.*(?:失效|无效|不存在))/i;
+const PUBLIC_PROVIDER_ERROR_PATTERN = /(session[_-]?key|share[_-]?id|user[_-]?id|file[_-]?id|[a-z_$][\w$]*\([^)]*\)\s*-|\b(?:null|undefined)\b)/i;
 
 function publicStatusForDisplay(status) {
     const text = String(status || "").trim();
@@ -120,6 +131,8 @@ function publicMessageForDisplay(message, status, fallback = "") {
     const safeFallback = String(fallback || "").trim();
     const fallbackText = safeFallback && safeFallback !== text ? safeFallback : publicDefaultMessage(status);
     if (!text) return fallbackText;
+    if (PUBLIC_SHARE_FAILURE_PATTERN.test(text)) return "分享链接已失效";
+    if (PUBLIC_PROVIDER_ERROR_PATTERN.test(text)) return fallbackText;
     if (PUBLIC_DETAIL_TEXT_PATTERN.test(text)) {
         return text.includes("提交成功") ? "提交成功，系统已收到请求，请保存提交编号。" : fallbackText;
     }
@@ -219,8 +232,8 @@ let publicBootstrapModule = null;
 function getPublicBootstrapModule() {
     if (publicBootstrapModule) return publicBootstrapModule;
     publicBootstrapModule = window.FnosPublicBootstrap.create({
-        state: publicState, getElement: $, api, toast, syncSearchSourceOptions, enabledSearchSourceKeys, setPublicSearchStatus,
-        loadCaptcha, bindRecentRequests, bindRequestStatusPage, searchPublicResources, selectedSearchSource, updateSearchSourceActiveState,
+        state: publicState, getElement: $, api, toast, syncSearchSourceOptions, enabledSearchSourceKeys, setPublicSearchStatus, stopPublicSearchSupplement,
+        loadCaptcha, bindRecentRequests, bindRequestStatusPage, searchPublicResources, handleTmdbAction, selectedSearchSource, updateSearchSourceActiveState,
         loadPublicTrending, bindPublicTrending,
         detectManualPublicLink, submitManualPublicLink, handleSixpanParseClick, handleSixpanParseChange, queryRequestStatus,
         closePublicSubmitConfirm, closeSixpanSlowWarning, continueSixpanSlowSubmit, updatePublicConfirmWarning,
@@ -278,6 +291,8 @@ function getPublicSearchModule() {
         publicMessageForDisplay,
         showGlobalLoading,
         hideGlobalLoading,
+        showPublicSearchTransition,
+        hidePublicSearchTransition,
         resetNoticeBox,
         setPublicSearchStatus,
         loadSixpanParseForPublic,
@@ -364,6 +379,84 @@ function isCloud139Candidate(...args) {
     return getPublicSearchModule().isCloud139Candidate(...args);
 }
 
+function showPublicSearchTransition(candidate = null, message = "正在匹配网盘和磁链资源，请稍候...") {
+    const mask = $("publicSearchTransition");
+    if (!mask) return;
+    if (publicSearchTransitionTimer) {
+        window.clearTimeout(publicSearchTransitionTimer);
+        publicSearchTransitionTimer = null;
+    }
+    const item = candidate && typeof candidate === "object" ? candidate : {};
+    const title = String(item.title || "").trim();
+    const year = String(item.year || "").trim();
+    const type = item.media_type === "tv" ? "剧集" : item.media_type === "movie" ? "电影" : "";
+    const poster = String(item.poster_url || item.poster_path || "").trim();
+    const posterBox = $("publicSearchTransitionPosterBox");
+    const posterImage = $("publicSearchTransitionPoster");
+    const fallback = $("publicSearchTransitionFallback");
+    const badge = $("publicSearchTransitionBadge");
+    const bg = $("publicSearchTransitionBg");
+    if ($("publicSearchTransitionTitle")) $("publicSearchTransitionTitle").textContent = title;
+    if ($("publicSearchTransitionYear")) $("publicSearchTransitionYear").textContent = year;
+    if ($("publicSearchTransitionMessage")) $("publicSearchTransitionMessage").textContent = message;
+    if (badge) {
+        badge.textContent = type;
+        badge.classList.toggle("hidden", !type);
+    }
+    if (fallback) {
+        fallback.textContent = title ? title.slice(0, 1) : "影";
+        fallback.classList.toggle("hidden", Boolean(poster));
+    }
+    if (posterImage) {
+        posterImage.src = poster;
+        posterImage.alt = title;
+        posterImage.classList.toggle("hidden", !poster);
+    }
+    if (bg) {
+        bg.src = poster;
+        bg.classList.toggle("hidden", !poster);
+    }
+    posterBox?.classList.toggle("is-empty", !poster);
+    mask.classList.remove("is-visible", "is-closing");
+    mask.classList.remove("hidden");
+    window.requestAnimationFrame(() => mask.classList.add("is-visible"));
+    const pageRoot = document.querySelector(".product-shell");
+    if (pageRoot) {
+        pageRoot.setAttribute("inert", "");
+        pageRoot.setAttribute("aria-busy", "true");
+        pageRoot.inert = true;
+    }
+    document.documentElement.classList.add("is-submit-transition-open");
+    document.body.classList.add("public-search-transition-active");
+    publicSearchTransitionOpenedAt = window.performance.now();
+    publicState.publicSearchTransitionOpen = true;
+}
+
+function hidePublicSearchTransition() {
+    const mask = $("publicSearchTransition");
+    if (!mask || mask.classList.contains("hidden")) return;
+    const elapsed = window.performance.now() - publicSearchTransitionOpenedAt;
+    const beginClose = () => {
+        mask.classList.remove("is-visible");
+        mask.classList.add("is-closing");
+        publicSearchTransitionTimer = window.setTimeout(() => {
+            mask.classList.add("hidden");
+            mask.classList.remove("is-closing");
+            const pageRoot = document.querySelector(".product-shell");
+            if (pageRoot) {
+                pageRoot.removeAttribute("inert");
+                pageRoot.removeAttribute("aria-busy");
+                pageRoot.inert = false;
+            }
+            document.documentElement.classList.remove("is-submit-transition-open");
+            document.body.classList.remove("public-search-transition-active");
+            publicSearchTransitionTimer = null;
+            publicState.publicSearchTransitionOpen = false;
+        }, 300);
+    };
+    publicSearchTransitionTimer = window.setTimeout(beginClose, Math.max(0, 850 - elapsed));
+}
+
 function isTianyiCandidate(...args) {
     return getPublicSearchModule().isTianyiCandidate(...args);
 }
@@ -438,6 +531,10 @@ function publicSubmitButtonMeta(...args) {
 
 function searchPublicResources(...args) {
     return getPublicSearchModule().searchPublicResources(...args);
+}
+
+function handleTmdbAction(...args) {
+    return getPublicSearchModule().handleTmdbAction(...args);
 }
 
 function bindSearchSourceSwitchActions(...args) {
@@ -527,6 +624,8 @@ function getPublicSubmitModule() {
         publicMessageForDisplay,
         showGlobalLoading,
         hideGlobalLoading,
+        showPublicSearchTransition,
+        hidePublicSearchTransition,
         showPublicModal,
         hidePublicModal,
         resetNoticeBox,

@@ -1527,7 +1527,20 @@
                 }
                 const tianyiPayload = tianyiSelectionPayload(publicId);
                 showGlobalLoading("正在提交入库并检测资源有效性...");
-                const submitPayload = { public_id: publicId, category, note, ...sixpanPayload, ...quarkPayload, ...cloud139Payload, ...tianyiPayload, ...captcha.data, ...notification };
+                const submitPayload = {
+                    public_id: publicId,
+                    category,
+                    note,
+                    ...(publicState.activeTab === "search" && publicState.tmdbSelection?.selection_token
+                        ? { tmdb_selection_token: publicState.tmdbSelection.selection_token }
+                        : {}),
+                    ...sixpanPayload,
+                    ...quarkPayload,
+                    ...cloud139Payload,
+                    ...tianyiPayload,
+                    ...captcha.data,
+                    ...notification,
+                };
                 const data = await api("/api/public/submit", {
                     method: "POST",
                     body: JSON.stringify(submitPayload),

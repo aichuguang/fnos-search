@@ -15,6 +15,7 @@ def create_public_blueprint(context: PublicRouteContext) -> Blueprint:
         ("/request/<token>", "request_status_page", "GET"),
         ("/api/public/config", "config", "GET"),
         ("/api/public/trending", "trending", "GET"),
+        ("/api/public/tmdb/search", "tmdb_search", "GET"),
         ("/api/public/captcha", "captcha", "GET"),
         ("/api/public/search", "search", "POST"),
         ("/api/public/detect", "detect", "POST"),

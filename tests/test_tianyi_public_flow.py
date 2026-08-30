@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from tests._repository_v1_fakes import RepositoryFakeMixin
 
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -229,6 +230,29 @@ class TianyiPublicFlowTests(unittest.TestCase):
             importer.check_calls,
             [("https://cloud.189.cn/t/AbC123", "Example", "4321")],
         )
+
+    def test_search_detail_hides_internal_invalid_share_error(self) -> None:
+        internal_error = (
+            "shareUserRightcheck() - sessionKey=null, userId=null, "
+            "shareId=12370119324299, fileId=525523204753998124, file not found."
+        )
+        importer = _TianyiStub(
+            share_ok=False,
+            share_data={"success": False, "message": internal_error},
+        )
+
+        detail = _public_resource_detail(
+            self._cached_resource(),
+            quark_importer=object(),
+            cloud139_importer=_Cloud139Stub(),
+            tianyi_importer=importer,
+        )
+
+        self.assertEqual(detail["inspection"]["message"], "分享链接已失效")
+        public_payload = json.dumps(detail["inspection"], ensure_ascii=False)
+        for internal_token in ("shareUserRightcheck", "sessionKey", "shareId", "userId", "fileId"):
+            with self.subTest(internal_token=internal_token):
+                self.assertNotIn(internal_token, public_payload)
 
     def test_child_directory_rechecks_share_and_uses_tianyi_share_context(self) -> None:
         importer = _TianyiStub()

@@ -106,6 +106,7 @@ class PublicSubmissionIntakeService:
                     "public_id": prepared.public_id,
                     "cached": self.cached_item(prepared.cached),
                     "request": self.request_payload(payload),
+                    **({"media_identity": payload.get("media_identity")} if isinstance(payload.get("media_identity"), dict) else {}),
                     "preflight": preflight,
                 },
             },

@@ -138,6 +138,7 @@ from .services.public_submission_preparation_service import (
 from .services.public_import_job_coordinator import PublicImportJobCoordinator
 from .services.public_submission_decision_service import PublicSubmissionDecisionService
 from .services.public_submission_intake_service import PublicSubmissionIntakeService
+from .services.public_tmdb_service import PublicTmdbService
 from .services.security_status_service import SecurityStatusService
 from .services.rate_limit_service import RateLimitService
 from .services.public_resource_detail_service import PublicResourceDetailService
@@ -202,6 +203,7 @@ from .public_web import (
     _public_resource_child_files,
     _public_resource_detail,
     _public_resource_item,
+    _public_result_provider_badges,
     _public_security_config,
     _public_status,
     _public_submit_message,
@@ -1124,6 +1126,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             "检测到 Docker Socket 挂载；当前进程继续启动但 readiness 将保持失败，请替换为无 Socket 的当前编排"
         )
     security_config = app_config.raw.get("security", {})
+    public_tmdb_service = PublicTmdbService(
+        client=lambda: organizer_service.tmdb,
+        secret_key=str(app.secret_key or ""),
+    )
     if not str(security_config.get("ip_hash_salt") or "").strip():
         security_config["ip_hash_salt"] = app.secret_key
     app.config.update(
@@ -3156,7 +3162,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 "security": _public_security_config(security_config),
                 "public": settings["public"],
                 "submission": settings["submission"],
-                "search": {"providers": search_service.describe_providers()},
+                "search": {
+                    "providers": search_service.describe_providers(),
+                    "result_provider_badges": _public_result_provider_badges(
+                        app_config.raw.get("pansou")
+                    ),
+                },
                 "adapters": _public_adapter_capabilities(
                     app_config.raw,
                     quark_importer=quark_importer,
@@ -3227,6 +3238,24 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 "updated_at": latest.get("finished_at") or latest.get("started_at") or "",
             }
         )
+
+    def api_public_tmdb_search():
+        if not _current_public_settings().get("allow_anonymous_search", True):
+            return jsonify({"success": False, "message": "匿名搜索已关闭，请使用链接提交。"}), 403
+        limited = _rate_limit("public_tmdb_search", "public_tmdb_search_rate_limit")
+        if limited:
+            return limited
+        try:
+            keyword = _limited_text(
+                request.args.get("q") or request.args.get("query"),
+                "影视关键词",
+                _config_int(security_config, "max_keyword_length", 80),
+                required=True,
+            )
+        except PublicInputError as exc:
+            return jsonify({"success": False, "message": str(exc)}), 400
+        result = public_tmdb_service.search(keyword)
+        return jsonify({"success": True, **result})
 
     def _public_submission_application() -> PublicSubmissionService:
         return PublicSubmissionService(
@@ -3720,7 +3749,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         limited = _rate_limit("public_submit", "public_submit_rate_limit")
         if limited:
             return limited
-        payload = request.get_json(silent=True) or {}
+        payload = dict(request.get_json(silent=True) or {})
+        selection_token = payload.pop("tmdb_selection_token", None)
+        media_identity = public_tmdb_service.resolve_token(selection_token)
+        payload.pop("media_identity", None)
+        if media_identity:
+            payload["media_identity"] = media_identity
         captcha_ok, captcha_message = _verify_public_captcha(
             payload, security_config, _client_ip(), str(app.secret_key or "")
         )
@@ -3861,7 +3895,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 "categories": app_config.categories,
                 "public": settings["public"],
                 "submission": settings["submission"],
-                "search": {"providers": search_service.describe_providers()},
+                "search": {
+                    "providers": search_service.describe_providers(),
+                    "result_provider_badges": _public_result_provider_badges(
+                        app_config.raw.get("pansou")
+                    ),
+                },
                 "category_labels": CATEGORY_LABELS,
             }
         )
@@ -4139,6 +4178,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         "request_status_page": request_status_page,
         "config": api_public_config,
         "trending": api_public_trending,
+        "tmdb_search": api_public_tmdb_search,
         "captcha": api_public_captcha,
         "search": api_public_search,
         "detect": api_public_detect,

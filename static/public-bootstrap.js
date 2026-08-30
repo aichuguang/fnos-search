@@ -1,6 +1,6 @@
 (function () {
     function create(context) {
-        const { state, getElement, api, toast, syncSearchSourceOptions, enabledSearchSourceKeys, setPublicSearchStatus, loadCaptcha, bindRecentRequests, bindRequestStatusPage, searchPublicResources, selectedSearchSource, updateSearchSourceActiveState, loadPublicTrending, bindPublicTrending, detectManualPublicLink, submitManualPublicLink, handleSixpanParseClick, handleSixpanParseChange, queryRequestStatus, closePublicSubmitConfirm, closeSixpanSlowWarning, continueSixpanSlowSubmit, updatePublicConfirmWarning, confirmPublicResourceSubmit, trapPublicModalFocus } = context;
+        const { state, getElement, api, toast, syncSearchSourceOptions, enabledSearchSourceKeys, setPublicSearchStatus, stopPublicSearchSupplement, loadCaptcha, bindRecentRequests, bindRequestStatusPage, searchPublicResources, handleTmdbAction, selectedSearchSource, updateSearchSourceActiveState, loadPublicTrending, bindPublicTrending, detectManualPublicLink, submitManualPublicLink, handleSixpanParseClick, handleSixpanParseChange, queryRequestStatus, closePublicSubmitConfirm, closeSixpanSlowWarning, continueSixpanSlowSubmit, updatePublicConfirmWarning, confirmPublicResourceSubmit, trapPublicModalFocus } = context;
         const publicState = state;
         const $ = getElement;
 
@@ -12,6 +12,7 @@
             publicState.submission = data.submission || {};
             publicState.notifications = data.notifications || {};
             publicState.searchProviders = data.search?.providers || [];
+            publicState.resultProviderBadges = data.search?.result_provider_badges || {};
             syncSearchSourceOptions();
             syncCategorySelect(publicState.selectedCategory);
             applyPublicFeatureSettings();
@@ -126,6 +127,42 @@
                 event.preventDefault();
                 searchPublicResources();
             });
+            $("publicKeywordInput")?.addEventListener("input", () => {
+                const value = $("publicKeywordInput")?.value.trim() || "";
+                if (value === publicState.tmdbQuery) return;
+                stopPublicSearchSupplement?.();
+                publicState.searchSequence = (publicState.searchSequence || 0) + 1;
+                publicState.results = [];
+                publicState.details = {};
+                publicState.filePreviews = {};
+                publicState.selectedPublicId = "";
+                if ($("publicResults")) $("publicResults").innerHTML = "";
+                setPublicSearchStatus("", { visible: false });
+                publicState.tmdbDecision = "";
+                publicState.tmdbSelection = null;
+                publicState.tmdbCandidates = [];
+                $("publicTmdbPanel")?.classList.add("hidden");
+            });
+            $("publicTmdbPanel")?.addEventListener("click", (event) => {
+                const target = event.target.closest("[data-tmdb-index], [data-tmdb-action]");
+                if (target) handleTmdbAction(target);
+            });
+            $("publicTmdbSkipBtn")?.addEventListener("click", () => handleTmdbAction({ dataset: { tmdbAction: "manual" } }));
+            $("publicTmdbCloseBtn")?.addEventListener("click", () => {
+                const panel = $("publicTmdbPanel");
+                panel?.classList.add("hidden");
+                document.body.classList.remove("public-tmdb-modal-open");
+                document.documentElement.classList.remove("is-tmdb-modal-open");
+                publicState.tmdbSearchSequence = (publicState.tmdbSearchSequence || 0) + 1;
+                publicState.tmdbDecision = "";
+                publicState.tmdbSelection = null;
+                publicState.tmdbCandidates = [];
+                if ($("publicTmdbCandidates")) $("publicTmdbCandidates").innerHTML = "";
+                setPublicSearchStatus("", { visible: false });
+            });
+            $("publicTmdbPanel")?.addEventListener("click", (event) => {
+                if (event.target === $("publicTmdbPanel")) $("publicTmdbCloseBtn")?.click();
+            });
             document.querySelectorAll('input[name="publicSearchSource"]').forEach((input) => {
                 input.addEventListener("change", () => {
                     publicState.searchSource = selectedSearchSource();
@@ -186,6 +223,10 @@
                     }
                     if (!$("publicSubmitConfirm")?.classList.contains("hidden")) {
                         closePublicSubmitConfirm();
+                        return;
+                    }
+                    if (!$("publicTmdbPanel")?.classList.contains("hidden")) {
+                        $("publicTmdbCloseBtn")?.click();
                     }
                 }
             });

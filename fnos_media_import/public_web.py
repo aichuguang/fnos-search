@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from flask import session
 
 from .classifiers.link_classifier import detect_link
+from .config import normalize_result_provider_badges
 from .constants import CATEGORY_LABELS
 from .importers.cloud139 import Cloud139Importer
 from .importers.sixpan import SixPanOfflineImporter
@@ -288,6 +289,18 @@ def _public_security_config(security_config: dict[str, Any]) -> dict[str, Any]:
             "max_url_length": _config_int(security_config, "max_url_length", 2048),
             "max_note_length": _config_int(security_config, "max_note_length", 500),
         },
+    }
+
+
+def _public_result_provider_badges(pansou_config: Any) -> dict[str, dict[str, Any]]:
+    config = pansou_config if isinstance(pansou_config, dict) else {}
+    normalized = normalize_result_provider_badges(config.get("result_provider_badges"))
+    return {
+        provider: {
+            "enabled": bool(settings.get("enabled", False)),
+            "text": str(settings.get("text") or "").strip(),
+        }
+        for provider, settings in normalized.items()
     }
 
 
@@ -1445,10 +1458,11 @@ def _public_request_response(guest_request: dict[str, Any] | None) -> dict[str, 
     status = str(item.get("status") or "")
     raw_data = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
     request_data = raw_data.get("request") if isinstance(raw_data.get("request"), dict) else {}
+    media_identity = raw_data.get("media_identity") if isinstance(raw_data.get("media_identity"), dict) else request_data.get("media_identity") if isinstance(request_data.get("media_identity"), dict) else None
     # 访客不提交 destination_id；展示服务端解析并绑定到正式任务的目标。
     job_result = raw_data.get("job_result") if isinstance(raw_data.get("job_result"), dict) else {}
     resolved_destination = str(job_result.get("destination_id") or "").strip() or None
-    return {
+    response = {
         "token": item.get("request_token"),
         "title": item.get("title"),
         "category": item.get("category"),
@@ -1459,6 +1473,9 @@ def _public_request_response(guest_request: dict[str, Any] | None) -> dict[str, 
         "updated_at": item.get("updated_at"),
         "message": _public_request_message_for_status(status),
     }
+    if media_identity:
+        response["media_identity"] = media_identity
+    return response
 
 
 def _public_submit_message(result: dict[str, Any]) -> str:
@@ -1550,6 +1567,16 @@ def _public_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
     quark_selection = _safe_public_quark_selection(payload.get("quark_selection"))
     cloud139_selection = _safe_public_cloud139_selection(payload.get("cloud139_selection"))
     tianyi_selection = _safe_public_tianyi_selection(payload.get("tianyi_selection"))
+    media_identity = payload.get("media_identity") if isinstance(payload.get("media_identity"), dict) else None
+    if media_identity:
+        media_identity = {
+            key: media_identity[key]
+            for key in (
+                "tmdb_id", "media_type", "title", "original_title", "year",
+                "poster_url", "overview", "season_number", "original_query",
+            )
+            if media_identity.get(key) not in (None, "")
+        }
     # v4: 访客不选择保存位置，payload 不携带 destination_id。
     return {
         "public_id": payload.get("public_id") or payload.get("resource_id") or "",
@@ -1562,6 +1589,7 @@ def _public_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "quark_selection": quark_selection,
         "cloud139_selection": cloud139_selection,
         "tianyi_selection": tianyi_selection,
+        **({"media_identity": media_identity} if media_identity else {}),
     }
 
 

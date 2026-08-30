@@ -1,6 +1,17 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
+
+
+_PUBLIC_SHARE_FAILURE_PATTERN = re.compile(
+    r"shareUserRightcheck|share\s+(?:not\s+found|invalid)|file\s+not\s+found|分享(?:链接|资源)?.*(?:失效|无效|不存在)",
+    re.IGNORECASE,
+)
+_PUBLIC_PROVIDER_ERROR_PATTERN = re.compile(
+    r"session[_-]?key|share[_-]?id|user[_-]?id|file[_-]?id|[a-z_$][\w$]*\([^)]*\)\s*-|\b(?:null|undefined)\b",
+    re.IGNORECASE,
+)
 
 
 class PublicResourceDetailService:
@@ -57,14 +68,16 @@ class PublicResourceDetailService:
             "reason": link.reason,
             "size": cached.get("size") or raw.get("size") or raw.get("size_text") or "",
         }
-        inspection = self.inspect_resource(
-            link,
-            title=title,
-            raw=raw,
-            quark_importer=quark_importer,
-            cloud139_importer=cloud139_importer,
-            sixpan_importer=sixpan_importer,
-            tianyi_importer=tianyi_importer,
+        inspection = _public_safe_inspection(
+            self.inspect_resource(
+                link,
+                title=title,
+                raw=raw,
+                quark_importer=quark_importer,
+                cloud139_importer=cloud139_importer,
+                sixpan_importer=sixpan_importer,
+                tianyi_importer=tianyi_importer,
+            )
         )
         return {
             "public_id": cached.get("public_id"),
@@ -105,11 +118,13 @@ class PublicResourceDetailService:
         client: Any,
         hide_full_links: bool,
     ) -> dict[str, Any]:
-        inspection = self.inspect_bt(
-            client,
-            source_url,
-            keyword=str(cached.get("keyword") or raw.get("keyword") or ""),
-            title=title,
+        inspection = _public_safe_inspection(
+            self.inspect_bt(
+                client,
+                source_url,
+                keyword=str(cached.get("keyword") or raw.get("keyword") or ""),
+                title=title,
+            )
         )
         poster = str(raw.get("poster") or raw.get("cover") or raw.get("image_url") or "").strip()
         origin = str(raw.get("source_origin") or "").strip()
@@ -139,6 +154,33 @@ class PublicResourceDetailService:
 
 def _datetime(raw: dict[str, Any], cached: dict[str, Any]) -> Any:
     return raw.get("datetime") or raw.get("created_at") or raw.get("time") or cached.get("created_at") or ""
+
+
+def _public_safe_inspection(inspection: Any) -> dict[str, Any]:
+    if not isinstance(inspection, dict):
+        return {}
+    result = dict(inspection)
+    public_fields = ("message", "error", "reason", "detail")
+    field_values = {
+        key: str(result.get(key) or "").strip()
+        for key in public_fields
+        if result.get(key) is not None
+    }
+    has_share_failure = any(
+        _PUBLIC_SHARE_FAILURE_PATTERN.search(value) for value in field_values.values()
+    )
+    has_provider_error = any(
+        _PUBLIC_PROVIDER_ERROR_PATTERN.search(value) for value in field_values.values()
+    )
+    if not has_share_failure and not has_provider_error:
+        return result
+
+    result["message"] = "分享链接已失效" if has_share_failure else "资源详情暂时无法读取"
+    for key in ("error", "reason", "detail"):
+        value = field_values.get(key, "")
+        if _PUBLIC_SHARE_FAILURE_PATTERN.search(value) or _PUBLIC_PROVIDER_ERROR_PATTERN.search(value):
+            result.pop(key, None)
+    return result
 
 
 def _source_url_payload(url: str, hidden: bool, mask: Callable[[str], str]) -> dict[str, str]:
