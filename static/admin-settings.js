@@ -35,14 +35,26 @@
         element.placeholder = configuredValue ? "已配置，留空保持不变" : "请输入";
     }
 
-    function changedConfigPatch(candidate, baseline) {
+    function changedConfigPatch(candidate, baseline, options = {}) {
         if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return {};
         const previous = baseline && typeof baseline === "object" && !Array.isArray(baseline) ? baseline : {};
+        const atomicPaths = options.atomicPaths instanceof Set
+            ? options.atomicPaths
+            : new Set(Array.isArray(options.atomicPaths) ? options.atomicPaths : []);
+        const prefix = String(options.path || "");
         const patch = {};
         Object.entries(candidate).forEach(([key, value]) => {
             const oldValue = previous[key];
+            const path = prefix ? `${prefix}.${key}` : key;
+            // 结构化取值（例如网盘角标 map）必须整体提交。只发变化的子键会让后端
+            // 收到缺字段的半个对象：勾选开关而文案未变时 text 会被裁掉，后端按
+            // 缺省值校验直接报“启用角标时必须填写中文”，用户填好的文案等于没绑上。
+            if (atomicPaths.has(path)) {
+                if (JSON.stringify(value ?? null) !== JSON.stringify(oldValue ?? null)) patch[key] = value;
+                return;
+            }
             if (value && typeof value === "object" && !Array.isArray(value)) {
-                const nested = changedConfigPatch(value, oldValue);
+                const nested = changedConfigPatch(value, oldValue, { atomicPaths, path });
                 if (Object.keys(nested).length) patch[key] = nested;
                 return;
             }

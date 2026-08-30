@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..constants import JOB_FAILED, JOB_SUBMITTED
-from ..http_client import HttpClient
+from ..http_client import HttpClient, HttpJsonDecodeError
 from .base import AdapterCheckResult, ImportResult
 
 
@@ -89,7 +89,16 @@ class GenericWebhookImporter:
             sep = "&" if "?" in url else "?"
             url = f"{url}{sep}token={self.token}"
 
-        status_code, data = self.http.post_json(url, payload, timeout=self.timeout)
+        try:
+            status_code, data = self.http.post_json(url, payload, timeout=self.timeout)
+        except HttpJsonDecodeError as exc:
+            return ImportResult(
+                False,
+                JOB_FAILED,
+                f"{self.name} 入库接口返回无效 JSON：HTTP {exc.status_code}",
+                target_path=str(payload["target_path"] or ""),
+                raw_data={"request": payload},
+            )
         ok = status_code < 400
         if isinstance(data, dict) and self.success_field in data:
             ok = bool(data.get(self.success_field))

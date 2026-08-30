@@ -2,7 +2,14 @@
 
 ## 1. 适用范围
 
-本手册适用于从数据库 v28 升级到 v29 的单版本原子发布。该发布不支持滚动升级、新旧容器并存、旧 API 字段别名或旧任务执行回退。
+本手册适用于已有数据库从 v1-v28 离线升级到 v29。升级工具会先在同目录临时副本中补齐普通迁移至 v28，再执行 v29 硬切换和完整性校验，最后原子替换源数据库。该发布不支持滚动升级、新旧容器并存、旧 API 字段别名或旧任务执行回退。
+
+应用启动不再自动迁移已有数据库：
+
+- 全新数据库会直接初始化为 v29；
+- 已有 v29 数据库正常启动；
+- v1-v28 数据库拒绝启动，并提示运行本手册中的离线命令；
+- 高于 v29 的数据库拒绝降级启动和降级迁移。
 
 移动云和天翼的跨 Provider 目标链路均为直连 Provider API 上传：
 
@@ -41,9 +48,10 @@ docker compose run --rm --no-deps fnos-media-import \
   --database /app/data/app.db --dry-run
 ```
 
-预演只读数据库，输出脱敏 JSON。发布人员必须审核：
+预演通过 SQLite backup API 克隆源库，只在临时副本中模拟 v1-v28 到 v29 的完整升级，不修改源数据库。输出脱敏 JSON，发布人员必须审核：
 
-- 当前 migration 和目标 `schema_version=29`；
+- `current_schema_version`、`pre_cutover_migrations` 和目标 `schema_version=29`；
+- `simulation_validated=true`；
 - 保留、删除任务数量；
 - 无效原因分布；
 - Worker、Transfer、Organizer、Rclone、访客请求、追更和热榜关联清理数量；
@@ -62,14 +70,17 @@ docker compose run --rm --no-deps fnos-media-import \
 `--apply` 会：
 
 1. 获取数据库旁路独占锁；
-2. 创建 v29 前数据库备份；
-3. 使用重建表方式更新 `import_jobs`；
-4. 保留合法 canonical V1 任务，删除旧版、缺失或损坏计划的任务及执行关联；
-5. 按既定规则解除访客请求、追更和热榜候选的任务绑定；
-6. 执行 `PRAGMA foreign_key_check`；
-7. 输出备份路径、清理统计和 ID 集合哈希。
+2. 确认数据库没有活跃写事务，并执行 WAL checkpoint；
+3. 使用 SQLite backup API 创建 `backups/app_before_schema_migration_v29_*.db`；
+4. 在同目录临时副本中将 v1-v27 普通迁移补齐至 v28；v28 数据库直接进入下一步；
+5. 使用重建表方式更新 `import_jobs`；
+6. 保留合法 canonical V1 任务，删除旧版、缺失或损坏计划的任务及执行关联；
+7. 按既定规则解除访客请求、追更和热榜候选的任务绑定；
+8. 执行 `PRAGMA foreign_key_check` 和 `PRAGMA integrity_check`；
+9. 校验通过后清理 WAL sidecar，并使用 `os.replace` 原子替换源数据库；
+10. 输出原版本、普通迁移列表、备份路径、清理统计和 ID 集合哈希。
 
-迁移失败时不得启动新版本。保留 CLI 输出和数据库备份，先定位错误或直接回滚。
+副本迁移、完整性校验或原子替换任一步失败，源数据库不会被迁移副本覆盖。迁移失败时不得启动新版本；保留 CLI 输出和数据库备份，先关闭遗漏的 SQLite 查看工具或服务，定位错误后重试，必要时直接回滚。
 
 ## 5. 启动与健康检查
 
@@ -105,6 +116,16 @@ docker compose logs --tail=200 fnos-rclone-worker
 5. 执行旧版本健康检查和最小业务冒烟。
 
 旧镜像不能直接读取 v29 数据库；应用镜像和数据库必须作为同一回滚单元。
+
+数据库恢复示例：
+
+```bash
+docker compose down
+cp /app/data/app.db /app/data/app.db.failed-v29
+cp /app/data/backups/app_before_schema_migration_v29_YYYYMMDD_HHMMSS.db \
+  /app/data/app.db
+rm -f /app/data/app.db-wal /app/data/app.db-shm
+```
 
 ## 7. 当前验证边界
 

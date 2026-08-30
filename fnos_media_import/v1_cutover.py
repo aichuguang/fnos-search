@@ -12,7 +12,9 @@ import hashlib
 import json
 import os
 import sqlite3
+import tempfile
 from collections import Counter
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -930,12 +932,166 @@ class V1JobContractHardCutover:
 
 
 def analyze_database(path: Path) -> dict[str, Any]:
-    connection = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
+    from .database import Database
+
+    database = Database(path)
+    with closing(
+        sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
+    ) as connection:
+        current = database.migration_runner.current_version(connection)
+    if current > CUTOVER_VERSION:
+        raise RuntimeError(
+            f"数据库迁移版本 v{current} 高于当前程序支持的 v{CUTOVER_VERSION}；"
+            "拒绝降级预检"
+        )
+
+    prepared: Path | None = None
     try:
-        return V1JobContractHardCutover().analyze(connection).summary(dry_run=True)
+        prepared, simulated_from, pre_cutover_migrations = _prepare_cutover_copy(path)
+        with closing(
+            sqlite3.connect(
+                f"file:{prepared.resolve().as_posix()}?mode=ro", uri=True
+            )
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            summary = V1JobContractHardCutover().analyze(connection).summary(dry_run=True)
+        _apply_v29_to_prepared_copy(prepared)
+        summary.update(
+            {
+                "current_schema_version": current,
+                "simulated_from_schema_version": simulated_from,
+                "pre_cutover_migrations": pre_cutover_migrations,
+                "target_schema_version": CUTOVER_VERSION,
+                "simulation_validated": True,
+            }
+        )
+        return summary
+    finally:
+        if prepared is not None:
+            prepared.unlink(missing_ok=True)
+
+
+def _clone_database(source: Path, target: Path) -> None:
+    source_connection = sqlite3.connect(
+        f"file:{source.resolve().as_posix()}?mode=ro", uri=True
+    )
+    target_connection = sqlite3.connect(target)
+    try:
+        source_connection.backup(target_connection)
+        target_connection.commit()
+    finally:
+        target_connection.close()
+        source_connection.close()
+
+
+def _prepare_cutover_copy(path: Path) -> tuple[Path, int, list[int]]:
+    handle, raw_target = tempfile.mkstemp(
+        prefix="v1-cutover-",
+        suffix=".db",
+        dir=str(path.parent),
+    )
+    os.close(handle)
+    target = Path(raw_target)
+    try:
+        _clone_database(path, target)
+        from .database import Database
+
+        database = Database(target)
+        with closing(sqlite3.connect(target)) as connection:
+            connection.row_factory = sqlite3.Row
+            current = database.migration_runner.current_version(connection)
+            if current > CUTOVER_VERSION:
+                raise RuntimeError(
+                    f"数据库迁移版本 v{current} 高于当前程序支持的 v{CUTOVER_VERSION}"
+                )
+            applied: list[int] = []
+            if current < database.PRE_CUTOVER_VERSION:
+                database.install_base_schema(connection)
+                applied = database.run_pre_cutover_migrations(connection)
+                database.install_base_schema(connection)
+                connection.commit()
+            return target, current, applied
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+
+
+def _validate_database(connection: sqlite3.Connection) -> None:
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise sqlite3.IntegrityError(
+            f"v29 foreign_key_check failed: {len(violations)} violation(s)"
+        )
+    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity.lower() != "ok":
+        raise sqlite3.IntegrityError(f"v29 integrity_check failed: {integrity}")
+
+
+def _apply_v29_to_prepared_copy(path: Path) -> dict[str, Any]:
+    from .database import Database
+
+    database = Database(path)
+    connection = sqlite3.connect(path, timeout=30, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=30000")
+    try:
+        current = database.migration_runner.current_version(connection)
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute(
+            "PRAGMA foreign_keys=OFF"
+            if current < CUTOVER_VERSION
+            else "PRAGMA foreign_keys=ON"
+        )
+        connection.execute("BEGIN EXCLUSIVE")
+        summary = V1JobContractHardCutover().apply(connection)
+        if current < CUTOVER_VERSION:
+            if current != database.PRE_CUTOVER_VERSION:
+                raise RuntimeError(
+                    f"v29 硬切换要求 v{database.PRE_CUTOVER_VERSION}，当前为 v{current}"
+                )
+            connection.execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                (CUTOVER_VERSION, CUTOVER_NAME, utc_now_iso()),
+            )
+        _validate_database(connection)
+        connection.commit()
+        return summary
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
+
+
+def _assert_database_offline(path: Path) -> None:
+    connection = sqlite3.connect(path, timeout=0.2, isolation_level=None)
+    try:
+        connection.execute("PRAGMA busy_timeout=200")
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint and int(checkpoint[0] or 0) != 0:
+            raise sqlite3.OperationalError("WAL checkpoint is busy")
+        connection.execute("BEGIN EXCLUSIVE")
+        connection.rollback()
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            "数据库仍被其他进程占用；请停止 Web、Worker、Scheduler 后重试"
+        ) from exc
+    finally:
+        connection.close()
+
+
+def _replace_database(source: Path, prepared: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        Path(f"{source}{suffix}").unlink(missing_ok=True)
+        Path(f"{prepared}{suffix}").unlink(missing_ok=True)
+    os.chmod(prepared, source.stat().st_mode)
+    try:
+        os.replace(prepared, source)
+    except OSError as exc:
+        raise RuntimeError(
+            "无法原子替换数据库；请确认 Web、Worker、Scheduler 及数据库查看工具"
+            "均已关闭后重试"
+        ) from exc
 
 
 def apply_database(path: Path) -> dict[str, Any]:
@@ -949,6 +1105,11 @@ def apply_database(path: Path) -> dict[str, Any]:
         os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
         with database.connect() as connection:
             current = database.migration_runner.current_version(connection)
+        if current > CUTOVER_VERSION:
+            raise RuntimeError(
+                f"数据库迁移版本 v{current} 高于当前程序支持的 v{CUTOVER_VERSION}；"
+                "拒绝降级执行离线升级"
+            )
         if current == CUTOVER_VERSION:
             pending = analyze_database(path)
             needs_cleanup = bool(pending.get("jobs", {}).get("deleted")) or any(
@@ -960,59 +1121,24 @@ def apply_database(path: Path) -> dict[str, Any]:
                 pending["already_applied"] = True
                 return pending
 
-            backup = database.backup_database(prefix="app_before_schema_migration_v29")
-            connection = sqlite3.connect(path, timeout=30, isolation_level=None)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA busy_timeout=30000")
-            try:
-                connection.execute("PRAGMA foreign_keys=ON")
-                connection.execute("BEGIN EXCLUSIVE")
-                summary = V1JobContractHardCutover().apply(connection)
-                violations = connection.execute("PRAGMA foreign_key_check").fetchall()
-                if violations:
-                    raise sqlite3.IntegrityError(
-                        f"v29 foreign_key_check failed: {len(violations)} violation(s)"
-                    )
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-            finally:
-                connection.close()
-            summary["backup_path"] = str(backup.get("path") or "")
-            summary["backup"] = backup
-            summary["already_applied"] = True
-            return summary
-        if current != CUTOVER_VERSION - 1:
-            raise RuntimeError(
-                f"硬切换 CLI 只接受 v{CUTOVER_VERSION - 1} 数据库，当前为 v{current}"
-            )
-
+        _assert_database_offline(path)
         backup = database.backup_database(prefix="app_before_schema_migration_v29")
-        connection = sqlite3.connect(path, timeout=30, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=30000")
+        prepared: Path | None = None
         try:
-            connection.execute("PRAGMA foreign_keys=OFF")
-            connection.execute("BEGIN EXCLUSIVE")
-            summary = V1JobContractHardCutover().apply(connection)
-            connection.execute(
-                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-                (CUTOVER_VERSION, CUTOVER_NAME, utc_now_iso()),
-            )
-            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
-            if violations:
-                raise sqlite3.IntegrityError(
-                    f"v29 foreign_key_check failed: {len(violations)} violation(s)"
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+            prepared, _simulated_from, pre_cutover_migrations = _prepare_cutover_copy(path)
+            summary = _apply_v29_to_prepared_copy(prepared)
+            _assert_database_offline(path)
+            _replace_database(path, prepared)
+            prepared = None
         finally:
-            connection.close()
+            if prepared is not None:
+                prepared.unlink(missing_ok=True)
         summary["backup_path"] = str(backup.get("path") or "")
         summary["backup"] = backup
+        summary["upgraded_from_schema_version"] = current
+        summary["pre_cutover_migrations"] = pre_cutover_migrations
+        if current == CUTOVER_VERSION:
+            summary["already_applied"] = True
         return summary
     finally:
         if lock_fd is not None:

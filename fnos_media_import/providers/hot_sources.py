@@ -383,7 +383,7 @@ class TencentHotSource:
 
     def fetch(self) -> list[HotItem]:
         payload = {"pageNum": 0, "pageSize": self.page_size, "data_version": self.data_version, "client_type": 2}
-        status, data = self.http.post_json(self.endpoint, payload)
+        status, data = self.http.post_json(self.endpoint, payload, read_only=True)
         if status >= 400:
             raise RuntimeError(f"Tencent hot list HTTP {status}")
         return self.parse(data, limit=self.max_items, per_category_limit=self.max_items_per_category)
@@ -642,13 +642,16 @@ class YoukuHotSource:
         self.timeout = int(config.get("timeout") or 20)
         self.max_items = max(1, int(config.get("max_items") or 20))
         self.max_items_per_category = max(1, int(config.get("max_items_per_category") or self.max_items))
-        if http_client is not None and isinstance(getattr(http_client, "session", None), requests.Session):
-            self.session = http_client.session
+        if http_client is not None and callable(getattr(http_client, "get_text", None)):
+            self.http = http_client
         elif isinstance(http_client, requests.Session):
-            self.session = http_client
+            self.http = HttpClient(
+                timeout=self.timeout,
+                trust_env=False,
+                session=http_client,
+            )
         else:
-            self.session = requests.Session()
-        self.session.trust_env = False
+            self.http = HttpClient(timeout=self.timeout, trust_env=False)
 
     @staticmethod
     def parse_html(html: str, limit: int | None = None, per_category_limit: int | None = None) -> list[HotItem]:
@@ -670,11 +673,15 @@ class YoukuHotSource:
     def fetch(self) -> list[HotItem]:
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xhtml+xml"}
         try:
-            response = self.session.get(self.endpoint, timeout=self.timeout, headers=headers)
-            if response.status_code >= 400:
-                raise RuntimeError(f"Youku hot list HTTP {response.status_code}")
+            status, html = self.http.get_text(
+                self.endpoint,
+                timeout=self.timeout,
+                headers=headers,
+            )
+            if status >= 400:
+                raise RuntimeError(f"Youku hot list HTTP {status}")
             return self.parse_html(
-                response.text,
+                html,
                 limit=self.max_items,
                 per_category_limit=self.max_items_per_category,
             )

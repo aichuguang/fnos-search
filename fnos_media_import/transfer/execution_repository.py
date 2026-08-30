@@ -5,10 +5,16 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from . import (
+    IMMUTABLE_TERMINAL_PHASES,
+    OPERATOR_RECOVERABLE_PHASES,
+    PHASE_FAILED,
+    PHASE_MANUAL_REVIEW,
+    PHASE_PLANNING,
+    PHASE_RETRY_WAIT,
+    TERMINAL_PHASES,
+)
 from ..time_utils import utc_now_iso, utc_now_iso_offset
-
-
-TERMINAL_PHASES = frozenset({"completed", "failed", "cancelled", "manual_review"})
 
 # A receipt represents an externally visible side effect.  It may only be
 # cleared at the two explicit hand-off points below: after a source landing has
@@ -38,11 +44,11 @@ _ALLOWED_PHASE_TRANSITIONS: dict[str, frozenset[str]] = {
     "organizing": frozenset({"organizing", "finalizing", "final_verifying", "failed", "manual_review", "cancel_pending", "retry_wait", "cancelled"}),
     "finalizing": frozenset({"finalizing", "final_verifying", "failed", "manual_review", "cancel_pending", "retry_wait", "cancelled"}),
     "final_verifying": frozenset({"final_verifying", "ack_pending", "failed", "manual_review", "cancel_pending", "retry_wait", "cancelled"}),
-    "ack_pending": frozenset({"ack_pending", "cleanup_pending", "completed", "failed", "manual_review", "cancel_pending", "cancelled", "retry_wait"}),
+    "ack_pending": frozenset({"ack_pending", "final_verifying", "cleanup_pending", "completed", "failed", "manual_review", "cancel_pending", "cancelled", "retry_wait"}),
     "cleanup_pending": frozenset({"cleanup_pending", "completed", "failed", "manual_review", "retry_wait"}),
     "retry_wait": frozenset({"retry_wait", "planning", "source_materializing", "native_submitting", "native_waiting", "transferring", "target_verifying", "organizing", "finalizing", "final_verifying", "ack_pending", "cleanup_pending", "failed", "manual_review", "cancel_pending", "cancelled"}),
     "cancel_pending": frozenset({"cancel_pending", "cancelled", "failed", "manual_review", "retry_wait"}),
-    "manual_review": frozenset({"manual_review"}),
+    "manual_review": frozenset({"manual_review", "retry_wait"}),
     "completed": frozenset({"completed"}),
     "failed": frozenset({"failed", "retry_wait", "planning", "source_materializing", "native_submitting", "transferring", "target_verifying", "manual_review"}),
     "cancelled": frozenset({"cancelled"}),
@@ -140,14 +146,20 @@ class TransferExecutionRepository:
         job_status: str | None = None,
         job_error_message: str = "",
         require_job_status_transition: bool = False,
+        operator_recovery: bool = False,
     ) -> TransferExecution:
         next_phase = str(phase or "").strip()
         _validate_phase_name(next_phase)
         _validate_transition(execution.phase, next_phase)
         if execution.phase in TERMINAL_PHASES and next_phase != execution.phase:
-            raise ExecutionConflictError(
-                f"terminal execution cannot transition: {execution.phase} -> {next_phase}"
-            )
+            if execution.phase in IMMUTABLE_TERMINAL_PHASES:
+                raise ExecutionConflictError(
+                    f"immutable terminal execution cannot transition: {execution.phase} -> {next_phase}"
+                )
+            if not operator_recovery or execution.phase not in OPERATOR_RECOVERABLE_PHASES:
+                raise ExecutionConflictError(
+                    f"terminal execution requires operator recovery: {execution.phase} -> {next_phase}"
+                )
         _validate_claim_owner(execution, claim_owner_id)
         receipt_value = snapshot.get("receipt")
         receipt = receipt_value if isinstance(receipt_value, dict) else None
@@ -312,14 +324,126 @@ class TransferExecutionRepository:
         execution = self.get(job_id)
         if execution is None:
             raise ExecutionConflictError("执行状态不存在")
-        if execution.phase == "completed":
-            raise ExecutionConflictError("已完成任务不能重试")
-        if execution.phase in {"manual_review", "cancelled"}:
-            raise ExecutionConflictError("人工复核或已取消任务不能自动重试")
+        if execution.phase in IMMUTABLE_TERMINAL_PHASES:
+            raise ExecutionConflictError(f"{execution.phase} execution cannot be recovered")
+        if execution.phase == PHASE_MANUAL_REVIEW:
+            raise ExecutionConflictError("manual_review requires recover_manual_review()")
+        if execution.phase != PHASE_FAILED:
+            snapshot = dict(execution.snapshot)
+            snapshot.update({"retry_ready": False, "error_code": "", "message": ""})
+            return self.save(
+                execution,
+                snapshot,
+                phase=execution.phase,
+                resume_at=None,
+                last_error_code="",
+                last_error_message="",
+            )
         snapshot = dict(execution.snapshot)
-        retry_from = str(snapshot.get("retry_from") or snapshot.get("phase") or "planning")
-        snapshot.update({"phase": retry_from, "retry_ready": False, "error_code": "", "message": ""})
-        return self.save(execution, snapshot, phase=retry_from, last_error_code="", last_error_message="")
+        resume_phase = self._recovery_phase(
+            execution,
+            snapshot.get("failure_from") or snapshot.get("retry_from"),
+        )
+        return self._operator_recover(execution, snapshot, resume_phase)
+
+    def recover_manual_review(
+        self,
+        job_id: int,
+        *,
+        resume_phase: str | None = None,
+    ) -> TransferExecution:
+        execution = self.get(job_id)
+        if execution is None:
+            raise ExecutionConflictError("执行状态不存在")
+        if execution.phase != PHASE_MANUAL_REVIEW:
+            raise ExecutionConflictError("execution is not awaiting manual review")
+        snapshot = dict(execution.snapshot)
+        recovered_phase = self._recovery_phase(
+            execution,
+            resume_phase or snapshot.get("review_from"),
+        )
+        return self._operator_recover(execution, snapshot, recovered_phase)
+
+    def _operator_recover(
+        self,
+        execution: TransferExecution,
+        snapshot: dict[str, Any],
+        resume_phase: str,
+    ) -> TransferExecution:
+        receipt_status = str((execution.receipt or {}).get("status") or "").strip().lower()
+        submission_phase = resume_phase in {
+            "source_materializing",
+            "native_submitting",
+            "transferring",
+        }
+        fence = snapshot.get("submission_fence")
+        if (
+            execution.receipt is None
+            and submission_phase
+            and isinstance(fence, dict)
+            and str(fence.get("state") or "").strip().lower() in {"prepared", "committed"}
+        ):
+            raise ExecutionConflictError(
+                f"submission fence exists but receipt is missing for {resume_phase}"
+            )
+        phase_attempts = (
+            dict(snapshot.get("phase_attempts"))
+            if isinstance(snapshot.get("phase_attempts"), dict)
+            else {}
+        )
+        # Older rows may have the receipt durable in ``receipt_json`` while
+        # the JSON snapshot predates that field.  Carry it forward so operator
+        # recovery cannot accidentally clear an external side-effect fence.
+        if execution.receipt is not None and not isinstance(snapshot.get("receipt"), dict):
+            snapshot["receipt"] = dict(execution.receipt)
+        preserve_receipt = bool(
+            execution.receipt is not None
+            and submission_phase
+            and receipt_status not in {"failed", "cancelled"}
+        )
+        phase_attempts.pop(resume_phase, None)
+        if resume_phase == "cleanup_pending" and isinstance(snapshot.get("cleanup"), dict):
+            cleanup = dict(snapshot["cleanup"])
+            cleanup.pop("attempt", None)
+            snapshot["cleanup"] = cleanup
+        snapshot.update(
+            {
+                "phase": PHASE_RETRY_WAIT,
+                "phase_attempts": phase_attempts,
+                "retry_from": resume_phase,
+                "preserve_receipt_on_retry": preserve_receipt,
+                "retry_ready": False,
+                "error_code": "",
+                "message": "",
+            }
+        )
+        snapshot.pop("claim", None)
+        return self.save(
+            execution,
+            snapshot,
+            phase=PHASE_RETRY_WAIT,
+            resume_at=None,
+            last_error_code="",
+            last_error_message="",
+            operator_recovery=True,
+        )
+
+    @staticmethod
+    def _recovery_phase(
+        execution: TransferExecution,
+        candidate: Any,
+    ) -> str:
+        phase = str(candidate or "").strip()
+        if not phase:
+            if execution.receipt is not None:
+                raise ExecutionConflictError(
+                    "execution receipt exists but recovery phase is unknown"
+                )
+            return PHASE_PLANNING
+        _validate_phase_name(phase)
+        if phase in TERMINAL_PHASES or phase in {PHASE_RETRY_WAIT, "cancel_pending"}:
+            raise ExecutionConflictError(f"invalid operator recovery phase: {phase}")
+        return phase
 
 
 def _decode(row: Any) -> TransferExecution:

@@ -58,6 +58,10 @@ __all__ = [
     "PHASE_CANCEL_PENDING",
     "PHASE_FAILED",
     "PHASE_CANCELLED",
+    "TERMINAL_PHASES",
+    "OPERATOR_RECOVERABLE_PHASES",
+    "IMMUTABLE_TERMINAL_PHASES",
+    "WAITING_PHASES",
     "ErrorCode",
     "RETRYABLE_ERROR_CODES",
     "TransferError",
@@ -102,8 +106,14 @@ PHASE_CANCEL_PENDING = "cancel_pending"
 PHASE_FAILED = "failed"
 PHASE_CANCELLED = "cancelled"
 
-# 终态
-TERMINAL_PHASES = frozenset({PHASE_COMPLETED, PHASE_FAILED, PHASE_CANCELLED})
+# Durable terminal phases are never picked up by the recovery scanner.  Failed
+# and manual-review executions may only leave this set through an explicit
+# repository operator-recovery API; completed and cancelled are immutable.
+TERMINAL_PHASES = frozenset(
+    {PHASE_COMPLETED, PHASE_FAILED, PHASE_MANUAL_REVIEW, PHASE_CANCELLED}
+)
+OPERATOR_RECOVERABLE_PHASES = frozenset({PHASE_FAILED, PHASE_MANUAL_REVIEW})
+IMMUTABLE_TERMINAL_PHASES = frozenset({PHASE_COMPLETED, PHASE_CANCELLED})
 
 # 需要等外部事件（轮询 / 退避 / 人工）的等待阶段
 WAITING_PHASES = frozenset(
@@ -658,6 +668,27 @@ class TransferPlan:
             nl = self.target_category["native_locator"]
             return NativeLocator(kind=str(nl.get("locator_kind") or "folder_id"), value=str(nl.get("value") or ""))
         return NativeLocator(kind="folder_id", value=self.destination_id)
+
+    def native_submit_locator(self) -> NativeLocator:
+        """原生转存的实际提交目录。
+
+        当计划冻结了原生入库暂存目录（分类目录 / _入库暂存 / job-N）时，Provider
+        必须把文件转存进暂存目录，之后由 OpenList Organizer 搬进正式分类目录；
+        没有暂存目录时退回分类定位器，保持直写分类目录的旧行为。
+        """
+
+        # 直接读冻结计划里的原始值：path() 会把定位器规范化成以 "/" 开头的
+        # POSIX 路径，而天翼云的 folder_path 是 "{root_folder_id}::{相对路径}"
+        # 复合定位器，加上前导 "/" 就再也解析不出 root_folder_id 了。
+        staging = self.paths.get("destination_staging")
+        if isinstance(staging, dict) and str(staging.get("kind") or "") == "native":
+            value = str(staging.get("path") or "").strip()
+            if value:
+                kind = str(staging.get("locator_kind") or "").strip()
+                if not kind:
+                    kind = self.native_locator().kind
+                return NativeLocator(kind=kind, value=value)
+        return self.native_locator()
 
     def verification_expected(self) -> dict[str, int | str]:
         minimum = self.verification.get("minimum") if isinstance(self.verification.get("minimum"), list) else []

@@ -7,6 +7,7 @@ import unittest
 import uuid
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from fnos_media_import.database import Database
 from fnos_media_import.migrations import Migration, MigrationRunner
@@ -78,12 +79,12 @@ class V1CutoverMigrationTests(unittest.TestCase):
         self.assertEqual(dry_run["cleanup"]["worker_tasks"], 5)
 
         database = Database(self.path)
-        database.init_schema()
+        with self.assertRaisesRegex(RuntimeError, "v28.*v1_cutover"):
+            database.init_schema()
+        summary = apply_database(self.path)
 
-        self.assertIsNotNone(database.last_migration_backup)
-        backup_path = Path(str((database.last_migration_backup or {}).get("path") or ""))
+        backup_path = Path(str(summary.get("backup_path") or ""))
         self.assertTrue(backup_path.is_file())
-        summary = database.last_cutover_summary or {}
         self.assertEqual(summary.get("migration"), CUTOVER_NAME)
         self.assertEqual(summary.get("jobs", {}).get("kept"), 1)
         self.assertEqual(summary.get("jobs", {}).get("deleted"), 7)
@@ -209,7 +210,7 @@ class V1CutoverMigrationTests(unittest.TestCase):
                 ],
             )
 
-        database.init_schema()
+        Database(self.path).init_schema()
         with closing(sqlite3.connect(self.path)) as connection:
             self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM import_jobs").fetchone()[0])
             self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM import_execution_plans").fetchone()[0])
@@ -252,6 +253,52 @@ class V1CutoverMigrationTests(unittest.TestCase):
             self.assertEqual("pid=4242\n", lock_path.read_text(encoding="ascii"))
         finally:
             lock_path.unlink(missing_ok=True)
+
+    def test_dry_run_does_not_modify_source_database(self) -> None:
+        self._build_v28_mixed_database()
+        before = self.path.read_bytes()
+
+        summary = analyze_database(self.path)
+
+        self.assertTrue(summary["dry_run"])
+        self.assertTrue(summary["simulation_validated"])
+        self.assertEqual(before, self.path.read_bytes())
+
+    def test_startup_rejection_does_not_modify_legacy_database(self) -> None:
+        self._build_v28_mixed_database()
+        before = self.path.read_bytes()
+
+        with self.assertRaisesRegex(RuntimeError, "v28.*v1_cutover"):
+            Database(self.path).init_schema()
+
+        self.assertEqual(before, self.path.read_bytes())
+
+    def test_apply_rejects_active_writer_transaction(self) -> None:
+        self._build_v28_mixed_database()
+        owner = sqlite3.connect(self.path, isolation_level=None)
+        try:
+            owner.execute("BEGIN IMMEDIATE")
+            owner.execute(
+                "UPDATE app_settings SET value=value WHERE key='advanced_config'"
+            )
+            with self.assertRaisesRegex(RuntimeError, "数据库仍被其他进程占用"):
+                apply_database(self.path)
+        finally:
+            owner.rollback()
+            owner.close()
+
+    def test_staged_cutover_failure_keeps_source_database_unchanged(self) -> None:
+        self._build_v28_mixed_database()
+        before = self.path.read_bytes()
+
+        with patch(
+            "fnos_media_import.v1_cutover._apply_v29_to_prepared_copy",
+            side_effect=RuntimeError("staged failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "staged failure"):
+                apply_database(self.path)
+
+        self.assertEqual(before, self.path.read_bytes())
 
     def test_cutover_preserves_caller_owned_exclusive_transaction(self) -> None:
         self._build_v28_mixed_database()

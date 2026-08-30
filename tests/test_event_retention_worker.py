@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import tempfile
 import unittest
 from pathlib import Path
+from uuid import uuid4
 
 from fnos_media_import.database import Database
 from fnos_media_import.repositories import RepositorySet
@@ -18,14 +18,22 @@ OLD_TIMESTAMP = "2000-01-01T00:00:00Z"
 
 class EventRetentionWorkerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.db_path = Path(self.temp_dir.name) / "events.db"
+        self.temp_dir = (
+            Path(__file__).resolve().parents[1]
+            / "codex_tmp"
+            / "event-retention-tests"
+            / uuid4().hex
+        )
+        self.temp_dir.mkdir(parents=True, exist_ok=False)
+        self.db_path = self.temp_dir / "events.db"
         self._database_infrastructure = Database(self.db_path)
         self._database_infrastructure.init_schema()
         self.database = RepositorySet.from_database(self._database_infrastructure)
 
     def tearDown(self) -> None:
-        self.temp_dir.cleanup()
+        for suffix in ("", "-journal", "-shm", "-wal"):
+            (Path(f"{self.db_path}{suffix}")).unlink(missing_ok=True)
+        self.temp_dir.rmdir()
 
     def _insert_job(self, status: str, suffix: str) -> int:
         job_id, created = self.database.job_commands.create(
@@ -65,6 +73,47 @@ class EventRetentionWorkerTests(unittest.TestCase):
                     f"请求-{suffix}",
                     f"https://example.invalid/request/{suffix}",
                     f"hash-{suffix}",
+                    OLD_TIMESTAMP,
+                    OLD_TIMESTAMP,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def _insert_update_subscription(self, suffix: str) -> int:
+        with self.database.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO update_subscriptions (
+                    title, category, category_label, media_type, schedule_kind,
+                    timezone, source_strategy, auto_import_policy, status,
+                    created_at, updated_at
+                ) VALUES (?, 'tv', 'TV', 'tv', 'manual', 'Asia/Shanghai',
+                          'search', 'review', 'enabled', ?, ?)
+                """,
+                (f"subscription-{suffix}", OLD_TIMESTAMP, OLD_TIMESTAMP),
+            )
+            return int(cursor.lastrowid)
+
+    def _insert_rclone_run(
+        self,
+        suffix: str,
+        *,
+        job_id: int | None = None,
+        status: str = "success",
+    ) -> int:
+        with self.database.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO rclone_runs (
+                    trigger_reason, operation_key, job_id, copy_descriptor_json,
+                    status, started_at, finished_at, updated_at
+                ) VALUES ('retention-test', ?, ?, '{}', ?, ?, ?, ?)
+                """,
+                (
+                    f"event-retention-run:{suffix}",
+                    job_id,
+                    status,
+                    OLD_TIMESTAMP,
                     OLD_TIMESTAMP,
                     OLD_TIMESTAMP,
                 ),
@@ -353,6 +402,166 @@ class EventRetentionWorkerTests(unittest.TestCase):
         self.assertEqual(acquire_count, 2)
         with self.database.connect() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM guest_request_events").fetchone()[0], 1)
+
+    def test_prunes_only_disposable_rclone_runs(self) -> None:
+        disposable_job_id = self._insert_job("done", "run-disposable")
+        active_job_id = self._insert_job("waiting_transfer", "run-active")
+        failed_job_id = self._insert_job("failed", "run-failed")
+        review_job_id = self._insert_job("failed", "run-review")
+        organizer_job_id = self._insert_job("done", "run-organizer")
+
+        disposable_run_id = self._insert_rclone_run("disposable", job_id=disposable_job_id)
+        active_run_id = self._insert_rclone_run("active", job_id=active_job_id)
+        failed_run_id = self._insert_rclone_run("failed", job_id=failed_job_id)
+        review_run_id = self._insert_rclone_run("review", job_id=review_job_id)
+        organizer_run_id = self._insert_rclone_run("organizer", job_id=organizer_job_id)
+
+        execution_repository = TransferExecutionRepository(self.database)
+        execution_repository.create(
+            failed_job_id,
+            rclone_v1_plan(failed_job_id),
+            phase="failed",
+        )
+        execution_repository.create(
+            review_job_id,
+            rclone_v1_plan(review_job_id),
+            phase="manual_review",
+        )
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO organizer_tasks (
+                    job_id, rclone_run_id, trigger_type, category, category_label,
+                    title, openlist_root_path, status, created_at, updated_at
+                ) VALUES (?, ?, 'rclone', 'tv', 'TV', 'linked', '/linked',
+                          'done', ?, ?)
+                """,
+                (organizer_job_id, organizer_run_id, OLD_TIMESTAMP, OLD_TIMESTAMP),
+            )
+
+        result = self._worker().run_once()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["deleted_by_table"].get("rclone_runs"), 1)
+        with self.database.connect() as connection:
+            remaining = {
+                int(row["id"])
+                for row in connection.execute("SELECT id FROM rclone_runs").fetchall()
+            }
+        self.assertNotIn(disposable_run_id, remaining)
+        self.assertEqual(
+            remaining,
+            {active_run_id, failed_run_id, review_run_id, organizer_run_id},
+        )
+
+    def test_prunes_terminal_update_history_and_expired_caches(self) -> None:
+        subscription_id = self._insert_update_subscription("history")
+        with self.database.connect() as connection:
+            terminal_run = connection.execute(
+                """
+                INSERT INTO update_runs (
+                    subscription_id, trigger_type, status, started_at, finished_at
+                ) VALUES (?, 'manual', 'success', ?, ?)
+                """,
+                (subscription_id, OLD_TIMESTAMP, OLD_TIMESTAMP),
+            )
+            preserved_run = connection.execute(
+                """
+                INSERT INTO update_runs (
+                    subscription_id, trigger_type, status, started_at, finished_at
+                ) VALUES (?, 'manual', 'success', ?, ?)
+                """,
+                (subscription_id, OLD_TIMESTAMP, OLD_TIMESTAMP),
+            )
+            empty_run = connection.execute(
+                """
+                INSERT INTO update_runs (
+                    subscription_id, trigger_type, status, started_at, finished_at
+                ) VALUES (?, 'manual', 'failed', ?, ?)
+                """,
+                (subscription_id, OLD_TIMESTAMP, OLD_TIMESTAMP),
+            )
+            terminal_run_id = int(terminal_run.lastrowid)
+            preserved_run_id = int(preserved_run.lastrowid)
+            empty_run_id = int(empty_run.lastrowid)
+            connection.execute(
+                """
+                INSERT INTO update_candidates (
+                    subscription_id, run_id, title, source_type, source_url,
+                    source_url_hash, decision, created_at
+                ) VALUES (?, ?, 'completed', 'quark', 'https://example.invalid/completed',
+                          'completed-hash', 'completed', ?)
+                """,
+                (subscription_id, terminal_run_id, OLD_TIMESTAMP),
+            )
+            for decision in ("review", "submitted", "auto_import"):
+                connection.execute(
+                    """
+                    INSERT INTO update_candidates (
+                        subscription_id, run_id, title, source_type, source_url,
+                        source_url_hash, decision, created_at
+                    ) VALUES (?, ?, ?, 'quark', ?, ?, ?, ?)
+                    """,
+                    (
+                        subscription_id,
+                        preserved_run_id,
+                        decision,
+                        f"https://example.invalid/{decision}",
+                        f"{decision}-hash",
+                        decision,
+                        OLD_TIMESTAMP,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO update_seen_items (
+                    subscription_id, fingerprint, first_seen_at, last_seen_at
+                ) VALUES (?, 'business-state', ?, ?)
+                """,
+                (subscription_id, OLD_TIMESTAMP, OLD_TIMESTAMP),
+            )
+            connection.execute(
+                """
+                INSERT INTO update_preview_cache (
+                    source_type, source_url_hash, expires_at, created_at, updated_at
+                ) VALUES ('quark', 'expired-preview', ?, ?, ?)
+                """,
+                (OLD_TIMESTAMP, OLD_TIMESTAMP, OLD_TIMESTAMP),
+            )
+            connection.execute(
+                """
+                INSERT INTO update_path_snapshots (
+                    subscription_id, openlist_path, captured_at, expires_at
+                ) VALUES (?, '/expired', ?, ?)
+                """,
+                (subscription_id, OLD_TIMESTAMP, OLD_TIMESTAMP),
+            )
+
+        result = self._worker().run_once()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["deleted_by_table"].get("update_candidates"), 1)
+        self.assertEqual(result["deleted_by_table"].get("update_runs"), 2)
+        self.assertEqual(result["deleted_by_table"].get("update_preview_cache"), 1)
+        self.assertEqual(result["deleted_by_table"].get("update_path_snapshots"), 1)
+        with self.database.connect() as connection:
+            decisions = {
+                str(row["decision"])
+                for row in connection.execute(
+                    "SELECT decision FROM update_candidates"
+                ).fetchall()
+            }
+            run_ids = {
+                int(row["id"])
+                for row in connection.execute("SELECT id FROM update_runs").fetchall()
+            }
+            self.assertEqual(decisions, {"review", "submitted", "auto_import"})
+            self.assertEqual(run_ids, {preserved_run_id})
+            self.assertNotIn(terminal_run_id, run_ids)
+            self.assertNotIn(empty_run_id, run_ids)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM update_seen_items").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM update_preview_cache").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM update_path_snapshots").fetchone()[0], 0)
 
     def test_schema_contains_retention_indexes_and_migration_marker(self) -> None:
         expected = {

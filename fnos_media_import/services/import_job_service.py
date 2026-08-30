@@ -614,6 +614,17 @@ class ImportJobCreationService:
             value = payload.get(key)
             if value not in (None, ""):
                 summary[key] = value
+        media_identity = payload.get("media_identity")
+        if isinstance(media_identity, dict):
+            allowed = (
+                "tmdb_id", "media_type", "title", "original_title", "year",
+                "poster_url", "overview", "season_number", "original_query",
+            )
+            summary["media_identity"] = {
+                key: media_identity[key]
+                for key in allowed
+                if media_identity.get(key) not in (None, "")
+            }
         return summary
 
     def _trusted_config_revision(self) -> int:

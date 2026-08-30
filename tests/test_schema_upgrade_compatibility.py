@@ -5,9 +5,8 @@ import unittest
 import uuid
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
-
 from fnos_media_import.database import Database
+from fnos_media_import.v1_cutover import analyze_database, apply_database
 
 
 class SchemaUpgradeCompatibilityTests(unittest.TestCase):
@@ -81,11 +80,63 @@ class SchemaUpgradeCompatibilityTests(unittest.TestCase):
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'import_jobs'"
                 ).fetchone()
             self.assertIsNone(import_jobs)
+            with self.assertRaisesRegex(RuntimeError, "v30.*v29"):
+                analyze_database(database_path)
+            with self.assertRaisesRegex(RuntimeError, "v30.*v29"):
+                apply_database(database_path)
         finally:
             for suffix in ("", "-wal", "-shm"):
                 path = Path(f"{database_path}{suffix}")
                 if path.exists():
                     path.unlink()
+
+    def test_minimal_v1_database_can_be_upgraded_offline_to_v29(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        database_path = root / f"schema-minimal-v1-{uuid.uuid4().hex}.db"
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at TEXT NOT NULL
+                    );
+                    INSERT INTO schema_migrations(version, name, applied_at)
+                    VALUES (1, 'baseline_scheduler_leases', '2026-01-01T00:00:00Z');
+                    """
+                )
+                connection.commit()
+
+            summary = apply_database(database_path)
+
+            self.assertEqual(1, summary["upgraded_from_schema_version"])
+            self.assertEqual(29, summary["schema_version"])
+            with closing(sqlite3.connect(database_path)) as connection:
+                self.assertEqual(
+                    (29,),
+                    connection.execute(
+                        "SELECT MAX(version) FROM schema_migrations"
+                    ).fetchone(),
+                )
+                self.assertEqual([], connection.execute("PRAGMA foreign_key_check").fetchall())
+                self.assertEqual(
+                    ("ok",),
+                    connection.execute("PRAGMA integrity_check").fetchone(),
+                )
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                path = Path(f"{database_path}{suffix}")
+                if path.exists():
+                    path.unlink()
+            backup_dir = database_path.parent / "backups"
+            if backup_dir.exists():
+                for candidate in backup_dir.glob("app_before_schema_migration_v29_*.db"):
+                    candidate.unlink()
+                try:
+                    backup_dir.rmdir()
+                except OSError:
+                    pass
 
     def test_provider_auth_session_polling_migration_adds_row_version(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -125,8 +176,9 @@ class SchemaUpgradeCompatibilityTests(unittest.TestCase):
                 connection.commit()
 
             database = Database(database_path)
-            with patch.object(database, "_backup_before_pending_migrations"):
+            with self.assertRaisesRegex(RuntimeError, "v26.*v1_cutover"):
                 database.init_schema()
+            apply_database(database_path)
             with closing(sqlite3.connect(database_path)) as connection:
                 columns = {
                     row[1]
@@ -194,9 +246,10 @@ class SchemaUpgradeCompatibilityTests(unittest.TestCase):
                 connection.commit()
 
             database = Database(database_path)
-            with patch.object(database, "_backup_before_pending_migrations"):
+            with self.assertRaisesRegex(RuntimeError, "v25.*v1_cutover"):
                 database.init_schema()
-                database.init_schema()
+            apply_database(database_path)
+            database.init_schema()
 
             with closing(sqlite3.connect(database_path)) as connection:
                 columns = {
@@ -290,9 +343,10 @@ class SchemaUpgradeCompatibilityTests(unittest.TestCase):
                 connection.commit()
 
             database = Database(database_path)
-            with patch.object(database, "_backup_before_pending_migrations"):
+            with self.assertRaisesRegex(RuntimeError, "v11.*v1_cutover"):
                 database.init_schema()
-                database.init_schema()
+            apply_database(database_path)
+            database.init_schema()
 
             with closing(sqlite3.connect(database_path)) as connection:
                 organizer_run_columns = {

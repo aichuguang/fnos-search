@@ -5,7 +5,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from ..constants import JOB_FAILED, JOB_SUBMITTED
-from ..http_client import HttpClient
+from ..http_client import HttpClient, HttpJsonDecodeError
 from ..media_path_rules import append_resource_dir, should_force_resource_dir
 from .base import AdapterCheckResult, ImportResult
 
@@ -417,11 +417,16 @@ class QuarkImporter:
         params: dict[str, Any] | None = None,
         base: str | None = None,
     ) -> dict[str, Any]:
-        status, payload = self.http.get_json(
-            f"{base or self.base_url}{path}",
-            params=params or {},
-            timeout=self.timeout,
-        )
+        try:
+            status, payload = self.http.get_json(
+                f"{base or self.base_url}{path}",
+                params=params or {},
+                timeout=self.timeout,
+            )
+        except HttpJsonDecodeError as exc:
+            raise QuarkApiError(
+                f"夸克 API 返回无效 JSON：HTTP {exc.status_code}"
+            ) from exc
         return self._validate_response(status, payload, path=path)
 
     def _post(
@@ -431,12 +436,17 @@ class QuarkImporter:
         *,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        status, value = self.http.post_json(
-            f"{self.base_url}{path}",
-            payload,
-            params=params or {},
-            timeout=self.timeout,
-        )
+        try:
+            status, value = self.http.post_json(
+                f"{self.base_url}{path}",
+                payload,
+                params=params or {},
+                timeout=self.timeout,
+            )
+        except HttpJsonDecodeError as exc:
+            raise QuarkApiError(
+                f"夸克 API 返回无效 JSON：HTTP {exc.status_code}"
+            ) from exc
         return self._validate_response(status, value, path=path)
 
     @staticmethod

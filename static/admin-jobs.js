@@ -220,6 +220,26 @@
             };
         }
 
+        function mediaIdentityInfo(item) {
+            const raw = item?.raw_data && typeof item.raw_data === "object" ? item.raw_data : {};
+            const request = raw.request && typeof raw.request === "object" ? raw.request : {};
+            const media = raw.media_identity && typeof raw.media_identity === "object"
+                ? raw.media_identity
+                : request.media_identity && typeof request.media_identity === "object" ? request.media_identity : null;
+            return media && media.tmdb_id ? media : null;
+        }
+
+        function renderMediaIdentity(item) {
+            const media = mediaIdentityInfo(item);
+            if (!media) return "";
+            const type = media.media_type === "tv" ? "电视剧" : "电影";
+            const subtitle = [media.year, type, `TMDB #${media.tmdb_id}`].filter(Boolean).join(" · ");
+            return `<section class="admin-media-identity">
+                ${media.poster_url ? `<img src="${escapeHtml(media.poster_url)}" alt="${escapeHtml(media.title || "影视海报")}" loading="lazy">` : ""}
+                <div><span>访客确认的影视</span><strong>${escapeHtml(media.title || "-")}</strong><small>${escapeHtml(subtitle)}</small>${media.original_title ? `<small>原名：${escapeHtml(media.original_title)}</small>` : ""}${media.original_query ? `<small>原始搜索：${escapeHtml(media.original_query)}</small>` : ""}</div>
+            </section>`;
+        }
+
         async function showRequestDetail(id) {
             const data = await api(`/api/admin/requests/${id}`);
             const item = data.request || {};
@@ -230,6 +250,7 @@
                 `请求详情`,
                 `
                 <div class="request-detail">
+                    ${renderMediaIdentity(item)}
                     <div class="detail-block">
                         <span>资源名称</span>
                         <strong>${escapeHtml(item.title || "-")}</strong>
@@ -704,6 +725,7 @@
             openDrawer(
                 `任务 #${job.id}`,
                 `
+                ${renderMediaIdentity(job)}
                 <div class="detail-grid">
                     <div><span>标题</span>${escapeHtml(job.title || "-")}</div>
                     <div><span>状态</span>${statusPill(job.status)}</div>

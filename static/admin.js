@@ -56,12 +56,24 @@ const adminState = {
 
 const $ = (id) => document.getElementById(id);
 
-const ADVANCED_CLOUD_TYPES = [
-    ["quark", "夸克"],
-    ["tianyi", "天翼云"],
-    ["mobile", "移动云盘"],
-    ["magnet", "磁链"],
-];
+const ADVANCED_PROVIDER_PRIORITY_DEFAULT = ["quark", "mobile", "tianyi", "magnet"];
+const ADVANCED_PROVIDER_LABELS = Object.freeze({
+    quark: "夸克网盘",
+    mobile: "移动云",
+    tianyi: "天翼云盘",
+    magnet: "磁链 / BT",
+});
+// 后端把这些字段当成一个整体校验（角标 map 的 enabled/text 互相约束），
+// 增量 patch 会把未改动的兄弟键裁掉并触发校验失败，所以整块提交。
+const ADVANCED_ATOMIC_CONFIG_PATHS = Object.freeze([
+    "pansou.result_provider_badges",
+]);
+const ADVANCED_PROVIDER_BADGE_DEFAULTS = Object.freeze({
+    quark: Object.freeze({ enabled: false, text: "" }),
+    mobile: Object.freeze({ enabled: false, text: "秒入库" }),
+    tianyi: Object.freeze({ enabled: false, text: "" }),
+    magnet: Object.freeze({ enabled: false, text: "快速入库" }),
+});
 
 const ADVANCED_SECRET_FIELDS = {
     advPansouPassword: "pansou.password",
@@ -1413,7 +1425,11 @@ function renderAdvancedConfig() {
     setValue("advPansouUsername", pansou.username);
     setSecret("advPansouPassword", pansou.password);
     setSecret("advPansouDefaultToken", pansou.default_token);
-    renderAdvancedCloudTypes(pansou.cloud_types || []);
+    renderAdvancedProviderPriority(
+        pansou.result_provider_priority || [],
+        pansou.cloud_types || [],
+        pansou.result_provider_badges || {},
+    );
     setValue("advPansouRes", pansou.res || "merge");
     setValue("advPansouSrc", pansou.src || "all");
     // 0 表示不传 conc，交给 PanSou 自动决定并发。固定 10 会让插件多的实例
@@ -1590,19 +1606,203 @@ async function clearAdvancedSecret(path, button, options = {}) {
     }
 }
 
-function renderAdvancedCloudTypes(values) {
-    const selected = new Set((values || []).map((item) => String(item).toLowerCase()));
-    const box = $("advPansouCloudTypes");
+function normalizeAdvancedProviderPriority(values) {
+    const result = [];
+    (Array.isArray(values) ? values : []).forEach((item) => {
+        const value = String(item || "").trim().toLowerCase();
+        if (ADVANCED_PROVIDER_PRIORITY_DEFAULT.includes(value) && !result.includes(value)) {
+            result.push(value);
+        }
+    });
+    ADVANCED_PROVIDER_PRIORITY_DEFAULT.forEach((value) => {
+        if (!result.includes(value)) result.push(value);
+    });
+    return result;
+}
+
+function normalizeAdvancedProviderBadges(values) {
+    const raw = values && typeof values === "object" && !Array.isArray(values) ? values : {};
+    return Object.fromEntries(ADVANCED_PROVIDER_PRIORITY_DEFAULT.map((provider) => {
+        const fallback = ADVANCED_PROVIDER_BADGE_DEFAULTS[provider] || { enabled: false, text: "" };
+        const item = raw[provider] && typeof raw[provider] === "object" ? raw[provider] : {};
+        return [provider, {
+            enabled: typeof item.enabled === "boolean" ? item.enabled : fallback.enabled,
+            text: String(item.text ?? fallback.text ?? "").trim(),
+        }];
+    }));
+}
+
+function currentAdvancedProviderSettings() {
+    const rows = Array.from(document.querySelectorAll("#advPansouProviderPriority [data-provider-priority-item]"))
+        .map((row) => ({
+            provider: row.dataset.providerPriorityItem || "",
+            sourceEnabled: Boolean(row.querySelector("[data-provider-source-enabled]")?.checked),
+            badgeEnabled: Boolean(row.querySelector("[data-provider-badge-enabled]")?.checked),
+            badgeText: String(row.querySelector("[data-provider-badge-text]")?.value || "").trim(),
+        }))
+        .filter((item) => ADVANCED_PROVIDER_PRIORITY_DEFAULT.includes(item.provider));
+    if (rows.length) return rows;
+    return ADVANCED_PROVIDER_PRIORITY_DEFAULT.map((provider) => ({
+        provider,
+        sourceEnabled: true,
+        badgeEnabled: ADVANCED_PROVIDER_BADGE_DEFAULTS[provider]?.enabled === true,
+        badgeText: ADVANCED_PROVIDER_BADGE_DEFAULTS[provider]?.text || "",
+    }));
+}
+
+function isValidAdvancedProviderBadgeText(value) {
+    return /^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,5}$/u.test(String(value || "").trim());
+}
+
+function validateAdvancedProviderBadgeConfig() {
+    const invalid = currentAdvancedProviderSettings().find((item) => {
+        const hasText = Boolean(item.badgeText);
+        return (item.badgeEnabled && !isValidAdvancedProviderBadgeText(item.badgeText))
+            || (hasText && !isValidAdvancedProviderBadgeText(item.badgeText));
+    });
+    if (!invalid) return true;
+    const label = ADVANCED_PROVIDER_LABELS[invalid.provider] || invalid.provider;
+    toast(`${label}的角标文案仅支持 2-5 个中文字符`, "error");
+    const input = document.querySelector(`#advPansouProviderPriority [data-provider-priority-item="${invalid.provider}"] [data-provider-badge-text]`);
+    input?.focus();
+    return false;
+}
+
+function updateAdvancedProviderPriorityPositions() {
+    document.querySelectorAll("#advPansouProviderPriority [data-provider-priority-item]").forEach((row, index, rows) => {
+        const position = row.querySelector("[data-provider-priority-position]");
+        const up = row.querySelector('[data-provider-priority-move="-1"]');
+        const down = row.querySelector('[data-provider-priority-move="1"]');
+        if (position) position.textContent = String(index + 1);
+        if (up) up.disabled = index === 0;
+        if (down) down.disabled = index === rows.length - 1;
+    });
+}
+
+function renderAdvancedProviderPriority(values, cloudTypes = [], badgeValues = {}) {
+    const box = $("advPansouProviderPriority");
     if (!box) return;
-    box.innerHTML = ADVANCED_CLOUD_TYPES.map(([value, label]) => `
-        <label class="mini-check"><input type="checkbox" data-adv-cloud-type="${escapeHtml(value)}" ${selected.has(value) ? "checked" : ""}>${escapeHtml(label)}</label>
-    `).join("");
+    const priority = normalizeAdvancedProviderPriority(values);
+    const enabledSources = new Set((Array.isArray(cloudTypes) ? cloudTypes : []).map((item) => String(item || "").toLowerCase()));
+    const badges = normalizeAdvancedProviderBadges(badgeValues);
+    box.innerHTML = priority.map((value, index) => {
+        const label = ADVANCED_PROVIDER_LABELS[value] || value;
+        const badge = badges[value] || { enabled: false, text: "" };
+        return `
+            <div class="provider-priority-row ${enabledSources.has(value) ? "" : "is-source-disabled"}" data-provider-priority-item="${escapeHtml(value)}" data-provider-kind="${escapeHtml(value)}">
+                <div class="provider-priority-main">
+                    <button class="provider-priority-handle" type="button" draggable="true" title="拖动排序" aria-label="拖动${escapeHtml(label)}排序"><span aria-hidden="true">⋮⋮</span></button>
+                    <span class="provider-priority-position" data-provider-priority-position>${index + 1}</span>
+                    <span class="provider-priority-swatch" aria-hidden="true"></span>
+                    <span class="provider-priority-label">${escapeHtml(label)}</span>
+                    <span class="provider-priority-actions">
+                        <button type="button" data-provider-priority-move="-1" title="上移" aria-label="${escapeHtml(label)}上移"><span aria-hidden="true">↑</span></button>
+                        <button type="button" data-provider-priority-move="1" title="下移" aria-label="${escapeHtml(label)}下移"><span aria-hidden="true">↓</span></button>
+                    </span>
+                </div>
+                <div class="provider-priority-controls">
+                    <label class="provider-priority-toggle">
+                        <input type="checkbox" data-provider-source-enabled ${enabledSources.has(value) ? "checked" : ""}>
+                        <span>启用来源</span>
+                    </label>
+                    <label class="provider-priority-toggle">
+                        <input type="checkbox" data-provider-badge-enabled ${badge.enabled ? "checked" : ""}>
+                        <span>展示角标</span>
+                    </label>
+                    <label class="provider-priority-badge-field">
+                        <span>角标文案</span>
+                        <input type="text" data-provider-badge-text value="${escapeHtml(badge.text)}" placeholder="2-5个中文" maxlength="5" ${badge.enabled ? "" : "disabled"} aria-label="${escapeHtml(label)}角标文案">
+                    </label>
+                </div>
+            </div>
+        `;
+    }).join("");
+
+    box.querySelectorAll("[data-provider-priority-move]").forEach((button) => {
+        button.addEventListener("click", () => {
+            const row = button.closest("[data-provider-priority-item]");
+            const rows = currentAdvancedProviderSettings();
+            const index = rows.findIndex((item) => item.provider === (row?.dataset.providerPriorityItem || ""));
+            const target = index + Number(button.dataset.providerPriorityMove || 0);
+            if (index < 0 || target < 0 || target >= rows.length) return;
+            [rows[index], rows[target]] = [rows[target], rows[index]];
+            renderAdvancedProviderPriority(
+                rows.map((item) => item.provider),
+                rows.filter((item) => item.sourceEnabled).map((item) => item.provider),
+                Object.fromEntries(rows.map((item) => [item.provider, { enabled: item.badgeEnabled, text: item.badgeText }])),
+            );
+        });
+    });
+
+    box.querySelectorAll("[data-provider-source-enabled]").forEach((checkbox) => {
+        checkbox.addEventListener("change", () => {
+            checkbox.closest("[data-provider-priority-item]")?.classList.toggle("is-source-disabled", !checkbox.checked);
+        });
+    });
+
+    box.querySelectorAll("[data-provider-badge-enabled]").forEach((checkbox) => {
+        checkbox.addEventListener("change", () => {
+            const input = checkbox.closest("[data-provider-priority-item]")?.querySelector("[data-provider-badge-text]");
+            if (!input) return;
+            input.disabled = !checkbox.checked;
+            if (checkbox.checked) input.focus();
+        });
+    });
+
+    box.querySelectorAll("[data-provider-badge-text]").forEach((input) => {
+        input.addEventListener("input", () => {
+            const characters = Array.from(input.value);
+            if (characters.length > 5) input.value = characters.slice(0, 5).join("");
+            const invalid = Boolean(input.value.trim()) && !isValidAdvancedProviderBadgeText(input.value);
+            input.classList.toggle("is-invalid", invalid);
+            input.setAttribute("aria-invalid", String(invalid));
+        });
+    });
+
+    box.querySelectorAll(".provider-priority-handle").forEach((handle) => {
+        handle.addEventListener("dragstart", (event) => {
+            const row = handle.closest("[data-provider-priority-item]");
+            row?.classList.add("is-dragging");
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", row?.dataset.providerPriorityItem || "");
+            if (row) event.dataTransfer.setDragImage(row, 24, row.offsetHeight / 2);
+        });
+        handle.addEventListener("dragend", () => {
+            box.querySelector(".is-dragging")?.classList.remove("is-dragging");
+            box.querySelectorAll(".is-drag-over").forEach((row) => row.classList.remove("is-drag-over"));
+            updateAdvancedProviderPriorityPositions();
+        });
+    });
+
+    box.ondragover = (event) => {
+        const dragging = box.querySelector(".is-dragging");
+        const target = event.target.closest("[data-provider-priority-item]");
+        if (!dragging || !target || target === dragging) return;
+        event.preventDefault();
+        box.querySelectorAll(".is-drag-over").forEach((row) => row.classList.remove("is-drag-over"));
+        target.classList.add("is-drag-over");
+        const before = event.clientY < target.getBoundingClientRect().top + target.offsetHeight / 2;
+        box.insertBefore(dragging, before ? target : target.nextSibling);
+        updateAdvancedProviderPriorityPositions();
+    };
+    box.ondrop = (event) => {
+        event.preventDefault();
+        box.querySelector(".is-dragging")?.classList.remove("is-dragging");
+        box.querySelectorAll(".is-drag-over").forEach((row) => row.classList.remove("is-drag-over"));
+        updateAdvancedProviderPriorityPositions();
+    };
+    updateAdvancedProviderPriorityPositions();
 }
 
 async function saveAdvancedConfig(options = {}) {
     const { silent = false } = options;
+    if (!validateAdvancedProviderBadgeConfig()) return { success: false };
     const collected = collectAdvancedConfig();
-    const config = window.FnosAdminSettings.changedConfigPatch(collected, adminState.advancedFormBaseline || {});
+    const config = window.FnosAdminSettings.changedConfigPatch(
+        collected,
+        adminState.advancedFormBaseline || {},
+        { atomicPaths: ADVANCED_ATOMIC_CONFIG_PATHS },
+    );
     const existingBtProxy = String(adminState.advancedConfig?.btbtla?.proxy_url || "").trim();
     if (collected.btbtla?.proxy_enabled && !String(collected.btbtla.proxy_url || "").trim() && !existingBtProxy) {
         toast("请先填写 BT 独立代理地址", "error");
@@ -1627,10 +1827,12 @@ async function saveAdvancedConfig(options = {}) {
 }
 
 async function saveAllSettingsTransaction() {
+    if (!validateAdvancedProviderBadgeConfig()) return { success: false };
     const collected = collectAdvancedConfig();
     const advancedPatch = window.FnosAdminSettings.changedConfigPatch(
         collected,
         adminState.advancedFormBaseline || {},
+        { atomicPaths: ADVANCED_ATOMIC_CONFIG_PATHS },
     );
     const existingBtProxy = String(adminState.advancedConfig?.btbtla?.proxy_url || "").trim();
     if (collected.btbtla?.proxy_enabled && !String(collected.btbtla.proxy_url || "").trim() && !existingBtProxy) {
@@ -1738,7 +1940,13 @@ function collectAdvancedConfig() {
     const value = reader.value.bind(reader);
     const numberValue = reader.number.bind(reader);
     const checked = reader.checked.bind(reader);
-    const cloudTypes = Array.from(document.querySelectorAll("[data-adv-cloud-type]:checked")).map((input) => input.dataset.advCloudType);
+    const providerSettings = currentAdvancedProviderSettings();
+    const cloudTypes = providerSettings.filter((item) => item.sourceEnabled).map((item) => item.provider);
+    const resultProviderPriority = normalizeAdvancedProviderPriority(providerSettings.map((item) => item.provider));
+    const resultProviderBadges = Object.fromEntries(providerSettings.map((item) => [item.provider, {
+        enabled: item.badgeEnabled,
+        text: item.badgeText,
+    }]));
     // 只生成页面可编辑字段的 patch，运行时发现的 folder id / 真实目录由后端保留。
     return {
         pansou: {
@@ -1747,6 +1955,8 @@ function collectAdvancedConfig() {
             password: value("advPansouPassword"),
             default_token: value("advPansouDefaultToken"),
             cloud_types: cloudTypes,
+            result_provider_priority: resultProviderPriority,
+            result_provider_badges: resultProviderBadges,
             res: value("advPansouRes") || "merge",
             src: value("advPansouSrc") || "all",
             conc: numberValue("advPansouConc", 0),

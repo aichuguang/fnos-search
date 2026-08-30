@@ -1793,6 +1793,13 @@ class OrganizerService:
             raise JobPlanError("V1 paths.organizer must use an openlist namespace")
 
     def _v1_target_root(self, plan: dict[str, Any]) -> str:
+        # 原生入库暂存链路会额外冻结 paths.organizer_final：Organizer 只能在
+        # OpenList 命名空间里搬运，而 paths.destination_final 对天翼云是
+        # "{root_folder_id}::{相对路径}" 复合定位器，OpenList 无法当目标根使用。
+        # 有 organizer_final 时以它为准，否则沿用 destination_final。
+        organizer_final = self._plan_path_text(plan, "organizer_final")
+        if organizer_final and organizer_final != "/":
+            return organizer_final
         final_root = self._plan_path_text(plan, "destination_final")
         if not final_root or final_root == "/":
             raise JobPlanError("V1 execution_plan is missing a valid paths.destination_final")
@@ -1896,6 +1903,15 @@ class OrganizerService:
                 raise OpenListError(
                     "Organizer mapping target path escaped frozen destination_final: "
                     f"mapping_id={mapping.get('id') or '<unknown>'}, target={target_path}, destination_final={final_root or '<empty>'}"
+                )
+            # 原生转存链路的入库暂存目录嵌套在分类目录内部（分类目录 /
+            # _入库暂存 / job-N），所以「目标仍在暂存目录里」照样满足上面的
+            # destination_final 包含性检查。这种映射会让文件永远留在暂存目录，
+            # 必须单独拦下。rclone 链路的暂存目录在分类目录之外，此判断恒真。
+            if _path_is_same_or_child(target_path, job_root):
+                raise OpenListError(
+                    "Organizer mapping target path stayed inside frozen staging root: "
+                    f"mapping_id={mapping.get('id') or '<unknown>'}, target={target_path}, staging_root={job_root}"
                 )
 
     def _openlist_visibility_source_message(self, task: dict[str, Any]) -> str:
@@ -5387,7 +5403,11 @@ class OrganizerService:
         _job, plan, _rejection = self._task_v1_plan(task, reject=False)
         if not plan:
             return ""
-        return self._plan_path_text(plan, "destination_final")
+        # STRM 刷新前缀要用 OpenList 可见的正式分类目录；原生入库暂存链路的
+        # destination_final 是 Provider 侧复合定位器，不能直接当路径前缀。
+        return self._plan_path_text(plan, "organizer_final") or self._plan_path_text(
+            plan, "destination_final"
+        )
 
     def _strm_refresh_prefix(self, normalized_category: str) -> str:
         prefix = str(self.organizer_config.get(f"strm_refresh_prefix_{normalized_category}") or "").strip()
@@ -5418,7 +5438,10 @@ class OrganizerService:
         if not frozen_plan:
             raise OpenListError("Organizer target path requires a frozen V1 execution_plan")
         organizer_root = self._plan_path_text(frozen_plan, "organizer")
-        final_root = self._plan_path_text(frozen_plan, "destination_final")
+        # 原生入库暂存链路以 paths.organizer_final 为搬运目标根（见 _v1_target_root）。
+        final_root = self._plan_path_text(frozen_plan, "organizer_final") or self._plan_path_text(
+            frozen_plan, "destination_final"
+        )
         if not organizer_root or organizer_root == "/":
             raise OpenListError("V1 execution_plan has no valid paths.organizer")
         if not final_root or final_root == "/":

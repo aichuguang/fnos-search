@@ -18,6 +18,7 @@ from fnos_media_import.transfer import (
     AckResult,
     CancelResult,
     ErrorCode,
+    NativeLocator,
     OperationReceipt,
     OrganizeResult,
     PHASE_ACK_PENDING,
@@ -74,6 +75,9 @@ class TransferState:
     # permanently consume the budget of a later transfer/verification phase.
     phase_attempts: dict[str, int] = field(default_factory=dict)
     retry_from: str = ""
+    failure_from: str = ""
+    review_from: str = ""
+    preserve_receipt_on_retry: bool = False
     retry_ready: bool = False
     target_verified: bool = False
     staging_verified: bool = False
@@ -147,6 +151,9 @@ class TransferOrchestrator:
             "attempt": self.state.attempt,
             "phase_attempts": dict(self.state.phase_attempts),
             "retry_from": self.state.retry_from,
+            "failure_from": self.state.failure_from,
+            "review_from": self.state.review_from,
+            "preserve_receipt_on_retry": self.state.preserve_receipt_on_retry,
             "retry_ready": self.state.retry_ready,
             "target_verified": self.state.target_verified,
             "staging_verified": self.state.staging_verified,
@@ -189,6 +196,9 @@ class TransferOrchestrator:
         else:
             self.state.phase_attempts = {}
         self.state.retry_from = str(raw.get("retry_from") or "")
+        self.state.failure_from = str(raw.get("failure_from") or "")
+        self.state.review_from = str(raw.get("review_from") or "")
+        self.state.preserve_receipt_on_retry = bool(raw.get("preserve_receipt_on_retry"))
         self.state.retry_ready = bool(raw.get("retry_ready"))
         self.state.target_verified = bool(raw.get("target_verified"))
         self.state.staging_verified = bool(raw.get("staging_verified"))
@@ -238,6 +248,13 @@ class TransferOrchestrator:
 
     def step(self) -> TransferStepResult:
         phase = self.state.phase
+        if phase == PHASE_MANUAL_REVIEW:
+            return TransferStepResult(
+                phase,
+                self.state.message or "任务等待人工复核",
+                finished=True,
+                needs_wait=True,
+            )
         if phase in TERMINAL_PHASES:
             return TransferStepResult(phase, self.state.message or f"任务已处于终态：{phase}", finished=True)
 
@@ -269,8 +286,6 @@ class TransferOrchestrator:
             return self._step_retry_wait()
         if phase == PHASE_CANCEL_PENDING:
             return self._step_cancel_pending()
-        if phase == PHASE_MANUAL_REVIEW:
-            return TransferStepResult(PHASE_MANUAL_REVIEW, self.state.message or "等待人工复核", finished=True, needs_wait=True)
         # 未知阶段：保守失败关闭
         return self._fail(TransferError(ErrorCode.INVALID_PLAN, f"未知阶段：{phase}"))
 
@@ -556,12 +571,30 @@ class TransferOrchestrator:
         return VerifyRequest(
             source=self.plan.source_descriptor,
             destination=self.plan.destination_descriptor,
-            locator=self.plan.native_locator(),
+            locator=self._native_verify_locator(descriptor),
             expected_file_count=int(expected["file_count"]),
             expected_total_size=int(expected["total_size"]),
             checksum=str(expected["checksum"]),
             operation=self.state.receipt,
         )
+
+    def _native_verify_locator(self, descriptor: dict[str, Any] | None) -> Any:
+        """按被校验的目录选择原生定位器。
+
+        目标校验阶段校验的是入库暂存目录（分类目录 / _入库暂存 / job-N），最终
+        校验阶段才是分类目录。两者用同一个分类定位器会让 VerifyRequest 自相
+        矛盾：descriptor 指暂存目录、locator 指分类目录。这里按 descriptor 取
+        冻结计划里对应的原生定位器，保持两者一致。
+        """
+
+        if isinstance(descriptor, dict) and str(descriptor.get("kind") or "") == "native":
+            value = str(descriptor.get("path") or "").strip()
+            if value:
+                kind = str(descriptor.get("locator_kind") or "").strip()
+                if not kind:
+                    kind = self.plan.native_locator().kind
+                return NativeLocator(kind=kind, value=value)
+        return self.plan.native_locator()
 
     def _invoke_verifier(self, verifier: Any, *, descriptor: dict[str, Any], native_target: bool) -> Any:
         """按统一协议调用目标校验器。
@@ -766,13 +799,24 @@ class TransferOrchestrator:
         self.state.app_acked = bool(ack.acked)
         self.state.message = ack.message
         if ack.acked:
-            if self.plan.delete_source_after_ack:
+            self.state.phase_attempts.pop(PHASE_ACK_PENDING, None)
+            if self.plan.delete_source_after_ack or self.plan.local_temp is not None:
                 self.state.phase = PHASE_CLEANUP_PENDING
             else:
                 self.state.phase = PHASE_COMPLETED
             return TransferStepResult(self.state.phase, "ACK 完成", finished=False)
-        # 目标已确认但 ACK 未完成：保留来源，恢复 ACK/清理，不重复传输（§13.3）
-        return TransferStepResult(PHASE_ACK_PENDING, ack.message or "应用 ACK 未完成，保留来源", finished=True, needs_wait=True)
+        # The target is already verified, so ACK retries must never restart the
+        # transfer.  Exhaustion is an operator decision, not a transfer failure.
+        return self._handle_failure(
+            TransferError(
+                ErrorCode.OPERATION_PENDING,
+                ack.message or "应用 ACK 未完成，保留来源",
+                retryable=True,
+                phase=PHASE_ACK_PENDING,
+            ),
+            PHASE_ACK_PENDING,
+            exhausted_to_manual_review=True,
+        )
 
     def _step_cleanup(self) -> TransferStepResult:
         if self.cleanup is None:
@@ -784,6 +828,8 @@ class TransferOrchestrator:
                 self.plan,
                 target_verified=self.state.target_verified,
                 app_acked=self.state.app_acked,
+                delete_source=self.plan.delete_source_after_ack,
+                delete_local_temp=True,
             )
         except Exception as exc:  # noqa: BLE001
             reason = f"清理异常：{exc}"
@@ -839,6 +885,8 @@ class TransferOrchestrator:
         self.state.error_code = ErrorCode.CLEANUP_FAILED
         self.state.message = f"清理失败：{reason or '未知错误'}"
         if not retryable or attempt >= max(1, int(self.retry_policy.max_attempts)):
+            self.state.failure_from = PHASE_CLEANUP_PENDING
+            self.state.retry_from = PHASE_CLEANUP_PENDING
             self.state.phase = PHASE_FAILED
             self.state.message = f"清理失败且无法继续重试：{reason or '未知错误'}"
             return TransferStepResult(PHASE_FAILED, self.state.message, finished=True)
@@ -855,8 +903,9 @@ class TransferOrchestrator:
         self.state.retry_ready = False
         retry_from = self.state.retry_from or PHASE_PLANNING
         self.state.phase = retry_from
-        if self._retry_resets_receipt(retry_from):
+        if self._retry_resets_receipt(retry_from) and not self.state.preserve_receipt_on_retry:
             self.state.receipt = None
+        self.state.preserve_receipt_on_retry = False
         return TransferStepResult(retry_from, "开始重试", finished=False)
 
     def _step_cancel_pending(self) -> TransferStepResult:
@@ -1039,34 +1088,67 @@ class TransferOrchestrator:
                 executor.plan = self.plan
         return executor
 
-    def _fail(self, error: TransferError) -> TransferStepResult:
+    def _fail(
+        self,
+        error: TransferError,
+        *,
+        failure_from: str | None = None,
+    ) -> TransferStepResult:
+        self.state.failure_from = str(failure_from or self.state.phase or PHASE_PLANNING)
         self.state.phase = PHASE_FAILED
         self.state.message = error.message
         self.state.error_code = error.code
         return TransferStepResult(PHASE_FAILED, error.message, finished=True)
 
-    def _to_manual_review(self, message: str) -> TransferStepResult:
+    def _to_manual_review(
+        self,
+        message: str,
+        *,
+        review_from: str | None = None,
+        error_code: str = ErrorCode.RESULT_UNKNOWN,
+    ) -> TransferStepResult:
+        self.state.review_from = str(review_from or self.state.phase or PHASE_PLANNING)
         self.state.phase = PHASE_MANUAL_REVIEW
         self.state.message = message
-        self.state.error_code = ErrorCode.RESULT_UNKNOWN
+        self.state.error_code = error_code
         return TransferStepResult(PHASE_MANUAL_REVIEW, message, finished=True, needs_wait=True)
 
-    def _handle_failure(self, error: TransferError, retry_from: str) -> TransferStepResult:
+    def _handle_failure(
+        self,
+        error: TransferError,
+        retry_from: str,
+        *,
+        exhausted_to_manual_review: bool = False,
+    ) -> TransferStepResult:
         self.state.attempt += 1
         phase_key = str(retry_from or self.state.phase or PHASE_PLANNING)
+        self.state.retry_from = phase_key
         phase_attempt = int(self.state.phase_attempts.get(phase_key, 0) or 0) + 1
         self.state.phase_attempts[phase_key] = phase_attempt
         self.state.message = error.message
         self.state.error_code = error.code
         if not error.retryable:
-            self.state.phase = PHASE_FAILED
-            return TransferStepResult(PHASE_FAILED, error.message, finished=True)
+            return self._fail(error, failure_from=phase_key)
         if phase_attempt >= self.retry_policy.max_attempts:
-            self.state.phase = PHASE_FAILED
-            self.state.message = f"重试次数耗尽：{error.message}"
-            return TransferStepResult(PHASE_FAILED, self.state.message, finished=True)
+            exhausted_message = f"重试次数耗尽：{error.message}"
+            if exhausted_to_manual_review:
+                return self._to_manual_review(
+                    exhausted_message,
+                    review_from=phase_key,
+                    error_code=error.code,
+                )
+            return self._fail(
+                TransferError(
+                    error.code,
+                    exhausted_message,
+                    retryable=False,
+                    phase=phase_key,
+                    details=error.details,
+                    account_id=error.account_id,
+                ),
+                failure_from=phase_key,
+            )
         self.state.phase = PHASE_RETRY_WAIT
-        self.state.retry_from = retry_from
         self.state.retry_ready = False
         return TransferStepResult(PHASE_RETRY_WAIT, error.message, finished=True, needs_wait=True)
 

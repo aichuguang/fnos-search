@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
@@ -32,13 +32,14 @@ def utc_seconds_from_now(seconds: int) -> str:
 
 
 class Database:
+    PRE_CUTOVER_VERSION = 28
+
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.last_migration_backup: dict[str, Any] | None = None
         self.last_cutover_summary: dict[str, Any] | None = None
-        self.migration_runner = MigrationRunner(
-            (
+        migrations = (
                 Migration(1, "baseline_scheduler_leases", lambda connection: None),
                 # 2-5 曾被早期开发版本用于其他迁移名称。继续复用这些版本号会让
                 # 已有数据库误判为“已执行”，从而跳过真实表结构升级。
@@ -68,7 +69,12 @@ class Database:
                 Migration(27, "provider_auth_session_cas", self._apply_provider_auth_session_cas_migration),
                 Migration(28, "openlist_mount_native_locator_column", self._apply_openlist_mount_native_locator_migration),
                 Migration(29, CUTOVER_NAME, self._apply_v1_job_contract_hard_cutover),
-            )
+        )
+        self.migration_runner = MigrationRunner(migrations)
+        self.pre_cutover_migration_runner = MigrationRunner(
+            migration
+            for migration in migrations
+            if migration.version <= self.PRE_CUTOVER_VERSION
         )
 
     @contextmanager
@@ -87,13 +93,26 @@ class Database:
             conn.close()
 
     def init_schema(self) -> None:
-        self.last_migration_backup = self._backup_before_pending_migrations()
+        fresh = self._is_fresh_database()
+        if not fresh:
+            with closing(sqlite3.connect(self.path)) as connection:
+                current = self.migration_runner.current_version(connection)
+                self.migration_runner.ensure_compatible(connection)
+            if current != self.migration_runner.latest_version:
+                raise RuntimeError(
+                    f"当前数据库为 v{current}，禁止应用启动时自动迁移；"
+                    f"请停止所有服务后执行 python -m fnos_media_import.v1_cutover "
+                    f"--database {self.path} --dry-run，再使用 --apply 升级到 "
+                    f"v{self.migration_runner.latest_version}"
+                )
+        self.last_migration_backup = None
         with self.connect() as conn:
             # journal_mode 是数据库级持久设置，启动建表时设置一次即可；
             # 避免每次短连接都执行 PRAGMA journal_mode=WAL 造成额外磁盘同步开销。
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(BASE_SCHEMA_SQL)
-            self.migration_runner.run(conn, utc_now)
+            if fresh:
+                self.migration_runner.run(conn, utc_now)
         if self.last_cutover_summary is not None:
             self.last_cutover_summary["backup_path"] = str(
                 (self.last_migration_backup or {}).get("path") or ""
@@ -107,6 +126,67 @@ class Database:
                     separators=(",", ":"),
                 ),
             )
+
+    def run_pre_cutover_migrations(self, connection: sqlite3.Connection) -> list[int]:
+        """Bring a legacy database through v28 for the offline cutover CLI."""
+
+        return self.pre_cutover_migration_runner.run(connection, utc_now)
+
+    @staticmethod
+    def install_base_schema(connection: sqlite3.Connection) -> None:
+        deferred_indexes: list[str] = []
+        statement = ""
+        for line in BASE_SCHEMA_SQL.splitlines(keepends=True):
+            statement += line
+            if not sqlite3.complete_statement(statement):
+                continue
+            sql = statement.strip()
+            statement = ""
+            if not sql:
+                continue
+            try:
+                connection.execute(sql)
+            except sqlite3.OperationalError as exc:
+                normalized = sql.lstrip().upper()
+                if (
+                    normalized.startswith("CREATE INDEX")
+                    or normalized.startswith("CREATE UNIQUE INDEX")
+                ) and "no such column" in str(exc).lower():
+                    deferred_indexes.append(sql)
+                    continue
+                raise
+        if statement.strip():
+            connection.execute(statement)
+        # Legacy tables may receive the indexed columns in a later migration.
+        # The caller reruns this installer after those migrations complete.
+        for sql in deferred_indexes:
+            try:
+                connection.execute(sql)
+            except sqlite3.OperationalError as exc:
+                if "no such column" not in str(exc).lower():
+                    raise
+
+    def _is_fresh_database(self) -> bool:
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return True
+        with closing(sqlite3.connect(self.path)) as connection:
+            tables = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ]
+            if not tables:
+                return True
+            if tables == ["schema_migrations"]:
+                count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations"
+                    ).fetchone()[0]
+                )
+                return count == 0
+            return False
 
     def _apply_v1_job_contract_hard_cutover(self, conn: sqlite3.Connection) -> None:
         self.last_cutover_summary = V1JobContractHardCutover().apply(conn)

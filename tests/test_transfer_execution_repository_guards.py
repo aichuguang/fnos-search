@@ -332,6 +332,103 @@ class TransferExecutionRepositoryGuardTests(unittest.TestCase):
         self.repository.save(current, {"phase": "manual_review"}, phase="manual_review")
         self.assertEqual(self.repository.list_due(), [])
 
+    def test_failed_requires_explicit_operator_recovery(self) -> None:
+        execution = self.repository.get(1)
+        assert execution is not None
+        failed = self.repository.save(
+            execution,
+            {
+                "phase": "failed",
+                "failure_from": "transferring",
+                "phase_attempts": {"transferring": 3},
+                "receipt": {
+                    "operation_id": "failed-run",
+                    "status": "failed",
+                    "metadata": {"operation_key": "import:1"},
+                },
+            },
+            phase="failed",
+        )
+        with self.assertRaises(ExecutionConflictError):
+            self.repository.save(failed, {"phase": "retry_wait"}, phase="retry_wait")
+        recovered = self.repository.reactivate(1)
+        self.assertEqual(recovered.phase, "retry_wait")
+        self.assertEqual(recovered.snapshot["retry_from"], "transferring")
+        self.assertEqual(recovered.snapshot["phase_attempts"], {})
+        self.assertEqual(recovered.receipt, failed.receipt)
+
+    def test_manual_review_has_explicit_recovery_path(self) -> None:
+        execution = self.repository.get(1)
+        assert execution is not None
+        reviewed = self.repository.save(
+            execution,
+            {"phase": "manual_review", "review_from": "target_verifying"},
+            phase="manual_review",
+        )
+        with self.assertRaises(ExecutionConflictError):
+            self.repository.save(reviewed, {"phase": "retry_wait"}, phase="retry_wait")
+        recovered = self.repository.recover_manual_review(1)
+        self.assertEqual(recovered.phase, "retry_wait")
+        self.assertEqual(recovered.snapshot["retry_from"], "target_verifying")
+
+    def test_manual_review_preserves_receipt_for_safe_polling_resume(self) -> None:
+        execution = self.repository.get(1)
+        assert execution is not None
+        reviewed = self.repository.save(
+            execution,
+            {
+                "phase": "manual_review",
+                "review_from": "native_submitting",
+                "receipt": {
+                    "operation_id": "provider-run",
+                    "status": "submitted",
+                    "metadata": {"operation_key": "import:1"},
+                },
+            },
+            phase="manual_review",
+        )
+        recovered = self.repository.recover_manual_review(1)
+        self.assertEqual(recovered.phase, "retry_wait")
+        self.assertTrue(recovered.snapshot["preserve_receipt_on_retry"])
+        self.assertEqual(recovered.receipt, reviewed.receipt)
+
+    def test_manual_review_refuses_submission_fence_without_receipt(self) -> None:
+        execution = self.repository.get(1)
+        assert execution is not None
+        self.repository.save(
+            execution,
+            {
+                "phase": "manual_review",
+                "review_from": "native_submitting",
+                "submission_fence": {
+                    "state": "prepared",
+                    "operation_key": "import:1",
+                },
+            },
+            phase="manual_review",
+        )
+        with self.assertRaises(ExecutionConflictError):
+            self.repository.recover_manual_review(1)
+
+    def test_ack_pending_can_return_to_final_verifying(self) -> None:
+        self.repository.create(2, _plan(2), phase="ack_pending")
+        ack = self.repository.get(2)
+        assert ack is not None
+        restored = self.repository.save(
+            ack,
+            {"phase": "final_verifying"},
+            phase="final_verifying",
+        )
+        self.assertEqual(restored.phase, "final_verifying")
+
+    def test_completed_and_cancelled_are_immutable(self) -> None:
+        self.repository.create(2, _plan(2), phase="completed")
+        self.repository.create(3, _plan(3), phase="cancelled")
+        with self.assertRaises(ExecutionConflictError):
+            self.repository.reactivate(2)
+        with self.assertRaises(ExecutionConflictError):
+            self.repository.reactivate(3)
+
 
 class TransferExecutionAdminViewTests(unittest.TestCase):
     def test_admin_view_exposes_state_but_redacts_receipt_identity(self) -> None:

@@ -19,6 +19,7 @@ from . import (
     DATA_PLANE_STRATEGIES,
     EXECUTION_PLAN_VERSION,
     INGRESS_DIR,
+    NATIVE_STAGING_DIR,
     STAGING_DIR,
     STRATEGY_EXECUTOR,
     STRATEGY_NATIVE_OFFLINE,
@@ -42,7 +43,10 @@ from . import (
     job_dir,
     local_contained,
     local_namespace,
+    mount_absolute_path,
+    mount_webdav_root,
     native_namespace,
+    native_staging_locator,
     normalize_path,
     openlist_namespace,
     is_relay_upload_strategy,
@@ -256,6 +260,7 @@ class ImportPlanner:
                 "destination_staging": paths["destination_staging"],
                 "destination_final": paths["destination_final"],
                 "organizer": paths["organizer"],
+                "organizer_final": paths["organizer_final"],
                 "local_temp": paths["local_temp"],
             },
             "verification": {
@@ -426,6 +431,10 @@ class ImportPlanner:
             "identity_status",
             "readable",
             "writable",
+            # OpenList 全局绝对路径必须由 webdav_root 拼出；缺了它只能冻结出
+            # 挂载内相对路径，Organizer 调 /api/fs/list 会直接 storage not found。
+            # 与其静默降级，不如失败关闭。
+            "webdav_root",
         )
         if any(key not in result for key in required):
             raise OpenlistUnavailable(f"{role} mount 修订快照不完整")
@@ -696,6 +705,21 @@ class ImportPlanner:
                 "path": native.value,
                 "locator_kind": native.kind,
             }
+            if strategy in {STRATEGY_NATIVE_SAVE, STRATEGY_NATIVE_OFFLINE} and organizer_enabled:
+                # 原生转存先落到「分类目录 / _入库暂存 / job-N」，再由 OpenList
+                # Organizer 搬进正式分类目录。只有 Organizer 启用时才冻结暂存目录：
+                # 原生 Provider 没有 move 能力，TransferFinalizer 也没有 native 分支，
+                # Organizer 是唯一能把暂存搬走的执行者。否则保持直写分类目录，
+                # 避免出现「进了暂存却没人搬」的死链路。
+                staging_value = native_staging_locator(native.kind, native.value, job)
+                if staging_value:
+                    destination_staging = {
+                        "kind": "native",
+                        "namespace_id": namespace,
+                        "path": staging_value,
+                        "locator_kind": native.kind,
+                        "role": "native_staging",
+                    }
             if is_relay_upload_strategy(strategy):
                 # Relay cache is a distinct, controlled local namespace.  It
                 # is not a destination staging directory and must be frozen
@@ -706,8 +730,9 @@ class ImportPlanner:
                     "path": f"{self._relay_root()}/{job}",
                 }
 
+        organizer_final: dict[str, str] | None = None
         if organizer_enabled:
-            organizer = self._build_organizer(
+            organizer, organizer_final = self._build_organizer(
                 category,
                 category_key,
                 job,
@@ -720,6 +745,7 @@ class ImportPlanner:
             "destination_staging": destination_staging,
             "destination_final": destination_final,
             "organizer": organizer,
+            "organizer_final": organizer_final,
             "local_temp": local_temp,
         }
 
@@ -774,7 +800,7 @@ class ImportPlanner:
         destination_staging: dict[str, str] | None,
         *,
         organizer_mount: Any = None,
-    ) -> dict[str, str]:
+    ) -> tuple[dict[str, str], dict[str, str] | None]:
         organizer_locator = category.organizer_locator
         if organizer_locator is None:
             raise PlanningError(
@@ -786,6 +812,11 @@ class ImportPlanner:
         namespace = str(organizer_mount.get("namespace_id") or "")
         if not namespace:
             namespace = openlist_namespace(organizer_locator.connection_id, organizer_locator.mount_id)
+        # 分类的 organizer_locator.path 是「挂载内相对路径」，而 Organizer 调用
+        # OpenList /api/fs/* 时必须给全局绝对路径。前缀取自冻结的 mount 快照，
+        # 保持「冻结即确定」，不读实时配置。webdav_root 只属于 OpenList 坐标系，
+        # 与天翼/移动/夸克的原生根无关，因此只作用于下面这些 openlist 路径。
+        webdav_root = mount_webdav_root(organizer_mount)
         extras = {
             "mount_id": organizer_locator.mount_id,
             "mount_revision": organizer_mount.get("revision"),
@@ -794,23 +825,56 @@ class ImportPlanner:
             "storage_identity_id": organizer_mount.get("storage_identity_id") or "",
             "identity_root": organizer_mount.get("identity_root") or "/",
         }
-        if destination_staging is not None and str(
-            destination_staging.get("kind") or ""
-        ) == "openlist":
+        staging_kind = str((destination_staging or {}).get("kind") or "")
+        if staging_kind == "openlist":
             # 执行暂存与 Organizer 可见目录是同一个任务级目录（§8.5）。
-            return {
+            # 暂存目录由 rclone 侧（remote_path 自行拼根）与 Organizer 侧共同访问，
+            # 计划里冻结的是挂载内相对路径，Organizer 消费时按 webdav_root 补齐。
+            return (
+                {
+                    "kind": "openlist",
+                    "namespace_id": namespace,
+                    "path": mount_absolute_path(
+                        webdav_root, f"/{STAGING_DIR}/{category_key}/{job}"
+                    ),
+                    **extras,
+                },
+                None,
+            )
+        if staging_kind == "native":
+            # 原生暂存：Organizer 从 OpenList 侧看到同一个「分类目录/_入库暂存/job-N」，
+            # 并把文件搬到 OpenList 可见的正式分类目录 organizer_final。
+            # paths.destination_final 对天翼云是 ``{root_folder_id}::{相对路径}``
+            # 复合定位器，OpenList 无法直接把它当目标根使用，所以正式分类目录
+            # 必须单独冻结一份 OpenList 可见路径。
+            final_path = mount_absolute_path(webdav_root, organizer_locator.path)
+            staging_path = normalize_path(
+                f"{final_path}/{NATIVE_STAGING_DIR}/{job}"
+            )
+            return (
+                {
+                    "kind": "openlist",
+                    "namespace_id": namespace,
+                    "path": staging_path,
+                    **extras,
+                },
+                {
+                    "kind": "openlist",
+                    "namespace_id": namespace,
+                    "path": final_path,
+                    **extras,
+                },
+            )
+        # native 直写 / 中继策略：Organizer 直接看到最终目录。
+        return (
+            {
                 "kind": "openlist",
                 "namespace_id": namespace,
-                "path": f"/{STAGING_DIR}/{category_key}/{job}",
+                "path": mount_absolute_path(webdav_root, organizer_locator.path),
                 **extras,
-            }
-        # native / 中继策略：Organizer 直接看到最终目录。
-        return {
-            "kind": "openlist",
-            "namespace_id": namespace,
-            "path": organizer_locator.path,
-            **extras,
-        }
+            },
+            None,
+        )
 
     def _build_bindings(
         self,

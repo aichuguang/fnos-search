@@ -63,7 +63,7 @@ class TransferRecoveryScanner:
             scanned += 1
             phase = str(getattr(execution, "phase", "") or "")
             job_id = int(getattr(execution, "job_id", 0) or 0)
-            if job_id <= 0 or phase in TERMINAL_PHASES or phase == "manual_review":
+            if job_id <= 0 or phase in TERMINAL_PHASES:
                 skipped += 1
                 continue
             key = f"{self.task_key_prefix}:{job_id}"

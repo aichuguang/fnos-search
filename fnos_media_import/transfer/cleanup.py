@@ -211,6 +211,8 @@ class TransferCleanupService:
         *,
         target_verified: bool = False,
         app_acked: bool = False,
+        delete_source: bool = True,
+        delete_local_temp: bool = True,
     ) -> CleanupResult:
         if not isinstance(plan, TransferPlan):
             try:
@@ -238,13 +240,20 @@ class TransferCleanupService:
         job_id = plan.job_id
         items: list[CleanupItem] = []
         landing = plan.source_landing
-        if landing is not None:
+        if delete_source and landing is not None:
             item = self._delete_scoped(landing, job_id)
             items.append(item)
         local_temp = plan.local_temp
-        if local_temp is not None:
+        if delete_local_temp and local_temp is not None:
             item = self._delete_scoped(local_temp, job_id)
             items.append(item)
+        if not items:
+            return CleanupResult(
+                ok=True,
+                skipped=True,
+                reason="当前任务没有启用需要执行的任务级清理项",
+                items=[],
+            )
         failed = [item for item in items if not item.ok]
         if failed:
             return CleanupResult(

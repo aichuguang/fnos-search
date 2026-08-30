@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from fnos_media_import.domain.models import SelectionSnapshot
+from fnos_media_import.planning import NATIVE_STAGING_DIR, native_staging_locator
 from fnos_media_import.planning.job_plan import (
     attach_plan_integrity,
     compute_operation_key,
@@ -27,6 +28,9 @@ def organizer_v1_plan(
     source_landing: str | None = None,
     destination_staging: str | None = None,
     local_temp: str | None = None,
+    native_staging: bool = False,
+    native_locator_kind: str = "provider_path",
+    organizer_final: str | None = None,
 ) -> dict[str, Any]:
     """Build the smallest fully valid canonical Organizer V1 plan for tests."""
 
@@ -60,6 +64,8 @@ def organizer_v1_plan(
         ),
         "path": str(destination_final),
     }
+    if strategy in {"native_save", "native_offline"}:
+        destination_final_ref["locator_kind"] = str(native_locator_kind)
     paths: dict[str, Any] = {
         "destination_final": destination_final_ref,
         "organizer": {
@@ -86,6 +92,34 @@ def organizer_v1_plan(
             "namespace_id": namespace,
             "path": str(destination_staging or organizer_root),
         }
+    if native_staging and strategy in {"native_save", "native_offline"}:
+        # 原生入库暂存链路：Provider 先转存到「分类目录 / _入库暂存 / job-N」，
+        # Organizer 从 OpenList 侧看同一个目录，并搬进 organizer_final。
+        staging_value = native_staging_locator(
+            native_locator_kind, str(destination_final), f"job-{job_id}"
+        )
+        if not staging_value:
+            raise ValueError(f"locator kind {native_locator_kind!r} 不支持原生入库暂存")
+        paths["destination_staging"] = {
+            "kind": "native",
+            "namespace_id": destination_final_ref["namespace_id"],
+            "path": staging_value,
+            "locator_kind": str(native_locator_kind),
+            "role": "native_staging",
+        }
+        final_visible = str(organizer_final or destination_final)
+        paths["organizer_final"] = {
+            "kind": "openlist",
+            "namespace_id": namespace,
+            "path": final_visible,
+            "mount_id": mount_id,
+            "mount_revision": int(mount_revision),
+            "connection_id": connection_id,
+            "connection_revision": int(connection_revision),
+            "storage_identity_id": storage_identity_id,
+            "identity_root": identity_root,
+        }
+        paths["organizer"]["path"] = f"{final_visible.rstrip('/')}/{NATIVE_STAGING_DIR}/job-{job_id}"
     if strategy == "relay_upload_provider":
         paths["local_temp"] = {
             "kind": "relay",

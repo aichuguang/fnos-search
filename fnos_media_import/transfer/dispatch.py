@@ -332,6 +332,7 @@ class TransferDispatchService:
         if orchestrator.state.phase in unsafe_phases and orchestrator.state.receipt is None:
             fence = dict(orchestrator.state.submission_fence or {})
             if fence.get("state") == "prepared":
+                orchestrator.state.review_from = orchestrator.state.phase
                 orchestrator.state.phase = PHASE_MANUAL_REVIEW
                 orchestrator.state.message = (
                     "外部提交 fence 已存在但 receipt 缺失，提交结果无法确认；"
@@ -757,6 +758,7 @@ class TransferDispatchService:
             if cleanup_result is not None:
                 snapshot["cancel_cleanup"] = cleanup_result
                 if cleanup_result.get("rejected"):
+                    snapshot["review_from"] = phase
                     snapshot["phase"] = PHASE_MANUAL_REVIEW
                     phase = PHASE_MANUAL_REVIEW
                     message = (
@@ -923,7 +925,15 @@ class TransferDispatchService:
         if execution is None or str(getattr(execution, "phase", "")) == PHASE_MANUAL_REVIEW:
             return
         snapshot = dict(getattr(execution, "snapshot", {}) or {})
-        snapshot.update({"phase": PHASE_MANUAL_REVIEW, "message": message, "error_code": "RESULT_UNKNOWN"})
+        review_from = str(snapshot.get("phase") or getattr(execution, "phase", "") or "planning")
+        snapshot.update(
+            {
+                "phase": PHASE_MANUAL_REVIEW,
+                "review_from": review_from,
+                "message": message,
+                "error_code": "RESULT_UNKNOWN",
+            }
+        )
         try:
             self.executions.save(
                 execution,

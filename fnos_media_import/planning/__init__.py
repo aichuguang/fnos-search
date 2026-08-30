@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from ..domain.models import (
     EXECUTION_PLAN_VERSION,  # noqa: F401  # re-export：本包统一使用 V1
@@ -70,6 +70,14 @@ DEFAULT_RELAY_ROOT = "/data/relay"
 # 任务级落地区 / 暂存区目录名（§8.5、§12.3）。
 INGRESS_DIR = "_fnos_ingress"
 STAGING_DIR = "_fnos_staging"
+
+# 原生转存（native_save / native_offline）的入库暂存目录名。
+#
+# 原生链路没有 rclone 的挂载级暂存区：Provider 只能在自己的目录树里创建子目录，
+# 所以暂存目录必须是「分类目录 / <NATIVE_STAGING_DIR> / job-N」。这里使用冻结常量
+# 而不是 ORGANIZER_STAGING_DIR_NAME 配置值，否则管理员改配置会让已冻结的执行计划
+# 校验失败。常量以 UTF-8 源码字面量声明，不经过任何 shell 拼接。
+NATIVE_STAGING_DIR = "_入库暂存"
 
 # 允许的来源形态（§3.3 SourceDescriptor.source_form）。
 VALID_SOURCE_FORMS = frozenset({"share", "magnet", "local", "http"})
@@ -235,6 +243,66 @@ def path_leaf(path: Any) -> str:
     return normalize_path(path).rstrip("/").rsplit("/", 1)[-1]
 
 
+def mount_absolute_path(webdav_root: Any, mount_relative_path: Any) -> str:
+    """把 OpenList 挂载根与挂载内相对路径拼成 OpenList 全局绝对路径。
+
+    OpenList 的 ``/api/fs/*`` 只认全局绝对路径（``/离线下载/电视剧/...``），而分类
+    定位器里保存的是挂载内相对路径（``/电视剧/...``）。rclone 侧由
+    ``OpenListLocatorResolver.remote_path`` 负责拼根，Organizer 侧则由本函数负责，
+    两边必须用同一套坐标系。
+
+    ``webdav_root`` 只描述 OpenList 自己的挂载点，与 Provider 原生根（天翼云
+    ``{folder_id}::{相对路径}``、夸克/移动的原生目录）是两套互不相通的坐标系，
+    因此本函数只能用于 OpenList 可见路径，绝不能作用于 native 定位器值。
+
+    幂等：已经带上挂载根前缀的路径不会被重复拼接。
+    """
+
+    root = normalize_path(webdav_root)
+    relative = normalize_path(mount_relative_path)
+    if root in ("", "/"):
+        return relative
+    if relative in ("", "/"):
+        return root
+    if relative == root or relative.startswith(f"{root}/"):
+        return relative
+    return normalize_path(f"{root}/{relative.lstrip('/')}")
+
+
+def mount_webdav_root(mount: Any) -> str:
+    """从冻结 mount 快照里取出 OpenList 挂载根（缺失时退化为根目录）。"""
+
+    if not isinstance(mount, Mapping):
+        return "/"
+    return normalize_path(mount.get("webdav_root") or "/")
+
+
+def native_staging_locator(locator_kind: Any, locator_value: Any, job: Any) -> str:
+    """由分类原生定位器推导任务级入库暂存定位器值。
+
+    规划器与校验器必须用同一个推导函数，否则冻结计划的暂存路径无法复核。
+
+    ``folder_path`` 是复合定位器 ``{root_folder_id}::{相对路径}``（天翼云），只在
+    相对路径一侧追加暂存段；``provider_path`` / ``path`` 是纯路径定位器，直接追加。
+    ``folder_id`` 之类的不透明 ID 无法派生子目录，返回空串表示不支持原生暂存。
+    """
+
+    kind = str(locator_kind or "").strip()
+    value = str(locator_value or "").strip()
+    leaf = str(job or "").strip().strip("/")
+    if not value or not leaf:
+        return ""
+    suffix = f"{NATIVE_STAGING_DIR}/{leaf}"
+    if kind == "folder_path":
+        root_folder_id, separator, relative = value.partition("::")
+        if not separator or not root_folder_id.strip() or not relative.strip():
+            return ""
+        return f"{root_folder_id}::{normalize_path(f'{relative}/{suffix}').lstrip('/')}"
+    if kind in {"provider_path", "path"}:
+        return normalize_path(f"{value}/{suffix}")
+    return ""
+
+
 # ---- 服务接口（Protocol） ---------------------------------------------------
 #
 # 本包只依赖这些最小接口。测试以 fakes 注入；真实实现（账号/目标/规则/OpenList
@@ -326,6 +394,10 @@ __all__ = [
     "DEFAULT_RELAY_ROOT",
     "INGRESS_DIR",
     "STAGING_DIR",
+    "NATIVE_STAGING_DIR",
+    "native_staging_locator",
+    "mount_absolute_path",
+    "mount_webdav_root",
     "VALID_SOURCE_FORMS",
     "CapabilityDecision",
     "PlanningError",

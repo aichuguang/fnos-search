@@ -21,7 +21,12 @@ from fnos_media_import.domain.models import (
 from fnos_media_import.openlist.connection_service import OpenListConnectionService
 from fnos_media_import.openlist.mount_service import OpenListMountService
 from fnos_media_import.planning.destination_resolver import DestinationResolver
-from fnos_media_import.planning import PlanningError, SourceAccountUnavailable
+from fnos_media_import.planning.job_plan import attach_plan_integrity
+from fnos_media_import.planning import (
+    NATIVE_STAGING_DIR,
+    PlanningError,
+    SourceAccountUnavailable,
+)
 from fnos_media_import.planning.plan_validator import PlanValidationDeps, validate_plan
 from fnos_media_import.planning.planner import ImportPlanner
 from fnos_media_import.planning.source_resolver import SourceResolver
@@ -39,6 +44,7 @@ from fnos_media_import.services.source_record_service import SourceRecordService
 from fnos_media_import.services.worker_task_dispatcher import WorkerTaskDispatcher
 from fnos_media_import.storage.assignment_service import SourceAssignmentService
 from fnos_media_import.storage.target_service import StorageTargetService
+from fnos_media_import.transfer import TransferPlan
 from fnos_media_import.transfer.execution_repository import TransferExecutionRepository
 
 
@@ -334,6 +340,288 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
             },
             deps=deps,
         )
+
+    def test_tianyi_native_save_stages_into_ingress_dir_before_category(self) -> None:
+        """原生转存先落 `分类/_入库暂存/job-N`，再由 Organizer 搬进正式分类目录。"""
+
+        tianyi_account = self._tianyi_account()
+        self.connections.create_connection(
+            {
+                "connection_id": "ol_native",
+                "name": "OpenList native",
+                "base_url": "http://openlist:5244/dav",
+                "username": "admin",
+                "password": "secret",
+            }
+        )
+        organizer_mount = self.mounts.create_mount(
+            {
+                "mount_id": "tianyi_native_target",
+                "connection_id": "ol_native",
+                "name": "天翼目标",
+                "webdav_root": "/tianyi",
+                "account_id": tianyi_account,
+                "provider_kind": "tianyi",
+                "identity_root": "/",
+                "native_locator": {
+                    "kind": "folder_id",
+                    "value": "root-folder-id",
+                    "organizer_mutation_verified": True,
+                },
+            }
+        )
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE openlist_mounts SET readable=1, writable=1, "
+                "last_tested_at='2026-08-09T00:00:00Z' WHERE mount_id=?",
+                (organizer_mount["mount_id"],),
+            )
+        self.mounts.confirm_identity(organizer_mount["mount_id"])
+        self.targets.create_target(
+            destination_id="tianyi_staged",
+            name="天翼暂存目标",
+            provider_kind="tianyi",
+            categories={
+                "movie": TargetCategory(
+                    category_key="movie",
+                    public_label="电影",
+                    native_locator=NativeLocator(
+                        "folder_path", "root-folder-id::电影"
+                    ),
+                    organizer_locator=OpenListLocator(
+                        "ol_native",
+                        organizer_mount["mount_id"],
+                        "/tianyi/电影",
+                    ),
+                )
+            },
+            account_id=tianyi_account,
+        )
+        self.assignments.upsert("tianyi", "movie", "tianyi_staged")
+        source = self.sources.capture(
+            SourceDescriptor(
+                "tianyi",
+                "share",
+                "tianyi:share:staged",
+                search_source_id="tianyi",
+            ),
+            {"url": "https://cloud.189.cn/t/staged", "password": ""},
+        )
+        planner, _resolver, deps = self._planner()
+
+        plan = planner.plan_import(
+            source=source,
+            category_key="movie",
+            job_id=47,
+            organizer_enabled=True,
+        )
+
+        paths = plan["paths"]
+        self.assertEqual(plan["transfer"]["strategy"], "native_save")
+        # destination_final 仍是真正的分类目录，不能被暂存目录顶掉。
+        self.assertEqual(paths["destination_final"]["path"], "root-folder-id::电影")
+        staging = paths["destination_staging"]
+        self.assertEqual(staging["kind"], "native")
+        self.assertEqual(staging["locator_kind"], "folder_path")
+        self.assertEqual(staging["role"], "native_staging")
+        self.assertEqual(
+            staging["path"], f"root-folder-id::电影/{NATIVE_STAGING_DIR}/job-47"
+        )
+        self.assertEqual(staging["namespace_id"], paths["destination_final"]["namespace_id"])
+        # Organizer 从 OpenList 侧看到同一个暂存目录，搬运目标是 organizer_final。
+        self.assertEqual(
+            paths["organizer"]["path"], f"/tianyi/电影/{NATIVE_STAGING_DIR}/job-47"
+        )
+        self.assertEqual(paths["organizer_final"]["path"], "/tianyi/电影")
+        self.assertEqual(paths["organizer_final"]["kind"], "openlist")
+
+        job_row = {
+            "id": 47,
+            "category": "movie",
+            "destination_id": "tianyi_staged",
+            "plan_version": 1,
+        }
+        validate_plan(plan, job_row, deps=deps)
+
+        # 提交目录必须是暂存目录，且复合定位器不能被规范化成 "/..."。
+        submit = TransferPlan(plan).native_submit_locator()
+        self.assertEqual(submit.kind, "folder_path")
+        self.assertEqual(
+            submit.value, f"root-folder-id::电影/{NATIVE_STAGING_DIR}/job-47"
+        )
+
+        # 暂存目录被改写成任意目录时必须失败。重新盖章 integrity，否则只是
+        # 哈希校验拦下来，验证不到暂存目录的重新推导逻辑。
+        tampered = attach_plan_integrity(json.loads(json.dumps(plan)))
+        tampered["paths"]["destination_staging"]["path"] = "root-folder-id::别的目录"
+        attach_plan_integrity(tampered)
+        with self.assertRaises(PlanningError) as raised:
+            validate_plan(tampered, job_row, deps=deps)
+        self.assertIn("destination_staging", str(raised.exception))
+
+        # 少了 organizer_final，Organizer 就没有 OpenList 侧的搬运目标根。
+        tampered = json.loads(json.dumps(plan))
+        tampered["paths"]["organizer_final"] = None
+        attach_plan_integrity(tampered)
+        with self.assertRaises(PlanningError):
+            validate_plan(tampered, job_row, deps=deps)
+
+    def test_native_staging_organizer_path_prefixes_mount_webdav_root(self) -> None:
+        """挂载内相对定位器必须冻结成 OpenList 全局绝对路径。
+
+        生产的 organizer_locator 是「挂载内相对路径」（``/电视剧``，因为
+        ``_build_categories`` 的 ``library_root`` 为空），而 Organizer 调
+        ``/api/fs/list`` 只认全局绝对路径。少了 webdav_root 前缀，OpenList 会去根
+        目录找名为「电视剧」的存储并返回 ``storage not found``。
+        """
+
+        quark_account = self._quark_account()
+        self.connections.create_connection(
+            {
+                "connection_id": "ol_rooted",
+                "name": "OpenList rooted",
+                "base_url": "http://openlist:5244/dav",
+                "username": "admin",
+                "password": "secret",
+            }
+        )
+        organizer_mount = self.mounts.create_mount(
+            {
+                "mount_id": "quark_rooted_target",
+                "connection_id": "ol_rooted",
+                "name": "夸克离线下载",
+                # 真实部署里挂载根不是 "/"，这正是 storage not found 的触发条件。
+                "webdav_root": "/离线下载",
+                "account_id": quark_account,
+                "provider_kind": "quark",
+                "identity_root": "/",
+                "native_locator": {
+                    "kind": "path",
+                    "value": "/FNOS",
+                    "organizer_mutation_verified": True,
+                },
+            }
+        )
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE openlist_mounts SET readable=1, writable=1, "
+                "last_tested_at='2026-08-09T00:00:00Z' WHERE mount_id=?",
+                (organizer_mount["mount_id"],),
+            )
+        self.mounts.confirm_identity(organizer_mount["mount_id"])
+        self.targets.create_target(
+            destination_id="quark_rooted",
+            name="夸克离线目标",
+            provider_kind="quark",
+            categories={
+                "tv": TargetCategory(
+                    category_key="tv",
+                    public_label="电视剧",
+                    native_locator=NativeLocator("path", "/电视剧"),
+                    organizer_locator=OpenListLocator(
+                        "ol_rooted",
+                        organizer_mount["mount_id"],
+                        # 挂载内相对路径，不含 webdav_root。
+                        "/电视剧",
+                    ),
+                )
+            },
+            account_id=quark_account,
+        )
+        self.assignments.upsert("quark", "tv", "quark_rooted")
+        source = self.sources.capture(
+            SourceDescriptor(
+                "quark",
+                "share",
+                "quark:share:rooted",
+                search_source_id="quark",
+            ),
+            {"url": "https://pan.quark.cn/s/rooted", "password": ""},
+        )
+        planner, _resolver, deps = self._planner()
+
+        plan = planner.plan_import(
+            source=source,
+            category_key="tv",
+            job_id=2,
+            organizer_enabled=True,
+        )
+
+        paths = plan["paths"]
+        self.assertEqual(plan["transfer"]["strategy"], "native_save")
+        # native 侧一律保持原生坐标系，webdav_root 不得渗入。
+        self.assertEqual(paths["destination_final"]["path"], "/电视剧")
+        self.assertEqual(
+            paths["destination_staging"]["path"],
+            f"/电视剧/{NATIVE_STAGING_DIR}/job-2",
+        )
+        # OpenList 侧必须带上挂载根。
+        self.assertEqual(paths["organizer_final"]["path"], "/离线下载/电视剧")
+        self.assertEqual(
+            paths["organizer"]["path"],
+            f"/离线下载/电视剧/{NATIVE_STAGING_DIR}/job-2",
+        )
+
+        validate_plan(
+            plan,
+            {
+                "id": 2,
+                "category": "tv",
+                "destination_id": "quark_rooted",
+                "plan_version": 1,
+            },
+            deps=deps,
+        )
+
+    def test_tianyi_native_save_without_organizer_writes_category_directly(self) -> None:
+        """Organizer 关闭时没人搬暂存目录，必须保持直写分类目录。"""
+
+        tianyi_account = self._tianyi_account()
+        self.targets.create_target(
+            destination_id="tianyi_direct",
+            name="天翼直写目标",
+            provider_kind="tianyi",
+            categories={
+                "movie": TargetCategory(
+                    category_key="movie",
+                    public_label="电影",
+                    native_locator=NativeLocator(
+                        "folder_path", "root-folder-id::电影"
+                    ),
+                )
+            },
+            account_id=tianyi_account,
+        )
+        self.assignments.upsert("tianyi", "movie", "tianyi_direct")
+        source = self.sources.capture(
+            SourceDescriptor(
+                "tianyi",
+                "share",
+                "tianyi:share:direct",
+                search_source_id="tianyi",
+            ),
+            {"url": "https://cloud.189.cn/t/direct", "password": ""},
+        )
+        planner, _resolver, deps = self._planner()
+
+        plan = planner.plan_import(source=source, category_key="movie", job_id=48)
+
+        self.assertIsNone(plan["paths"]["destination_staging"])
+        self.assertEqual(
+            plan["paths"]["destination_final"]["path"], "root-folder-id::电影"
+        )
+        validate_plan(
+            plan,
+            {
+                "id": 48,
+                "category": "movie",
+                "destination_id": "tianyi_direct",
+                "plan_version": 1,
+            },
+            deps=deps,
+        )
+        submit = TransferPlan(plan).native_submit_locator()
+        self.assertEqual(submit.value, "root-folder-id::电影")
 
     def test_runtime_builder_initial_build_can_create_execute_and_retry_without_rewire(self) -> None:
         account_id = self._quark_account()

@@ -11,7 +11,7 @@ import threading
 from typing import Any, Callable
 
 from ..constants import JOB_CANCELLED, JOB_DONE, JOB_FAILED, JOB_UNSUPPORTED
-from ..time_utils import utc_now_iso_offset
+from ..time_utils import utc_now_iso, utc_now_iso_offset
 
 
 # 表名来自白名单常量，不接收外部输入，SQL 拼接安全。
@@ -21,6 +21,13 @@ EVENT_RETENTION_TABLES = (
     "rclone_events",
     "rclone_file_events",
     "update_events",
+)
+HISTORY_RETENTION_TABLES = EVENT_RETENTION_TABLES + (
+    "update_candidates",
+    "update_runs",
+    "rclone_runs",
+    "update_preview_cache",
+    "update_path_snapshots",
 )
 DEFAULT_RETENTION_DAYS = 90
 TERMINAL_JOB_STATUSES = (
@@ -43,6 +50,33 @@ RECOVERABLE_UNMATCHED_RCLONE_STATUSES = (
     "done",
     "success",
     "skipped_existing",
+)
+TERMINAL_RCLONE_RUN_STATUSES = (
+    "success",
+    "failed",
+    "cancelled",
+    "canceled",
+    "done",
+    "completed",
+)
+TERMINAL_UPDATE_RUN_STATUSES = (
+    "success",
+    "failed",
+    "interrupted",
+    "cancelled",
+    "canceled",
+    "completed",
+)
+TERMINAL_UPDATE_CANDIDATE_DECISIONS = (
+    "completed",
+    "imported",
+    "failed",
+    "rejected",
+    "skipped",
+)
+DISPOSABLE_TRANSFER_PHASES = (
+    "completed",
+    "cancelled",
 )
 
 
@@ -125,15 +159,16 @@ class EventRetentionWorker:
             deleted_total = 0
             batches = 0
             visited_tables: set[str] = set()
+            deleted_by_table: dict[str, int] = {}
             consecutive_empty = 0
             lease_lost = False
 
             while (
                 deleted_total < self.max_delete_per_run
-                and consecutive_empty < len(EVENT_RETENTION_TABLES)
+                and consecutive_empty < len(HISTORY_RETENTION_TABLES)
                 and not self.stop_event.is_set()
             ):
-                table = EVENT_RETENTION_TABLES[self._next_table_index]
+                table = HISTORY_RETENTION_TABLES[self._next_table_index]
                 if batches and not self._renew_lease():
                     lease_lost = True
                     self._safe_log("Event retention stopped because its scheduler lease could not be renewed.")
@@ -143,7 +178,8 @@ class EventRetentionWorker:
                 removed = self._prune_table(table, cutoff, limit)
                 batches += 1
                 visited_tables.add(table)
-                self._next_table_index = (self._next_table_index + 1) % len(EVENT_RETENTION_TABLES)
+                deleted_by_table[table] = deleted_by_table.get(table, 0) + removed
+                self._next_table_index = (self._next_table_index + 1) % len(HISTORY_RETENTION_TABLES)
                 deleted_total += removed
                 consecutive_empty = 0 if removed else consecutive_empty + 1
 
@@ -158,6 +194,7 @@ class EventRetentionWorker:
                 "tables": len(visited_tables),
                 "batches": batches,
                 "cutoff": cutoff,
+                "deleted_by_table": deleted_by_table,
                 "stopped": self.stop_event.is_set(),
                 "lease_lost": lease_lost,
             }
@@ -184,6 +221,14 @@ class EventRetentionWorker:
     def _prune_table(self, table: str, cutoff: str, limit: int) -> int:
         if table == "rclone_file_events":
             return self._prune_rclone_file_events(cutoff, limit)
+        if table == "rclone_runs":
+            return self._prune_rclone_runs(cutoff, limit)
+        if table == "update_candidates":
+            return self._prune_update_candidates(cutoff, limit)
+        if table == "update_runs":
+            return self._prune_update_runs(cutoff, limit)
+        if table in {"update_preview_cache", "update_path_snapshots"}:
+            return self._prune_expired_cache(table, utc_now_iso(), limit)
 
         predicate = ""
         parameters: list[Any] = [cutoff]
@@ -218,6 +263,170 @@ class EventRetentionWorker:
                 )
                 """,
                 parameters,
+            )
+            return max(0, int(cursor.rowcount))
+
+    def _prune_rclone_runs(self, cutoff: str, limit: int) -> int:
+        run_placeholders = ",".join("?" for _ in TERMINAL_RCLONE_RUN_STATUSES)
+        job_placeholders = ",".join("?" for _ in TERMINAL_JOB_STATUSES)
+        transfer_placeholders = ",".join("?" for _ in DISPOSABLE_TRANSFER_PHASES)
+        with self.database.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                DELETE FROM rclone_runs
+                WHERE id IN (
+                    SELECT run_row.id
+                    FROM rclone_runs AS run_row
+                    WHERE LOWER(COALESCE(run_row.status, '')) IN ({run_placeholders})
+                      AND COALESCE(
+                            NULLIF(run_row.finished_at, ''),
+                            NULLIF(run_row.updated_at, ''),
+                            run_row.started_at
+                          ) < ?
+                      AND (
+                        run_row.job_id IS NULL
+                        OR NOT EXISTS (
+                            SELECT 1 FROM import_jobs AS parent_job
+                            WHERE parent_job.id = run_row.job_id
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM import_jobs AS parent_job
+                            WHERE parent_job.id = run_row.job_id
+                              AND parent_job.status IN ({job_placeholders})
+                        )
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM organizer_tasks AS organizer_task
+                        WHERE organizer_task.rclone_run_id = run_row.id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM transfer_executions AS execution
+                        WHERE execution.job_id = run_row.job_id
+                          AND execution.phase NOT IN ({transfer_placeholders})
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM rclone_events AS run_event
+                        WHERE run_event.run_id = run_row.id
+                          AND run_event.created_at >= ?
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM rclone_file_events AS file_event
+                        WHERE file_event.run_id = run_row.id
+                          AND file_event.created_at >= ?
+                      )
+                    ORDER BY COALESCE(
+                               NULLIF(run_row.finished_at, ''),
+                               NULLIF(run_row.updated_at, ''),
+                               run_row.started_at
+                             ), run_row.id
+                    LIMIT ?
+                )
+                """,
+                (
+                    *TERMINAL_RCLONE_RUN_STATUSES,
+                    cutoff,
+                    *TERMINAL_JOB_STATUSES,
+                    *DISPOSABLE_TRANSFER_PHASES,
+                    cutoff,
+                    cutoff,
+                    limit,
+                ),
+            )
+            return max(0, int(cursor.rowcount))
+
+    def _prune_update_candidates(self, cutoff: str, limit: int) -> int:
+        decision_placeholders = ",".join(
+            "?" for _ in TERMINAL_UPDATE_CANDIDATE_DECISIONS
+        )
+        run_placeholders = ",".join("?" for _ in TERMINAL_UPDATE_RUN_STATUSES)
+        job_placeholders = ",".join("?" for _ in TERMINAL_JOB_STATUSES)
+        with self.database.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                DELETE FROM update_candidates
+                WHERE id IN (
+                    SELECT candidate.id
+                    FROM update_candidates AS candidate
+                    WHERE candidate.created_at < ?
+                      AND LOWER(COALESCE(candidate.decision, '')) IN ({decision_placeholders})
+                      AND (
+                        candidate.run_id IS NULL
+                        OR EXISTS (
+                            SELECT 1 FROM update_runs AS parent_run
+                            WHERE parent_run.id = candidate.run_id
+                              AND LOWER(COALESCE(parent_run.status, '')) IN ({run_placeholders})
+                              AND COALESCE(NULLIF(parent_run.finished_at, ''), parent_run.started_at) < ?
+                        )
+                      )
+                      AND (
+                        candidate.job_id IS NULL
+                        OR NOT EXISTS (
+                            SELECT 1 FROM import_jobs AS parent_job
+                            WHERE parent_job.id = candidate.job_id
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM import_jobs AS parent_job
+                            WHERE parent_job.id = candidate.job_id
+                              AND parent_job.status IN ({job_placeholders})
+                        )
+                      )
+                    ORDER BY candidate.created_at, candidate.id
+                    LIMIT ?
+                )
+                """,
+                (
+                    cutoff,
+                    *TERMINAL_UPDATE_CANDIDATE_DECISIONS,
+                    *TERMINAL_UPDATE_RUN_STATUSES,
+                    cutoff,
+                    *TERMINAL_JOB_STATUSES,
+                    limit,
+                ),
+            )
+            return max(0, int(cursor.rowcount))
+
+    def _prune_update_runs(self, cutoff: str, limit: int) -> int:
+        run_placeholders = ",".join("?" for _ in TERMINAL_UPDATE_RUN_STATUSES)
+        with self.database.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                DELETE FROM update_runs
+                WHERE id IN (
+                    SELECT run_row.id
+                    FROM update_runs AS run_row
+                    WHERE LOWER(COALESCE(run_row.status, '')) IN ({run_placeholders})
+                      AND COALESCE(NULLIF(run_row.finished_at, ''), run_row.started_at) < ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM update_candidates AS candidate
+                        WHERE candidate.run_id = run_row.id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM update_events AS run_event
+                        WHERE run_event.run_id = run_row.id
+                          AND run_event.created_at >= ?
+                      )
+                    ORDER BY COALESCE(NULLIF(run_row.finished_at, ''), run_row.started_at), run_row.id
+                    LIMIT ?
+                )
+                """,
+                (*TERMINAL_UPDATE_RUN_STATUSES, cutoff, cutoff, limit),
+            )
+            return max(0, int(cursor.rowcount))
+
+    def _prune_expired_cache(self, table: str, now: str, limit: int) -> int:
+        with self.database.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                DELETE FROM {table}
+                WHERE id IN (
+                    SELECT cache_row.id
+                    FROM {table} AS cache_row
+                    WHERE cache_row.expires_at < ?
+                    ORDER BY cache_row.expires_at, cache_row.id
+                    LIMIT ?
+                )
+                """,
+                (now, limit),
             )
             return max(0, int(cursor.rowcount))
 

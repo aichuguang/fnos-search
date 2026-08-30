@@ -32,6 +32,7 @@ from fnos_media_import.transfer import (
     PHASE_CLEANUP_PENDING,
     PHASE_COMPLETED,
     PHASE_FAILED,
+    PHASE_FINAL_VERIFYING,
     PHASE_MANUAL_REVIEW,
     PHASE_NATIVE_SUBMITTING,
     PHASE_NATIVE_WAITING,
@@ -467,10 +468,31 @@ class _FakeCleanup(RepositoryFakeMixin):
         self.events = events
         self.calls: list[dict] = []
 
-    def cleanup(self, plan, *, target_verified, app_acked):
-        self.calls.append({"target_verified": target_verified, "app_acked": app_acked})
+    def cleanup(
+        self,
+        plan,
+        *,
+        target_verified,
+        app_acked,
+        delete_source=True,
+        delete_local_temp=True,
+    ):
+        self.calls.append(
+            {
+                "target_verified": target_verified,
+                "app_acked": app_acked,
+                "delete_source": delete_source,
+                "delete_local_temp": delete_local_temp,
+            }
+        )
         if self.events is not None:
-            self.events.add("cleanup", target_verified=target_verified, app_acked=app_acked)
+            self.events.add(
+                "cleanup",
+                target_verified=target_verified,
+                app_acked=app_acked,
+                delete_source=delete_source,
+                delete_local_temp=delete_local_temp,
+            )
         return CleanupResult(ok=self.ok, items=[])
 
 
@@ -703,23 +725,90 @@ class NativeSaveFlowTests(unittest.TestCase):
         plan = make_plan(source_kind="quark", dest_kind="quark", strategy="native_save")
         executor = NativeTransferExecutor({"quark": adapter}, strategy="native_save")
         orch = TransferOrchestrator(plan, {"native_save": executor}, cleanup=cleanup, ack_service=ack)
-        _drive(orch)
-        # 目标已确认但 ACK 未完成：停在 ack_pending，来源不清理
-        self.assertEqual(orch.state.phase, PHASE_ACK_PENDING)
+        # The first ACK failure is bounded and durable: enter retry_wait
+        # without restarting the already verified transfer.
+        first = orch.run()
+        self.assertEqual(first.phase, "retry_wait")
+        self.assertEqual(orch.state.phase, "retry_wait")
         self.assertTrue(orch.state.target_verified)
         self.assertFalse(orch.state.app_acked)
         self.assertEqual(len(cleanup.calls), 0, "ACK 未完成不得清理来源")
-        # 取消请求在此时应恢复 ACK/清理而非重复传输
+        orch.mark_retry_ready()
+        orch.run()
+        self.assertEqual(orch.state.phase, PHASE_COMPLETED)
+        self.assertTrue(orch.state.app_acked)
+        self.assertEqual(ack.calls, 2)
+        self.assertEqual(adapter.submit_count, 1, "ACK 重试不得重复传输")
+        self.assertEqual(len(cleanup.calls), 1)
+
+    def test_ack_retry_exhaustion_enters_manual_review(self) -> None:
+        adapter = _FakeNativeAdapter("quark")
+        ack = _FakeAck(acked=False)
+        cleanup = _FakeCleanup()
+        plan = make_plan(source_kind="quark", dest_kind="quark", strategy="native_save")
+        executor = NativeTransferExecutor({"quark": adapter}, strategy="native_save")
+        from fnos_media_import.transfer.orchestrator import RetryPolicy
+
+        orch = TransferOrchestrator(
+            plan,
+            {"native_save": executor},
+            cleanup=cleanup,
+            ack_service=ack,
+            retry_policy=RetryPolicy(max_attempts=2, base_delay_seconds=0.001),
+        )
+        for _ in range(4):
+            result = orch.run()
+            if orch.state.phase == "retry_wait":
+                orch.mark_retry_ready()
+            if result.phase == "manual_review":
+                break
+        self.assertEqual(orch.state.phase, "manual_review")
+        self.assertEqual(ack.calls, 2)
+        self.assertEqual(adapter.submit_count, 1)
+        self.assertEqual(len(cleanup.calls), 0)
+        self.assertEqual(orch.state.review_from, PHASE_ACK_PENDING)
+
+    def test_legacy_ack_snapshot_returns_to_final_verifying(self) -> None:
+        adapter = _FakeNativeAdapter("quark")
+        plan = make_plan(source_kind="quark", dest_kind="quark", strategy="native_save")
+        executor = NativeTransferExecutor({"quark": adapter}, strategy="native_save")
+        orch = TransferOrchestrator(plan, {"native_save": executor}, ack_service=_FakeAck())
+        orch.restore({"phase": PHASE_ACK_PENDING, "target_verified": True, "final_verified": False})
+        result = orch.step()
+        self.assertEqual(result.phase, PHASE_FINAL_VERIFYING)
+        self.assertEqual(orch.state.phase, PHASE_FINAL_VERIFYING)
+
+        # 取消请求在 ACK 等待阶段恢复 ACK/清理而非重复传输
+        orch.restore({"phase": PHASE_ACK_PENDING, "target_verified": True, "final_verified": True})
         cancel = orch.cancel()
         self.assertEqual(cancel.status, "resume_ack")
         self.assertEqual(orch.state.phase, PHASE_ACK_PENDING)
-        self.assertEqual(adapter.submit_count, 1, "不得重复传输")
-        # 应用 ACK 完成后恢复清理并完成
-        _drive(orch)
-        self.assertEqual(orch.state.phase, PHASE_COMPLETED)
-        self.assertTrue(orch.state.app_acked)
-        self.assertEqual(len(cleanup.calls), 1)
-        self.assertTrue(cleanup.calls[0]["app_acked"])
+        self.assertEqual(adapter.submit_count, 0, "旧快照校验不得触发传输")
+
+    def test_operator_retry_can_preserve_active_receipt(self) -> None:
+        adapter = _FakeNativeAdapter("quark")
+        plan = make_plan(source_kind="quark", dest_kind="quark", strategy="native_save")
+        executor = NativeTransferExecutor({"quark": adapter}, strategy="native_save")
+        receipt = {
+            "operation_id": "existing-operation",
+            "status": "submitted",
+            "provider_kind": "quark",
+            "metadata": {"operation_key": "import:job-1"},
+        }
+        orch = TransferOrchestrator(plan, {"native_save": executor})
+        orch.restore(
+            {
+                "phase": PHASE_RETRY_WAIT,
+                "retry_from": PHASE_NATIVE_SUBMITTING,
+                "retry_ready": True,
+                "preserve_receipt_on_retry": True,
+                "receipt": receipt,
+            }
+        )
+        result = orch.step()
+        self.assertEqual(result.phase, PHASE_NATIVE_SUBMITTING)
+        self.assertIsNotNone(orch.state.receipt)
+        self.assertFalse(orch.state.preserve_receipt_on_retry)
 
 
 class MagnetRestrictionTests(unittest.TestCase):
@@ -1166,7 +1255,7 @@ class ProviderRelayTests(unittest.TestCase):
         self.assertEqual(account_id, "acc_mobile")
         self.assertEqual(len(cleanup.calls), 0, "上传未确认不得清理缓存/来源")
 
-    def test_relay_delete_source_after_ack_false_skips_cleanup(self) -> None:
+    def test_relay_delete_source_after_ack_false_cleans_local_temp_only(self) -> None:
         plan = make_plan(
             source_kind="quark",
             dest_kind="mobile",
@@ -1196,7 +1285,9 @@ class ProviderRelayTests(unittest.TestCase):
         )
         _drive(orch)
         self.assertEqual(orch.state.phase, PHASE_COMPLETED)
-        self.assertEqual(len(cleanup.calls), 0, "delete_source_after_ack=False 时不做清理")
+        self.assertEqual(len(cleanup.calls), 1)
+        self.assertFalse(cleanup.calls[0]["delete_source"])
+        self.assertTrue(cleanup.calls[0]["delete_local_temp"])
 
 
 class RelayProviderTests(unittest.TestCase):
@@ -1305,6 +1396,34 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertEqual(len(result.items), 2)
         self.assertTrue(all(item.ok for item in result.items))
         self.assertEqual(len(fs.deleted), 2)
+
+    def test_cleanup_can_delete_local_temp_without_source(self) -> None:
+        fs = _FakeFilesystem()
+        service = TransferCleanupService(fs, local_roots=("/data/relay",))
+        plan = self._plan(landing="/_fnos_ingress/job-1", local_temp="/data/relay/job-1")
+        result = service.cleanup(
+            plan,
+            target_verified=True,
+            app_acked=True,
+            delete_source=False,
+            delete_local_temp=True,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual([item["path"] for item in fs.deleted], ["/data/relay/job-1"])
+
+    def test_cleanup_can_delete_source_without_local_temp(self) -> None:
+        fs = _FakeFilesystem()
+        service = TransferCleanupService(fs, local_roots=("/data/relay",))
+        plan = self._plan(landing="/_fnos_ingress/job-1", local_temp="/data/relay/job-1")
+        result = service.cleanup(
+            plan,
+            target_verified=True,
+            app_acked=True,
+            delete_source=True,
+            delete_local_temp=False,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual([item["path"] for item in fs.deleted], ["/_fnos_ingress/job-1"])
 
     def test_cleanup_refuses_non_job_dir(self) -> None:
         fs = _FakeFilesystem()

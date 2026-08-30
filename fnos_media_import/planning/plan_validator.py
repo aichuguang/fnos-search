@@ -26,6 +26,7 @@ from . import (
     DEFAULT_RELAY_ROOT,
     DATA_PLANE_STRATEGIES,
     EXECUTION_PLAN_VERSION,
+    NATIVE_STAGING_DIR,
     STAGING_DIR,
     STRATEGY_EXECUTOR,
     STRATEGY_NATIVE_OFFLINE,
@@ -41,7 +42,10 @@ from . import (
     TargetService,
     job_dir,
     local_contained,
+    mount_absolute_path,
+    mount_webdav_root,
     namespace_kind,
+    native_staging_locator,
     normalize_path,
     path_is_safe,
     path_leaf,
@@ -798,8 +802,14 @@ class PlanValidator:
             "local_temp": {"relay"},
         }
         expected_kinds = {
-            STRATEGY_NATIVE_SAVE: {"destination_final": {"native"}},
-            STRATEGY_NATIVE_OFFLINE: {"destination_final": {"native"}},
+            STRATEGY_NATIVE_SAVE: {
+                "destination_final": {"native"},
+                "destination_staging": {"native"},
+            },
+            STRATEGY_NATIVE_OFFLINE: {
+                "destination_final": {"native"},
+                "destination_staging": {"native"},
+            },
             STRATEGY_RELAY_UPLOAD_PROVIDER: relay_expected_kinds,
             STRATEGY_RCLONE_COPY: {
                 "source_landing": {"openlist"},
@@ -820,10 +830,19 @@ class PlanValidator:
             self._storage_identity_ref(label, namespace, path, bindings)
             for label, namespace, path, _kind in valid_refs
         ]
+        # 原生入库暂存目录故意嵌套在正式分类目录里面（分类/_入库暂存/job-N），
+        # 这对组合的「重叠」是设计要求而不是冲突，单独放行；其合法性由
+        # _native_staging_errors 逐项复核。
+        overlap_exempt: set[frozenset[str]] = set()
+        if strategy in {STRATEGY_NATIVE_SAVE, STRATEGY_NATIVE_OFFLINE} and staging and final:
+            if not self._native_staging_errors(strategy, staging, final, job):
+                overlap_exempt.add(frozenset({"destination_staging", "destination_final"}))
         for i in range(len(identity_refs)):
             for j in range(i + 1, len(identity_refs)):
                 label_a, namespace_a, path_a = identity_refs[i]
                 label_b, namespace_b, path_b = identity_refs[j]
+                if frozenset({label_a, label_b}) in overlap_exempt:
+                    continue
                 if paths_overlap(namespace_a, path_a, namespace_b, path_b):
                     errors.append(f"paths.{label_a} 与 paths.{label_b} 在同一命名空间重叠")
 
@@ -873,10 +892,17 @@ class PlanValidator:
             if not final:
                 errors.append(f"{strategy} 缺少 destination_final")
         elif strategy in {STRATEGY_NATIVE_SAVE, STRATEGY_NATIVE_OFFLINE}:
-            if staging or source_landing or local_temp:
-                errors.append(f"{strategy} 不允许数据面 landing/staging/local_temp")
+            if source_landing or local_temp:
+                errors.append(f"{strategy} 不允许数据面 landing/local_temp")
             if not final:
                 errors.append(f"{strategy} 缺少 destination_final")
+            # 原生转存允许一个「分类目录 / _入库暂存 / job-N」的任务级暂存目录：
+            # Provider 先把文件转存进去，再由 OpenList Organizer 搬进正式分类目录。
+            # 它不是数据面 staging（没有 rclone 搬运），所以必须逐项复核：命名空间与
+            # destination_final 完全一致、叶子是 job-N、且路径能由 destination_final
+            # 原样重新推导出来，防止冻结计划被改写成任意目录。
+            if staging:
+                errors.extend(self._native_staging_errors(strategy, staging, final, job))
 
         # destination_staging 是 rclone_copy 的任务级暂存目录；中继链路
         # 直接写入冻结 destination_final，不得把 staging 当成必需步骤。
@@ -1387,6 +1413,7 @@ class PlanValidator:
             errors.append("organizer must use an openlist namespace")
         mount_id = _str(bindings.get("organizer_mount_id"))
         mount_revision = _int_or(bindings.get("organizer_mount_revision"), 0)
+        frozen_mount: dict[str, Any] | None = None
         if not mount_id or mount_revision <= 0:
             errors.append("Organizer 缺少冻结 mount revision")
         else:
@@ -1449,6 +1476,15 @@ class PlanValidator:
                     or service.get_revision(connection_id, connection_revision) is None
                 ):
                     errors.append("Organizer connection revision 不存在")
+        # 分类定位器保存的是「挂载内相对路径」，计划冻结的是 OpenList 全局绝对
+        # 路径（挂载根 + 相对路径）。比对必须在同一坐标系里做，否则 webdav_root
+        # 非 "/" 的挂载会被误判成不一致。挂载根只属于 OpenList，与天翼/移动/夸克
+        # 的原生根无关，因此 native 侧的 destination_* 一律不参与这里的换算。
+        webdav_root = mount_webdav_root(frozen_mount) if frozen_mount else "/"
+
+        def locator_absolute(value: Any) -> str:
+            return mount_absolute_path(webdav_root, value)
+
         locator = getattr(category, "organizer_locator", None) if category is not None else None
         if locator is None:
             errors.append("Organizer enabled but target category has no organizer locator")
@@ -1460,17 +1496,81 @@ class PlanValidator:
             ):
                 errors.append("Organizer connection 与目标分类 locator 不一致")
         staging = _mapping(paths.get("destination_staging"))
-        if staging and namespace_kind(staging.get("namespace_id")) == "openlist":
-            if path_leaf(path) != job_dir(_int_or(plan.get("job_id"), 0)):
+        staging_kind = _str(staging.get("kind")) or namespace_kind(staging.get("namespace_id"))
+        job = job_dir(_int_or(plan.get("job_id"), 0))
+        if staging and staging_kind == "openlist":
+            if path_leaf(path) != job:
                 errors.append("organizer path is not task-scoped")
+        elif staging and staging_kind == "native":
+            # 原生入库暂存链路：Organizer 的扫描根是 OpenList 侧看到的同一个
+            # 「分类目录 / _入库暂存 / job-N」，搬运目标则是单独冻结的
+            # paths.organizer_final（destination_final 对天翼云是复合定位器，
+            # OpenList 不能直接当目标根使用）。
+            organizer_final = _mapping(paths.get("organizer_final"))
+            final_path = _str(organizer_final.get("path"))
+            if not organizer_final:
+                errors.append("原生入库暂存链路缺少 paths.organizer_final")
+            elif namespace_kind(organizer_final.get("namespace_id")) != "openlist":
+                errors.append("paths.organizer_final 必须位于 openlist 命名空间")
+            elif _str(organizer_final.get("namespace_id")) != _str(organizer.get("namespace_id")):
+                errors.append("paths.organizer_final 必须与 paths.organizer 同命名空间")
+            if path_leaf(path) != job:
+                errors.append("organizer path is not task-scoped")
+            if final_path and normalize_path(path) != normalize_path(
+                f"{final_path}/{NATIVE_STAGING_DIR}/{job}"
+            ):
+                errors.append("Organizer path 不是 organizer_final 下的入库暂存目录")
+            if (
+                locator is not None
+                and final_path
+                and normalize_path(final_path)
+                != locator_absolute(getattr(locator, "path", ""))
+            ):
+                errors.append("paths.organizer_final 与目标分类 locator 不一致")
         else:
             final = _mapping(paths.get("destination_final"))
             if (_str(final.get("kind")) or namespace_kind(final.get("namespace_id"))) != "native":
                 errors.append("native strategy organizer mapping is not verifiable")
-            elif locator is not None and normalize_path(path) != normalize_path(
+            elif locator is not None and normalize_path(path) != locator_absolute(
                 getattr(locator, "path", "")
             ):
                 errors.append("Organizer path 与目标分类 locator 不一致")
+
+    def _native_staging_errors(
+        self,
+        strategy: str,
+        staging: dict[str, Any],
+        final: dict[str, Any],
+        job: str,
+    ) -> list[str]:
+        """复核原生入库暂存描述符（分类目录 / _入库暂存 / job-N）。
+
+        暂存目录必须能由 destination_final 原样重新推导出来，否则视为被改写。
+        返回空列表表示该暂存描述符合法。
+        """
+
+        errors: list[str] = []
+        staging_kind = _str(staging.get("kind")) or namespace_kind(staging.get("namespace_id"))
+        if staging_kind != "native":
+            errors.append(f"{strategy} 的 destination_staging 必须是 native 暂存目录")
+            return errors
+        staging_namespace = _str(staging.get("namespace_id"))
+        if staging_namespace != _str(final.get("namespace_id")):
+            errors.append("destination_staging 必须与 destination_final 同命名空间")
+        locator_kind = _str(staging.get("locator_kind")) or _str(final.get("locator_kind"))
+        expected = native_staging_locator(locator_kind, _str(final.get("path")), job)
+        staging_path = _str(staging.get("path"))
+        if not expected:
+            errors.append("该原生定位器不支持入库暂存目录")
+        elif staging_path != expected:
+            errors.append("destination_staging 无法由 destination_final 推导")
+        if staging_path and path_leaf(staging_path) != job:
+            errors.append("destination_staging 不是任务级目录")
+        if staging_path and NATIVE_STAGING_DIR not in staging_path:
+            errors.append("destination_staging 缺少入库暂存目录段")
+        if _str(staging.get("role")) != "native_staging":
+            errors.append("destination_staging 缺少 role=native_staging 标记")
+        return errors
 
     def _storage_identity_ref(
         self,
