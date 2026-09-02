@@ -68,8 +68,15 @@ DEFAULT_LOCAL_TARGET_ROOT = "/storage-targets"
 DEFAULT_RELAY_ROOT = "/data/relay"
 
 # 任务级落地区 / 暂存区目录名（§8.5、§12.3）。
-INGRESS_DIR = "_fnos_ingress"
-STAGING_DIR = "_fnos_staging"
+#
+# 目录名与原生入库暂存统一为 <NATIVE_STAGING_DIR>（用户拍板：全局只用
+# _入库暂存，不再引入 _fnos_ingress/_fnos_staging 等英文名）。两个常量的
+# 语义仍不同——INGRESS_DIR 是来源侧落地区（Provider 物化 + rclone 下载），
+# STAGING_DIR 是 rclone_copy 目标侧暂存区——只是目录名相同，路径形状也不同
+# （落地区为 <挂载根>/_入库暂存/job-N，暂存区为 <挂载根>/_入库暂存/分类/job-N）。
+# 以 UTF-8 源码字面量声明，不经过任何 shell 拼接。
+INGRESS_DIR = "_入库暂存"
+STAGING_DIR = "_入库暂存"
 
 # 原生转存（native_save / native_offline）的入库暂存目录名。
 #
