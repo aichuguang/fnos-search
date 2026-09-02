@@ -1,104 +1,27 @@
-# 仅供源码开发和自行构建使用，用于本地验证双容器（web + rclone Worker）编排。
+# 仅供源码开发和自行构建使用：在正式编排基础上覆盖镜像来源为本地构建。
+# 必须与 docker-compose.yml 合并使用：
+#   docker compose -f docker-compose.yml -f compose.dev.yaml up -d --build
 # 普通部署不要加载本文件，直接运行：docker compose up -d
-x-app-common: &app-common
-  restart: unless-stopped
-  init: true
-  stop_grace_period: 2m
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
-  security_opt:
-    - no-new-privileges:true
-  cap_drop:
-    - ALL
-  cap_add:
-    - CHOWN
-    - DAC_OVERRIDE
-    - FOWNER
-    - SETGID
-    - SETUID
+x-app-build: &app-build
+  context: .
+  args:
+    PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11-slim}
+    RCLONE_IMAGE: ${RCLONE_IMAGE:-rclone/rclone:1.70.3}
+    APP_UID: ${APP_UID:-10001}
+    APP_GID: ${APP_GID:-10001}
+    APP_VERSION: ${APP_VERSION:-dev}
+    VCS_REF: ${VCS_REF:-unknown}
+    PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    PIP_EXTRA_INDEX_URLS: ${PIP_EXTRA_INDEX_URLS:-https://mirrors.aliyun.com/pypi/simple https://mirrors.cloud.tencent.com/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple}
 
+# 环境变量、挂载、安全加固、pansou 等其余配置全部继承 docker-compose.yml，
+# 不要在这里重复任何列表型字段（security_opt/cap_add/volumes 等），
+# 否则多文件合并时序列会被拼接出重复项，compose 校验直接报错。
 services:
   fnos-media-import:
-    <<: *app-common
     image: ${APP_IMAGE:-fnos-search-local}:${APP_VERSION:-dev}
-    build:
-      context: .
-      args:
-        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11-slim}
-        RCLONE_IMAGE: ${RCLONE_IMAGE:-rclone/rclone:1.70.3}
-        APP_UID: ${APP_UID:-10001}
-        APP_GID: ${APP_GID:-10001}
-        APP_VERSION: ${APP_VERSION:-dev}
-        VCS_REF: ${VCS_REF:-unknown}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
-        PIP_EXTRA_INDEX_URLS: ${PIP_EXTRA_INDEX_URLS:-https://mirrors.aliyun.com/pypi/simple https://mirrors.cloud.tencent.com/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple}
-    container_name: fnos-media-import
-    depends_on:
-      fnos-rclone-worker:
-        condition: service_healthy
-    ports:
-      - "${APP_PORT:-5251}:5251"
-    environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      FNOS_PROCESS_ROLE: web
-      RCLONE_WORKER_URL: http://fnos-rclone-worker:5251
-      RCLONE_WORKER_CONTROL_TOKEN: "${RCLONE_WORKER_CONTROL_TOKEN:-}"
-      FNOS_ROOT_KEY: "${FNOS_ROOT_KEY:-}"
-      FNOS_RELAY_ROOT: /data/relay
-      FNOS_LOCAL_TARGET_ROOT: /storage-targets
-      LOG_FILE: /app/logs/web.log
-      PANSOU_BASE_URL: http://pansou:8888
-      PANSOU_USERNAME: "${PANSOU_USERNAME:-fnos-search}"
-      PANSOU_PASSWORD: "${PANSOU_PASSWORD:-fnos-search}"
-    volumes:
-      - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
-      - "${APP_DATA_HOST_PATH:-./data}:/app/data"
-      - "${APP_LOGS_HOST_PATH:-./logs}:/app/logs"
-      - "${FNOS_RELAY_HOST_PATH:-./rclone/relay}:/data/relay"
+    build: *app-build
 
   fnos-rclone-worker:
-    <<: *app-common
     image: ${APP_IMAGE:-fnos-search-local}:${APP_VERSION:-dev}
-    container_name: fnos-rclone-worker
-    environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      FNOS_PROCESS_ROLE: all
-      RCLONE_CONFIG_PATH: /config/rclone/rclone.conf
-      RCLONE_CACHE_DIR: /cache
-      RCLONE_WORKER_CONTROL_TOKEN: "${RCLONE_WORKER_CONTROL_TOKEN:-}"
-      FNOS_ROOT_KEY: "${FNOS_ROOT_KEY:-}"
-      FNOS_RELAY_ROOT: /data/relay
-      FNOS_LOCAL_TARGET_ROOT: /storage-targets
-      LOG_FILE: /app/logs/worker.log
-    volumes:
-      - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
-      - "${APP_DATA_HOST_PATH:-./data}:/app/data"
-      - "${APP_LOGS_HOST_PATH:-./logs}:/app/logs"
-      - "${RCLONE_CONFIG_HOST_PATH:-./rclone/config}:/config/rclone"
-      - "${RCLONE_CACHE_HOST_PATH:-./rclone/cache}:/cache"
-      - "${RCLONE_TEMP_HOST_PATH:-./rclone/temp}:/temp"
-      - "${FNOS_RELAY_HOST_PATH:-./rclone/relay}:/data/relay"
-      # 可选：本地目录存储目标（local folder storage target）。
-      # 启用前先在 .env 中把 RCLONE_LOCAL_STORAGE_HOST_PATH 指向已挂载的目录，
-      # 再取消下一行注释；容器内映射到 /storage-targets。
-      # - "${RCLONE_LOCAL_STORAGE_HOST_PATH:-./rclone/local-storage}:/storage-targets"
-
-  # 与正式编排保持一致：可选内置 PanSou 聚合搜索（默认不启动）。
-  # 本地验证整体链路时用：docker compose -f docker-compose.yml -f compose.dev.yaml --profile pansou up -d --build
-  pansou:
-    image: ${PANSOU_IMAGE:-ghcr.io/fish2018/pansou:latest}
-    container_name: fnos-pansou
-    profiles:
-      - pansou
-    restart: unless-stopped
-    init: true
-    security_opt:
-      - no-new-privileges:true
-    environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      PORT: "8888"
-      AUTH_ENABLED: "true"
-      AUTH_USERS: "${PANSOU_USERNAME:-fnos-search}:${PANSOU_PASSWORD:-fnos-search}"
-      CACHE_PATH: /cache
-    volumes:
-      - "${PANSOU_CACHE_HOST_PATH:-./pansou/cache}:/cache"
+    build: *app-build

@@ -44,7 +44,9 @@ jobs:
         run: find static -type f -name '*.js' -print0 | xargs -0 -n1 node --check
 
       - name: Validate Compose configuration
-        run: docker compose config --quiet
+        run: |
+          docker compose config --quiet
+          docker compose -f docker-compose.yml -f compose.dev.yaml config --quiet
 
   publish:
     needs: validate
