@@ -451,16 +451,25 @@
             return "";
         }
 
+        function tmdbReferenceCategory() {
+            // TMDB 只有 movie/tv 两个类型，仅作默认分类参考：资源关键词建议
+            // （能区分动漫/综艺）和访客手动选择都优先于它。
+            const mediaType = String(publicState.tmdbSelection?.media_type || "").toLowerCase();
+            if (mediaType === "movie") return "movie";
+            if (mediaType === "tv") return "tv";
+            return "";
+        }
+
         function categoryForPublicResource(publicId) {
             const item = publicResourceById(publicId);
             if (publicState.categoryTouched) return publicState.selectedCategory || "movie";
-            return item?.category_suggestion?.key || publicState.selectedCategory || "movie";
+            return item?.category_suggestion?.key || tmdbReferenceCategory() || publicState.selectedCategory || "movie";
         }
 
         function recommendedCategoryForItem(item) {
             const suggestion = item?.category_suggestion || {};
             if (publicState.categoryTouched) return publicState.selectedCategory || suggestion.key || "movie";
-            return suggestion.key || publicState.selectedCategory || "movie";
+            return suggestion.key || tmdbReferenceCategory() || publicState.selectedCategory || "movie";
         }
 
         function publicResourceById(publicId) {

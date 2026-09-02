@@ -220,7 +220,16 @@ class AdminDashboardService:
 
     @classmethod
     def _dashboard_job(cls, item: dict[str, Any]) -> dict[str, Any]:
-        return {field: item.get(field) for field in cls.RECENT_JOB_FIELDS}
+        result = {field: item.get(field) for field in cls.RECENT_JOB_FIELDS}
+        result["poster_url"] = cls._poster_url(item.get("raw_data"))
+        return result
+
+    @staticmethod
+    def _poster_url(raw_data: Any) -> str:
+        data = raw_data if isinstance(raw_data, dict) else {}
+        request = data.get("request") if isinstance(data.get("request"), dict) else {}
+        media = request.get("media_identity") if isinstance(request.get("media_identity"), dict) else {}
+        return str(media.get("poster_url") or "").strip()
 
     @staticmethod
     def _count(items: list[dict[str, Any]]) -> dict[str, int]:

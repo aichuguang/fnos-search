@@ -236,6 +236,14 @@ class ImportJobCreationService:
     def _create(self, payload: dict[str, Any]) -> dict[str, Any]:
 
         title = str(payload.get("title") or "未命名资源").strip()
+        # 访客经 TMDB 选片提交时，任务标题使用 TMDB 正式标题；
+        # 原始分享标题保留在 raw_data.request.raw_title 便于追溯。
+        media_identity = payload.get("media_identity")
+        if isinstance(media_identity, dict):
+            tmdb_title = str(media_identity.get("title") or "").strip()
+            if tmdb_title:
+                tmdb_year = str(media_identity.get("year") or "").strip()
+                title = f"{tmdb_title} ({tmdb_year})" if tmdb_year else tmdb_title
         url = str(payload.get("url") or payload.get("source_url") or "").strip()
         if not url:
             raise ValueError("资源链接不能为空")
@@ -614,6 +622,11 @@ class ImportJobCreationService:
             value = payload.get(key)
             if value not in (None, ""):
                 summary[key] = value
+        raw_title = str(payload.get("title") or "").strip()
+        media_identity = payload.get("media_identity")
+        if raw_title and isinstance(media_identity, dict) and str(media_identity.get("title") or "").strip():
+            # 任务标题已被 TMDB 正式标题替换，这里保留访客提交的原始标题。
+            summary["raw_title"] = raw_title[:500]
         media_identity = payload.get("media_identity")
         if isinstance(media_identity, dict):
             allowed = (

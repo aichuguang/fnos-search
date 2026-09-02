@@ -490,6 +490,10 @@ def _default_config() -> dict[str, Any]:
             "strm_refresh_prefix_anime": os.getenv("ORGANIZER_STRM_REFRESH_PREFIX_ANIME", ""),
             "strm_refresh_prefix_variety": os.getenv("ORGANIZER_STRM_REFRESH_PREFIX_VARIETY", ""),
             "local_strm_root": os.getenv("ORGANIZER_LOCAL_STRM_ROOT", ""),
+            "exclude_file_patterns": _env_csv(
+                "ORGANIZER_EXCLUDE_FILE_PATTERNS",
+                ["广告", "推广", "二维码", "扫码", "最新网址", "色情网站", "sample", "trailer"],
+            ),
         },
         "update_scheduler": {
             "enabled": _env_bool("UPDATE_SCHEDULER_ENABLED", True),
@@ -509,6 +513,8 @@ def _default_config() -> dict[str, Any]:
             "pending_import_check_interval_minutes": _env_int("UPDATE_PENDING_IMPORT_CHECK_INTERVAL_MINUTES", 30),
             "source_health_warn_threshold": _env_int("UPDATE_SOURCE_HEALTH_WARN_THRESHOLD", 4),
             "tmdb_probe_lead_minutes": _env_int("UPDATE_TMDB_PROBE_LEAD_MINUTES", 0),
+            "per_subscription_interval_seconds": _env_int("UPDATE_PER_SUBSCRIPTION_INTERVAL_SECONDS", 5),
+            "per_subscription_jitter_seconds": _env_int("UPDATE_PER_SUBSCRIPTION_JITTER_SECONDS", 5),
         },
         "hot_discovery": {
             "enabled": _env_bool("HOT_DISCOVERY_ENABLED", False),

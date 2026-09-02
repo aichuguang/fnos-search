@@ -8,7 +8,7 @@ from pathlib import Path
 class AdminAssetCacheVersionTests(unittest.TestCase):
     def test_changed_admin_assets_use_current_release_version(self) -> None:
         source = Path("templates/admin.html").read_text(encoding="utf-8")
-        expected_version = "20260829-provider-priority-v004"
+        expected_version = "20260901-poster-v001"
         for asset in (
             "admin-media.js",
             "admin-jobs.js",

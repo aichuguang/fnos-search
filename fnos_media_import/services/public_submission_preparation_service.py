@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -8,6 +9,37 @@ class PublicSubmissionPreparationError(ValueError):
     def __init__(self, message: str, status_code: int = 400) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+# 分享文案常见截断标记：介绍段、大小、标签、下载提示、链接。
+_SHARE_TITLE_CUT_RE = re.compile(
+    r"📜|📁|🏷|⬇️|⬇|🔍|【评论区|大小[:：]|标签[:：]|介绍[:：]|简介[:：]|剧情[:：]|https?://"
+)
+# 分享文案常见分类前缀，如「电影🗄」「剧集🗄」。
+_SHARE_TITLE_PREFIX_RE = re.compile(
+    r"^\s*(?:电影|剧集|连续剧|电视剧|动漫|综艺|纪录片|资源分享?|分享)\s*(?:[🗄📌🏷🎬📺]|[:：])?\s*"
+)
+
+
+def normalize_share_title(value: Any, max_length: int) -> str:
+    """从整段分享文案中提取干净标题，超长截断而不是拒绝。
+
+    搜索结果缓存里的标题常带介绍、大小、标签、链接等整段文案，
+    访客提交这类缓存资源时按纯标题校验会误伤，这里统一收敛为
+    标记前的核心标题并截断到上限。
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    cut = _SHARE_TITLE_CUT_RE.search(raw)
+    text = raw[: cut.start()].strip() if cut else raw
+    text = _SHARE_TITLE_PREFIX_RE.sub("", text, count=1)
+    text = re.sub(r"\s+", " ", text).strip(" \t-_|·•，,")
+    if not text:
+        text = re.sub(r"\s+", " ", raw)
+    if max_length > 0 and len(text) > max_length:
+        text = text[:max_length].rstrip()
+    return text
 
 
 @dataclass(frozen=True)
@@ -111,9 +143,8 @@ class PublicSubmissionPreparationService:
         if not cached and not str(manual_title or prepared.get("title") or "").strip():
             raise PublicSubmissionPreparationError("资源标题不能为空")
 
-        prepared["title"] = manual_title or self.limited_text(
+        prepared["title"] = manual_title or normalize_share_title(
             prepared.get("title") or "手动提交资源",
-            "资源标题",
             max_title_length,
         )
         prepared["url"] = self.validate_url(prepared.get("url"), security)

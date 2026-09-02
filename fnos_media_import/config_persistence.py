@@ -152,6 +152,8 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "pending_import_check_interval_minutes": "int",
         "source_health_warn_threshold": "int",
         "tmdb_probe_lead_minutes": "int",
+        "per_subscription_interval_seconds": "float",
+        "per_subscription_jitter_seconds": "float",
     },
     "hot_discovery": {
         "enabled": "bool",
@@ -239,6 +241,7 @@ SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "strm_refresh_prefix_anime": "str",
         "strm_refresh_prefix_variety": "str",
         "local_strm_root": "str",
+        "exclude_file_patterns": "list",
     },
     "sixpan": {
         "timeout": "int",

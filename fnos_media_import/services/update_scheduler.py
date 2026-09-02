@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -135,7 +136,7 @@ class UpdateScheduler:
         return result
 
     def _loop(self) -> None:
-        while not self.stop_event.wait(self.interval_seconds):
+        while not self.stop_event.wait(self._next_tick_seconds()):
             try:
                 lease_ttl = max(90, self.interval_seconds * 3)
                 if not self.service.db.scheduler_leases.acquire(self.lease_name, self.owner_id, lease_ttl):
@@ -146,6 +147,10 @@ class UpdateScheduler:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("update scheduler failed")
                 self.last_error = str(exc)
+
+    def _next_tick_seconds(self) -> int:
+        # 0-10% 随机抖动，避免多个部署/多个定时任务整点对齐集中请求。
+        return max(1, int(self.interval_seconds * (1 + random.uniform(0, 0.1))))
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:

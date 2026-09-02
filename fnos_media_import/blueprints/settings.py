@@ -23,6 +23,8 @@ class SettingsRouteContext:
     notifications_test: Callable[..., Any] = lambda payload: ({}, 200)
     notifications_deliveries: Callable[..., Any] = lambda payload: ({}, 200)
     notifications_retry: Callable[..., Any] = lambda task_id: ({}, 200)
+    full_backup_export: Callable[..., Any] = lambda: ({}, 200)
+    full_backup_import: Callable[..., Any] = lambda payload: ({}, 200)
 
 
 def create_settings_blueprint(context: SettingsRouteContext) -> Blueprint:
@@ -71,6 +73,18 @@ def create_settings_blueprint(context: SettingsRouteContext) -> Blueprint:
         "/api/admin/notifications/tasks/<int:task_id>/retry",
         endpoint="notifications_retry",
         view_func=protected(context.notifications_retry),
+        methods=["POST"],
+    )
+    blueprint.add_url_rule(
+        "/api/admin/config-backup/export",
+        endpoint="full_backup_export",
+        view_func=protected(context.full_backup_export),
+        methods=["POST"],
+    )
+    blueprint.add_url_rule(
+        "/api/admin/config-backup/import",
+        endpoint="full_backup_import",
+        view_func=protected(context.full_backup_import),
         methods=["POST"],
     )
     return blueprint

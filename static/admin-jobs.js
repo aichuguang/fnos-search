@@ -229,6 +229,20 @@
             return media && media.tmdb_id ? media : null;
         }
 
+        function jobPosterHtml(item) {
+            const media = mediaIdentityInfo(item);
+            if (!media || !media.poster_url) return "";
+            return `<img class="job-poster" src="${escapeHtml(media.poster_url)}" alt="${escapeHtml(media.title || item.title || "影视海报")}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`;
+        }
+
+        function jobPosterSubText(item) {
+            const media = mediaIdentityInfo(item);
+            if (!media) return "";
+            const type = media.media_type === "tv" ? "电视剧" : "电影";
+            const text = [media.year, type].filter(Boolean).join(" · ");
+            return text ? `<p class="muted">${escapeHtml(text)}</p>` : "";
+        }
+
         function renderMediaIdentity(item) {
             const media = mediaIdentityInfo(item);
             if (!media) return "";
@@ -423,7 +437,7 @@
                     (item) => `
                     <tr>
                         <td>#${item.id}</td>
-                        <td>${escapeHtml(item.title)}</td>
+                        <td><div class="job-title-cell">${jobPosterHtml(item)}<div class="job-title-main"><strong>${escapeHtml(item.title)}</strong>${jobPosterSubText(item)}</div></div></td>
                         <td>${escapeHtml(item.category_label || item.category)}</td>
                         <td>${statusPill(item.status)}</td>
                         <td>${escapeHtml(jobSourceText(item))}</td>
@@ -472,7 +486,7 @@
                 .map(
                     (item) => `
                     <article class="dashboard-task-row">
-                        <div class="dashboard-task-cover">${icon(categoryIconName(item.category))}</div>
+                        <div class="dashboard-task-cover">${overviewPosterHtml(item) || icon(categoryIconName(item.category))}</div>
                         <div class="dashboard-task-main">
                             <strong title="${escapeHtml(item.title || "未命名任务")}">${escapeHtml(item.title || "未命名任务")}</strong>
                             <small>${escapeHtml(jobSourceText(item))} · ${escapeHtml(item.category_label || item.category || "未分类")}</small>
@@ -495,6 +509,13 @@
 
         function categoryIconName(category) {
             return { movie: "movie", tv: "tv", anime: "anime", variety: "variety" }[String(category || "").toLowerCase()] || "other";
+        }
+
+        function overviewPosterHtml(item) {
+            const media = mediaIdentityInfo(item);
+            const poster = media?.poster_url || item?.poster_url || "";
+            if (!poster) return "";
+            return `<img src="${escapeHtml(poster)}" alt="${escapeHtml(media?.title || item.title || "影视海报")}" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">`;
         }
 
         function dashboardTerminalStatuses() {
@@ -535,7 +556,7 @@
             ];
             target.innerHTML = `
                 <div class="dashboard-selected-job">
-                    <span class="dashboard-selected-icon">${icon(categoryIconName(item.category))}</span>
+                    <span class="dashboard-selected-icon">${overviewPosterHtml(item) || icon(categoryIconName(item.category))}</span>
                     <div>
                         <strong>${escapeHtml(item.title || "未命名任务")}</strong>
                         <small>#${escapeHtml(item.id)} · ${escapeHtml(jobSourceText(item))}</small>

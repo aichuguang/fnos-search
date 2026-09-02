@@ -98,9 +98,12 @@
             promptLabel.textContent = options.promptLabel || "输入内容";
             promptInput.value = options.defaultValue ?? "";
             promptInput.placeholder = options.placeholder || "";
+            promptInput.type = options.inputType || "text";
+            promptInput.autocomplete = options.autocomplete || "off";
         } else {
             promptWrap.classList.add("hidden");
             promptInput.value = "";
+            promptInput.type = "text";
         }
 
         return new Promise((resolve) => {

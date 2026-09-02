@@ -107,6 +107,8 @@ const ADVANCED_SECRET_LABELS = {
 // accidentally sending the removed pre-V1 bare patch shape.
 const ADVANCED_CONFIG_FORMAT = "fnos-media-import/advanced-config";
 const ADVANCED_CONFIG_VERSION = 1;
+const FULL_BACKUP_FORMAT = "fnos-media-import/full-backup";
+const FULL_BACKUP_VERSION = 1;
 
 function advancedConfigEnvelope(stored = {}) {
     return {
@@ -1459,6 +1461,8 @@ function renderAdvancedConfig() {
     const updateScheduler = config.update_scheduler || {};
     setChecked("advUpdateSchedulerEnabled", updateScheduler.enabled, true);
     setNumber("advUpdateSchedulerTmdbProbeLeadMinutes", updateScheduler.tmdb_probe_lead_minutes ?? 0);
+    setNumber("advUpdateSchedulerPerSubscriptionInterval", updateScheduler.per_subscription_interval_seconds ?? 5);
+    setNumber("advUpdateSchedulerPerSubscriptionJitter", updateScheduler.per_subscription_jitter_seconds ?? 5);
 
     // OpenList identity (URL, account and token) is a V1 connection/mount
     // resource managed by the storage setup workspace.  The advanced form
@@ -1498,6 +1502,7 @@ function renderAdvancedConfig() {
     setValue("advOrganizerStrmRefreshPrefixAnime", organizer.strm_refresh_prefix_anime || organizer.strm_refresh_prefix_tv || organizer.strm_refresh_prefix || "");
     setValue("advOrganizerStrmRefreshPrefixVariety", organizer.strm_refresh_prefix_variety || organizer.strm_refresh_prefix_tv || organizer.strm_refresh_prefix || "");
     setValue("advOrganizerLocalStrmRoot", organizer.local_strm_root || "");
+    setValue("advOrganizerExcludeFilePatterns", listToText(organizer.exclude_file_patterns || []));
 
 
     const fnos = config.fnos || {};
@@ -1864,29 +1869,47 @@ async function saveAllSettingsTransaction() {
 
 async function exportAdvancedConfig() {
     const confirmed = await confirmDialog({
-        message: "导出的文件包含各服务 Token、密码等敏感信息。请只保存到可信位置，确定继续？",
+        message: "导出的文件包含整套系统设置：基础设置、搜索源、高级配置（含各服务 Token、密码）、网盘账号凭证（密文）、OpenList 连接与挂载、存储位置和分配规则。请只保存到可信位置，确定继续？",
         tone: "danger",
     });
     if (!confirmed) return;
+    const password = await promptDialog({
+        title: "校验后台登录密码",
+        message: "导出包含敏感信息的全量配置前，需要校验后台登录密码。",
+        promptLabel: "后台登录密码",
+        placeholder: "请输入后台登录密码",
+        inputType: "password",
+        autocomplete: "current-password",
+        required: true,
+        requiredMessage: "请输入后台登录密码",
+        confirmText: "校验并导出",
+        tone: "danger",
+    });
+    if (password === null || password === "") return;
     const button = $("exportAdvancedConfigBtn");
     if (button) button.disabled = true;
     try {
-        const data = await api("/api/admin/advanced-config/export", {
+        const data = await api("/api/admin/config-backup/export", {
             method: "POST",
-            body: JSON.stringify({ confirm: true }),
+            body: JSON.stringify({ confirm: true, password }),
+            allowFailure: true,
         });
+        if (!data.success) {
+            toast(data.message || "导出失败", "error");
+            return;
+        }
         const documentPayload = data.document || {};
         const blob = new Blob([JSON.stringify(documentPayload, null, 2)], { type: "application/json" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
         link.href = url;
-        link.download = `fnos-advanced-config-v${documentPayload.version || 1}-${stamp}.json`;
+        link.download = `fnos-full-backup-v${documentPayload.version || FULL_BACKUP_VERSION}-${stamp}.json`;
         document.body.appendChild(link);
         link.click();
         link.remove();
         URL.revokeObjectURL(url);
-        toast("敏感配置已导出，请妥善保管", "success");
+        toast("全量配置已导出，请妥善保管", "success");
     } finally {
         if (button) button.disabled = false;
     }
@@ -1904,8 +1927,11 @@ async function importAdvancedConfig(file) {
         toast("配置文件格式不正确", "error");
         return;
     }
+    if (config.format === FULL_BACKUP_FORMAT) {
+        return importFullBackup(config);
+    }
     if (config.format !== ADVANCED_CONFIG_FORMAT || Number(config.version) !== ADVANCED_CONFIG_VERSION) {
-        toast(`仅支持 ${ADVANCED_CONFIG_FORMAT} v${ADVANCED_CONFIG_VERSION} 配置文件，请重新导出后再导入`, "error");
+        toast(`仅支持全量备份（${FULL_BACKUP_FORMAT}）或高级配置（${ADVANCED_CONFIG_FORMAT}）文件，请重新导出后再导入`, "error");
         return;
     }
     if (!config.stored || typeof config.stored !== "object" || Array.isArray(config.stored)) {
@@ -1930,6 +1956,39 @@ async function importAdvancedConfig(file) {
         renderAdvancedConfig();
         toast(data.message || "配置已导入", "success");
         await Promise.all([loadSearchProviders(), loadMediaLibraries(), loadOrganizer(), loadSecurityStatus()]);
+    } finally {
+        if (saveBtn) saveBtn.disabled = false;
+    }
+}
+
+async function importFullBackup(document) {
+    if (Number(document.version) !== FULL_BACKUP_VERSION) {
+        toast(`仅支持 ${FULL_BACKUP_FORMAT} v${FULL_BACKUP_VERSION} 备份文件，请重新导出后再导入`, "error");
+        return;
+    }
+    const confirmed = await confirmDialog({
+        message: "全量导入会用文件内容覆盖当前系统的基础设置、搜索源、高级配置、网盘账号、OpenList 连接与挂载、存储位置和分配规则（管理员登录密码与历史任务数据不受影响）。网盘账号凭证为密文，新旧系统必须使用相同的 FNOS_ROOT_KEY。确定继续？",
+        tone: "danger",
+    });
+    if (!confirmed) return;
+    const saveBtn = $("importAdvancedConfigBtn");
+    if (saveBtn) saveBtn.disabled = true;
+    try {
+        const data = await api("/api/admin/config-backup/import", {
+            method: "POST",
+            body: JSON.stringify({ confirm: true, document }),
+            allowFailure: true,
+        });
+        toast(data.message || (data.success ? "全量配置已导入" : "导入失败"), data.success ? "success" : "error");
+        if (!data.success) return;
+        await Promise.all([
+            loadSettings(),
+            loadSearchProviders(),
+            loadMediaLibraries(),
+            loadOrganizer(),
+            loadSecurityStatus(),
+            loadAdapters(),
+        ]);
     } finally {
         if (saveBtn) saveBtn.disabled = false;
     }
@@ -1983,6 +2042,8 @@ function collectAdvancedConfig() {
         update_scheduler: {
             enabled: checked("advUpdateSchedulerEnabled"),
             tmdb_probe_lead_minutes: numberValue("advUpdateSchedulerTmdbProbeLeadMinutes", 0),
+            per_subscription_interval_seconds: numberValue("advUpdateSchedulerPerSubscriptionInterval", 5),
+            per_subscription_jitter_seconds: numberValue("advUpdateSchedulerPerSubscriptionJitter", 5),
         },
         openlist: {
             timeout: numberValue("advOpenlistTimeout", 30),
@@ -2017,6 +2078,7 @@ function collectAdvancedConfig() {
             strm_refresh_prefix_anime: value("advOrganizerStrmRefreshPrefixAnime"),
             strm_refresh_prefix_variety: value("advOrganizerStrmRefreshPrefixVariety"),
             local_strm_root: value("advOrganizerLocalStrmRoot"),
+            exclude_file_patterns: value("advOrganizerExcludeFilePatterns"),
         },
         fnos: {
             server_url: value("advFnosServerUrl"),

@@ -2379,7 +2379,21 @@ class OrganizerService:
                     if retry_result:
                         return retry_result
                 raise
-            videos = self._filter_videos_for_task(task, videos)
+            videos, excluded_videos = self._filter_videos_for_task(task, videos)
+            companion_files, excluded_companions = self._filter_companions_for_task(task, companion_files)
+            if excluded_videos or excluded_companions:
+                excluded_total = len(excluded_videos) + len(excluded_companions)
+                logger.info(
+                    "organizer_exclude_file_patterns task_id=%s excluded=%s",
+                    task_id,
+                    excluded_total,
+                )
+                self._sync_linked_job(
+                    task,
+                    status=JOB_ORGANIZING,
+                    stage="organizing",
+                    message=f"已按排除规则忽略 {excluded_total} 个广告/无关文件",
+                )
             if scan_lease is not None:
                 scan_lease.ensure_owned()
             self._ensure_task_active(
@@ -5417,12 +5431,38 @@ class OrganizerService:
             prefix = str(self.organizer_config.get("strm_refresh_prefix") or "").strip()
         return _dedupe_repeated_tail_path(normalize_path(prefix)) if prefix else ""
 
-    def _filter_videos_for_task(self, task: dict[str, Any], videos: list[Any]) -> list[Any]:
-        """Return videos from the already V1-scoped OpenList scan."""
+    def _filter_videos_for_task(self, task: dict[str, Any], videos: list[Any]) -> tuple[list[Any], list[Any]]:
+        """Return videos from the already V1-scoped OpenList scan, minus excluded patterns."""
 
         if not self._task_has_v1_plan(task):
             raise OpenListError("Organizer video filtering requires a valid V1 execution_plan")
-        return videos
+        patterns = self._exclude_file_patterns()
+        if not patterns:
+            return videos, []
+        kept: list[Any] = []
+        excluded: list[Any] = []
+        for item in videos:
+            (excluded if _matches_any_pattern(item.name, patterns) else kept).append(item)
+        return kept, excluded
+
+    def _filter_companions_for_task(self, task: dict[str, Any], companions: list[Any]) -> tuple[list[Any], list[Any]]:
+        if not self._task_has_v1_plan(task):
+            raise OpenListError("Organizer companion filtering requires a valid V1 execution_plan")
+        patterns = self._exclude_file_patterns()
+        if not patterns:
+            return companions, []
+        kept: list[Any] = []
+        excluded: list[Any] = []
+        for item in companions:
+            (excluded if _matches_any_pattern(getattr(item, "name", ""), patterns) else kept).append(item)
+        return kept, excluded
+
+    def _exclude_file_patterns(self) -> list[str]:
+        """可配置的排除规则：命中文件名的子串模式（大小写不敏感）。"""
+
+        raw = self.organizer_config.get("exclude_file_patterns")
+        patterns = [str(item or "").strip() for item in (raw if isinstance(raw, list) else [])]
+        return [pattern for pattern in patterns if pattern]
 
     @staticmethod
     def _task_scan_filters(task: dict[str, Any]) -> dict[str, Any]:
@@ -7892,11 +7932,15 @@ def _title_from_update_payload(payload: dict[str, Any], job: dict[str, Any], nor
     organizer_context = payload.get("organizer_context") if isinstance(payload.get("organizer_context"), dict) else {}
     request_update_context = request_payload.get("update_context") if isinstance(request_payload.get("update_context"), dict) else {}
     request_organizer_context = request_payload.get("organizer_context") if isinstance(request_payload.get("organizer_context"), dict) else {}
+    # TMDB 正式标题作为高优先级参考（访客选片确认过），但不是唯一依据：
+    # 整理时仍会解析文件名并做 TMDB 匹配校验。
+    media_identity = request_payload.get("media_identity") if isinstance(request_payload.get("media_identity"), dict) else {}
     values = [
         update_context.get("canonical_title"),
         organizer_context.get("canonical_title"),
         request_update_context.get("canonical_title"),
         request_organizer_context.get("canonical_title"),
+        media_identity.get("title"),
         payload.get("title"),
         request_payload.get("title"),
         job.get("title"),
@@ -8015,6 +8059,11 @@ def _is_supported_companion_name(value: str) -> bool:
         return False
     extension = posixpath.splitext(name)[1].lower()
     return extension in COMPANION_SUBTITLE_EXTENSIONS or extension in COMPANION_METADATA_EXTENSIONS
+
+
+def _matches_any_pattern(name: Any, patterns: list[str]) -> bool:
+    lowered = str(name or "").casefold()
+    return any(str(pattern or "").casefold() in lowered for pattern in patterns)
 
 
 def _companion_is_safely_related(name: str, matched_video: dict[str, Any] | None) -> bool:

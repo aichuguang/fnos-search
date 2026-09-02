@@ -33,7 +33,154 @@
             adminState.updateScheduler = data.scheduler || {};
             adminState.pagination.updates = normalizePagination(data.pagination, { page, per_page: perPage });
             renderUpdates();
+            if (getUpdateViewMode() === "calendar") await loadUpdateCalendar();
         }
+
+        function getUpdateViewMode() {
+            return adminState.updateViewMode || "list";
+        }
+
+        function setUpdateViewMode(mode) {
+            adminState.updateViewMode = mode === "calendar" ? "calendar" : "list";
+            const calendarPanel = $("updateCalendarPanel");
+            const tableWrap = $("updateTableWrap");
+            const pager = $("updatesPager");
+            const toggleBtn = $("updateViewToggleBtn");
+            const showCalendar = adminState.updateViewMode === "calendar";
+            if (calendarPanel) calendarPanel.hidden = !showCalendar;
+            if (tableWrap) tableWrap.hidden = showCalendar;
+            if (pager) pager.hidden = showCalendar;
+            if (toggleBtn) toggleBtn.textContent = showCalendar ? "订阅列表" : "追剧日历";
+        }
+
+        async function toggleUpdateView() {
+            const next = getUpdateViewMode() === "calendar" ? "list" : "calendar";
+            setUpdateViewMode(next);
+            if (next === "calendar") await loadUpdateCalendar();
+        }
+
+        async function loadUpdateCalendar() {
+            const status = $("updateStatusFilter")?.value || "";
+            const items = [];
+            const perPage = 200;
+            for (let page = 1; page <= 5; page += 1) {
+                const query = new URLSearchParams({ page: String(page), per_page: String(perPage) });
+                if (status) query.set("status", status);
+                const data = await api(`/api/admin/update-subscriptions?${query.toString()}`);
+                const pageItems = data.items || [];
+                items.push(...pageItems);
+                const total = Number(data.pagination?.total || 0);
+                if (page * perPage >= total || pageItems.length < perPage) break;
+            }
+            adminState.updateCalendarItems = items;
+            renderUpdateCalendar();
+        }
+
+        function updateCalendarMonthState() {
+            const current = adminState.updateCalendarMonth;
+            if (current && Number.isFinite(current.year) && Number.isFinite(current.month)) return current;
+            const now = new Date();
+            const state = { year: now.getFullYear(), month: now.getMonth() };
+            adminState.updateCalendarMonth = state;
+            return state;
+        }
+
+        function shiftUpdateCalendarMonth(delta) {
+            const state = updateCalendarMonthState();
+            const date = new Date(state.year, state.month + delta, 1);
+            adminState.updateCalendarMonth = { year: date.getFullYear(), month: date.getMonth() };
+            renderUpdateCalendar();
+        }
+
+        function resetUpdateCalendarMonth() {
+            const now = new Date();
+            adminState.updateCalendarMonth = { year: now.getFullYear(), month: now.getMonth() };
+            renderUpdateCalendar();
+        }
+
+        function updateCalendarEvents(item) {
+            const rawData = item.raw_data && typeof item.raw_data === "object" ? item.raw_data : {};
+            const tmdbSchedule = rawData.tmdb_schedule && typeof rawData.tmdb_schedule === "object" ? rawData.tmdb_schedule : {};
+            const nextAirDate = String(tmdbSchedule.next_air_date || "").trim();
+            if (nextAirDate) {
+                return [{
+                    date: nextAirDate,
+                    kind: "tmdb",
+                    season: Number(tmdbSchedule.next_air_season) || Number(item.season) || 0,
+                    episode: Number(tmdbSchedule.next_air_episode) || Number(tmdbSchedule.episode) || 0,
+                }];
+            }
+            const nextRunAt = String(item.next_run_at || "").trim();
+            if (nextRunAt) {
+                return [{
+                    date: nextRunAt.slice(0, 10),
+                    kind: "plan",
+                    season: Number(item.season) || 0,
+                    episode: Number(item.next_episode) || 0,
+                }];
+            }
+            return [];
+        }
+
+        function renderUpdateCalendar() {
+            const grid = $("updateCalendarGrid");
+            if (!grid) return;
+            const { year, month } = updateCalendarMonthState();
+            const title = $("updateCalendarTitle");
+            if (title) title.textContent = `${year} 年 ${month + 1} 月`;
+            const items = adminState.updateCalendarItems || [];
+            const byDate = new Map();
+            for (const item of items) {
+                for (const event of updateCalendarEvents(item)) {
+                    if (!event.date) continue;
+                    if (!byDate.has(event.date)) byDate.set(event.date, []);
+                    byDate.get(event.date).push({ item, event });
+                }
+            }
+            const now = new Date();
+            const todayText = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+            const firstDay = new Date(year, month, 1);
+            const leading = (firstDay.getDay() + 6) % 7;
+            const cells = [];
+            const weekdayNames = ["一", "二", "三", "四", "五", "六", "日"];
+            for (const name of weekdayNames) cells.push(`<div class="update-calendar-weekday">周${name}</div>`);
+            const totalDays = new Date(year, month + 1, 0).getDate();
+            const trailing = (7 - ((leading + totalDays) % 7)) % 7;
+            const dayCount = leading + totalDays + trailing;
+            for (let index = 0; index < dayCount; index += 1) {
+                const date = new Date(year, month, 1 + index - leading);
+                const dayText = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+                const otherMonth = date.getMonth() !== month;
+                const classes = ["update-calendar-day"];
+                if (otherMonth) classes.push("other-month");
+                if (dayText === todayText) classes.push("today");
+                const entries = byDate.get(dayText) || [];
+                const chips = entries
+                    .map(({ item, event }) => {
+                        const episodeText = event.episode ? ` S${String(event.season || 1).padStart(2, "0")}E${String(event.episode).padStart(2, "0")}` : "";
+                        const paused = item.status && item.status !== "enabled" ? " paused" : "";
+                        return `<button type="button" class="update-calendar-chip ${event.kind}${paused}" data-calendar-subscription="${escapeHtml(item.id)}" title="${escapeHtml(item.title || "")}${escapeHtml(episodeText)}">${escapeHtml(item.title || `#${item.id}`)}${escapeHtml(episodeText)}</button>`;
+                    })
+                    .join("");
+                cells.push(`<div class="${classes.join(" ")}"><span class="day-number">${date.getDate()}</span>${chips}</div>`);
+            }
+            grid.innerHTML = cells.join("");
+            grid.querySelectorAll("[data-calendar-subscription]").forEach((chip) => {
+                chip.addEventListener("click", () => openUpdateDetail(chip.dataset.calendarSubscription).catch((error) => toast(error.message, "error")));
+            });
+            const monthText = `${year}-${String(month + 1).padStart(2, "0")}`;
+            const hasEntries = Array.from(byDate.keys()).some((date) => String(date).startsWith(monthText));
+            const emptyBox = $("updateCalendarEmpty");
+            if (emptyBox) emptyBox.hidden = hasEntries;
+        }
+
+        function bindUpdateCalendarControls() {
+            $("updateViewToggleBtn")?.addEventListener("click", () => toggleUpdateView().catch((error) => toast(error.message, "error")));
+            $("updateCalendarPrevBtn")?.addEventListener("click", () => shiftUpdateCalendarMonth(-1));
+            $("updateCalendarNextBtn")?.addEventListener("click", () => shiftUpdateCalendarMonth(1));
+            $("updateCalendarTodayBtn")?.addEventListener("click", resetUpdateCalendarMonth);
+        }
+        bindUpdateCalendarControls();
 
         function renderUpdates() {
             const items = adminState.updateSubscriptions || [];
@@ -1039,6 +1186,9 @@
         return Object.freeze({
             loadUpdates,
             renderUpdates,
+            toggleUpdateView,
+            loadUpdateCalendar,
+            renderUpdateCalendar,
             renderUpdateSubscriptionRow,
             updateSubscriptionAction,
             openUpdateDetail,

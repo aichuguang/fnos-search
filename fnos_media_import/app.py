@@ -134,6 +134,7 @@ from .services.runtime_reload_service import RuntimeReloadService, finalize_orga
 from .services.public_submission_preparation_service import (
     PublicSubmissionPreparationError,
     PublicSubmissionPreparationService,
+    normalize_share_title,
 )
 from .services.public_import_job_coordinator import PublicImportJobCoordinator
 from .services.public_submission_decision_service import PublicSubmissionDecisionService
@@ -2611,6 +2612,13 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             search_providers=search_service.describe_providers,
         )
     )
+    from .services.backup_service import FullBackupService
+
+    full_backup_service = FullBackupService(
+        db=db,
+        master_key=_v1_master_key,
+        reload_runtime=_reload_runtime_config,
+    )
     from .accounts.service import ProviderAccountService
     from .accounts.blueprint import accounts_blueprint_for_service
     from .accounts.auth_sessions import (
@@ -2992,6 +3000,53 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     def api_admin_settings():
         return _settings_response(settings_service.settings())
+
+    def api_admin_full_backup_export():
+        payload = request.get_json(silent=True) or {}
+        if not _payload_bool(payload, "confirm", False):
+            return jsonify({"success": False, "message": "请先确认导出包含敏感信息的全量配置"}), 400
+        password = str(payload.get("password") or "")
+        if not password:
+            return jsonify({"success": False, "message": "请输入后台登录密码后再导出"}), 403
+        limited = _rate_limit("admin_backup_export", "admin_login_rate_limit")
+        if limited is not None:
+            return limited
+        if not _current_admin_password_ok(password):
+            app.logger.warning(
+                "full backup export rejected: password verification failed admin=%s",
+                str(session.get("admin_username") or "admin"),
+            )
+            return jsonify({"success": False, "message": "后台登录密码校验失败"}), 403
+        body, status_code = full_backup_service.export_document()
+        response = jsonify(body)
+        response.headers["Cache-Control"] = "no-store, private, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        if status_code == 200:
+            meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+            app.logger.info(
+                "full backup export completed: admin=%s tables=%s",
+                str(session.get("admin_username") or "admin"),
+                json.dumps(meta.get("table_counts") or {}, sort_keys=True),
+            )
+        return response, status_code
+
+    def api_admin_full_backup_import():
+        payload = request.get_json(silent=True) or {}
+        if not _payload_bool(payload, "confirm", False):
+            return jsonify({"success": False, "message": "请先确认覆盖导入全量配置"}), 400
+        result, status_code = full_backup_service.import_document(
+            payload.get("document"), confirm=True
+        )
+        response = jsonify(result)
+        response.headers["Cache-Control"] = "no-store, private, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        if status_code == 200:
+            app.logger.info(
+                "full backup import completed: admin=%s",
+                str(session.get("admin_username") or "admin"),
+            )
+        return response, status_code
 
     def api_admin_settings_update():
         return _settings_response(settings_service.update_settings(request.get_json(silent=True) or {}))
@@ -3493,7 +3548,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         payload = request.get_json(silent=True) or {}
         try:
             public_id = _limited_text(payload.get("public_id") or payload.get("resource_id"), "资源编号", _config_int(security_config, "max_token_length", 80))
-            title = _limited_text(payload.get("title"), "资源标题", _config_int(security_config, "max_title_length", 300))
+            title = normalize_share_title(payload.get("title"), _config_int(security_config, "max_title_length", 300))
         except PublicInputError as exc:
             return jsonify({"success": False, "message": str(exc), "items": []}), 400
         result, status_code = public_sixpan_preview_service.preview(
@@ -3525,7 +3580,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             public_id = _limited_text(payload.get("public_id") or payload.get("resource_id"), "资源编号", _config_int(security_config, "max_token_length", 80), required=True)
             resource_id = _limited_text(payload.get("resource_id") or payload.get("download_id"), "下载资源 ID", 40)
             resource_url = _limited_text(payload.get("resource_url"), "下载页地址", _config_int(security_config, "max_url_length", 2048))
-            resource_title = _limited_text(payload.get("resource_title") or payload.get("title"), "资源标题", _config_int(security_config, "max_title_length", 300))
+            resource_title = normalize_share_title(
+                payload.get("resource_title") or payload.get("title"),
+                _config_int(security_config, "max_title_length", 300),
+            )
         except PublicInputError as exc:
             return jsonify({"success": False, "message": str(exc)}), 400
         result, status_code = public_bt_resolve_service.resolve(
@@ -4010,6 +4068,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 advanced_config=api_admin_advanced_config,
                 advanced_config_update=api_admin_advanced_config_update,
                 advanced_export=api_admin_advanced_config_export,
+                full_backup_export=api_admin_full_backup_export,
+                full_backup_import=api_admin_full_backup_import,
                 settings=api_admin_settings,
                 settings_update=api_admin_settings_update,
                 settings_update_all=api_admin_settings_update_all,
