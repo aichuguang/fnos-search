@@ -108,17 +108,47 @@ ensure_rclone_available() {
   log "Worker 内的 rclone 命令不可用"
   exit 1
 }
+rclone_error_excerpt() {
+  # 打印 rclone 真实错误的摘要（最多 3 行）：定位 remote 缺失、凭证失效、
+  # 路径不存在等差异，避免只看到“创建失败”却不知道原因。
+  err_file="$1"
+  [ -f "$err_file" ] || return 0
+  sed '/^[[:space:]]*$/d' "$err_file" 2>/dev/null | head -3 | sed 's/^/    rclone: /' >&2
+}
 ensure_remote_dir() {
   remote="$1"
-  if rclone_cmd lsf "$remote" --max-depth 1 --timeout "$RCLONE_TIMEOUT" --contimeout "$RCLONE_CONNECT_TIMEOUT" --max-duration "${RCLONE_LIST_MAX_DURATION:-10m}" >/dev/null 2>&1; then
+  err_file="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-ensure.XXXXXX")" || return 1
+  if rclone_cmd lsf "$remote" --max-depth 1 --timeout "$RCLONE_TIMEOUT" --contimeout "$RCLONE_CONNECT_TIMEOUT" --max-duration "${RCLONE_LIST_MAX_DURATION:-10m}" >/dev/null 2>"$err_file"; then
+    rm -f "$err_file"
     return 0
   fi
 
-  log "远端目录不存在或不可列出，尝试创建：${remote}"
-  if ! rclone_cmd mkdir "$remote" >/dev/null 2>&1; then
-    log "远端目录创建失败：${remote}"
+  log "远端目录不存在或不可列出：${remote}"
+  rclone_error_excerpt "$err_file"
+  rm -f "$err_file"
+
+  # 先区分 remote 级故障（配置缺失/凭证失效/不可达）与目录级缺失，
+  # 两者的修复动作完全不同。
+  remote_name="${remote%%:*}"
+  remote_probe="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-probe.XXXXXX")" || return 1
+  if rclone_cmd lsd "${remote_name}:" --timeout "$RCLONE_TIMEOUT" --contimeout "$RCLONE_CONNECT_TIMEOUT" >/dev/null 2>"$remote_probe"; then
+    rm -f "$remote_probe"
+    log "remote ${remote_name} 可访问，仅目录缺失，尝试创建：${remote}"
+  else
+    log "rclone remote ${remote_name} 不可访问：请检查 Worker 的 rclone.conf 是否包含该 remote（管理后台 rclone WebDAV 配置）、OpenList WebDAV 地址与凭证是否有效"
+    rclone_error_excerpt "$remote_probe"
+    rm -f "$remote_probe"
     return 1
   fi
+
+  mkdir_err="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-mkdir.XXXXXX")" || return 1
+  if ! rclone_cmd mkdir "$remote" >/dev/null 2>"$mkdir_err"; then
+    log "远端目录创建失败：${remote}"
+    rclone_error_excerpt "$mkdir_err"
+    rm -f "$mkdir_err"
+    return 1
+  fi
+  rm -f "$mkdir_err"
 
   if ! rclone_cmd lsf "$remote" --max-depth 1 --timeout "$RCLONE_TIMEOUT" --contimeout "$RCLONE_CONNECT_TIMEOUT" --max-duration "${RCLONE_LIST_MAX_DURATION:-10m}" >/dev/null 2>&1; then
     log "远端目录创建后仍不可访问：${remote}"
@@ -743,6 +773,7 @@ copy_scoped_job() {
 
   if ! ensure_remote_dir "$source_remote_dir"; then
     log "rclone_copy 源任务目录不可用，本轮拒绝执行：${source_remote_dir}"
+    log "排查提示：管理后台 OpenList 挂载的 webdav_root 必须与 OpenList 中该存储的实际挂载路径一致，且来源账号的原生目录应指向网盘内同一目录；夸克转存完成但 rclone 列不到，通常就是这两处路径没对上"
     return 1
   fi
   if [ "$copy_is_local" -eq 1 ]; then
