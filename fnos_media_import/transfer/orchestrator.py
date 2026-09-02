@@ -596,7 +596,14 @@ class TransferOrchestrator:
                 return NativeLocator(kind=kind, value=value)
         return self.plan.native_locator()
 
-    def _invoke_verifier(self, verifier: Any, *, descriptor: dict[str, Any], native_target: bool) -> Any:
+    def _invoke_verifier(
+        self,
+        verifier: Any,
+        *,
+        descriptor: dict[str, Any],
+        native_target: bool,
+        require_non_empty: bool = False,
+    ) -> Any:
         """按统一协议调用目标校验器。
 
         通用文件系统校验器保留现有 ``verify(plan, **kwargs)`` 契约；原生
@@ -616,13 +623,15 @@ class TransferOrchestrator:
 
         expected = self.plan.verification_expected()
         if callable(object_verify):
-            return verify_call(
-                self.plan,
-                descriptor=descriptor,
-                expected_file_count=int(expected["file_count"]),
-                expected_total_size=int(expected["total_size"]),
-                checksum=str(expected["checksum"]),
-            )
+            kwargs: dict[str, Any] = {
+                "descriptor": descriptor,
+                "expected_file_count": int(expected["file_count"]),
+                "expected_total_size": int(expected["total_size"]),
+                "checksum": str(expected["checksum"]),
+            }
+            if require_non_empty:
+                kwargs["require_non_empty"] = True
+            return verify_call(self.plan, **kwargs)
         # 裸 callable 的 V1 兼容约定：传入冻结计划，而不是 receipt/None。
         return verify_call(self.plan)
 
@@ -764,8 +773,23 @@ class TransferOrchestrator:
         verifier = getattr(executor, "verify", None) if native_target and executor else self.verifier
         if verifier is None:
             return self._to_manual_review("未配置最终目录校验器")
+        expected = self.plan.verification_expected()
+        # 访客整分享提交在规划期拿不到数量（冻结 0/0），而 Organizer 已经
+        # 把整理产物落到最终目录。此时按「目录存在且至少一个文件」降级
+        # 校验，而不是拒绝校验进人工复核；空目录仍失败。
+        counts_unknown = (
+            self.plan.organizer_enabled
+            and int(expected["file_count"]) <= 0
+            and int(expected["total_size"]) <= 0
+            and not native_target
+        )
         try:
-            result = self._invoke_verifier(verifier, descriptor=descriptor, native_target=native_target)
+            result = self._invoke_verifier(
+                verifier,
+                descriptor=descriptor,
+                native_target=native_target,
+                require_non_empty=counts_unknown,
+            )
         except Exception as exc:  # noqa: BLE001
             return self._to_manual_review(f"最终目录校验异常：{exc}")
         result = self._normalize_verify_result(result)

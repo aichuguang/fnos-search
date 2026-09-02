@@ -39,6 +39,35 @@ class TransferIntegrityGuardTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "ok")
 
+    def test_unknown_counts_with_require_non_empty_passes_on_landed_files(self) -> None:
+        # 访客整分享提交冻结数量为 0/0（数量未知）。Organizer 已把整理产物
+        # 落到最终目录后，降级校验只需目录存在且至少一个文件。
+        verifier = TransferVerifier(
+            target_lister=lambda _descriptor: ListedFiles(
+                exists=True, file_count=1, total_size=22425567232
+            )
+        )
+        result = verifier.verify(
+            descriptor={"kind": "openlist", "namespace_id": "openlist:x", "path": "/电影"},
+            expected_file_count=0,
+            expected_total_size=0,
+            require_non_empty=True,
+        )
+        self.assertEqual(result.status, "ok")
+
+    def test_unknown_counts_with_require_non_empty_fails_on_empty_target(self) -> None:
+        verifier = TransferVerifier(
+            target_lister=lambda _descriptor: ListedFiles(exists=True, file_count=0, total_size=0)
+        )
+        result = verifier.verify(
+            descriptor={"kind": "openlist", "namespace_id": "openlist:x", "path": "/电影"},
+            expected_file_count=0,
+            expected_total_size=0,
+            require_non_empty=True,
+        )
+        self.assertEqual(result.status, "missing")
+        self.assertEqual(result.code, "VERIFY_MISMATCH")
+
     def test_local_finalize_reconciles_move_completed_before_snapshot(self) -> None:
         root = _writable_temp_dir(self)
         if root is None:

@@ -593,6 +593,44 @@ class OpenListMountTests(unittest.TestCase):
             webdav_factory=lambda _creds: FakeWebDAV(),
         )
 
+    def test_resolve_mount_absolute_path_is_idempotent(self) -> None:
+        # 计划路径是挂载内相对路径，Organizer final_path 是全局路径；
+        # 两种口径都必须只拼一次挂载根，否则全局路径被拼成 /清云/清云/...。
+        resolve = OpenListMountService.resolve_mount_absolute_path
+        mount = {"webdav_root": "/清云"}
+        self.assertEqual(resolve(mount, "/电视剧/Season 01"), "/清云/电视剧/Season 01")
+        self.assertEqual(resolve(mount, "/清云/电视剧/Season 01"), "/清云/电视剧/Season 01")
+        self.assertEqual(resolve(mount, "电视剧/Season 01"), "/清云/电视剧/Season 01")
+        self.assertEqual(resolve({"webdav_root": "/"}, "/电视剧"), "/电视剧")
+        self.assertEqual(resolve(mount, ""), "/清云")
+        self.assertEqual(resolve(mount, "/"), "/清云")
+
+    def test_list_path_accepts_mount_relative_and_global_paths(self) -> None:
+        self.mount_service.create_mount(
+            {
+                "connection_id": "ol_main",
+                "mount_id": "mount_sixpan",
+                "name": "清云",
+                "webdav_root": "/清云",
+                "provider_kind": "quark",
+                "account_id": "acc_quark_a",
+            }
+        )
+        fake = FakeWebDAV()
+        service = OpenListMountService(
+            self.database,
+            connection_service=self.connection_service,
+            webdav_factory=lambda _creds: fake,
+        )
+        fake.dirs.add("/清云/电视剧/Season 01")
+        fake.files["/清云/电视剧/Season 01/a.mkv"] = b"x" * 3
+        relative = service.list_path("mount_sixpan", "/电视剧/Season 01")
+        global_path = service.list_path("mount_sixpan", "/清云/电视剧/Season 01")
+        self.assertEqual(relative, global_path)
+        self.assertTrue(relative["exists"])
+        self.assertEqual(relative["file_count"], 1)
+        self.assertEqual(relative["total_size"], 3)
+
     def test_mount_create_auto_namespace_and_bind(self) -> None:
         mount = self.mount_service.create_mount(
             {

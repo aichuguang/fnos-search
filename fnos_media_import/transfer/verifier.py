@@ -86,6 +86,7 @@ class TransferVerifier:
         expected_total_size: int | None = None,
         checksum: str | None = None,
         allow_empty: bool = False,
+        require_non_empty: bool = False,
     ) -> TransferVerifyResult:
         if descriptor is None and plan is not None:
             descriptor = getattr(plan, "destination_staging", None) or getattr(plan, "destination_final", None)
@@ -121,13 +122,25 @@ class TransferVerifier:
             and expected_count <= 0
             and expected_size <= 0
         ):
-            return TransferVerifyResult(
-                "unknown",
-                "plan has no frozen file count or total size",
-                file_count=listing.file_count,
-                total_size=listing.total_size,
-                code=ErrorCode.RESULT_UNKNOWN,
-            )
+            if not require_non_empty:
+                return TransferVerifyResult(
+                    "unknown",
+                    "plan has no frozen file count or total size",
+                    file_count=listing.file_count,
+                    total_size=listing.total_size,
+                    code=ErrorCode.RESULT_UNKNOWN,
+                )
+            # 数量未知（如访客整分享提交）的任务：冻结计划没有可比对的
+            # 文件数/总大小，退化为「目录存在且至少落了一个文件」的校验。
+            # 空目录仍判失败，不允许假装成功。
+            if listing.file_count <= 0 and listing.total_size <= 0:
+                return TransferVerifyResult(
+                    "missing",
+                    "数量未知的任务要求目标目录至少存在一个文件",
+                    file_count=listing.file_count,
+                    total_size=listing.total_size,
+                    code=ErrorCode.VERIFY_MISMATCH,
+                )
         problems: list[str] = []
         if expected_count is not None and (expected_count > 0 or allow_empty) and listing.file_count != expected_count:
             problems.append(f"文件数 {listing.file_count} != {expected_file_count}")

@@ -506,6 +506,108 @@ class JobRetryCommandV1Tests(unittest.TestCase):
         self.assertTrue(result["requires_new_job"])
         self.assertEqual(auto_start_calls, [])
 
+    def test_manual_review_retry_recovers_execution_and_requeues(self) -> None:
+        from fnos_media_import.services.import_job_service import ImportJobRetryService
+        from fnos_media_import.domain import EXECUTION_PLAN_VERSION
+
+        job = {
+            "id": 42,
+            "status": "review",
+            "plan_version": EXECUTION_PLAN_VERSION,
+            "idempotency_key": "import:job-42",
+        }
+        events: list[tuple[int, str, str]] = []
+        enqueued: list[int] = []
+        recovered: list[int] = []
+
+        class _JobQueries:
+            @staticmethod
+            def get(job_id: int) -> dict[str, Any]:
+                return dict(job) if job_id == 42 else None
+
+        class _JobCommands:
+            @staticmethod
+            def add_event(job_id: int, level: str, message: str) -> None:
+                events.append((job_id, level, message))
+
+        class _Executions:
+            @staticmethod
+            def plan(job_id: int) -> dict[str, Any]:
+                return {"version": 1, "job_id": job_id} if job_id == 42 else None
+
+            @staticmethod
+            def get(job_id: int) -> Any:
+                return SimpleNamespace(phase="manual_review") if job_id == 42 else None
+
+            @staticmethod
+            def recover_manual_review(job_id: int) -> None:
+                recovered.append(job_id)
+
+        database = SimpleNamespace(job_queries=_JobQueries, job_commands=_JobCommands)
+        service = ImportJobRetryService(
+            database=database,
+            config={},
+            validate_plan=lambda _plan, _job, **_kwargs: None,
+            execution_repository=_Executions,
+            enqueue_transfer=lambda job_id: enqueued.append(job_id),
+        )
+
+        result = service.retry(42)
+
+        self.assertTrue(result["success"], result)
+        self.assertTrue(result["recovered_from_manual_review"])
+        self.assertEqual(recovered, [42])
+        self.assertEqual(enqueued, [42])
+        self.assertIn("人工复核", events[0][2])
+
+    def test_manual_review_retry_reports_repository_conflict_as_failure(self) -> None:
+        from fnos_media_import.services.import_job_service import ImportJobRetryService
+        from fnos_media_import.domain import EXECUTION_PLAN_VERSION
+
+        job = {
+            "id": 42,
+            "status": "review",
+            "plan_version": EXECUTION_PLAN_VERSION,
+            "idempotency_key": "import:job-42",
+        }
+
+        class _JobQueries:
+            @staticmethod
+            def get(job_id: int) -> dict[str, Any]:
+                return dict(job) if job_id == 42 else None
+
+        class _JobCommands:
+            @staticmethod
+            def add_event(_job_id: int, _level: str, _message: str) -> None:
+                pass
+
+        class _Executions:
+            @staticmethod
+            def plan(job_id: int) -> dict[str, Any]:
+                return {"version": 1, "job_id": job_id} if job_id == 42 else None
+
+            @staticmethod
+            def get(job_id: int) -> Any:
+                return SimpleNamespace(phase="manual_review") if job_id == 42 else None
+
+            @staticmethod
+            def recover_manual_review(_job_id: int) -> None:
+                raise RuntimeError("execution is not awaiting manual review")
+
+        database = SimpleNamespace(job_queries=_JobQueries, job_commands=_JobCommands)
+        service = ImportJobRetryService(
+            database=database,
+            config={},
+            validate_plan=lambda _plan, _job, **_kwargs: None,
+            execution_repository=_Executions,
+            enqueue_transfer=lambda _job_id: None,
+        )
+
+        result = service.retry(42)
+
+        self.assertFalse(result["success"])
+        self.assertIn("manual review", result["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

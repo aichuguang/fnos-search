@@ -1025,7 +1025,7 @@ class OpenListMountService:
         self, mount_id: str, path: str, *, revision: int | None = None
     ) -> dict[str, Any]:
         client, mount = self.client_for_mount(mount_id, revision=revision)
-        absolute = normalize_openlist_path(posixpath.join(mount["webdav_root"], str(path).lstrip("/")))
+        absolute = self.resolve_mount_absolute_path(mount, path)
         if not client.exists(absolute):
             return {"exists": False, "file_count": 0, "total_size": 0}
         files = self._walk_files(client, absolute)
@@ -1034,6 +1034,26 @@ class OpenListMountService:
             "file_count": len(files),
             "total_size": sum(int(item.get("size") or 0) for item in files),
         }
+
+    @staticmethod
+    def resolve_mount_absolute_path(mount: Any, path: Any) -> str:
+        """把挂载内相对路径拼成 OpenList 全局绝对路径（幂等）。
+
+        计划路径（暂存/最终目录）按惯例是挂载内相对路径；但 Organizer 整理后的
+        最终路径（organizer final_path）来自 OpenList 全局坐标（已带 webdav_root
+        前缀，如 ``/清云/电视剧/Season 01``）。两种口径都会进入 list_path，
+        必须与 ``planning.mount_absolute_path`` 使用同一套幂等规则，否则全局
+        路径被二次拼根后指向不存在的目录。
+        """
+
+        root = normalize_openlist_path(str(mount.get("webdav_root") or "/"))
+        text = str(path or "").strip()
+        if not text:
+            return root
+        candidate = normalize_openlist_path(text)
+        if candidate == root or candidate.startswith(f"{root}/"):
+            return candidate
+        return normalize_openlist_path(f"{root}/{candidate.lstrip('/')}")
 
     @staticmethod
     def _walk_files(client: Any, root: str, *, max_entries: int = 100_000) -> list[dict[str, Any]]:

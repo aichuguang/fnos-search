@@ -375,6 +375,104 @@ class NativeProtocolTests(unittest.TestCase):
             "ok",
         )
 
+    def test_mobile_task_poll_falls_back_to_target_listing_when_task_query_fails(self) -> None:
+        # /task/get 对分享批量转存任务（sk*）固定返回 00010014，
+        # 轮询必须退回目标目录探测而不是把错误当成可重试网络故障。
+        class _TaskQueryBroken:
+            def _cmcc(self):
+                return self
+
+            def get_task(self, _task_id):
+                raise RuntimeError("系统服务调用错误(00010014)")
+
+            def list_dir(self, parent_file_id, **_kwargs):
+                assert parent_file_id == "folder-target"
+                return [{"name": "抓丨特丨务", "type": "folder"}]
+
+        adapter = MobileProviderAdapter(
+            importer_factory=lambda _account_id, _revision: _TaskQueryBroken(),
+            account_importer_factory=lambda _values: _TaskQueryBroken(),
+            source_record_service=_SourceRecords(),
+        )
+        receipt = OperationReceipt(
+            operation_id="sk*2030026136821630336",
+            status="submitted",
+            provider_kind="mobile",
+            metadata={
+                "account_id": "acc-mobile",
+                "account_revision": 1,
+                "raw": {
+                    "target_parent_file_id": "folder-target",
+                    "directory_plan": {
+                        "resource_dir_applied": True,
+                        "resource_name": "mobile share d8f922ac",
+                    },
+                    "selection": {
+                        "selected_files": [],
+                        "selected_folders": [{"name": "抓丨特丨务", "fileName": "抓丨特丨务"}],
+                    },
+                },
+            },
+        )
+
+        status = adapter.poll_operation(receipt)
+        self.assertEqual(status.status, "completed")
+        self.assertIn("目标目录", status.message or "")
+
+    def test_mobile_task_poll_fallback_reports_running_before_items_land(self) -> None:
+        class _TaskQueryBrokenEmpty:
+            def _cmcc(self):
+                return self
+
+            def get_task(self, _task_id):
+                raise RuntimeError("系统服务调用错误(00010014)")
+
+            def list_dir(self, _parent_file_id, **_kwargs):
+                return []
+
+        adapter = MobileProviderAdapter(
+            importer_factory=lambda _account_id, _revision: _TaskQueryBrokenEmpty(),
+            account_importer_factory=lambda _values: _TaskQueryBrokenEmpty(),
+            source_record_service=_SourceRecords(),
+        )
+        receipt = OperationReceipt(
+            operation_id="sk*1",
+            status="submitted",
+            provider_kind="mobile",
+            metadata={
+                "account_id": "acc-mobile",
+                "account_revision": 1,
+                "raw": {
+                    "target_parent_file_id": "folder-target",
+                    "selection": {
+                        "selected_files": [{"name": "movie-01.mkv"}],
+                        "selected_folders": [],
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(adapter.poll_operation(receipt).status, "running")
+
+    def test_mobile_task_poll_fallback_fails_closed_without_probe_info(self) -> None:
+        class _TaskQueryBroken:
+            def _cmcc(self):
+                return self
+
+            def get_task(self, _task_id):
+                raise RuntimeError("系统服务调用错误(00010014)")
+
+        adapter = MobileProviderAdapter(
+            importer_factory=lambda _account_id, _revision: _TaskQueryBroken(),
+            account_importer_factory=lambda _values: _TaskQueryBroken(),
+            source_record_service=_SourceRecords(),
+        )
+        receipt = _receipt("sk*1", "mobile")
+
+        status = adapter.poll_operation(receipt)
+        self.assertEqual(status.status, "unknown")
+        self.assertEqual(status.error_code, ErrorCode.RESULT_UNKNOWN)
+
     def test_cleanup_failure_never_claims_completed(self) -> None:
         class _FailingCleanup:
             @staticmethod

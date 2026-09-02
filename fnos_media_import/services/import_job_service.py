@@ -816,9 +816,9 @@ class ImportJobRetryService:
                 "manual_review": True,
                 "error_code": "EXECUTION_MISSING",
             }
-        if execution.phase in {"cancelled", "manual_review"}:
+        if execution.phase == "cancelled":
             message = (
-                "已取消或人工复核任务不能复用原外部操作栅栏；"
+                "已取消任务不能复用原外部操作栅栏；"
                 "请按当前来源与管理员路由创建新一代入库任务"
             )
             self.database.job_commands.add_event(job_id, EVENT_WARN, message)
@@ -829,6 +829,28 @@ class ImportJobRetryService:
                 "success": False,
                 "requires_new_job": True,
                 "error_code": "REIMPORT_NEW_GENERATION_REQUIRED",
+            }
+        if execution.phase == "manual_review":
+            # 人工复核恢复走 recover_manual_review：保留 receipt、从
+            # review_from 阶段续跑，只重新校验/收尾，不会重复提交转存。
+            try:
+                self.execution_repository.recover_manual_review(job_id)
+                queued = self.enqueue_transfer(job_id)
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc)
+                self.database.job_commands.add_event(job_id, EVENT_WARN, message)
+                return {"job": job, "created": False, "message": message, "success": False}
+            self.database.job_commands.add_event(
+                job_id, EVENT_INFO, "人工复核任务已恢复执行并重新入队"
+            )
+            return {
+                "job": self.database.job_queries.get(job_id),
+                "created": False,
+                "message": "已从人工复核恢复执行并重新入队",
+                "success": True,
+                "queued": queued,
+                "recovered_from_manual_review": True,
+                "idempotency_key": str(job.get("idempotency_key") or ""),
             }
         try:
             self.execution_repository.reactivate(job_id)

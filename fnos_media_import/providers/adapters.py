@@ -463,7 +463,13 @@ class MobileProviderAdapter(_FrozenImporterAdapter):
         client_factory = getattr(importer, "_cmcc", None)
         if not callable(client_factory) or not task_id:
             return super()._poll_provider_task(importer, receipt)
-        task = client_factory().get_task(task_id)
+        try:
+            task = client_factory().get_task(task_id)
+        except Exception as exc:  # noqa: BLE001
+            # 分享批量转存任务（createOuterLinkBatchOprTask 返回的 sk* 任务号）
+            # 无法走 /task/get：该端点对任何任务号都返回
+            # 系统服务调用错误(00010014)。改用目标目录探测转存结果。
+            return self._poll_by_target_listing(importer, receipt, exc)
         text = str(
             (task or {}).get("status")
             or (task or {}).get("taskStatus")
@@ -482,6 +488,66 @@ class MobileProviderAdapter(_FrozenImporterAdapter):
             message or f"移动云任务状态未知：{text or 'empty'}",
             error_code=ErrorCode.RESULT_UNKNOWN,
         )
+
+    def _poll_by_target_listing(
+        self, importer: Any, receipt: OperationReceipt, cause: Exception
+    ) -> OperationStatus:
+        metadata = dict(getattr(receipt, "metadata", {}) or {})
+        raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+        parent_id = str(raw.get("target_parent_file_id") or "").strip()
+        expected = self._expected_target_names(raw)
+        if not parent_id or not expected:
+            return OperationStatus(
+                "unknown",
+                f"移动云任务状态查询失败，且缺少可探测的目标目录信息：{cause}",
+                error_code=ErrorCode.RESULT_UNKNOWN,
+            )
+        client_factory = getattr(importer, "_cmcc", None)
+        if not callable(client_factory):
+            return OperationStatus(
+                "unknown",
+                f"移动云任务状态查询失败，目标目录探测不可用：{cause}",
+                error_code=ErrorCode.RESULT_UNKNOWN,
+            )
+        try:
+            items = client_factory().list_dir(parent_id)
+        except Exception as exc:  # noqa: BLE001
+            return OperationStatus(
+                "unknown",
+                f"移动云任务状态查询失败，目标目录探测也失败：{exc}",
+                error_code=ErrorCode.RESULT_UNKNOWN,
+            )
+        actual = {
+            str(item.get("name") or item.get("fileName") or "").strip()
+            for item in items
+            if isinstance(item, dict)
+        }
+        if all(name in actual for name in expected):
+            return OperationStatus("completed", "移动云原生转存完成（目标目录已出现保存内容）")
+        return OperationStatus("running", "移动云原生转存进行中（目标目录尚未出现保存内容）")
+
+    @staticmethod
+    def _expected_target_names(raw: dict[str, Any]) -> list[str]:
+        # 落盘到 target_parent_file_id 下的子项名 = 转存勾选的分享条目名
+        # （勾选文件夹时是该文件夹的原名，如「抓丨特丨务」；整分享默认
+        # 保存时 selection 里带分享根条目）。resource_name 只是目标目录
+        # 自身的名字，已经体现在 target_parent_file_id 里，不会作为子项
+        # 出现，不能拿来当期望名。
+        selection = raw.get("selection") if isinstance(raw.get("selection"), dict) else {}
+        names: list[str] = []
+        for key in ("selected_files", "selected_folders"):
+            for item in selection.get(key) or []:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or item.get("fileName") or "").strip()
+                    if name:
+                        names.append(name)
+        if names:
+            return names
+        plan = raw.get("directory_plan") if isinstance(raw.get("directory_plan"), dict) else {}
+        if plan.get("resource_dir_applied"):
+            return []
+        name = str(plan.get("resource_name") or "").strip()
+        return [name] if name else []
 
     def relay_uploader(self) -> Any:
         from ..transfer.mobile_relay_executor import CmccMobileUploader

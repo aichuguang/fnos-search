@@ -1656,6 +1656,82 @@ class OrganizerTests(unittest.TestCase):
         self.assertLess(order.index("organize"), order.index("ack"))
         self.assertEqual(organizer.calls, 1)
 
+    def test_unknown_counts_organizer_task_finishes_after_files_land(self) -> None:
+        # 访客整分享提交冻结数量 0/0：Organizer 完成后最终目录有文件即通过，
+        # 不能因为数量未知进人工复核。
+        adapter = _FakeNativeAdapter("quark")
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="quark",
+            strategy="native_save",
+            organizer_enabled=True,
+            expected_file_count=0,
+            expected_total_size=0,
+        )
+        executor = NativeTransferExecutor({"quark": adapter}, strategy="native_save")
+        orch = TransferOrchestrator(
+            plan,
+            {"native_save": executor},
+            organizer_service=_FakeOrganizer(status="done"),
+            verifier=TransferVerifier(
+                target_lister=_FakeTargetLister(file_count=1, total_size=22425567232)
+            ),
+            ack_service=_FakeAck(),
+            cleanup=_FakeCleanup(),
+        )
+        _drive(orch)
+        self.assertEqual(orch.state.phase, PHASE_COMPLETED)
+
+    def test_unknown_counts_organizer_task_fails_when_final_target_is_empty(self) -> None:
+        # 数量未知不是免检牌：最终目录空目录仍要失败关闭。
+        adapter = _FakeNativeAdapter("quark")
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="quark",
+            strategy="native_save",
+            organizer_enabled=True,
+            expected_file_count=0,
+            expected_total_size=0,
+        )
+        executor = NativeTransferExecutor({"quark": adapter}, strategy="native_save")
+        orch = TransferOrchestrator(
+            plan,
+            {"native_save": executor},
+            organizer_service=_FakeOrganizer(status="done"),
+            verifier=TransferVerifier(
+                target_lister=_FakeTargetLister(exists=True, file_count=0, total_size=0)
+            ),
+            ack_service=_FakeAck(),
+            cleanup=_FakeCleanup(),
+        )
+        _drive(orch)
+        self.assertNotEqual(orch.state.phase, PHASE_COMPLETED)
+        self.assertNotEqual(orch.state.phase, PHASE_MANUAL_REVIEW)
+
+    def test_unknown_counts_without_organizer_still_requires_manual_review(self) -> None:
+        # 没有 Organizer 产物作证据时，数量未知保持失败关闭进人工复核。
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="quark",
+            strategy="rclone_copy",
+            landing="/_fnos_ingress/job-1",
+            staging="/影视/_fnos_staging/job-1",
+            final="/影视/电影",
+            expected_file_count=0,
+            expected_total_size=0,
+        )
+        orch = TransferOrchestrator(
+            plan,
+            {},
+            verifier=TransferVerifier(target_lister=_FakeTargetLister(file_count=3, total_size=90)),
+            ack_service=_FakeAck(),
+            cleanup=_FakeCleanup(),
+        )
+        orch.state.phase = PHASE_FINAL_VERIFYING
+        orch.state.target_verified = True
+        orch.step()
+        self.assertEqual(orch.state.phase, PHASE_MANUAL_REVIEW)
+
 
 if __name__ == "__main__":
     unittest.main()
