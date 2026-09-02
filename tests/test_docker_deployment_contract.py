@@ -11,7 +11,12 @@ def test_compose_supports_release_image_and_source_build() -> None:
     compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
     development = yaml.safe_load((ROOT / "compose.dev.yaml").read_text(encoding="utf-8"))
     services = compose["services"]
-    assert set(services) == {"fnos-media-import", "fnos-rclone-worker"}
+    assert set(services) == {"fnos-media-import", "fnos-rclone-worker", "pansou"}
+
+    pansou = services["pansou"]
+    assert pansou["profiles"] == ["pansou"]
+    assert "ports" not in pansou
+    assert pansou["environment"]["AUTH_ENABLED"] == "true"
 
     app = services["fnos-media-import"]
     assert app["image"] == "aichuguang/fnos-search:${APP_VERSION:-latest}"
@@ -28,6 +33,9 @@ def test_compose_supports_release_image_and_source_build() -> None:
         "FNOS_PROCESS_ROLE": "web",
         "RCLONE_WORKER_URL": "http://fnos-rclone-worker:5251",
         "LOG_FILE": "/app/logs/web.log",
+        "PANSOU_BASE_URL": "http://pansou:8888",
+        "PANSOU_USERNAME": "${PANSOU_USERNAME:-fnos-search}",
+        "PANSOU_PASSWORD": "${PANSOU_PASSWORD:-fnos-search}",
     }
 
     development_app = development["services"]["fnos-media-import"]
@@ -98,6 +106,8 @@ def test_optional_env_example_only_exposes_common_user_settings() -> None:
         "FNOS_ROOT_KEY",
         "FNOS_RELAY_HOST_PATH",
         "RCLONE_LOCAL_STORAGE_HOST_PATH",
+        "PANSOU_USERNAME",
+        "PANSOU_PASSWORD",
     }
 
 
