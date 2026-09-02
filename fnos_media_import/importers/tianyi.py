@@ -176,15 +176,15 @@ class TianyiImporter:
             or self._sson_cookie()
             or (self.username and self.password)
         ):
-            return AdapterCheckResult(False, "unconfigured", "Cloud189 account credential is not configured")
-        return AdapterCheckResult(True, "ready", "Cloud189 account credential is configured")
+            return AdapterCheckResult(False, "unconfigured", "天翼云账号凭据未配置")
+        return AdapterCheckResult(True, "ready", "天翼云账号凭据已配置")
 
     def begin_password_login(self, username: str, password: str) -> dict[str, Any]:
         """Start Cloud189 password login and return a captcha challenge when required."""
         login_name = str(username or "").strip()
         secret = str(password or "")
         if not login_name or not secret:
-            raise TianyiApiError("Cloud189 username and password are required", code="LOGIN_INPUT_REQUIRED")
+            raise TianyiApiError("天翼云账号和密码不能为空", code="LOGIN_INPUT_REQUIRED")
         # Keep credentials on this short-lived importer so a login gateway that
         # changes its decision between needcaptcha and loginSubmit can refresh
         # the challenge without submitting a second blind password attempt.
@@ -204,8 +204,8 @@ class TianyiImporter:
                 verify=self.http.verify_tls,
             )
         except Exception as exc:  # noqa: BLE001
-            raise self._network_error("need_captcha", "Cloud189 captcha check request failed", exc) from exc
-        self._raise_for_http(need_captcha, "Cloud189 captcha check", stage="need_captcha")
+            raise self._network_error("need_captcha", "天翼云验证码检查请求失败", exc) from exc
+        self._raise_for_http(need_captcha, "天翼云验证码检查", stage="need_captcha")
         captcha_required = self._captcha_required(need_captcha)
         logger.info(
             "event=tianyi_need_captcha stage=need_captcha required=%s raw=%s",
@@ -220,7 +220,7 @@ class TianyiImporter:
     def complete_password_login(self, login_state: dict[str, Any], validate_code: str) -> dict[str, Any]:
         code = str(validate_code or "").strip()
         if not code:
-            raise TianyiApiError("Cloud189 captcha is required", code="CAPTCHA_REQUIRED")
+            raise TianyiApiError("需要输入天翼云验证码", code="CAPTCHA_REQUIRED")
         state = dict(login_state or {})
         self._restore_login_cookies(state)
         return self._submit_password_login(state, code)
@@ -240,7 +240,7 @@ class TianyiImporter:
                 pass
         if not self.username or not self.password:
             raise TianyiApiError(
-                "Cloud189 captcha challenge expired; please restart login",
+                "天翼云验证码已过期，请重新登录",
                 code="CAPTCHA_EXPIRED",
                 stage="captcha_image",
             )
@@ -261,7 +261,7 @@ class TianyiImporter:
         login_ticket = str(value.get("lt") or "").strip()
         if not captcha_token or not req_id or not login_ticket:
             raise TianyiApiError(
-                "Cloud189 captcha challenge is incomplete",
+                "天翼云验证码挑战信息不完整",
                 code="LOGIN_STATE_INVALID",
                 stage="captcha_image",
             )
@@ -279,13 +279,13 @@ class TianyiImporter:
             )
         except Exception as exc:  # noqa: BLE001
             raise self._network_error(
-                "captcha_image", "Cloud189 captcha image request failed", exc
+                "captcha_image", "天翼云验证码图片请求失败", exc
             ) from exc
-        self._raise_for_http(response, "Cloud189 captcha image", stage="captcha_image")
+        self._raise_for_http(response, "天翼云验证码图片", stage="captcha_image")
         content = bytes(getattr(response, "content", b"") or b"")
         if len(content) <= 20:
             raise TianyiApiError(
-                "Cloud189 captcha image response is invalid",
+                "天翼云验证码图片响应无效",
                 code="CAPTCHA_IMAGE_INVALID",
                 stage="captcha_image",
                 http_status=getattr(response, "status_code", None),
@@ -400,7 +400,7 @@ class TianyiImporter:
             share_id = str(info.get("shareId") or "")
             if share_mode == 1:
                 if not str(password or "").strip():
-                    raise TianyiApiError("This Cloud189 share requires an access code", code="ACCESS_CODE_REQUIRED")
+                    raise TianyiApiError("该天翼云分享需要提取码", code="ACCESS_CODE_REQUIRED")
                 checked = self._web_get(
                     "/api/open/share/checkAccessCode.action",
                     shareCode=share_code,
@@ -409,13 +409,13 @@ class TianyiImporter:
                 )
                 share_id = str(checked.get("shareId") or share_id)
                 if not share_id:
-                    raise TianyiApiError("The Cloud189 access code is invalid", code="ACCESS_CODE_INVALID")
+                    raise TianyiApiError("天翼云提取码无效", code="ACCESS_CODE_INVALID")
             if not share_id:
-                raise TianyiApiError("Cloud189 share information did not include shareId", code="SHARE_INVALID")
+                raise TianyiApiError("天翼云分享信息缺少 shareId", code="SHARE_INVALID")
 
             file_id = str(info.get("fileId") or "")
             if not file_id:
-                raise TianyiApiError("Cloud189 share information did not include fileId", code="SHARE_INVALID")
+                raise TianyiApiError("天翼云分享信息缺少 fileId", code="SHARE_INVALID")
             is_folder = self._as_bool(info.get("isFolder"), default=True)
             items = self._list_share_items(
                 share_id=share_id,
@@ -478,7 +478,7 @@ class TianyiImporter:
         del category
         target_parent_id = str(save_path or "").strip()
         if not target_parent_id:
-            return ImportResult(False, JOB_FAILED, "Cloud189 target folder_id cannot be empty")
+            return ImportResult(False, JOB_FAILED, "天翼云目标 folder_id 不能为空")
         configured = self.check_configuration()
         if not configured.ok:
             return ImportResult(False, JOB_FAILED, configured.message, target_path=target_parent_id)
@@ -486,7 +486,7 @@ class TianyiImporter:
             ok, share = self.check_share(share_url, title, password)
             if not ok:
                 raise TianyiApiError(
-                    str(share.get("message") or "Cloud189 share check failed"),
+                    str(share.get("message") or "天翼云分享检测失败"),
                     code=str(share.get("error_code") or "SHARE_INVALID"),
                 )
             selected = self._select_items(share.get("items"), native_selection)
@@ -495,7 +495,7 @@ class TianyiImporter:
             target_folder_id = target_parent_id
             if create_resource_dir:
                 folder_name = self._safe_folder_name(
-                    str(title or share.get("file_name") or "Cloud189 resource")
+                    str(title or share.get("file_name") or "天翼云资源")
                 )
                 target_folder_id = self._ensure_child_folder(target_parent_id, folder_name)
 
@@ -504,7 +504,7 @@ class TianyiImporter:
                     return ImportResult(
                         True,
                         JOB_DONE,
-                        "Cloud189 empty folder materialized",
+                        "天翼云空文件夹已落库",
                         external_task_id=f"folder:{target_folder_id}",
                         target_path=target_folder_id,
                         raw_data={
@@ -514,7 +514,7 @@ class TianyiImporter:
                             "target_folder_id": target_folder_id,
                         },
                     )
-                raise TianyiApiError("Cloud189 share has no transferable items", code="SHARE_EMPTY")
+                raise TianyiApiError("天翼云分享没有可转存的文件", code="SHARE_EMPTY")
 
             task_infos = [self._batch_task_info(item) for item in selected]
             form = {
@@ -526,11 +526,11 @@ class TianyiImporter:
             result = self._post("/batch/createBatchTask.action", form=form)
             task_id = str(result.get("taskId") or "")
             if not task_id:
-                raise TianyiApiError("Cloud189 batch save did not return taskId", code="TASK_ID_MISSING")
+                raise TianyiApiError("天翼云批量转存未返回 taskId", code="TASK_ID_MISSING")
             return ImportResult(
                 True,
                 JOB_SUBMITTED,
-                "Cloud189 transfer task submitted",
+                "天翼云转存任务已提交",
                 external_task_id=task_id,
                 target_path=target_folder_id,
                 raw_data={
@@ -547,7 +547,7 @@ class TianyiImporter:
             return ImportResult(
                 False,
                 JOB_FAILED,
-                f"Cloud189 transfer failed: {exc}",
+                f"天翼云转存失败：{exc}",
                 target_path=target_parent_id,
                 raw_data={"provider": "tianyi", "error_code": str(getattr(exc, "code", "") or "")},
             )
@@ -569,12 +569,12 @@ class TianyiImporter:
             return ImportResult(
                 False,
                 JOB_FAILED,
-                "Cloud189 source mount requires a folder_id native root locator",
+                "天翼云来源挂载需要 folder_id 原生根定位器",
             )
         try:
             landing_folder_id = self._ensure_folder_path(root_folder_id, landing_path)
         except Exception as exc:  # noqa: BLE001
-            return ImportResult(False, JOB_FAILED, f"Cloud189 landing folder creation failed: {exc}")
+            return ImportResult(False, JOB_FAILED, f"天翼云落地区文件夹创建失败：{exc}")
         result = self.import_resource(
             title=title,
             share_url=share_url,
@@ -593,34 +593,34 @@ class TianyiImporter:
     def poll_operation(self, receipt: Any) -> dict[str, Any]:
         task_id = self._receipt_task_id(receipt)
         if not task_id:
-            return {"status": "unknown", "message": "Cloud189 task ID is missing"}
+            return {"status": "unknown", "message": "天翼云任务 ID 缺失"}
         try:
             value = self._check_batch_task(task_id)
             state = self._as_int(value.get("taskStatus"), default=-999)
             if state in {1, 3}:
-                return {"status": "running", "message": "Cloud189 transfer is running", "metadata": value}
+                return {"status": "running", "message": "天翼云转存进行中", "metadata": value}
             if state == 2:
                 self._resolve_conflicts(task_id)
                 return {
                     "status": "running",
-                    "message": "Cloud189 name conflicts were ignored; transfer resumed",
+                    "message": "天翼云重名冲突已忽略，转存继续",
                     "metadata": value,
                 }
             if state == 4:
-                return {"status": "completed", "message": "Cloud189 transfer completed", "metadata": value}
+                return {"status": "completed", "message": "天翼云转存完成", "metadata": value}
             if state in {-1, 5, 6}:
                 return {
                     "status": "failed",
-                    "message": self._message(value, "Cloud189 transfer failed"),
+                    "message": self._message(value, "天翼云转存失败"),
                     "metadata": value,
                 }
             return {
                 "status": "unknown",
-                "message": f"Cloud189 returned unknown task status: {value.get('taskStatus')}",
+                "message": f"天翼云返回未知任务状态：{value.get('taskStatus')}",
                 "metadata": value,
             }
         except Exception as exc:  # noqa: BLE001
-            return {"status": "unknown", "message": f"Cloud189 task check failed: {exc}"}
+            return {"status": "unknown", "message": f"天翼云任务查询失败：{exc}"}
 
     def verify_native_result(self, request: Any) -> dict[str, Any]:
         from ..transfer.verifier import VerifyRequest
@@ -632,9 +632,9 @@ class TianyiImporter:
         if not raw.get("empty_share"):
             status = self.poll_operation(receipt)
             if status.get("status") == "failed":
-                return {"status": "missing", "message": status.get("message") or "Cloud189 transfer failed"}
+                return {"status": "missing", "message": status.get("message") or "天翼云转存失败"}
             if status.get("status") != "completed":
-                return {"status": "unknown", "message": status.get("message") or "Cloud189 task is not complete"}
+                return {"status": "unknown", "message": status.get("message") or "天翼云任务尚未完成"}
 
         target_folder_id = str(
             (getattr(receipt, "metadata", {}) or {}).get("target_path")
@@ -642,7 +642,7 @@ class TianyiImporter:
             or ""
         )
         if not target_folder_id:
-            return {"status": "unknown", "message": "Cloud189 target folder ID is missing"}
+            return {"status": "unknown", "message": "天翼云目标文件夹 ID 缺失"}
         try:
             target_items = self._list_drive_items(target_folder_id)
             expected_names = {str(name) for name in raw.get("expected_names") or [] if str(name)}
@@ -650,16 +650,16 @@ class TianyiImporter:
             missing = sorted(expected_names - actual_names)
             if missing:
                 preview = ", ".join(missing[:3])
-                return {"status": "missing", "message": f"Cloud189 target is missing saved items: {preview}"}
-            return {"status": "ok", "message": "Cloud189 task and target folder verified"}
+                return {"status": "missing", "message": f"天翼云目标目录缺少已转存文件：{preview}"}
+            return {"status": "ok", "message": "天翼云任务与目标目录校验通过"}
         except Exception as exc:  # noqa: BLE001
-            return {"status": "unknown", "message": f"Cloud189 target verification failed: {exc}"}
+            return {"status": "unknown", "message": f"天翼云目标目录校验失败：{exc}"}
 
     def cancel_operation(self, receipt: Any) -> dict[str, Any]:
         del receipt
         return {
             "status": "not_cancellable",
-            "message": "Cloud189 web API does not expose a reliable batch-task cancel operation",
+            "message": "天翼云网页接口不支持可靠的批量任务取消",
         }
 
     def _check_batch_task(self, task_id: str) -> dict[str, Any]:
@@ -737,7 +737,7 @@ class TianyiImporter:
             container = value.get("fileListAO") if isinstance(value.get("fileListAO"), dict) else {}
             if not container:
                 raise TianyiApiError(
-                    "Cloud189 目录列表响应缺少 fileListAO",
+                    "天翼云目录列表响应缺少 fileListAO",
                     code="INVALID_RESPONSE",
                     stage="provider_request",
                 )
@@ -759,7 +759,7 @@ class TianyiImporter:
     def _ensure_child_folder(self, parent_folder_id: str, folder_name: str) -> str:
         name = self._safe_folder_name(folder_name)
         if not name:
-            raise TianyiApiError("Cloud189 folder name cannot be empty", code="FOLDER_NAME_INVALID")
+            raise TianyiApiError("天翼云文件夹名称不能为空", code="FOLDER_NAME_INVALID")
         existing = self._find_folder(parent_folder_id, name)
         if existing:
             return existing
@@ -780,7 +780,7 @@ class TianyiImporter:
                 raise
         existing = self._find_folder(parent_folder_id, name)
         if not existing:
-            raise TianyiApiError(f"Cloud189 folder creation returned no ID: {name}", code="FOLDER_CREATE_FAILED")
+            raise TianyiApiError(f"天翼云创建文件夹未返回 ID：{name}", code="FOLDER_CREATE_FAILED")
         return existing
 
     def _find_folder(self, parent_folder_id: str, name: str) -> str:
@@ -816,19 +816,19 @@ class TianyiImporter:
         if kind == "folder_id":
             if not value:
                 raise TianyiApiError(
-                    "Cloud189 target folder_id cannot be empty",
+                    "天翼云目标 folder_id 不能为空",
                     code="TARGET_FOLDER_REQUIRED",
                 )
             return value
         if kind != "folder_path":
             raise TianyiApiError(
-                f"Unsupported Cloud189 target locator: {kind}",
+                f"不支持的天翼云目标定位器：{kind}",
                 code="TARGET_LOCATOR_INVALID",
             )
         root_folder_id, separator, relative_path = value.partition("::")
         if not separator or not root_folder_id or not relative_path:
             raise TianyiApiError(
-                "Cloud189 folder_path locator is invalid",
+                "天翼云 folder_path 定位器无效",
                 code="TARGET_LOCATOR_INVALID",
             )
         if create:
@@ -857,25 +857,25 @@ class TianyiImporter:
         path = os.path.realpath(str(local_file or ""))
         if not path or not os.path.isfile(path):
             raise TianyiApiError(
-                f"Cloud189 upload file does not exist: {local_file}",
+                f"天翼云上传文件不存在：{local_file}",
                 code="LOCAL_FILE_MISSING",
             )
         folder_id = str(parent_folder_id or "").strip()
         if not folder_id:
             raise TianyiApiError(
-                "Cloud189 upload parent folder_id is required",
+                "天翼云上传需要父级 folder_id",
                 code="TARGET_FOLDER_REQUIRED",
             )
         file_name = str(target_name or os.path.basename(path)).strip()
         if not file_name or file_name in {".", ".."} or "/" in file_name or "\\" in file_name:
             raise TianyiApiError(
-                "Cloud189 upload file name is invalid",
+                "天翼云上传文件名无效",
                 code="FILE_NAME_INVALID",
             )
         file_size = int(os.path.getsize(path))
         if file_size <= 0:
             raise TianyiApiError(
-                "Cloud189 189CloudPC upload does not support empty files",
+                "天翼云 PC 客户端上传不支持空文件",
                 code="EMPTY_FILE_UNSUPPORTED",
             )
         slice_size = self._upload_part_size(file_size)
@@ -901,7 +901,7 @@ class TianyiImporter:
         ).strip()
         if not upload_file_id:
             raise TianyiApiError(
-                "Cloud189 initMultiUpload returned no uploadFileId",
+                "天翼云 initMultiUpload 未返回 uploadFileId",
                 code="UPLOAD_SESSION_MISSING",
                 stage="upload_init",
             )
@@ -926,7 +926,7 @@ class TianyiImporter:
                     upload_urls = nested.get("uploadUrls") if isinstance(nested, dict) else None
                 if not isinstance(upload_urls, dict) or not upload_urls:
                     raise TianyiApiError(
-                        "Cloud189 getMultiUploadUrls returned no URL",
+                        "天翼云 getMultiUploadUrls 未返回上传地址",
                         code="UPLOAD_URL_MISSING",
                         stage="upload_part_url",
                     )
@@ -937,14 +937,14 @@ class TianyiImporter:
                 )
                 if not isinstance(raw_url, dict):
                     raise TianyiApiError(
-                        "Cloud189 upload URL payload is invalid",
+                        "天翼云上传地址响应无效",
                         code="UPLOAD_URL_INVALID",
                         stage="upload_part_url",
                     )
                 request_url = str(raw_url.get("requestURL") or "").strip()
                 if not request_url:
                     raise TianyiApiError(
-                        "Cloud189 upload URL is empty",
+                        "天翼云上传地址为空",
                         code="UPLOAD_URL_INVALID",
                         stage="upload_part_url",
                     )
@@ -1017,7 +1017,7 @@ class TianyiImporter:
         task_id = str(created.get("taskId") or "").strip()
         if not task_id:
             raise TianyiApiError(
-                "Cloud189 delete task returned no taskId",
+                "天翼云删除任务未返回 taskId",
                 code="TASK_ID_MISSING",
             )
         return self._wait_batch_task(task_id, "DELETE")
@@ -1047,12 +1047,12 @@ class TianyiImporter:
                 continue
             if state in {-1, 5, 6}:
                 raise TianyiApiError(
-                    self._message(value, f"Cloud189 {task_type} task failed"),
+                    self._message(value, f"天翼云 {task_type} 任务失败"),
                     code=self._response_code(value) or "BATCH_TASK_FAILED",
                 )
             time.sleep(max(0.0, float(interval)))
         raise TianyiApiError(
-            f"Cloud189 {task_type} task did not finish in time",
+            f"天翼云 {task_type} 任务未在规定时间内完成",
             code="BATCH_TASK_TIMEOUT",
         )
 
@@ -1085,7 +1085,7 @@ class TianyiImporter:
                     chunk = handle.read(min(1024 * 1024, remaining - consumed))
                     if not chunk:
                         raise TianyiApiError(
-                            "Cloud189 upload source changed while hashing",
+                            "天翼云上传源文件在校验过程中发生了变化",
                             code="LOCAL_FILE_CHANGED",
                             stage="upload_hash",
                         )
@@ -1104,7 +1104,7 @@ class TianyiImporter:
                 offset += remaining
         if offset != file_size:
             raise TianyiApiError(
-                "Cloud189 upload source size changed while hashing",
+                "天翼云上传源文件大小在校验过程中发生了变化",
                 code="LOCAL_FILE_CHANGED",
                 stage="upload_hash",
             )
@@ -1121,7 +1121,7 @@ class TianyiImporter:
         key_bytes = str(key or "").encode("utf-8")[:16]
         if len(key_bytes) != 16:
             raise TianyiApiError(
-                "Cloud189 sessionSecret is too short for upload parameter encryption",
+                "天翼云 sessionSecret 过短，无法加密上传参数",
                 code="SESSION_CREDENTIALS_MISSING",
                 stage="upload_request",
             )
@@ -1157,7 +1157,7 @@ class TianyiImporter:
         session_secret = str(session.get("sessionSecret") or "").strip()
         if not session_key or not session_secret:
             raise TianyiApiError(
-                "Cloud189 PC session is missing sessionKey/sessionSecret",
+                "天翼云 PC 会话缺少 sessionKey/sessionSecret",
                 code="SESSION_CREDENTIALS_MISSING",
                 stage="upload_request",
             )
@@ -1189,16 +1189,16 @@ class TianyiImporter:
         except Exception as exc:  # noqa: BLE001
             raise self._network_error(
                 "upload_request",
-                "Cloud189 upload API request failed",
+                "天翼云上传接口请求失败",
                 exc,
             ) from exc
         value = self._response_payload(
             response,
-            "Cloud189 upload API",
+            "天翼云上传接口",
             stage="upload_request",
         )
         code = self._response_code(value)
-        message = self._message(value, f"Cloud189 upload API error: {code}")
+        message = self._message(value, f"天翼云上传接口错误：{code}")
         invalid_session = code in {
             "InvalidSessionKey",
             "InvalidAccessToken",
@@ -1231,7 +1231,7 @@ class TianyiImporter:
                     http_status=response.status_code,
                 )
             raise TianyiApiError(
-                "Cloud189 PC session expired; please re-login",
+                "天翼云 PC 会话已过期，请重新登录",
                 code=code or "AUTH_EXPIRED",
                 stage="upload_request",
                 http_status=response.status_code,
@@ -1240,7 +1240,7 @@ class TianyiImporter:
             response.status_code == 403 and self._is_auth_rejection(code, message)
         ):
             raise TianyiApiError(
-                "Cloud189 authentication expired",
+                "天翼云登录已过期",
                 code=code or "AUTH_EXPIRED",
                 stage="upload_request",
                 http_status=response.status_code,
@@ -1291,7 +1291,7 @@ class TianyiImporter:
                 try:
                     value = self._response_payload(
                         response,
-                        "Cloud189 upload part",
+                        "天翼云上传分片",
                         stage="upload_part",
                     )
                 except TianyiApiError:
@@ -1299,7 +1299,7 @@ class TianyiImporter:
                 raise TianyiApiError(
                     self._message(
                         value,
-                        f"Cloud189 upload part HTTP {response.status_code}",
+                        f"天翼云上传分片 HTTP {response.status_code}",
                     ),
                     code=self._response_code(value) or f"HTTP_{response.status_code}",
                     stage="upload_part",
@@ -1320,8 +1320,8 @@ class TianyiImporter:
             raise last_error
         raise self._network_error(
             "upload_part",
-            "Cloud189 upload part failed",
-            last_error or RuntimeError("unknown upload error"),
+            "天翼云上传分片失败",
+            last_error or RuntimeError("未知上传错误"),
         )
 
     def _get(self, path: str, **params: Any) -> dict[str, Any]:
@@ -1389,7 +1389,7 @@ class TianyiImporter:
             self._publish_tokens(value)
         if not value.get("sessionKey") or not value.get("sessionSecret"):
             raise TianyiApiError(
-                "Cloud189 PC session is missing sessionKey/sessionSecret",
+                "天翼云 PC 会话缺少 sessionKey/sessionSecret",
                 code="SESSION_CREDENTIALS_MISSING",
                 stage="authenticate",
             )
@@ -1434,7 +1434,7 @@ class TianyiImporter:
         session_secret = str(session.get("sessionSecret") or "").strip()
         if not session_key or not session_secret:
             raise TianyiApiError(
-                "Cloud189 PC session is missing sessionKey/sessionSecret",
+                "天翼云 PC 会话缺少 sessionKey/sessionSecret",
                 code="SESSION_CREDENTIALS_MISSING",
                 stage="provider_request",
             )
@@ -1459,11 +1459,11 @@ class TianyiImporter:
             )
         except Exception as exc:  # noqa: BLE001
             raise self._network_error(
-                "provider_request", "Cloud189 PC API request failed", exc
+                "provider_request", "天翼云 PC 接口请求失败", exc
             ) from exc
-        value = self._response_payload(response, "Cloud189 PC API", stage="provider_request")
+        value = self._response_payload(response, "天翼云 PC 接口", stage="provider_request")
         code = self._response_code(value)
-        provider_message = self._message(value, f"Cloud189 API error: {code}")
+        provider_message = self._message(value, f"天翼云接口错误：{code}")
         invalid_session = code in {"InvalidSessionKey", "InvalidAccessToken", "UserInvalidOpenToken"} or (
             "usersessionboisnull" in provider_message.lower().replace(" ", "")
         )
@@ -1498,7 +1498,7 @@ class TianyiImporter:
                     http_status=response.status_code,
                 )
             raise TianyiApiError(
-                "Cloud189 PC session expired; please re-login",
+                "天翼云 PC 会话已过期，请重新登录",
                 code=code or "AUTH_EXPIRED",
                 stage="provider_request",
                 http_status=response.status_code,
@@ -1507,21 +1507,21 @@ class TianyiImporter:
             response.status_code == 403 and self._is_auth_rejection(code, provider_message)
         ):
             raise TianyiApiError(
-                "Cloud189 authentication expired",
+                "天翼云登录已过期",
                 code=code or "AUTH_EXPIRED",
                 stage="provider_request",
                 http_status=response.status_code,
             )
         if response.status_code >= 400:
             raise TianyiApiError(
-                self._message(value, f"Cloud189 API HTTP {response.status_code}"),
+                self._message(value, f"天翼云接口 HTTP {response.status_code}"),
                 code=code or f"HTTP_{response.status_code}",
                 stage="provider_request",
                 http_status=response.status_code,
             )
         if not isinstance(value, dict):
             raise TianyiApiError(
-                "Cloud189 API returned an invalid payload",
+                "天翼云接口返回了无效响应",
                 code="INVALID_RESPONSE",
                 stage="provider_request",
                 http_status=response.status_code,
@@ -1571,9 +1571,9 @@ class TianyiImporter:
             timeout=self.timeout,
             verify=self.http.verify_tls,
         )
-        value = self._response_payload(response, "Cloud189 web API", stage="provider_request")
+        value = self._response_payload(response, "天翼云网页接口", stage="provider_request")
         code = self._response_code(value)
-        provider_message = self._message(value, f"Cloud189 web API error: {code}")
+        provider_message = self._message(value, f"天翼云网页接口错误：{code}")
         if self._is_session_ip_mismatch(provider_message):
             logger.warning(
                 "event=tianyi_session_ip_mismatch stage=provider_request path=%s code=%s raw=%s "
@@ -1615,7 +1615,7 @@ class TianyiImporter:
             response.status_code == 403 and self._is_auth_rejection(code, provider_message)
         ):
             raise TianyiApiError(
-                "Cloud189 authentication expired",
+                "天翼云登录已过期",
                 code=code or "AUTH_EXPIRED",
                 stage="provider_request",
                 http_status=response.status_code,
@@ -1733,7 +1733,7 @@ class TianyiImporter:
             self._publish_tokens(self._auth_data)
         session_key = str(self._auth_data.get("sessionKey") or "")
         if not session_key:
-            raise TianyiApiError("Cloud189 login returned no sessionKey", code="SESSION_KEY_MISSING")
+            raise TianyiApiError("天翼云登录未返回 sessionKey", code="SESSION_KEY_MISSING")
         return session_key
 
     def _authenticate(self) -> dict[str, Any]:
@@ -1755,7 +1755,7 @@ class TianyiImporter:
                 value = self._login_by_access_token(self.access_token)
                 return self._cache_auth(cache_key, value)
             except Exception as exc:  # noqa: BLE001
-                failures.append(self._as_api_error("access_token", "Cloud189 access-token login failed", exc))
+                failures.append(self._as_api_error("access_token", "天翼云 access token 登录失败", exc))
 
         if self.refresh_token:
             try:
@@ -1767,7 +1767,7 @@ class TianyiImporter:
                 self._force_refresh = False
                 return self._cache_auth(self._auth_cache_key(), value)
             except Exception as exc:  # noqa: BLE001
-                failures.append(self._as_api_error("token_refresh", "Cloud189 token refresh login failed", exc))
+                failures.append(self._as_api_error("token_refresh", "天翼云刷新 token 登录失败", exc))
 
         sson = self._sson_cookie()
         if sson:
@@ -1777,14 +1777,14 @@ class TianyiImporter:
                 self._force_refresh = False
                 return self._cache_auth(self._auth_cache_key(), value)
             except Exception as exc:  # noqa: BLE001
-                failures.append(self._as_api_error("sson_login", "Cloud189 SSON login failed", exc))
+                failures.append(self._as_api_error("sson_login", "天翼云 SSON 登录失败", exc))
 
         if self.username and self.password:
             try:
                 result = self.begin_password_login(self.username, self.password)
                 if result.get("status") == "captcha_required":
                     raise TianyiApiError(
-                        "Cloud189 requires a captcha; please re-login from the admin account page",
+                        "天翼云需要验证码，请到管理后台账号页重新登录",
                         code="CAPTCHA_REQUIRED",
                     )
                 value = dict(result.get("session") or {})
@@ -1796,13 +1796,13 @@ class TianyiImporter:
                     raise
                 failures.append(exc)
             except Exception as exc:  # noqa: BLE001
-                failures.append(self._as_api_error("password_login", "Cloud189 password login failed", exc))
+                failures.append(self._as_api_error("password_login", "天翼云密码登录失败", exc))
 
         last = failures[-1] if failures else None
         if last is None:
-            raise TianyiApiError("Cloud189 authentication failed: no usable credential", code="LOGIN_FAILED", stage="authenticate")
+            raise TianyiApiError("天翼云登录失败：没有可用的凭据", code="LOGIN_FAILED", stage="authenticate")
         raise TianyiApiError(
-            f"Cloud189 authentication failed: {last}",
+            f"天翼云登录失败：{last}",
             code=last.code or "LOGIN_FAILED",
             stage=last.stage or "authenticate",
             http_status=last.http_status,
@@ -1828,7 +1828,7 @@ class TianyiImporter:
 
     def _login_by_access_token(self, access_token: str) -> dict[str, Any]:
         if not str(access_token or "").strip():
-            raise TianyiApiError("Cloud189 access token is empty", code="ACCESS_TOKEN_MISSING")
+            raise TianyiApiError("天翼云 access token 为空", code="ACCESS_TOKEN_MISSING")
         return self._get_pc_session(access_token=str(access_token).strip())
 
     def _get_pc_session(self, *, redirect_url: str = "", access_token: str = "") -> dict[str, Any]:
@@ -1838,7 +1838,7 @@ class TianyiImporter:
         bearer = str(access_token or "").strip()
         if not redirect and not bearer:
             raise TianyiApiError(
-                "Cloud189 PC session exchange input is empty",
+                "天翼云 PC 会话交换入参为空",
                 code="SESSION_EXCHANGE_INPUT_REQUIRED",
                 stage="session_exchange",
             )
@@ -1867,22 +1867,22 @@ class TianyiImporter:
                 )
         except Exception as exc:  # noqa: BLE001
             raise self._network_error(
-                "session_exchange", "Cloud189 PC session request failed", exc
+                "session_exchange", "天翼云 PC 会话请求失败", exc
             ) from exc
         value = self._normalize_session_data(
-            self._response_payload(response, "Cloud189 PC session", stage="session_exchange")
+            self._response_payload(response, "天翼云 PC 会话", stage="session_exchange")
         )
         code = self._response_code(value)
         if response.status_code >= 400 or code not in {"", "0", "success", "SUCCESS"}:
             raise TianyiApiError(
-                self._message(value, "Cloud189 PC session exchange failed"),
+                self._message(value, "天翼云 PC 会话交换失败"),
                 code=code or f"HTTP_{response.status_code}",
                 stage="session_exchange",
                 http_status=response.status_code,
             )
         if not value.get("sessionKey") or not value.get("sessionSecret"):
             raise TianyiApiError(
-                self._message(value, "Cloud189 login returned an incomplete PC session"),
+                self._message(value, "天翼云登录返回的 PC 会话不完整"),
                 code="SESSION_CREDENTIALS_MISSING",
                 stage="session_exchange",
                 http_status=response.status_code,
@@ -1931,13 +1931,13 @@ class TianyiImporter:
                 verify=self.http.verify_tls,
             )
         except Exception as exc:  # noqa: BLE001
-            raise self._network_error("session_exchange", "Cloud189 access-token exchange request failed", exc) from exc
-        self._raise_for_http(response, "Cloud189 access-token exchange", stage="session_exchange")
-        value = self._json_response(response, "Cloud189 access-token exchange", stage="session_exchange")
+            raise self._network_error("session_exchange", "天翼云 access token 交换请求失败", exc) from exc
+        self._raise_for_http(response, "天翼云 access token 交换", stage="session_exchange")
+        value = self._json_response(response, "天翼云 access token 交换", stage="session_exchange")
         code = self._response_code(value)
         if code not in {"", "0", "success", "SUCCESS"}:
             raise TianyiApiError(
-                self._message(value, "Cloud189 access-token exchange failed"),
+                self._message(value, "天翼云 access token 交换失败"),
                 code=code,
                 stage="session_exchange",
                 http_status=response.status_code,
@@ -1945,7 +1945,7 @@ class TianyiImporter:
         access_token = str(value.get("accessToken") or value.get("access_token") or "").strip()
         if not access_token:
             raise TianyiApiError(
-                "Cloud189 access-token exchange returned no token",
+                "天翼云 access token 交换未返回 token",
                 code="ACCESS_TOKEN_MISSING",
                 stage="session_exchange",
             )
@@ -1972,12 +1972,12 @@ class TianyiImporter:
                 verify=self.http.verify_tls,
             )
         except Exception as exc:  # noqa: BLE001
-            raise self._network_error("token_refresh", "Cloud189 token refresh request failed", exc) from exc
-        self._raise_for_http(response, "Cloud189 token refresh", stage="token_refresh")
-        value = self._json_response(response, "Cloud189 token refresh", stage="token_refresh")
+            raise self._network_error("token_refresh", "天翼云刷新 token 请求失败", exc) from exc
+        self._raise_for_http(response, "天翼云刷新 token", stage="token_refresh")
+        value = self._json_response(response, "天翼云刷新 token", stage="token_refresh")
         if not value.get("accessToken"):
             raise TianyiApiError(
-                self._message(value, "Cloud189 token refresh failed"),
+                self._message(value, "天翼云刷新 token 失败"),
                 code=self._response_code(value) or "REFRESH_FAILED",
                 stage="token_refresh",
                 http_status=response.status_code,
@@ -1998,13 +1998,13 @@ class TianyiImporter:
             )
         except Exception as exc:  # noqa: BLE001
             raise self._network_error(
-                "login_form", "Cloud189 login page request failed", exc
+                "login_form", "天翼云登录页请求失败", exc
             ) from exc
-        self._raise_for_http(response, "Cloud189 login page", stage="login_form")
+        self._raise_for_http(response, "天翼云登录页", stage="login_form")
         html = str(response.text or "")
         if not all(marker in html for marker in ("captchaToken", "paramId", "reqId", "lt")):
             raise TianyiApiError(
-                "Cloud189 login page returned an incomplete challenge",
+                "天翼云登录页返回的挑战信息不完整",
                 code="LOGIN_STATE_INVALID",
                 stage="login_form",
                 http_status=response.status_code,
@@ -2035,9 +2035,9 @@ class TianyiImporter:
                 timeout=self.timeout,
                 verify=self.http.verify_tls,
             )
-            self._raise_for_http(encrypt_response, "Cloud189 encryption config", stage="login_form")
+            self._raise_for_http(encrypt_response, "天翼云加密配置", stage="login_form")
             encrypt_payload = self._json_response(
-                encrypt_response, "Cloud189 encryption config", stage="login_form"
+                encrypt_response, "天翼云加密配置", stage="login_form"
             )
             encrypt_data = encrypt_payload.get("data") if isinstance(encrypt_payload.get("data"), dict) else {}
             configured_key = str(encrypt_data.get("pubKey") or "").strip()
@@ -2052,12 +2052,12 @@ class TianyiImporter:
             logger.info("event=tianyi_encrypt_config_fallback stage=login_form")
         except Exception as exc:  # noqa: BLE001
             if not page_key:
-                raise self._network_error("login_form", "Cloud189 encryption config request failed", exc) from exc
+                raise self._network_error("login_form", "天翼云加密配置请求失败", exc) from exc
             logger.info("event=tianyi_encrypt_config_fallback stage=login_form")
 
         if not public_key:
             raise TianyiApiError(
-                "Cloud189 login page returned no RSA public key",
+                "天翼云登录页未返回 RSA 公钥",
                 code="ENCRYPT_CONFIG_FAILED",
                 stage="login_form",
             )
@@ -2104,7 +2104,7 @@ class TianyiImporter:
         )
         if any(not str(state.get(key) or "") for key in required):
             raise TianyiApiError(
-                "Cloud189 login challenge is incomplete",
+                "天翼云登录挑战信息不完整",
                 code="LOGIN_STATE_INVALID",
                 stage="login_submit",
             )
@@ -2137,9 +2137,9 @@ class TianyiImporter:
                 verify=self.http.verify_tls,
             )
         except Exception as exc:  # noqa: BLE001
-            raise self._network_error("login_submit", "Cloud189 password login request failed", exc) from exc
-        self._raise_for_http(response, "Cloud189 password login", stage="login_submit")
-        value = self._json_response(response, "Cloud189 password login", stage="login_submit")
+            raise self._network_error("login_submit", "天翼云密码登录请求失败", exc) from exc
+        self._raise_for_http(response, "天翼云密码登录", stage="login_submit")
+        value = self._json_response(response, "天翼云密码登录", stage="login_submit")
         redirect_url = str(
             value.get("toUrl")
             or value.get("redirectUrl")
@@ -2147,7 +2147,7 @@ class TianyiImporter:
             or ""
         ).strip()
         if not redirect_url:
-            message = str(value.get("msg") or value.get("message") or "Cloud189 password login failed")
+            message = str(value.get("msg") or value.get("message") or "天翼云密码登录失败")
             provider_code = self._response_code(value)
             if not provider_code and value.get("result") not in (None, 0, "0", "success", "SUCCESS"):
                 provider_code = str(value.get("result") or "")
@@ -2279,7 +2279,7 @@ class TianyiImporter:
             key = RSA.import_key(key_text)
             encrypted = PKCS1_v1_5.new(key).encrypt(str(value).encode("utf-8"))
         except (ValueError, IndexError, TypeError) as exc:
-            raise TianyiApiError("Cloud189 RSA encryption failed", code="ENCRYPT_FAILED") from exc
+            raise TianyiApiError("天翼云 RSA 加密失败", code="ENCRYPT_FAILED") from exc
         # OpenList 189CloudPC serialises the encrypted block as upper-case hex.
         return encrypted.hex().upper()
 
@@ -2288,7 +2288,7 @@ class TianyiImporter:
         match = re.search(pattern, str(html or ""), flags=re.IGNORECASE)
         if not match:
             raise TianyiApiError(
-                f"Cloud189 login page is missing {name}",
+                f"天翼云登录页缺少 {name}",
                 code="LOGIN_FORM_INVALID",
                 stage="login_form",
             )
@@ -2310,14 +2310,14 @@ class TianyiImporter:
             value = response.json()
         except ValueError as exc:
             raise TianyiApiError(
-                f"{label} returned a non-JSON response",
+                f"{label} 返回了非 JSON 响应",
                 code="INVALID_RESPONSE",
                 stage=stage,
                 http_status=getattr(response, "status_code", None),
             ) from exc
         if not isinstance(value, dict):
             raise TianyiApiError(
-                f"{label} returned an invalid payload",
+                f"{label} 返回了无效响应",
                 code="INVALID_RESPONSE",
                 stage=stage,
                 http_status=getattr(response, "status_code", None),
@@ -2521,7 +2521,7 @@ class TianyiImporter:
         if not code and "share.html" in parsed.path:
             code = parsed.fragment.rstrip("/").split("/")[-1]
         if not re.fullmatch(r"[A-Za-z0-9]+", code or ""):
-            raise TianyiApiError("Invalid Cloud189 share URL", code="SHARE_URL_INVALID")
+            raise TianyiApiError("天翼云分享链接无效", code="SHARE_URL_INVALID")
         return code
 
     @staticmethod

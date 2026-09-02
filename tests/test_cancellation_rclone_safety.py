@@ -63,7 +63,7 @@ class CmccVerificationSafetyTests(unittest.TestCase):
 
             self.assertFalse(result.success)
             self.assertEqual(result.status, "failed")
-            self.assertIn("verification failed", result.message)
+            self.assertIn("校验失败", result.message)
             payloads = [
                 call.args[1]
                 for call in write_manifest.call_args_list

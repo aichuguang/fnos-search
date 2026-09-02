@@ -115,7 +115,7 @@ class TianyiCloudUploader:
         if not operation_key:
             return UploadOutcome(
                 "failed",
-                "Tianyi relay upload requires an idempotency key",
+                "天翼云中继上传缺少幂等键",
                 error_code=ErrorCode.INVALID_PLAN,
             )
 
@@ -123,7 +123,7 @@ class TianyiCloudUploader:
         if not locator_kind or not locator_value:
             return UploadOutcome(
                 "failed",
-                "Tianyi relay upload requires a native target locator",
+                "天翼云中继上传缺少原生目标定位器",
                 error_code=ErrorCode.INVALID_PLAN,
             )
 
@@ -131,13 +131,13 @@ class TianyiCloudUploader:
         if not files:
             return UploadOutcome(
                 "failed",
-                f"relay directory is empty or missing: {local_dir}",
+                f"中继目录为空或不存在：{local_dir}",
                 error_code=ErrorCode.SOURCE_LANDING_UNAVAILABLE,
             )
         if any(size <= 0 for _path, _relative, size in files):
             return UploadOutcome(
                 "failed",
-                "Tianyi 189CloudPC upload does not support empty files",
+                "天翼云 PC 客户端上传不支持空文件",
                 error_code=ErrorCode.INVALID_PLAN,
             )
 
@@ -170,7 +170,7 @@ class TianyiCloudUploader:
             ]
             return UploadOutcome(
                 "done",
-                "Tianyi upload already reconciled from durable manifest",
+                "天翼云上传已按持久 fence 对账完成",
                 file_count=len(completed),
                 total_size=sum(int(item.get("size") or 0) for item in completed),
             )
@@ -197,7 +197,7 @@ class TianyiCloudUploader:
         except TianyiApiError as exc:
             return self._api_failure(
                 exc,
-                prefix="Tianyi target folder resolution failed",
+                prefix="天翼云目标目录解析失败",
             )
 
         callback = progress if callable(progress) else None
@@ -237,11 +237,11 @@ class TianyiCloudUploader:
                     ),
                 )
             except TianyiApiError as exc:
-                return self._api_failure(exc, prefix="Tianyi upload failed")
+                return self._api_failure(exc, prefix="天翼云上传失败")
             except Exception as exc:  # noqa: BLE001
                 return UploadOutcome(
                     "failed",
-                    f"Tianyi upload exception: {exc}",
+                    f"天翼云上传异常：{exc}",
                     file_count=uploaded_count,
                     total_size=uploaded_size,
                     error_code=ErrorCode.NETWORK_TRANSIENT,
@@ -272,7 +272,7 @@ class TianyiCloudUploader:
             if not record["success"]:
                 return UploadOutcome(
                     "failed",
-                    f"Tianyi upload incomplete: {relative_path}",
+                    f"天翼云上传不完整：{relative_path}",
                     file_count=uploaded_count,
                     total_size=uploaded_size,
                     error_code=ErrorCode.NETWORK_TRANSIENT,
@@ -316,7 +316,7 @@ class TianyiCloudUploader:
         if str(manifest.get("status") or "").lower() != "completed":
             return TransferVerifyResult(
                 "unknown",
-                "Tianyi upload manifest is missing or incomplete",
+                "天翼云上传 fence 缺失或不完整",
                 code=ErrorCode.RESULT_UNKNOWN,
             )
         records = self._manifest_records(manifest)
@@ -344,7 +344,7 @@ class TianyiCloudUploader:
                 )
             return TransferVerifyResult(
                 "unknown",
-                f"Tianyi target verification failed: {exc}",
+                f"天翼云目标校验失败：{exc}",
                 code=ErrorCode.RESULT_UNKNOWN,
             )
 
@@ -375,13 +375,13 @@ class TianyiCloudUploader:
         )
         problems: list[str] = []
         if missing:
-            problems.append("missing: " + ", ".join(missing[:10]))
+            problems.append("缺失：" + "、".join(missing[:10]))
         if expected_file_count > 0 and len(expected_records) != expected_file_count:
             problems.append(
-                f"manifest files {len(expected_records)} != {expected_file_count}"
+                f"fence 文件数 {len(expected_records)} != 期望 {expected_file_count}"
             )
         if expected_total_size > 0 and manifest_size != expected_total_size:
-            problems.append(f"manifest size {manifest_size} != {expected_total_size}")
+            problems.append(f"fence 总大小 {manifest_size} != 期望 {expected_total_size}")
         if problems:
             return TransferVerifyResult(
                 "missing",
@@ -421,7 +421,7 @@ class TianyiCloudUploader:
             folder_id = self._target_folder_id(target_locator, create=False)
             if not folder_id:
                 raise TianyiApiError(
-                    "Cloud189 target folder does not exist",
+                    "天翼云目标目录不存在",
                     code="TARGET_FOLDER_MISSING",
                 )
             with tempfile.TemporaryDirectory(prefix="fnos-tianyi-probe-") as temp_dir:

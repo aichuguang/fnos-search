@@ -90,9 +90,9 @@ class CmccMobileUploader:
     ) -> UploadOutcome:
         operation_key = str(idempotency_key or "").strip()
         if not operation_key:
-            return UploadOutcome("failed", "mobile relay upload requires an idempotency key", error_code=ErrorCode.INVALID_PLAN)
+            return UploadOutcome("failed", "移动云中继上传缺少幂等键", error_code=ErrorCode.INVALID_PLAN)
         if not isinstance(target_locator, dict):
-            return UploadOutcome("failed", "mobile relay upload requires an explicit target locator", error_code=ErrorCode.INVALID_PLAN)
+            return UploadOutcome("failed", "移动云中继上传缺少明确的目标定位器", error_code=ErrorCode.INVALID_PLAN)
         target_path = str(target_locator.get("path") or "").strip()
         target_parent_id = str(
             target_locator.get("parent_file_id")
@@ -100,11 +100,11 @@ class CmccMobileUploader:
             or ""
         ).strip()
         if not target_path and not target_parent_id:
-            return UploadOutcome("failed", "mobile relay target path or parent id is required", error_code=ErrorCode.INVALID_PLAN)
+            return UploadOutcome("failed", "移动云中继目标路径和父目录 ID 不能同时为空", error_code=ErrorCode.INVALID_PLAN)
 
         files = self._list_local_files(local_dir)
         if not files:
-            return UploadOutcome("failed", f"relay directory is empty or missing: {local_dir}", error_code=ErrorCode.SOURCE_LANDING_UNAVAILABLE)
+            return UploadOutcome("failed", f"中继目录为空或不存在：{local_dir}", error_code=ErrorCode.SOURCE_LANDING_UNAVAILABLE)
 
         manifest_path = self._operation_manifest_path(local_dir, operation_key)
         manifest = self._read_operation_manifest(manifest_path)
@@ -129,7 +129,7 @@ class CmccMobileUploader:
             records = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
             return UploadOutcome(
                 "done",
-                "mobile upload already reconciled from durable manifest",
+                "移动云上传已按持久 fence 对账完成",
                 file_count=sum(1 for item in records.values() if isinstance(item, dict) and item.get("success")),
                 total_size=sum(int(item.get("size") or 0) for item in records.values() if isinstance(item, dict) and item.get("success")),
             )
@@ -159,19 +159,19 @@ class CmccMobileUploader:
             try:
                 result = self._call_upload_file(kwargs)
             except CmccAuthExpired:
-                return UploadOutcome("auth_expired", "mobile account authorization expired")
+                return UploadOutcome("auth_expired", "移动云账号授权已过期")
             except CmccAuthConfigError as exc:
-                return UploadOutcome("failed", f"mobile credential configuration error: {exc}", error_code=ErrorCode.AUTH_CONFIG)
+                return UploadOutcome("failed", f"移动云凭据配置错误：{exc}", error_code=ErrorCode.AUTH_CONFIG)
             except CmccApiError as exc:
                 return UploadOutcome(
                     "auth_expired" if exc.auth_expired else "failed",
-                    f"mobile upload failed: {exc}",
+                    f"移动云上传失败：{exc}",
                     error_code=ErrorCode.AUTH_EXPIRED if exc.auth_expired else ErrorCode.NETWORK_TRANSIENT,
                 )
             except TransferError as exc:
                 return UploadOutcome("failed", exc.message, error_code=exc.code)
             except Exception as exc:  # noqa: BLE001
-                return UploadOutcome("failed", f"mobile upload exception: {exc}", error_code=ErrorCode.NETWORK_TRANSIENT)
+                return UploadOutcome("failed", f"移动云上传异常：{exc}", error_code=ErrorCode.NETWORK_TRANSIENT)
             result = _coerce_cmcc_result(result, relative_path, size)
             records[relative_path] = {"success": bool(result.success), "size": size, "result": result.to_dict()}
             manifest["status"] = "uploading"
@@ -180,7 +180,7 @@ class CmccMobileUploader:
             if not result.success:
                 return UploadOutcome(
                     "failed",
-                    f"mobile upload incomplete: {result.message}",
+                    f"移动云上传不完整：{result.message}",
                     file_count=len(uploaded),
                     total_size=sum(int(item.size or 0) for item in uploaded),
                     error_code=ErrorCode.NETWORK_TRANSIENT,
@@ -191,12 +191,12 @@ class CmccMobileUploader:
         if not self._write_operation_manifest(manifest_path, manifest):
             return UploadOutcome("unknown", "无法持久化移动云完成回执", error_code=ErrorCode.RESULT_UNKNOWN)
         total_size = sum(int(item.size or 0) for item in uploaded)
-        return UploadOutcome("done", "mobile upload completed", file_count=len(uploaded), total_size=total_size)
+        return UploadOutcome("done", "移动云上传完成", file_count=len(uploaded), total_size=total_size)
 
     def _call_upload_file(self, kwargs: dict[str, Any]) -> Any:
         method = getattr(self.uploader, "upload_file", None)
         if not callable(method):
-            raise TransferError(ErrorCode.AUTH_CONFIG, "mobile uploader does not expose upload_file")
+            raise TransferError(ErrorCode.AUTH_CONFIG, "移动云上传器未提供 upload_file 方法")
         return method(**kwargs)
 
     @staticmethod
@@ -279,11 +279,11 @@ class CmccMobileUploader:
         local_dir: str = "",
     ) -> TransferVerifyResult:
         if not isinstance(target_locator, dict):
-            return TransferVerifyResult("unknown", "mobile relay target locator is missing", code=ErrorCode.INVALID_PLAN)
+            return TransferVerifyResult("unknown", "移动云中继缺少目标定位器", code=ErrorCode.INVALID_PLAN)
         target_path = str(target_locator.get("path") or "").strip()
         parent_id = str(target_locator.get("parent_file_id") or target_locator.get("parentFileId") or "").strip()
         if not target_path and not parent_id:
-            return TransferVerifyResult("unknown", "mobile relay target path or parent id is required", code=ErrorCode.INVALID_PLAN)
+            return TransferVerifyResult("unknown", "移动云中继目标路径和父目录 ID 不能同时为空", code=ErrorCode.INVALID_PLAN)
         if not parent_id:
             parent_id = self._resolve_readonly(target_path)
         if not parent_id:
@@ -346,14 +346,14 @@ class CmccMobileUploader:
         count = len(expected_records) - len(missing)
         problems: list[str] = []
         if missing:
-            problems.append("missing: " + ", ".join(missing[:10]))
+            problems.append("缺失：" + "、".join(missing[:10]))
         if expected_file_count > 0 and len(expected_records) != expected_file_count:
             problems.append(
-                f"manifest files {len(expected_records)} != {expected_file_count}"
+                f"fence 文件数 {len(expected_records)} != 期望 {expected_file_count}"
             )
         if expected_total_size > 0 and manifest_size != expected_total_size:
             problems.append(
-                f"manifest size {manifest_size} != {expected_total_size}"
+                f"fence 总大小 {manifest_size} != 期望 {expected_total_size}"
             )
         if problems:
             return TransferVerifyResult(
@@ -388,7 +388,7 @@ class CmccMobileUploader:
                 "upload_verified": False,
                 "organizer_mutation_verified": False,
                 "code": "TARGET_LOCATOR_INVALID",
-                "message": "mobile native upload probe requires a target locator",
+                "message": "移动云原生上传探测需要目标 locator",
             }
         target_path = str(
             target_locator.get("path")
@@ -406,7 +406,7 @@ class CmccMobileUploader:
                 "upload_verified": False,
                 "organizer_mutation_verified": False,
                 "code": "TARGET_LOCATOR_INVALID",
-                "message": "mobile native upload probe target is empty",
+                "message": "移动云原生上传探测目标为空",
             }
         file_name = f"fnos-native-probe-{uuid.uuid4().hex}.txt"
         content = b"fnos-mobile-native-upload-probe"
@@ -429,7 +429,7 @@ class CmccMobileUploader:
                     "upload_verified": False,
                     "organizer_mutation_verified": False,
                     "code": "PROVIDER_UPLOAD_PROBE_FAILED",
-                    "message": result.message or "mobile native upload probe failed",
+                    "message": result.message or "移动云原生上传探测失败",
                 }
             observer_result: dict[str, Any] = {}
             if callable(observer):
@@ -534,7 +534,7 @@ def _coerce_cmcc_result(value: Any, relative_path: str, size: int) -> CmccUpload
             manifest_path=str(payload.get("manifest_path") or ""),
             raw=dict(payload.get("raw") or {}),
         )
-    return CmccUploadResult(False, "failed", f"unsupported mobile upload result: {type(value).__name__}", target_name=relative_path, size=size)
+    return CmccUploadResult(False, "failed", f"无法识别的移动云上传结果：{type(value).__name__}", target_name=relative_path, size=size)
 
 
 def _cmcc_result_from_dict(value: Any, relative_path: str, size: int) -> CmccUploadResult:

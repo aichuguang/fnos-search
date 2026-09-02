@@ -39,7 +39,7 @@ class RcloneJobFeasibilityEvaluator:
                 "status": "manual_review",
                 "manual_review": True,
                 "error_code": "UNSUPPORTED_PLAN_VERSION",
-                "message": f"rclone feasibility requires a valid V1 execution_plan: {exc}",
+                "message": f"rclone 可行性检查需要有效的 V1 execution_plan：{exc}",
                 "expected_file_count": 0,
                 "completed_file_count": 0,
                 "manifest_required": False,
@@ -53,7 +53,7 @@ class RcloneJobFeasibilityEvaluator:
                 "status": "manual_review",
                 "manual_review": True,
                 "error_code": "INVALID_PLAN",
-                "message": "rclone feasibility only accepts V1 rclone_copy plans",
+                "message": "rclone 可行性检查只接受 V1 rclone_copy 计划",
                 "expected_file_count": 0,
                 "completed_file_count": 0,
                 "manifest_required": False,
@@ -149,7 +149,7 @@ class RcloneJobFeasibilityEvaluator:
             return {
                 "ready": False,
                 "status": "transferring",
-                "message": "rclone task manifest is required before completion can be acknowledged",
+                "message": "确认完成前必须先持久化 rclone 任务清单",
                 **common,
                 "failed_file_count": 0,
             }

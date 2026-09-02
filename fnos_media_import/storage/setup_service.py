@@ -821,7 +821,7 @@ class StorageSetupService:
                 return {
                     "organizer_mutation_verified": False,
                     "deleted": False,
-                    "message": "Provider upload probe returned no file name",
+                    "message": "Provider 上传探测未返回文件名",
                 }
             source = posixpath.join(root, file_name)
             moved = posixpath.join(root, f"{file_name}.moved")
@@ -850,19 +850,19 @@ class StorageSetupService:
             deleted = False
             try:
                 if not visible(source, True):
-                    raise RuntimeError("OpenList did not expose the native probe file")
+                    raise RuntimeError("OpenList 未暴露原生探测文件")
 
                 def read_verified() -> bytes:
                     last: BaseException | None = None
                     for attempt in range(12):
                         try:
                             if int(client.file_size(source) or 0) != expected_size:
-                                raise RuntimeError("OpenList probe file size does not match")
+                                raise RuntimeError("OpenList 探测文件大小不一致")
                             if content:
                                 data = bytes(client.read_bytes(source))
                                 if data != content:
                                     raise RuntimeError(
-                                        "OpenList probe file content does not match"
+                                        "OpenList 探测文件内容不一致"
                                     )
                                 return data
                             return b""
@@ -870,22 +870,22 @@ class StorageSetupService:
                             last = exc
                             if attempt < 11:
                                 time.sleep(0.5)
-                    raise RuntimeError(f"OpenList probe file read failed: {last}") from last
+                    raise RuntimeError(f"OpenList 探测文件读取失败：{last}") from last
 
                 read_verified()
                 client.move(source, moved)
                 if not visible(moved, True) or not visible(source, False):
-                    raise RuntimeError("OpenList MOVE result could not be verified")
+                    raise RuntimeError("OpenList MOVE 结果无法复核")
                 if int(client.file_size(moved) or 0) != expected_size:
-                    raise RuntimeError("OpenList moved probe file size does not match")
+                    raise RuntimeError("OpenList 移动后的探测文件大小不一致")
                 client.delete(moved)
                 deleted = visible(moved, False)
                 if not deleted:
-                    raise RuntimeError("OpenList DELETE result could not be verified")
+                    raise RuntimeError("OpenList DELETE 结果无法复核")
                 return {
                     "organizer_mutation_verified": True,
                     "deleted": True,
-                    "message": "OpenList read, MOVE and DELETE checks passed",
+                    "message": "OpenList 读取、MOVE 与 DELETE 检查通过",
                 }
             except Exception as exc:  # noqa: BLE001 - return structured probe failure
                 # ``deleted`` tells the Provider uploader to skip its own native
@@ -904,7 +904,7 @@ class StorageSetupService:
                 return {
                     "organizer_mutation_verified": False,
                     "deleted": deleted,
-                    "message": f"OpenList organizer mutation probe failed: {exc}",
+                    "message": f"OpenList Organizer 整理能力探测失败：{exc}",
                 }
 
         observe.probe_paths = probe_paths  # type: ignore[attr-defined]

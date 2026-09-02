@@ -473,7 +473,7 @@ class TrendingRepository:
             return None
         unsupported = set(statuses) - {"discovered", "import_failed"}
         if unsupported:
-            raise ValueError("invalid initial import claim status")
+            raise ValueError("非法的初次入库认领状态")
         claim_conditions: list[str] = []
         if "discovered" in statuses:
             claim_conditions.append("(status = 'discovered' AND initial_import_job_id IS NULL)")
@@ -516,7 +516,7 @@ class TrendingRepository:
     ) -> bool:
         target_status = str(status or "importing").strip()
         if target_status not in {"importing", "imported", "import_failed"}:
-            raise ValueError("invalid initial import status")
+            raise ValueError("非法的初次入库状态")
         now = _now()
         with self._connection_factory() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -556,7 +556,7 @@ class TrendingRepository:
     ) -> bool:
         target_status = str(status or "discovered").strip()
         if target_status not in {"discovered", "import_failed"}:
-            raise ValueError("invalid initial import release status")
+            raise ValueError("非法的初次入库释放状态")
         with self._connection_factory() as connection:
             cursor = connection.execute(
                 """

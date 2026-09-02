@@ -141,7 +141,7 @@ class CompositeFilesystemOps(FilesystemOps):
                 return {"ok": False, "retryable": True, "message": "本地删除适配器未配置"}
             return self.local_ops.delete_tree(descriptor)
         if kind == "native":
-            return {"ok": False, "refused": True, "message": "native target is not a cleanup landing"}
+            return {"ok": False, "refused": True, "message": "native 目标不是可清理的落地区"}
         if self.openlist_ops is None:
             return {"ok": False, "retryable": True, "message": "OpenList 删除适配器未配置，跳过远端清理"}
         return self.openlist_ops.delete_tree(descriptor)

@@ -307,7 +307,7 @@ class CmccClient:
         if not str(task_id or "").strip():
             return {}
         result = self.post_json("/task/get", {"taskId": str(task_id)}, retries=1)
-        return self.require_success(result, action="get task")
+        return self.require_success(result, action="查询任务")
 
     @staticmethod
     def _normalize_share_items(info: dict[str, Any], *, pdir_fid: str = "root") -> list[dict[str, Any]]:
@@ -478,7 +478,7 @@ class CmccClient:
             part_infos=part_infos,
         )
         result = self.post_json(create_path, payload, retries=1)
-        data = self.require_success(result, action="create file")
+        data = self.require_success(result, action="创建文件")
         if parent_id and "parentFileId" not in data:
             data["parentFileId"] = parent_id
         return data
@@ -496,7 +496,7 @@ class CmccClient:
     ) -> tuple[str, dict[str, Any], str]:
         parent_id = str(parent_file_id or "").strip() or self.ensure_path(parent_path)
         if not parent_id:
-            raise CmccApiError("target parent file id/path is required")
+            raise CmccApiError("缺少目标父目录 ID/路径")
 
         if not part_infos:
             part_infos = [
@@ -531,7 +531,7 @@ class CmccClient:
             "commonAccountInfo": self._account(),
         }
         result = self.post_json(os.getenv("CMCC_WEB_GET_UPLOAD_URL_PATH", "/file/getUploadUrl"), payload, retries=1)
-        return self.require_success(result, action="get upload url")
+        return self.require_success(result, action="获取上传地址")
 
     def redacted_headers_for_debug(self, *, payload: dict[str, Any] | None = None, sign_catalog_id: str = "") -> dict[str, str]:
         _ = sign_catalog_id
@@ -560,7 +560,7 @@ class CmccClient:
             "uploadId": upload_id,
         }
         result = self.post_json(os.getenv("CMCC_WEB_COMPLETE_PATH", "/file/complete"), payload, retries=0)
-        return self.require_success(result, action="complete file")
+        return self.require_success(result, action="完成上传")
 
     def create_folder(self, *, name: str, parent_file_id: str) -> dict[str, Any]:
         parent_id = str(parent_file_id or "/").strip() or "/"
@@ -572,7 +572,7 @@ class CmccClient:
             "fileRenameMode": "force_rename",
         }
         result = self.post_json(os.getenv("CMCC_WEB_CREATE_PATH", "/file/create"), payload, retries=1)
-        data = self.require_success(result, action="create folder")
+        data = self.require_success(result, action="创建文件夹")
         if parent_id and "parentFileId" not in data:
             data["parentFileId"] = parent_id
         return data
@@ -601,7 +601,7 @@ class CmccClient:
                 "parentFileId": parent_id,
             }
             result = self.post_json("/file/list", payload, retries=1)
-            data = self.require_success(result, action="list dir")
+            data = self.require_success(result, action="列出目录")
             rows = data.get("items") or data.get("fileList") or []
             if isinstance(rows, list):
                 items.extend(row for row in rows if isinstance(row, dict))
@@ -626,13 +626,13 @@ class CmccClient:
             if exists.get("exist") and exists.get("file_id"):
                 file_type = str(exists.get("file_type") or "").lower()
                 if file_type and "folder" not in file_type and "dir" not in file_type:
-                    raise CmccApiError(f"target path segment exists but is not a folder: {segment}")
+                    raise CmccApiError(f"目标路径段已存在但不是文件夹：{segment}")
                 current = str(exists["file_id"])
                 continue
             created = self.create_folder(name=segment, parent_file_id=current)
             current = str(created.get("fileId") or created.get("file_id") or created.get("id") or "")
             if not current:
-                raise CmccApiError(f"create folder succeeded but no fileId returned: {segment}")
+                raise CmccApiError(f"创建文件夹成功但未返回 fileId：{segment}")
         return current
 
     @staticmethod

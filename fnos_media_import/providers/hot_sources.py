@@ -385,7 +385,7 @@ class TencentHotSource:
         payload = {"pageNum": 0, "pageSize": self.page_size, "data_version": self.data_version, "client_type": 2}
         status, data = self.http.post_json(self.endpoint, payload, read_only=True)
         if status >= 400:
-            raise RuntimeError(f"Tencent hot list HTTP {status}")
+            raise RuntimeError(f"腾讯热榜请求 HTTP {status}")
         return self.parse(data, limit=self.max_items, per_category_limit=self.max_items_per_category)
 
 
@@ -475,7 +475,7 @@ class IqiyiHotSource:
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
         )
         if status >= 400:
-            raise RuntimeError(f"Iqiyi hot list HTTP {status}")
+            raise RuntimeError(f"爱奇艺热榜请求 HTTP {status}")
         return self.parse(data, limit=self.max_items_per_category)
 
 
@@ -679,14 +679,14 @@ class YoukuHotSource:
                 headers=headers,
             )
             if status >= 400:
-                raise RuntimeError(f"Youku hot list HTTP {status}")
+                raise RuntimeError(f"优酷热榜请求 HTTP {status}")
             return self.parse_html(
                 html,
                 limit=self.max_items,
                 per_category_limit=self.max_items_per_category,
             )
         except requests.RequestException as exc:
-            raise RuntimeError(f"Youku hot list request failed: {exc}") from exc
+            raise RuntimeError(f"优酷热榜请求失败：{exc}") from exc
 
 
 __all__ = ["HotItem", "TencentHotSource", "IqiyiHotSource", "YoukuHotSource"]

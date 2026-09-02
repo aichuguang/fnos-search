@@ -206,7 +206,7 @@ class PlanValidator:
                 or source_selection_revision is None
                 or source_selection_revision <= 0
             ):
-                errors.append("source account revision/selection revision is incomplete")
+                errors.append("source account revision/selection revision 不完整")
             else:
                 self._validate_account(
                     provider_kind=source_provider,
@@ -266,7 +266,7 @@ class PlanValidator:
         if dest_account_id:
             dest_account_revision = _int_or(destination.get("account_revision"))
             if dest_account_revision is None or dest_account_revision <= 0:
-                errors.append("destination account revision is incomplete")
+                errors.append("destination account revision 不完整")
             elif dest_provider:
                 if binding is not None and binding.account_revision != dest_account_revision:
                     errors.append("目标 binding 账号修订与计划不一致")
@@ -284,16 +284,16 @@ class PlanValidator:
         planned_category = _str(plan.get("category"))
         persisted_category = _str(job.get("category"))
         if not planned_category:
-            errors.append("plan missing category")
+            errors.append("计划缺少 category")
         elif persisted_category and planned_category != persisted_category:
-            errors.append("plan category does not match job category")
+            errors.append("计划 category 与任务 category 不一致")
         if not category_key:
-            errors.append("plan missing category_key")
+            errors.append("计划缺少 category_key")
         category = None
         if target is not None:
             category = target.category(category_key)
             if category is None and plan_destination:
-                errors.append(f"target {plan_destination} has no category {category_key or '(empty)'}")
+                errors.append(f"target {plan_destination} 没有分类 {category_key or '(空)'}")
 
         self._validate_target_category_snapshot(
             plan=plan,
@@ -355,10 +355,10 @@ class PlanValidator:
                 source_record_id, source_record_revision
             )
         except Exception as exc:  # noqa: BLE001 - fail closed, keep diagnostics
-            errors.append(f"source snapshot cannot be resolved: {exc}")
+            errors.append(f"source snapshot 无法解析：{exc}")
             return
         if not isinstance(snapshot_payload, Mapping):
-            errors.append("source snapshot is not an object")
+            errors.append("source snapshot 不是对象")
             return
         for plan_key, snapshot_key in (
             ("provider_kind", "provider_kind"),
@@ -368,9 +368,9 @@ class PlanValidator:
             value = _str(snapshot_payload.get(snapshot_key))
             planned = _str(source.get(plan_key))
             if not value or not planned:
-                errors.append(f"source snapshot missing {plan_key}")
+                errors.append(f"source snapshot 缺少 {plan_key}")
             elif value != planned:
-                errors.append(f"source snapshot {plan_key} does not match plan")
+                errors.append(f"source snapshot {plan_key} 与计划不一致")
 
         for plan_key, snapshot_key in (
             ("expected_file_count", "expected_file_count"),
@@ -380,10 +380,10 @@ class PlanValidator:
                 planned_value = int(verification.get(plan_key))
                 stored_value = int(snapshot_payload.get(snapshot_key))
             except (TypeError, ValueError):
-                errors.append(f"source snapshot {snapshot_key} metadata is invalid")
+                errors.append(f"source snapshot {snapshot_key} metadata 无效")
                 continue
             if planned_value < 0 or planned_value != stored_value:
-                errors.append(f"verification.{plan_key} does not match source snapshot")
+                errors.append(f"verification.{plan_key} 与 source snapshot 不一致")
 
         selection_payload = source.get("selection")
         snapshot_selection_payload = snapshot_payload.get("selection")
@@ -409,22 +409,22 @@ class PlanValidator:
                     _str(source.get("provider_kind")), snapshot_payload
                 )
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"source selection snapshot invalid: {exc}")
+            errors.append(f"source selection snapshot 无效：{exc}")
             return
         planned_hash = _str(source.get("selection_hash"))
         if selection_payload and not planned_selection.is_valid:
-            errors.append("source.selection hash is invalid")
+            errors.append("source.selection hash 无效")
         if selection_payload and planned_hash and planned_hash != planned_selection.selection_hash:
-            errors.append("source.selection_hash does not match source.selection")
+            errors.append("source.selection_hash 与 source.selection 不一致")
         if selection_payload and stored_selection.selection_hash != planned_selection.selection_hash:
-            errors.append("source selection differs from immutable source snapshot")
+            errors.append("source selection 与不可变 source snapshot 不一致")
         if snapshot_selection_payload and isinstance(snapshot_selection_payload, Mapping):
             stored_declared_hash = _str(
                 snapshot_selection_payload.get("selection_hash")
                 or snapshot_selection_payload.get("hash")
             )
             if stored_declared_hash and stored_declared_hash != stored_selection.selection_hash:
-                errors.append("stored source selection hash is invalid")
+                errors.append("存储的 source selection hash 无效")
 
     @staticmethod
     def _validate_verification(
@@ -489,16 +489,16 @@ class PlanValidator:
         if not expected_source:
             errors.append("source.search_source_id 缺失")
         elif _str(routing.get("search_source_id")) != expected_source:
-            errors.append("routing search_source_id does not match source")
+            errors.append("routing search_source_id 与 source 不一致")
         if _str(routing.get("category_key")) != category_key:
-            errors.append("routing category does not match plan")
+            errors.append("routing category 与计划不一致")
         routed_destination = _str(routing.get("destination_id"))
         if not routed_destination or routed_destination != _str(destination.get("id")):
-            errors.append("routing destination does not match plan")
+            errors.append("routing destination 与计划不一致")
         revision = _int_or(routing.get("assignment_revision"))
         assignment_id = _str(routing.get("assignment_id"))
         if not assignment_id or revision is None or revision <= 0:
-            errors.append("routing assignment revision is missing")
+            errors.append("routing assignment revision 缺失")
         elif expected_source and _str(routing.get("category_key")):
             expected_assignment_id = stable_assignment_id(
                 expected_source, _str(routing.get("category_key"))
@@ -522,7 +522,7 @@ class PlanValidator:
                 except Exception:  # noqa: BLE001
                     historical = None
                 if historical is None:
-                    errors.append("routing assignment revision does not exist")
+                    errors.append("routing assignment revision 不存在")
                 elif isinstance(historical, Mapping):
                     if (
                         _str(historical.get("search_source_id")) != expected_source
@@ -530,7 +530,7 @@ class PlanValidator:
                         or _str(historical.get("destination_id")) != _str(destination.get("id"))
                         or not bool(historical.get("enabled"))
                     ):
-                        errors.append("routing assignment revision identity mismatch")
+                        errors.append("routing assignment revision 身份不一致")
                 else:
                     # Dataclass implementations are accepted only when every
                     # frozen field is present; no current-row fallback.
@@ -540,7 +540,7 @@ class PlanValidator:
                         or _str(getattr(historical, "destination_id", "")) != _str(destination.get("id"))
                         or not bool(getattr(historical, "enabled", False))
                     ):
-                        errors.append("routing assignment revision identity mismatch")
+                        errors.append("routing assignment revision 身份不一致")
 
     # ---- 账号一致性 ----------------------------------------------------------
 
@@ -627,19 +627,19 @@ class PlanValidator:
             destination_caps = ProviderCapabilities(supports_rclone_dest=True)
 
         if source_form == "magnet" and strategy != STRATEGY_NATIVE_OFFLINE:
-            errors.append("magnet sources only support native_offline")
+            errors.append("磁链来源只支持 native_offline")
 
         if strategy == STRATEGY_NATIVE_SAVE:
             if source_provider != dest_provider:
-                errors.append("native_save requires the same source and destination Provider")
+                errors.append("native_save 要求来源与目标 Provider 一致")
             if source_form != "share":
-                errors.append("native_save requires a share source")
+                errors.append("native_save 要求分享来源")
             if category is None or category.native_locator is None:
-                errors.append("native_save requires a native destination locator")
+                errors.append("native_save 要求原生目标 locator")
             if not source_caps.supports_native_save:
-                errors.append("source Adapter does not advertise supports_native_save")
+                errors.append("来源 Adapter 未声明 supports_native_save")
             if not destination_caps.supports_native_save:
-                errors.append("destination Adapter does not advertise supports_native_save")
+                errors.append("目标 Adapter 未声明 supports_native_save")
             if source_adapter is not None and category is not None and category.native_locator is not None:
                 try:
                     decision = source_adapter.can_native_transfer(
@@ -648,7 +648,7 @@ class PlanValidator:
                         self._destination_account_ctx(destination),
                     )
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"native_save capability check failed: {exc}")
+                    errors.append(f"native_save 能力检查失败：{exc}")
                 else:
                     if not getattr(decision, "available", False):
                         errors.append(
@@ -656,53 +656,53 @@ class PlanValidator:
                         )
         elif strategy == STRATEGY_NATIVE_OFFLINE:
             if source_form not in {"magnet", "torrent"}:
-                errors.append("native_offline requires a magnet/torrent source")
+                errors.append("native_offline 要求磁链/种子来源")
             if source_form == "magnet" and _str(source.get("search_source_id")) != "sixpan_magnet":
-                errors.append("magnet source must use the sixpan_magnet search source")
+                errors.append("磁链来源必须使用 sixpan_magnet 搜索源")
             if dest_provider != "sixpan":
-                errors.append("native_offline destination must be sixpan")
+                errors.append("native_offline 目标必须是六盘")
             if category is None or category.native_locator is None:
-                errors.append("native_offline requires a native locator")
+                errors.append("native_offline 要求原生 locator")
             elif not _str(category.native_locator.kind) or not _str(
                 category.native_locator.value
             ):
-                errors.append("native_offline locator is incomplete")
+                errors.append("native_offline locator 不完整")
             if not _str(destination.get("account_id")) or _int_or(
                 destination.get("account_revision"), 0
             ) <= 0:
-                errors.append("native_offline requires a frozen sixpan account revision")
+                errors.append("native_offline 要求冻结的六盘账号 revision")
             if not destination_caps.supports_native_offline:
-                errors.append("destination Adapter does not advertise supports_native_offline")
+                errors.append("目标 Adapter 未声明 supports_native_offline")
         elif is_relay_upload_strategy(strategy):
             if dest_provider in {"local", "generic", "openlist_generic"}:
-                errors.append("Provider relay requires a registered Provider destination")
+                errors.append("Provider relay 要求已注册的 Provider 目标")
             if source_provider == dest_provider:
-                errors.append("same-provider transfers must use native_save")
+                errors.append("同 Provider 转存必须使用 native_save")
             if category is None or category.native_locator is None:
-                errors.append("Provider relay requires a native destination locator")
+                errors.append("Provider relay 要求原生目标 locator")
             if not destination_caps.supports_relay_upload:
-                errors.append("destination Adapter does not advertise supports_relay_upload")
+                errors.append("目标 Adapter 未声明 supports_relay_upload")
             elif destination_adapter is None or not callable(getattr(destination_adapter, "relay_uploader", None)):
-                errors.append("destination Adapter has no relay uploader factory")
+                errors.append("目标 Adapter 没有 relay uploader 工厂")
             elif destination_adapter.relay_uploader() is None:
-                errors.append("destination Adapter relay uploader is unavailable")
+                errors.append("目标 Adapter relay uploader 不可用")
             if not source_caps.supports_source_materialization:
-                errors.append("source Adapter does not advertise supports_source_materialization")
+                errors.append("来源 Adapter 未声明 supports_source_materialization")
         elif strategy == STRATEGY_RCLONE_COPY:
             if category is None or category.rclone_locator is None:
-                errors.append("rclone_copy requires an rclone or local destination locator")
+                errors.append("rclone_copy 要求 rclone 或本地目标 locator")
             if source_form == "magnet":
-                errors.append("magnet sources cannot use rclone_copy")
+                errors.append("磁链来源不能使用 rclone_copy")
             if dest_provider in {"mobile", "tianyi"}:
                 errors.append(
                     "rclone_copy cannot write Mobile or Tianyi targets; use Provider API relay"
                 )
             if not source_caps.supports_source_materialization:
-                errors.append("source Adapter does not advertise supports_source_materialization")
+                errors.append("来源 Adapter 未声明 supports_source_materialization")
             if dest_provider not in {"local", "generic", "openlist_generic"} and not destination_caps.supports_rclone_dest:
-                errors.append("destination Adapter does not advertise supports_rclone_dest")
+                errors.append("目标 Adapter 未声明 supports_rclone_dest")
         elif strategy:
-            errors.append("unknown transfer strategy")
+            errors.append("未知转存策略")
 
     def _adapter(self, provider_kind: str, errors: list[str], role: str) -> Any:
         try:
@@ -776,24 +776,24 @@ class PlanValidator:
             namespace = _str(ref.get("namespace_id"))
             path = _str(ref.get("path"))
             if not namespace or not path:
-                errors.append(f"paths.{label} missing namespace_id/path")
+                errors.append(f"paths.{label} 缺少 namespace_id/path")
                 continue
             if not path_is_safe(path):
-                errors.append(f"paths.{label} path is unsafe")
+                errors.append(f"paths.{label} 路径不安全")
             inferred_kind = namespace_kind(namespace)
             declared_kind = _str(ref.get("kind"))
             if strict_v1_paths and not declared_kind:
-                errors.append(f"paths.{label} must explicitly declare kind")
+                errors.append(f"paths.{label} 必须显式声明 kind")
             kind = declared_kind or inferred_kind
             if kind == "relay":
                 if inferred_kind != "local":
-                    errors.append(f"paths.{label} relay must use a local namespace")
+                    errors.append(f"paths.{label} relay 必须使用本地命名空间")
             elif kind not in {"openlist", "local", "native"}:
-                errors.append(f"paths.{label} kind is unsupported")
+                errors.append(f"paths.{label} kind 不受支持")
             elif declared_kind and inferred_kind != kind:
-                errors.append(f"paths.{label} kind does not match namespace")
+                errors.append(f"paths.{label} kind 与命名空间不一致")
             if inferred_kind == "openlist" and split_openlist_namespace(namespace) is None:
-                errors.append(f"paths.{label} openlist namespace is malformed")
+                errors.append(f"paths.{label} openlist 命名空间格式不合法")
             valid_refs.append((label, namespace, path, kind))
 
         # Validate strategy-specific path kinds before mount checks.
@@ -825,7 +825,7 @@ class PlanValidator:
                 continue
             actual = _str(ref.get("kind")) or namespace_kind(ref.get("namespace_id"))
             if actual not in allowed:
-                errors.append(f"paths.{label} kind must be one of {sorted(allowed)}")
+                errors.append(f"paths.{label} kind 必须是 {sorted(allowed)} 之一")
 
         identity_refs = [
             self._storage_identity_ref(label, namespace, path, bindings)
@@ -855,7 +855,7 @@ class PlanValidator:
             if not is_relay_upload_strategy(strategy):
                 errors.append("paths.local_temp 只允许 Provider relay 使用")
             if strict_v1_paths and _str(local_temp.get("kind")) != "relay":
-                errors.append("paths.local_temp must explicitly declare kind=relay")
+                errors.append("paths.local_temp 必须显式声明 kind=relay")
             if not local_temp_namespace or namespace_kind(local_temp_namespace) != "local":
                 errors.append("paths.local_temp 必须位于 local 命名空间")
             if local_temp_namespace and local_temp_namespace != "local:relay":
@@ -931,32 +931,32 @@ class PlanValidator:
         destination_mount_id = _str(bindings.get("destination_mount_id"))
         if source_landing:
             if not source_mount_id:
-                errors.append("source_landing missing source mount binding")
+                errors.append("source_landing 缺少来源 mount 绑定")
             else:
                 revision = _int_or(bindings.get("source_mount_revision"), 0)
                 frozen_mount = self._frozen_mount(source_mount_id, revision)
                 if frozen_mount is None:
-                    errors.append(f"source mount revision does not exist: {source_mount_id}@{revision}")
+                    errors.append(f"来源 mount revision 不存在：{source_mount_id}@{revision}")
                 else:
                     if not bool(frozen_mount.get("readable", True)):
-                        errors.append("source mount revision is not readable")
+                        errors.append("来源 mount revision 不可读")
                     mount_provider = _str(frozen_mount.get("provider_kind"))
                     if mount_provider and mount_provider != source_provider:
-                        errors.append("source mount Provider does not match plan source")
+                        errors.append("来源 mount Provider 与计划来源不一致")
                     mount_account = _str(frozen_mount.get("account_id"))
                     if mount_account and mount_account != source_account_id:
-                        errors.append("source mount account does not match plan source")
+                        errors.append("来源 mount 账号与计划来源不一致")
                     if _str(bindings.get("source_mount_storage_identity_id")) != _str(
                         frozen_mount.get("storage_identity_id")
                     ):
-                        errors.append("source mount storage identity does not match revision")
+                        errors.append("来源 mount 存储身份与 revision 不一致")
                     if normalize_path(bindings.get("source_mount_identity_root")) != normalize_path(
                         frozen_mount.get("identity_root")
                     ):
-                        errors.append("source mount identity root does not match revision")
+                        errors.append("来源 mount identity root 与 revision 不一致")
                     expected_namespace = _str(bindings.get("source_mount_namespace_id")) or self._mount_namespace(source_mount_id, frozen_mount)
                     if expected_namespace and expected_namespace != _str(source_landing.get("namespace_id")):
-                        errors.append("source landing namespace does not match frozen mount")
+                        errors.append("source landing 命名空间与冻结 mount 不一致")
                     self._validate_path_mount_identity(
                         source_landing,
                         role="source landing",
@@ -973,7 +973,7 @@ class PlanValidator:
                     frozen_locator = _mapping(frozen_mount.get("native_locator"))
                     plan_locator = _mapping(bindings.get("source_native_locator"))
                     if not plan_locator.get("kind") or not plan_locator.get("value"):
-                        errors.append("source landing is missing frozen Provider locator")
+                        errors.append("source landing 缺少冻结 Provider locator")
                     elif not frozen_locator:
                         errors.append("source mount revision 缺少 Provider locator")
                     # ``native_locator`` also stores probe evidence such as
@@ -987,17 +987,17 @@ class PlanValidator:
                         "kind": _str(frozen_locator.get("kind")),
                         "value": _str(frozen_locator.get("value")),
                     }:
-                        errors.append("source Provider locator does not match mount revision")
+                        errors.append("来源 Provider locator 与 mount revision 不一致")
                     source_connection_id = _str(bindings.get("source_connection_id"))
                     source_connection_revision = _int_or(
                         bindings.get("source_connection_revision"), 0
                     )
                     if source_connection_id != _str(frozen_mount.get("connection_id")):
-                        errors.append("source connection id does not match mount revision")
+                        errors.append("来源 connection id 与 mount revision 不一致")
                     if source_connection_revision != _int_or(
                         frozen_mount.get("connection_revision"), 0
                     ):
-                        errors.append("source connection revision does not match mount revision")
+                        errors.append("来源 connection revision 与 mount revision 不一致")
                     service = getattr(self.mount_service, "connection_service", None)
                     if (
                         not source_connection_id
@@ -1008,38 +1008,38 @@ class PlanValidator:
                         )
                         is None
                     ):
-                        errors.append("source OpenList connection revision does not exist")
+                        errors.append("来源 OpenList connection revision 不存在")
 
         staging_kind = namespace_kind(staging.get("namespace_id")) if staging else ""
         if strategy == STRATEGY_RCLONE_COPY and staging:
             if staging_kind == "openlist":
                 if not destination_mount_id:
-                    errors.append("destination staging missing destination mount binding")
+                    errors.append("destination staging 缺少目标 mount 绑定")
                 else:
                     revision = _int_or(bindings.get("destination_mount_revision"), 0)
                     frozen_mount = self._frozen_mount(destination_mount_id, revision)
                     if frozen_mount is None:
-                        errors.append(f"destination mount revision does not exist: {destination_mount_id}@{revision}")
+                        errors.append(f"目标 mount revision 不存在：{destination_mount_id}@{revision}")
                     else:
                         if not bool(frozen_mount.get("writable", True)):
-                            errors.append("destination mount revision is not writable")
+                            errors.append("目标 mount revision 不可写")
                         mount_provider = _str(frozen_mount.get("provider_kind"))
                         if mount_provider and mount_provider != dest_provider:
-                            errors.append("destination mount Provider does not match plan target")
+                            errors.append("目标 mount Provider 与计划目标不一致")
                         mount_account = _str(frozen_mount.get("account_id"))
                         if mount_account and mount_account != dest_account_id:
-                            errors.append("destination mount account does not match plan target")
+                            errors.append("目标 mount 账号与计划目标不一致")
                         if _str(bindings.get("destination_mount_storage_identity_id")) != _str(
                             frozen_mount.get("storage_identity_id")
                         ):
-                            errors.append("destination mount storage identity does not match revision")
+                            errors.append("目标 mount 存储身份与 revision 不一致")
                         if normalize_path(
                             bindings.get("destination_mount_identity_root")
                         ) != normalize_path(frozen_mount.get("identity_root")):
-                            errors.append("destination mount identity root does not match revision")
+                            errors.append("目标 mount identity root 与 revision 不一致")
                         expected_namespace = _str(bindings.get("destination_mount_namespace_id")) or self._mount_namespace(destination_mount_id, frozen_mount)
                         if expected_namespace and expected_namespace != _str(staging.get("namespace_id")):
-                            errors.append("destination staging namespace does not match frozen mount")
+                            errors.append("destination staging 命名空间与冻结 mount 不一致")
                         self._validate_path_mount_identity(
                             staging,
                             role="destination staging",
@@ -1056,19 +1056,19 @@ class PlanValidator:
                         connection_id = _str(bindings.get("destination_connection_id"))
                         connection_revision = _int_or(bindings.get("destination_connection_revision"), 0)
                         if connection_id != _str(frozen_mount.get("connection_id")):
-                            errors.append("destination connection id does not match mount revision")
+                            errors.append("目标 connection id 与 mount revision 不一致")
                         if connection_revision != _int_or(
                             frozen_mount.get("connection_revision"), 0
                         ):
-                            errors.append("destination connection revision does not match mount revision")
+                            errors.append("目标 connection revision 与 mount revision 不一致")
                         service = getattr(self.mount_service, "connection_service", None)
                         if not connection_id or service is None or not service.get_revision(connection_id, connection_revision):
-                            errors.append("destination OpenList connection revision does not exist")
+                            errors.append("目标 OpenList connection revision 不存在")
             elif staging_kind == "local":
                 if destination_mount_id:
-                    errors.append("local destination must not bind an OpenList mount")
+                    errors.append("本地目标不得绑定 OpenList mount")
             elif staging_kind == "native":
-                errors.append("rclone_copy staging cannot use native namespace")
+                errors.append("rclone_copy 暂存不能使用 native 命名空间")
 
         # Provider-neutral relay plans freeze the destination mount even though
         # the final write uses a native locator.  That immutable revision is the
@@ -1077,7 +1077,7 @@ class PlanValidator:
         # unbound historical relay plan.
         if strategy == STRATEGY_RELAY_UPLOAD_PROVIDER:
             if not destination_mount_id:
-                errors.append("Provider relay missing destination mount binding")
+                errors.append("Provider relay 缺少目标 mount 绑定")
             else:
                 revision = _int_or(bindings.get("destination_mount_revision"), 0)
                 frozen_mount = self._frozen_mount(destination_mount_id, revision)
@@ -1089,37 +1089,37 @@ class PlanValidator:
                 else:
                     native_locator = _mapping(frozen_mount.get("native_locator"))
                     if _str(frozen_mount.get("provider_kind")) != dest_provider:
-                        errors.append("destination mount Provider does not match plan target")
+                        errors.append("目标 mount Provider 与计划目标不一致")
                     if _str(frozen_mount.get("account_id")) != dest_account_id:
-                        errors.append("destination mount account does not match plan target")
+                        errors.append("目标 mount 账号与计划目标不一致")
                     if not bool(frozen_mount.get("readable")):
-                        errors.append("Provider relay destination mount is not readable")
+                        errors.append("Provider relay 目标 mount 不可读")
                     if not bool(native_locator.get("upload_verified")):
-                        errors.append("Provider relay destination mount has no native upload proof")
+                        errors.append("Provider relay 目标 mount 缺少原生上传能力探测")
                     if not bool(native_locator.get("organizer_mutation_verified")):
-                        errors.append("Provider relay destination mount has no organizer mutation proof")
+                        errors.append("Provider relay 目标 mount 缺少 Organizer 整理能力探测")
                     if _str(bindings.get("destination_mount_storage_identity_id")) != _str(
                         frozen_mount.get("storage_identity_id")
                     ):
-                        errors.append("destination mount storage identity does not match revision")
+                        errors.append("目标 mount 存储身份与 revision 不一致")
                     if normalize_path(
                         bindings.get("destination_mount_identity_root")
                     ) != normalize_path(frozen_mount.get("identity_root")):
-                        errors.append("destination mount identity root does not match revision")
+                        errors.append("目标 mount identity root 与 revision 不一致")
                     if _str(bindings.get("destination_mount_namespace_id")) != _str(
                         frozen_mount.get("namespace_id")
                     ):
-                        errors.append("destination mount namespace does not match revision")
+                        errors.append("目标 mount 命名空间与 revision 不一致")
                     connection_id = _str(bindings.get("destination_connection_id"))
                     connection_revision = _int_or(
                         bindings.get("destination_connection_revision"), 0
                     )
                     if connection_id != _str(frozen_mount.get("connection_id")):
-                        errors.append("destination connection id does not match mount revision")
+                        errors.append("目标 connection id 与 mount revision 不一致")
                     if connection_revision != _int_or(
                         frozen_mount.get("connection_revision"), 0
                     ):
-                        errors.append("destination connection revision does not match mount revision")
+                        errors.append("目标 connection revision 与 mount revision 不一致")
                     service = getattr(self.mount_service, "connection_service", None)
                     if (
                         not connection_id
@@ -1127,23 +1127,23 @@ class PlanValidator:
                         or service is None
                         or service.get_revision(connection_id, connection_revision) is None
                     ):
-                        errors.append("destination OpenList connection revision does not exist")
+                        errors.append("目标 OpenList connection revision 不存在")
 
         # For an OpenList rclone final path, the frozen destination mount is
         # the same one used by staging.  Requiring this explicitly prevents a
         # tampered plan from copying into a different mount after validation.
         if strategy == STRATEGY_RCLONE_COPY and final and namespace_kind(final.get("namespace_id")) == "openlist":
             if not destination_mount_id:
-                errors.append("destination final missing destination mount binding")
+                errors.append("destination final 缺少目标 mount 绑定")
             else:
                 revision = _int_or(bindings.get("destination_mount_revision"), 0)
                 frozen_mount = self._frozen_mount(destination_mount_id, revision)
                 if frozen_mount is None:
-                    errors.append(f"destination mount revision does not exist: {destination_mount_id}@{revision}")
+                    errors.append(f"目标 mount revision 不存在：{destination_mount_id}@{revision}")
                 else:
                     expected_namespace = _str(bindings.get("destination_mount_namespace_id")) or self._mount_namespace(destination_mount_id, frozen_mount)
                     if expected_namespace and expected_namespace != _str(final.get("namespace_id")):
-                        errors.append("destination final namespace does not match frozen mount")
+                        errors.append("destination final 命名空间与冻结 mount 不一致")
                     self._validate_path_mount_identity(
                         final,
                         role="destination final",
@@ -1158,12 +1158,12 @@ class PlanValidator:
                         errors=errors,
                     )
             if staging and namespace_kind(staging.get("namespace_id")) == "openlist" and _str(staging.get("namespace_id")) != _str(final.get("namespace_id")):
-                errors.append("destination staging/final namespace must match")
+                errors.append("destination staging/final 命名空间必须一致")
         elif strategy == STRATEGY_RCLONE_COPY and staging and final:
             # Local rclone plans also freeze one target namespace for both
             # legs; do not let a caller mix two local namespaces.
             if namespace_kind(staging.get("namespace_id")) == "local" and namespace_kind(final.get("namespace_id")) == "local" and _str(staging.get("namespace_id")) != _str(final.get("namespace_id")):
-                errors.append("local destination staging/final namespace must match")
+                errors.append("本地目标 staging/final 命名空间必须一致")
 
         if strategy in {STRATEGY_NATIVE_SAVE, STRATEGY_NATIVE_OFFLINE}:
             if source_mount_id:
@@ -1203,12 +1203,12 @@ class PlanValidator:
             if not isinstance(locator, NativeLocator) or not final:
                 return
             if _str(final.get("locator_kind")) and _str(final.get("locator_kind")) != _str(locator.kind):
-                errors.append("destination_final locator kind does not match target category")
+                errors.append("destination_final locator kind 与目标分类不一致")
             if normalize_path(final.get("path")) != normalize_path(locator.value):
-                errors.append("destination_final path does not match target category")
+                errors.append("destination_final path 与目标分类不一致")
             expected_namespace = f"native:{_str(destination.get('provider_kind'))}:{_str(destination.get('id'))}"
             if _str(final.get("namespace_id")) != expected_namespace:
-                errors.append("destination_final native namespace does not match target")
+                errors.append("destination_final native 命名空间与目标不一致")
             if is_relay_upload_strategy(strategy):
                 openlist_locator = getattr(category, "organizer_locator", None)
                 if openlist_locator is None:
@@ -1220,11 +1220,11 @@ class PlanValidator:
                 frozen_mount_id = _str(bindings.get("destination_mount_id"))
                 frozen_connection_id = _str(bindings.get("destination_connection_id"))
                 if strategy == STRATEGY_RELAY_UPLOAD_PROVIDER and not locator_mount_id:
-                    errors.append("Provider relay target category has no OpenList mount locator")
+                    errors.append("Provider relay 目标分类缺少 OpenList mount locator")
                 if locator_mount_id and frozen_mount_id != locator_mount_id:
-                    errors.append("destination mount does not match target category")
+                    errors.append("目标 mount 与目标分类不一致")
                 if locator_connection_id and frozen_connection_id != locator_connection_id:
-                    errors.append("destination connection does not match target category")
+                    errors.append("目标 connection 与目标分类不一致")
             return
 
         if strategy != STRATEGY_RCLONE_COPY:
@@ -1244,18 +1244,18 @@ class PlanValidator:
             # Do not require a derived path when called directly without the
             # plan id; the full validate() path always sets this context.
             if _str(final.get("namespace_id")) != expected_namespace:
-                errors.append("destination_final namespace does not match target rclone locator")
+                errors.append("destination_final 命名空间与目标 rclone locator 不一致")
             if expected_final and normalize_path(final.get("path")) != expected_final:
-                errors.append("destination_final path does not match target rclone locator")
+                errors.append("destination_final path 与目标 rclone locator 不一致")
         elif isinstance(locator, LocalLocator):
             expected_namespace = f"local:{_str(destination.get('id'))}"
             root = normalize_path(locator.root)
             relative = normalize_path(f"{root}/{locator.relative_path}") if locator.relative_path else root
             expected_final = normalize_path(f"{relative}/{task_leaf}") if task_leaf else ""
             if _str(final.get("namespace_id")) != expected_namespace:
-                errors.append("destination_final namespace does not match target local locator")
+                errors.append("destination_final 命名空间与目标本地 locator 不一致")
             if expected_final and normalize_path(final.get("path")) != expected_final:
-                errors.append("destination_final path does not match target local locator")
+                errors.append("destination_final path 与目标本地 locator 不一致")
 
         # Staging is always derived from the category key and job id.  It is
         # intentionally checked only when a descriptor exists; the strategy
@@ -1274,7 +1274,7 @@ class PlanValidator:
                     f"/{STAGING_DIR}/{category_key}/{task_leaf}"
                 )
             if normalize_path(staging.get("path")) != expected_staging:
-                errors.append("destination_staging path does not match frozen task contract")
+                errors.append("destination_staging path 与冻结任务契约不一致")
 
     @staticmethod
     def _validate_path_mount_identity(
@@ -1394,18 +1394,18 @@ class PlanValidator:
             return
         organizer = _mapping(paths.get("organizer"))
         if not organizer:
-            errors.append("Organizer enabled but plan has no organizer path")
+            errors.append("已启用 Organizer 但计划缺少 organizer path")
             return
         namespace = _str(organizer.get("namespace_id"))
         path = _str(organizer.get("path"))
         if not namespace or not path:
-            errors.append("organizer path is incomplete")
+            errors.append("organizer path 不完整")
         if not path_is_safe(path):
-            errors.append("organizer path is unsafe")
+            errors.append("organizer path 不安全")
         if _str(organizer.get("kind")) not in {"", "openlist"}:
-            errors.append("organizer path kind must be openlist")
+            errors.append("organizer path kind 必须是 openlist")
         if namespace_kind(namespace) != "openlist":
-            errors.append("organizer must use an openlist namespace")
+            errors.append("organizer 必须使用 openlist 命名空间")
         mount_id = _str(bindings.get("organizer_mount_id"))
         mount_revision = _int_or(bindings.get("organizer_mount_revision"), 0)
         frozen_mount: dict[str, Any] | None = None
@@ -1482,7 +1482,7 @@ class PlanValidator:
 
         locator = getattr(category, "organizer_locator", None) if category is not None else None
         if locator is None:
-            errors.append("Organizer enabled but target category has no organizer locator")
+            errors.append("已启用 Organizer 但目标分类缺少 organizer locator")
         else:
             if _str(getattr(locator, "mount_id", "")) != mount_id:
                 errors.append("Organizer mount 与目标分类 locator 不一致")
@@ -1495,7 +1495,7 @@ class PlanValidator:
         job = job_dir(_int_or(plan.get("job_id"), 0))
         if staging and staging_kind == "openlist":
             if path_leaf(path) != job:
-                errors.append("organizer path is not task-scoped")
+                errors.append("organizer path 不是任务级目录")
         elif staging and staging_kind == "native":
             # 原生入库暂存链路：Organizer 的扫描根是 OpenList 侧看到的、与分类
             # 目录同级的「分类父目录/_入库暂存/分类名/job-N」，搬运目标则是单独
@@ -1510,7 +1510,7 @@ class PlanValidator:
             elif _str(organizer_final.get("namespace_id")) != _str(organizer.get("namespace_id")):
                 errors.append("paths.organizer_final 必须与 paths.organizer 同命名空间")
             if path_leaf(path) != job:
-                errors.append("organizer path is not task-scoped")
+                errors.append("organizer path 不是任务级目录")
             if final_path and normalize_path(path) != normalize_path(
                 native_staging_path(final_path, job)
             ):
@@ -1525,7 +1525,7 @@ class PlanValidator:
         else:
             final = _mapping(paths.get("destination_final"))
             if (_str(final.get("kind")) or namespace_kind(final.get("namespace_id"))) != "native":
-                errors.append("native strategy organizer mapping is not verifiable")
+                errors.append("native 策略的 Organizer 映射无法复核")
             elif locator is not None and normalize_path(path) != locator_absolute(
                 getattr(locator, "path", "")
             ):

@@ -241,7 +241,7 @@ class NativeStagingMappingBoundaryTests(unittest.TestCase):
                 "mappings": [{"id": 91, **_video_mapping(), "target_path": target_path}],
             }
             with self.subTest(target_path=target_path), self.assertRaisesRegex(
-                OpenListError, "target path escaped frozen destination_final"
+                OpenListError, "越出冻结 destination_final"
             ):
                 service._validate_v1_mapping_boundaries(task)
 
@@ -259,7 +259,7 @@ class NativeStagingMappingBoundaryTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(
-            OpenListError, "target path escaped frozen destination_final"
+            OpenListError, "越出冻结 destination_final"
         ):
             service._validate_v1_mapping_boundaries(task)
 
@@ -277,7 +277,7 @@ class NativeStagingMappingBoundaryTests(unittest.TestCase):
                 "mappings": [{"id": 91, **_video_mapping(), "source_path": source_path}],
             }
             with self.subTest(source_path=source_path), self.assertRaisesRegex(
-                OpenListError, "source path escaped frozen organizer root"
+                OpenListError, "越出冻结 organizer root"
             ):
                 service._validate_v1_mapping_boundaries(task)
 
@@ -370,7 +370,7 @@ class NativeStagingApplyGuardTests(unittest.TestCase):
                 **_video_mapping(),
                 "target_path": "/其它挂载/电影/流浪地球 (2019)/流浪地球 (2019).mkv",
             },
-            "target path escaped frozen destination_final",
+            "越出冻结 destination_final",
         )
 
     def test_apply_rejects_source_taken_from_the_final_category_root(self) -> None:
@@ -379,13 +379,13 @@ class NativeStagingApplyGuardTests(unittest.TestCase):
                 **_video_mapping(),
                 "source_path": f"{FINAL_ROOT}/已入库资源/旧文件.mkv",
             },
-            "source path escaped frozen organizer root",
+            "越出冻结 organizer root",
         )
 
     def test_apply_rejects_the_staging_root_itself_as_a_file(self) -> None:
         self._assert_apply_rejects_mapping(
             {**_video_mapping(), "source_path": STAGING_ROOT},
-            "source path escaped frozen organizer root",
+            "越出冻结 organizer root",
         )
 
 

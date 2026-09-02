@@ -654,7 +654,7 @@ class StorageSetupV1Tests(unittest.TestCase):
             "upload_verified": False,
             "organizer_mutation_verified": False,
             "code": "AUTH_EXPIRED",
-            "message": "Cloud189 authentication expired",
+            "message": "天翼云登录已过期",
         }
 
         with self.assertRaises(StorageSetupError) as raised:
@@ -2024,7 +2024,7 @@ class OpenListMutationObserverTests(unittest.TestCase):
 
         self.assertFalse(result["organizer_mutation_verified"])
         self.assertFalse(result["deleted"])
-        self.assertIn("did not expose the native probe file", result["message"])
+        self.assertIn("未暴露原生探测文件", result["message"])
 
     def test_probe_file_visible_to_openlist_passes_and_is_cleaned(self) -> None:
         self.webdav.dirs.add("/天翼")

@@ -27,7 +27,7 @@ def _safe_provider_message(exc: BaseException) -> str:
     """Return a useful provider error without echoing credentials or URLs."""
     import re
 
-    value = str(exc or "").strip() or "Provider authentication failed"
+    value = str(exc or "").strip() or "Provider 认证失败"
     # requests exceptions may include a complete URL containing redirect
     # tickets, tokens, or query parameters.  Keep only the endpoint path.
     value = re.sub(r"https?://[^\s]+", "provider endpoint", value, flags=re.IGNORECASE)

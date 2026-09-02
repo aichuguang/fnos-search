@@ -1115,7 +1115,7 @@ class TianyiImporterTests(unittest.TestCase):
                 raise ValueError("not json")
 
         value = self.importer._response_payload(
-            Response(), "Cloud189 PC API", stage="provider_request"
+            Response(), "天翼云 PC 接口", stage="provider_request"
         )
         self.assertEqual(value["code"], "InvalidSessionKey")
         self.assertEqual(value["message"], "session expired")

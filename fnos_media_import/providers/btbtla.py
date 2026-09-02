@@ -299,7 +299,7 @@ class BtbtlaClient:
             "meta": meta,
             "items": [resource.__dict__ for resource in resources],
             "recommended": resources[0].__dict__ if resources else {},
-            "message": "BT download resources loaded" if resources else "No downloadable BT resources found",
+            "message": "已读取 BT 下载资源" if resources else "暂无资源",
         }
 
     def resolve_magnet(self, detail_url: str, *, resource_id: str = "", resource_url: str = "") -> dict[str, Any]:
@@ -322,7 +322,7 @@ class BtbtlaClient:
         html_text = self._get_text(tdown_url)
         magnet = _extract_magnet(html_text)
         if not magnet:
-            raise ValueError("Download page did not contain a magnet link")
+            raise ValueError("下载页未找到磁力链接")
         link = detect_link(magnet)
         return {
             "success": True,

@@ -154,11 +154,11 @@ class TransferExecutionRepository:
         if execution.phase in TERMINAL_PHASES and next_phase != execution.phase:
             if execution.phase in IMMUTABLE_TERMINAL_PHASES:
                 raise ExecutionConflictError(
-                    f"immutable terminal execution cannot transition: {execution.phase} -> {next_phase}"
+                    f"不可变的终态执行不能迁移：{execution.phase} -> {next_phase}"
                 )
             if not operator_recovery or execution.phase not in OPERATOR_RECOVERABLE_PHASES:
                 raise ExecutionConflictError(
-                    f"terminal execution requires operator recovery: {execution.phase} -> {next_phase}"
+                    f"终态执行需要人工恢复：{execution.phase} -> {next_phase}"
                 )
         _validate_claim_owner(execution, claim_owner_id)
         receipt_value = snapshot.get("receipt")
@@ -211,7 +211,7 @@ class TransferExecutionRepository:
                 )
                 if require_job_status_transition and not job_updated:
                     raise ExecutionConflictError(
-                        "job status changed before external submission fence was acquired"
+                        "外部提交 fence 获取前任务状态已变化"
                     )
         latest = self.get(execution.job_id)
         if latest is None:
@@ -255,7 +255,7 @@ class TransferExecutionRepository:
 
         owner = str(owner_id or "").strip()
         if not owner:
-            raise ValueError("owner_id is required")
+            raise ValueError("缺少 owner_id")
         execution = self.get(job_id)
         if execution is None or execution.phase in TERMINAL_PHASES:
             return None
@@ -282,7 +282,7 @@ class TransferExecutionRepository:
 
         owner = str(owner_id or "").strip()
         if not owner:
-            raise ValueError("owner_id is required")
+            raise ValueError("缺少 owner_id")
         now = utc_now_iso()
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -327,7 +327,7 @@ class TransferExecutionRepository:
         if execution.phase in IMMUTABLE_TERMINAL_PHASES:
             raise ExecutionConflictError(f"{execution.phase} execution cannot be recovered")
         if execution.phase == PHASE_MANUAL_REVIEW:
-            raise ExecutionConflictError("manual_review requires recover_manual_review()")
+            raise ExecutionConflictError("manual_review 状态必须通过 recover_manual_review() 恢复")
         if execution.phase != PHASE_FAILED:
             snapshot = dict(execution.snapshot)
             snapshot.update({"retry_ready": False, "error_code": "", "message": ""})
@@ -356,7 +356,7 @@ class TransferExecutionRepository:
         if execution is None:
             raise ExecutionConflictError("执行状态不存在")
         if execution.phase != PHASE_MANUAL_REVIEW:
-            raise ExecutionConflictError("execution is not awaiting manual review")
+            raise ExecutionConflictError("执行不在人工审核状态")
         snapshot = dict(execution.snapshot)
         recovered_phase = self._recovery_phase(
             execution,
@@ -384,7 +384,7 @@ class TransferExecutionRepository:
             and str(fence.get("state") or "").strip().lower() in {"prepared", "committed"}
         ):
             raise ExecutionConflictError(
-                f"submission fence exists but receipt is missing for {resume_phase}"
+                f"提交 fence 已存在但缺少 {resume_phase} 的回执"
             )
         phase_attempts = (
             dict(snapshot.get("phase_attempts"))
@@ -437,12 +437,12 @@ class TransferExecutionRepository:
         if not phase:
             if execution.receipt is not None:
                 raise ExecutionConflictError(
-                    "execution receipt exists but recovery phase is unknown"
+                    "执行已有回执但恢复阶段未知"
                 )
             return PHASE_PLANNING
         _validate_phase_name(phase)
         if phase in TERMINAL_PHASES or phase in {PHASE_RETRY_WAIT, "cancel_pending"}:
-            raise ExecutionConflictError(f"invalid operator recovery phase: {phase}")
+            raise ExecutionConflictError(f"非法的人工恢复阶段：{phase}")
         return phase
 
 
@@ -484,14 +484,14 @@ def _optional_object(value: Any) -> dict[str, Any] | None:
 
 def _validate_phase_name(phase: str) -> None:
     if phase not in _ALLOWED_PHASE_TRANSITIONS:
-        raise ExecutionConflictError(f"unknown transfer execution phase: {phase}")
+        raise ExecutionConflictError(f"未知的传输执行阶段：{phase}")
 
 
 def _validate_transition(current: str, next_phase: str) -> None:
     _validate_phase_name(current)
     _validate_phase_name(next_phase)
     if next_phase not in _ALLOWED_PHASE_TRANSITIONS[current]:
-        raise ExecutionConflictError(f"illegal transfer phase transition: {current} -> {next_phase}")
+        raise ExecutionConflictError(f"非法的阶段迁移：{current} -> {next_phase}")
 
 
 def _operation_key(value: Any) -> str:
@@ -561,11 +561,11 @@ def _validate_receipt_fence(
         transition = (execution.phase, next_phase)
         if transition not in _RECEIPT_CLEAR_TRANSITIONS:
             raise ExecutionConflictError(
-                f"receipt cannot be cleared during {execution.phase} -> {next_phase}"
+                f"{execution.phase} -> {next_phase} 期间不能清除回执"
             )
     if old_key and new_key and old_key != new_key:
         raise ExecutionConflictError(
-            f"receipt operation key changed for job {execution.job_id}: {old_key} -> {new_key}"
+            f"任务 {execution.job_id} 的回执 operation_key 已变化：{old_key} -> {new_key}"
         )
     fence = snapshot.get("submission_fence")
     if isinstance(fence, dict):
@@ -576,7 +576,7 @@ def _validate_receipt_fence(
         # prepared fence; the old implementation did exactly that and made the
         # first rclone receipt impossible to save.
         if new_key and fence_key and not (_operation_key_aliases(receipt) & _operation_key_aliases(fence)):
-            raise ExecutionConflictError("receipt does not match submission fence")
+            raise ExecutionConflictError("回执与提交 fence 不匹配")
 
 
 def _next_attempts(execution: TransferExecution, snapshot: dict[str, Any]) -> int:
@@ -584,10 +584,10 @@ def _next_attempts(execution: TransferExecution, snapshot: dict[str, Any]) -> in
     try:
         value = int(raw)
     except (TypeError, ValueError) as exc:
-        raise ExecutionConflictError("execution attempt must be an integer") from exc
+        raise ExecutionConflictError("执行尝试次数必须是整数") from exc
     if value < execution.attempts:
         raise ExecutionConflictError(
-            f"execution attempt cannot move backwards: {execution.attempts} -> {value}"
+            f"执行尝试次数不能回退：{execution.attempts} -> {value}"
         )
     return value
 
@@ -598,10 +598,10 @@ def _validate_claim_owner(execution: TransferExecution, owner_id: str | None) ->
     claim = execution.snapshot.get("claim") if isinstance(execution.snapshot.get("claim"), dict) else {}
     current_owner = str(claim.get("owner_id") or "").strip()
     if not current_owner:
-        raise ExecutionConflictError("execution is not claimed by a Worker")
+        raise ExecutionConflictError("执行未被任何 Worker 认领")
     if current_owner != str(owner_id or "").strip():
         raise ExecutionConflictError(
-            f"execution claim owner mismatch: {current_owner} != {owner_id}"
+            f"执行认领者不匹配：{current_owner} != {owner_id}"
         )
 
 

@@ -1263,7 +1263,7 @@ class OrganizerService:
         job = guarded_job
         organizer_root = self._plan_path_text(v1_plan or {}, "organizer")
         if not organizer_root:
-            return {"success": False, "skipped": True, "manual_review": True, "message": "V1 execution_plan has no organizer path"}
+            return {"success": False, "skipped": True, "manual_review": True, "message": "V1 execution_plan 缺少 organizer path"}
         if not self.enabled:
             return {"success": True, "skipped": True, "message": "Organizer 未启用"}
         if not callable(getattr(self, "_openlist_client_resolver", None)):
@@ -1352,7 +1352,7 @@ class OrganizerService:
         job = guarded_job
         organizer_root = self._plan_path_text(v1_plan or {}, "organizer")
         if not organizer_root:
-            return {"success": False, "skipped": True, "manual_review": True, "message": "V1 execution_plan has no organizer path"}
+            return {"success": False, "skipped": True, "manual_review": True, "message": "V1 execution_plan 缺少 organizer path"}
         if not self.enabled:
             return {"success": True, "skipped": True, "message": "Organizer 未启用"}
         if not callable(getattr(self, "_openlist_client_resolver", None)):
@@ -1448,7 +1448,7 @@ class OrganizerService:
 
     def _get_or_create_organizer_task(self, *, job_id: int | None, **task_values: Any) -> tuple[int, bool]:
         if not _safe_positive_int(job_id):
-            raise JobPlanError("Organizer task creation requires a linked V1 import job")
+            raise JobPlanError("Organizer 任务缺少关联的 V1 导入任务")
         return self.db.organizer.get_or_create_organizer_task_for_job(
             job_id=int(job_id),
             **task_values,
@@ -1716,17 +1716,17 @@ class OrganizerService:
             try:
                 plan = self._validated_job_plan(job)
                 if not plan_requires_organizer(plan):
-                    raise JobPlanError("V1 execution_plan does not enable Organizer")
+                    raise JobPlanError("V1 execution_plan 未启用 Organizer")
                 if not self._plan_path_text(plan, "organizer"):
-                    raise JobPlanError("V1 execution_plan is missing paths.organizer")
+                    raise JobPlanError("V1 execution_plan 缺少 paths.organizer")
                 task_raw = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
                 task_ref = task_raw.get("execution_plan_ref") if isinstance(task_raw.get("execution_plan_ref"), dict) else {}
                 if str(task_ref.get("plan_hash") or "") != compute_persisted_plan_hash(plan):
-                    raise JobPlanError("Organizer task execution_plan_ref differs from linked job plan")
+                    raise JobPlanError("Organizer 任务 execution_plan_ref 与关联任务计划不一致")
                 task_category = str(task.get("category") or "").strip()
                 plan_category = str(plan.get("category") or "").strip()
                 if not task_category or task_category != plan_category:
-                    raise JobPlanError("Organizer task category differs from linked V1 plan")
+                    raise JobPlanError("Organizer 任务 category 与关联 V1 计划不一致")
             except (JobPlanError, TypeError, ValueError) as exc:
                 plan = None
                 error = exc
@@ -1786,11 +1786,11 @@ class OrganizerService:
         actual_scan = normalize_path(task.get("openlist_root_path") or "")
         if not expected_scan or actual_scan.casefold() != expected_scan.casefold():
             raise JobPlanError(
-                f"Organizer scan path does not match V1 execution_plan: task={actual_scan or '<empty>'}, plan={expected_scan or '<empty>'}"
+                f"Organizer 扫描路径与 V1 execution_plan 不一致：task={actual_scan or '<empty>'}, plan={expected_scan or '<empty>'}"
             )
         ref = plan_path(plan, "organizer")
         if not str(ref.get("namespace_id") or "").strip().lower().startswith("openlist:"):
-            raise JobPlanError("V1 paths.organizer must use an openlist namespace")
+            raise JobPlanError("V1 paths.organizer 必须使用 openlist 命名空间")
 
     def _v1_target_root(self, plan: dict[str, Any]) -> str:
         # 原生入库暂存链路会额外冻结 paths.organizer_final：Organizer 只能在
@@ -1802,7 +1802,7 @@ class OrganizerService:
             return organizer_final
         final_root = self._plan_path_text(plan, "destination_final")
         if not final_root or final_root == "/":
-            raise JobPlanError("V1 execution_plan is missing a valid paths.destination_final")
+            raise JobPlanError("V1 execution_plan 缺少有效的 paths.destination_final")
         return final_root
 
     def _guard_enqueue_job(
@@ -1824,13 +1824,13 @@ class OrganizerService:
         try:
             plan = self._validated_job_plan(candidate)
             if not plan_requires_organizer(plan):
-                raise JobPlanError("V1 execution_plan does not enable Organizer")
+                raise JobPlanError("V1 execution_plan 未启用 Organizer")
             ref = plan_path(plan, "organizer")
             if not str(ref.get("namespace_id") or "").strip() or not str(ref.get("path") or "").strip():
-                raise JobPlanError("V1 execution_plan is missing paths.organizer")
+                raise JobPlanError("V1 execution_plan 缺少 paths.organizer")
             strategy = plan_strategy(plan)
             if allowed_strategies and strategy not in allowed_strategies:
-                raise JobPlanError(f"Organizer enqueue does not support strategy {strategy!r}")
+                raise JobPlanError(f"Organizer 入队不支持策略 {strategy!r}")
         except (JobPlanError, TypeError, ValueError) as exc:
             return candidate, None, reject_non_v1_job(self.db, candidate, context=context, error=exc)
         return candidate, plan, None
@@ -1856,7 +1856,7 @@ class OrganizerService:
     ) -> None:
         _job, plan, _rejection = self._task_v1_plan(task, reject=False)
         if not plan:
-            raise OpenListError("Organizer task is not backed by a valid V1 execution_plan")
+            raise OpenListError("Organizer 任务缺少有效的 V1 execution_plan")
         try:
             self._assert_task_v1_paths(task, plan)
             expected_scan = self._plan_path_text(plan, "organizer")
@@ -1866,17 +1866,17 @@ class OrganizerService:
         actual_scan = normalize_path(scan_root)
         if actual_scan.casefold() != expected_scan.casefold():
             raise OpenListError(
-                f"Organizer scan path does not match V1 execution_plan: scan={actual_scan}, plan={expected_scan}"
+                f"Organizer 扫描路径与 V1 execution_plan 不一致：scan={actual_scan}, plan={expected_scan}"
             )
         if not final_root or final_root == "/":
-            raise OpenListError("V1 execution_plan has no valid destination_final")
+            raise OpenListError("V1 execution_plan 缺少有效的 destination_final")
 
     def _validate_v1_mapping_boundaries(self, task: dict[str, Any]) -> None:
         """Revalidate editable mappings against immutable V1 paths."""
 
         _job, plan, _rejection = self._task_v1_plan(task, reject=False)
         if not plan:
-            raise OpenListError("Organizer task lacks a valid V1 execution_plan; apply rejected")
+            raise OpenListError("Organizer 任务缺少有效的 V1 execution_plan，已拒绝执行")
         try:
             self._assert_task_v1_paths(task, plan)
             job_root = self._plan_path_text(plan, "organizer")
@@ -1896,12 +1896,12 @@ class OrganizerService:
             # source; require a strict descendant just like destination_final.
             if not job_root or not _is_child_path(source_path, job_root):
                 raise OpenListError(
-                    "Organizer mapping source path escaped frozen organizer root: "
+                    "Organizer 映射来源路径越出冻结 organizer root："
                     f"mapping_id={mapping.get('id') or '<unknown>'}, source={source_path}, organizer_root={job_root or '<empty>'}"
                 )
             if not final_root or not _is_child_path(target_path, final_root):
                 raise OpenListError(
-                    "Organizer mapping target path escaped frozen destination_final: "
+                    "Organizer 映射目标路径越出冻结 destination_final："
                     f"mapping_id={mapping.get('id') or '<unknown>'}, target={target_path}, destination_final={final_root or '<empty>'}"
                 )
             # 原生转存链路的入库暂存目录与分类目录同级（分类父目录 /
@@ -1910,7 +1910,7 @@ class OrganizerService:
             # 万一映射目标被改写进暂存目录，文件会永远留在 _入库暂存 里。
             if _path_is_same_or_child(target_path, job_root):
                 raise OpenListError(
-                    "Organizer mapping target path stayed inside frozen staging root: "
+                    "Organizer 映射目标路径仍留在冻结暂存根目录内："
                     f"mapping_id={mapping.get('id') or '<unknown>'}, target={target_path}, staging_root={job_root}"
                 )
 
@@ -2541,7 +2541,7 @@ class OrganizerService:
 
     def _scan_openlist_videos(self, task: dict[str, Any], root_path: str) -> list[Any]:
         if not self._task_has_v1_plan(task):
-            raise OpenListError("Organizer scan requires a valid V1 execution_plan")
+            raise OpenListError("Organizer 扫描需要有效的 V1 execution_plan")
         filters = self._task_scan_filters(task)
         expected_names = [str(item or "").strip() for item in (filters.get("expected_names") or []) if str(item or "").strip()]
         expected_paths = [str(item or "").strip() for item in (filters.get("expected_paths") or []) if str(item or "").strip()]
@@ -2587,7 +2587,7 @@ class OrganizerService:
 
     def _scan_staging_companion_files(self, task: dict[str, Any], root_path: str) -> list[Any]:
         if not self._task_has_v1_plan(task):
-            raise OpenListError("Organizer companion scan requires a valid V1 execution_plan")
+            raise OpenListError("Organizer 配套文件扫描需要有效的 V1 execution_plan")
         normalized_root = normalize_path(root_path)
         raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
         raw_transport_paths = (
@@ -2651,7 +2651,7 @@ class OrganizerService:
 
     def _scan_completeness_message(self, task: dict[str, Any], videos: list[Any], root_path: str) -> str:
         if not self._task_has_v1_plan(task):
-            return "Organizer task lacks a valid V1 execution_plan"
+            return "Organizer 任务缺少有效的 V1 execution_plan"
         filters = self._task_scan_filters(task)
         normalized_root = normalize_path(root_path)
         # 持久化 expected_count 可能把非 OpenList 命名空间路径（如 rclone 存储的
@@ -2775,7 +2775,7 @@ class OrganizerService:
         task_root = normalize_path(task.get("openlist_root_path") or "")
         _job, frozen_plan, _rejection = self._task_v1_plan(task, reject=False)
         if not frozen_plan:
-            raise OpenListError("Organizer approval requires a valid V1 execution_plan")
+            raise OpenListError("Organizer 确认需要有效的 V1 execution_plan")
         final_root = normalize_path(self._v1_target_root(frozen_plan))
         owners: dict[str, int] = {}
         for mapping in mappings:
@@ -4165,7 +4165,7 @@ class OrganizerService:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         target_category = self._target_category_for_task(task, category)
         if not self._task_has_v1_plan(task):
-            raise OpenListError("Organizer plan generation requires a valid V1 execution_plan")
+            raise OpenListError("Organizer 计划生成需要有效的 V1 execution_plan")
         root_name = basename(task.get("openlist_root_path") or "")
         parent_name = basename(dirname(task.get("openlist_root_path") or ""))
         names = [item.name for item in videos]
@@ -4615,7 +4615,7 @@ class OrganizerService:
         target_category = self._target_category_for_task(task, category)
         category_root = normalize_path(target_category.get("source_category_root_path") or "")
         if category_root == "/":
-            raise OpenListError("V1 execution_plan has no valid Organizer source root")
+            raise OpenListError("V1 execution_plan 缺少有效的 Organizer 来源根目录")
         candidates: list[str] = []
         task_root = normalize_path(task.get("openlist_root_path") or "")
         if self._safe_cleanup_dir(task_root, category_root):
@@ -5435,7 +5435,7 @@ class OrganizerService:
         """Return videos from the already V1-scoped OpenList scan, minus excluded patterns."""
 
         if not self._task_has_v1_plan(task):
-            raise OpenListError("Organizer video filtering requires a valid V1 execution_plan")
+            raise OpenListError("Organizer 视频筛选需要有效的 V1 execution_plan")
         patterns = self._exclude_file_patterns()
         if not patterns:
             return videos, []
@@ -5447,7 +5447,7 @@ class OrganizerService:
 
     def _filter_companions_for_task(self, task: dict[str, Any], companions: list[Any]) -> tuple[list[Any], list[Any]]:
         if not self._task_has_v1_plan(task):
-            raise OpenListError("Organizer companion filtering requires a valid V1 execution_plan")
+            raise OpenListError("Organizer 配套文件筛选需要有效的 V1 execution_plan")
         patterns = self._exclude_file_patterns()
         if not patterns:
             return companions, []
@@ -5476,16 +5476,16 @@ class OrganizerService:
     def _target_category_for_task(self, task: dict[str, Any], category: dict[str, Any]) -> dict[str, Any]:
         _job, frozen_plan, _rejection = self._task_v1_plan(task, reject=False)
         if not frozen_plan:
-            raise OpenListError("Organizer target path requires a frozen V1 execution_plan")
+            raise OpenListError("Organizer 目标路径需要冻结的 V1 execution_plan")
         organizer_root = self._plan_path_text(frozen_plan, "organizer")
         # 原生入库暂存链路以 paths.organizer_final 为搬运目标根（见 _v1_target_root）。
         final_root = self._plan_path_text(frozen_plan, "organizer_final") or self._plan_path_text(
             frozen_plan, "destination_final"
         )
         if not organizer_root or organizer_root == "/":
-            raise OpenListError("V1 execution_plan has no valid paths.organizer")
+            raise OpenListError("V1 execution_plan 缺少有效的 paths.organizer")
         if not final_root or final_root == "/":
-            raise OpenListError("V1 execution_plan has no valid paths.destination_final")
+            raise OpenListError("V1 execution_plan 缺少有效的 paths.destination_final")
         scoped = dict(category)
         for key in (
             "openlist_root_path",

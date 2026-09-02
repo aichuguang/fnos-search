@@ -90,7 +90,7 @@ class RcloneOperationAdapter:
         except Exception as exc:  # noqa: BLE001
             raise TransferError(
                 ErrorCode.NETWORK_TRANSIENT,
-                f"rclone copy submission failed: {exc}",
+                f"rclone 提交失败：{exc}",
                 retryable=True,
             ) from exc
 
@@ -119,7 +119,7 @@ class RcloneOperationAdapter:
             if self._norm_path(frozen_path) != self._norm_path(local_path):
                 raise TransferError(
                     ErrorCode.INVALID_PLAN,
-                    "relay local path does not match the frozen plan",
+                    "relay 本地路径与冻结计划不一致",
                 )
         from .rclone_executor import build_managed_copy_run
 
@@ -131,7 +131,7 @@ class RcloneOperationAdapter:
         if not copy_run.get("relay_mode") or expected_local_dir != local_path:
             raise TransferError(
                 ErrorCode.INVALID_PLAN,
-                "relay copy descriptor does not match the frozen local_temp path",
+                "relay 复制描述符与冻结 local_temp 路径不一致",
             )
         return self.start_copy(
             source,
@@ -148,7 +148,7 @@ class RcloneOperationAdapter:
         metadata = receipt.metadata or {}
         run_id = self._run_id(metadata.get("run_id"))
         if not run_id:
-            return OperationStatus("unknown", "rclone receipt has no durable run_id", error_code=ErrorCode.RESULT_UNKNOWN)
+            return OperationStatus("unknown", "rclone 回执缺少持久 run_id", error_code=ErrorCode.RESULT_UNKNOWN)
         operation_key = str(metadata.get("operation_key") or "")
         try:
             value = self._poll_scoped(run_id, receipt, operation_key)
@@ -157,13 +157,13 @@ class RcloneOperationAdapter:
         except Exception as exc:  # noqa: BLE001
             raise TransferError(
                 ErrorCode.NETWORK_TRANSIENT,
-                f"rclone scoped status query failed: {exc}",
+                f"rclone 限定状态查询失败：{exc}",
                 retryable=True,
             ) from exc
         if value is None:
             return OperationStatus(
                 "unknown",
-                "rclone service cannot query the receipt-scoped run",
+                "rclone 服务无法查询回执限定的 run",
                 error_code=ErrorCode.RESULT_UNKNOWN,
             )
         status = normalize_operation_status(value)
@@ -172,7 +172,7 @@ class RcloneOperationAdapter:
         if isinstance(value, dict):
             returned = self._run_id(value.get("run_id") or value.get("id"))
             if returned and str(returned) != str(run_id):
-                return OperationStatus("unknown", "rclone run_id does not match the receipt", error_code=ErrorCode.RESULT_UNKNOWN)
+                return OperationStatus("unknown", "rclone 返回的 run_id 与回执不一致", error_code=ErrorCode.RESULT_UNKNOWN)
         return status
 
     def check(self, receipt: OperationReceipt) -> dict[str, Any]:
@@ -186,50 +186,50 @@ class RcloneOperationAdapter:
 
     def cancel(self, receipt: OperationReceipt) -> CancelResult:
         if self.plan is None:
-            return CancelResult("not_cancellable", "rclone adapter is not bound", operation_id=getattr(receipt, "operation_id", ""))
+            return CancelResult("not_cancellable", "rclone 适配器未绑定计划", operation_id=getattr(receipt, "operation_id", ""))
         if not isinstance(receipt, OperationReceipt):
-            return CancelResult("not_cancellable", "invalid rclone receipt", operation_id="")
+            return CancelResult("not_cancellable", "rclone 回执无效", operation_id="")
         run_id = self._run_id((receipt.metadata or {}).get("run_id"))
         if not run_id:
-            return CancelResult("not_cancellable", "rclone receipt has no durable run_id", operation_id=receipt.operation_id)
+            return CancelResult("not_cancellable", "rclone 回执缺少持久 run_id", operation_id=receipt.operation_id)
         operation_key = str((receipt.metadata or {}).get("operation_key") or "")
         try:
             result = self._cancel_scoped(run_id, receipt, operation_key)
         except Exception as exc:  # noqa: BLE001
-            return CancelResult("cancel_pending", f"rclone cancel query failed: {exc}", operation_id=receipt.operation_id)
+            return CancelResult("cancel_pending", f"rclone 取消查询失败：{exc}", operation_id=receipt.operation_id)
         if result is None:
             return CancelResult(
                 "not_cancellable",
-                "rclone service does not expose a receipt-scoped cancel method",
+                "rclone 服务未提供回执限定的取消方法",
                 operation_id=receipt.operation_id,
             )
         if isinstance(result, CancelResult):
             return result
         if isinstance(result, dict):
             if result.get("success") is False:
-                return CancelResult("not_cancellable", str(result.get("message") or "rclone cancel rejected"), operation_id=receipt.operation_id)
+                return CancelResult("not_cancellable", str(result.get("message") or "rclone 拒绝取消"), operation_id=receipt.operation_id)
             status = str(result.get("status") or "cancel_pending").strip().lower()
             if status in {"cancelled", "canceled", "stopped", "done"}:
                 status = "cancelled"
             elif status not in {"cancel_pending", "resume_ack", "not_cancellable", "already_final"}:
                 status = "cancel_pending"
-            return CancelResult(status, str(result.get("message") or "rclone cancel requested"), operation_id=receipt.operation_id)
+            return CancelResult(status, str(result.get("message") or "已请求 rclone 取消"), operation_id=receipt.operation_id)
         if result is True:
-            return CancelResult("cancel_pending", "rclone cancel requested", operation_id=receipt.operation_id)
-        return CancelResult("cancel_pending", str(result or "rclone cancel requested"), operation_id=receipt.operation_id)
+            return CancelResult("cancel_pending", "已请求 rclone 取消", operation_id=receipt.operation_id)
+        return CancelResult("cancel_pending", str(result or "已请求 rclone 取消"), operation_id=receipt.operation_id)
 
     # ------------------------------------------------------------------
     # Internal contract helpers
     # ------------------------------------------------------------------
     def _require_plan(self) -> None:
         if self.plan is None:
-            raise TransferError(ErrorCode.INVALID_PLAN, "rclone adapter is not bound to a plan")
+            raise TransferError(ErrorCode.INVALID_PLAN, "rclone 适配器未绑定计划")
 
     @staticmethod
     def _require_operation_key(value: Any) -> str:
         key = str(value or "").strip()
         if not key:
-            raise TransferError(ErrorCode.INVALID_PLAN, "rclone operation requires a non-empty idempotency key")
+            raise TransferError(ErrorCode.INVALID_PLAN, "rclone 操作需要非空幂等键")
         return key
 
     @staticmethod
@@ -251,13 +251,13 @@ class RcloneOperationAdapter:
     def _validate_relay_path(self, value: Any) -> str:
         text = self._norm_path(value)
         if not text.startswith("/"):
-            raise TransferError(ErrorCode.INVALID_PLAN, "relay local path must be absolute")
+            raise TransferError(ErrorCode.INVALID_PLAN, "relay 本地路径必须是绝对路径")
         parts = [part for part in text.split("/") if part]
         if any(part in {".", ".."} for part in parts):
-            raise TransferError(ErrorCode.INVALID_PLAN, "relay local path contains traversal segments")
+            raise TransferError(ErrorCode.INVALID_PLAN, "relay 本地路径包含路径穿越段")
         expected = f"job-{int(self.plan.job_id)}"
         if not parts or parts[-1] != expected:
-            raise TransferError(ErrorCode.INVALID_PLAN, f"relay local path must end with {expected}")
+            raise TransferError(ErrorCode.INVALID_PLAN, f"relay 本地路径必须以 {expected} 结尾")
         frozen = self.plan.local_temp
         if not isinstance(frozen, dict):
             raise TransferError(ErrorCode.INVALID_PLAN, "relay plan 缺少 frozen local_temp")
@@ -266,7 +266,7 @@ class RcloneOperationAdapter:
         if frozen_kind != "relay" or frozen_namespace != "local:relay":
             raise TransferError(
                 ErrorCode.INVALID_PLAN,
-                "relay local_temp must use kind=relay and namespace local:relay",
+                "relay local_temp 必须使用 kind=relay 且命名空间为 local:relay",
             )
         return text
 
@@ -276,7 +276,7 @@ class RcloneOperationAdapter:
         except Exception as exc:  # noqa: BLE001
             raise TransferError(
                 ErrorCode.NETWORK_TRANSIENT,
-                f"rclone reconcile lookup failed: {exc}",
+                f"rclone 对账查询失败：{exc}",
                 retryable=True,
             ) from exc
         if isinstance(value, dict):
@@ -284,7 +284,7 @@ class RcloneOperationAdapter:
             if run_job not in (None, "") and int(run_job) != int(self.plan.job_id):
                 raise TransferError(
                     ErrorCode.RESULT_UNKNOWN,
-                    "rclone operation lookup returned another job",
+                    "rclone 操作查询返回了其他任务",
                 )
         return value or None
 
@@ -300,7 +300,7 @@ class RcloneOperationAdapter:
         if isinstance(value, OperationReceipt):
             receipt = value
         elif isinstance(value, dict) and value.get("success") is False:
-            raise TransferError(ErrorCode.NETWORK_TRANSIENT, str(value.get("message") or "rclone copy submission failed"), retryable=True)
+            raise TransferError(ErrorCode.NETWORK_TRANSIENT, str(value.get("message") or "rclone 提交失败"), retryable=True)
         else:
             receipt = normalize_receipt(value, provider_kind="rclone")
         metadata = dict(receipt.metadata or {})
@@ -316,7 +316,7 @@ class RcloneOperationAdapter:
         if not run_id:
             raise TransferError(
                 ErrorCode.RESULT_UNKNOWN,
-                "rclone submission did not return a durable task-scoped run_id",
+                "rclone 提交未返回持久的任务级 run_id",
             )
         metadata.update(
             {
@@ -354,9 +354,9 @@ class RcloneOperationAdapter:
 
     def _require_receipt(self, receipt: OperationReceipt) -> None:
         if not isinstance(receipt, OperationReceipt):
-            raise TransferError(ErrorCode.RESULT_UNKNOWN, "invalid rclone operation receipt")
+            raise TransferError(ErrorCode.RESULT_UNKNOWN, "rclone 操作回执无效")
         if not str(receipt.operation_id or "").strip():
-            raise TransferError(ErrorCode.RESULT_UNKNOWN, "rclone receipt has no operation_id")
+            raise TransferError(ErrorCode.RESULT_UNKNOWN, "rclone 回执缺少 operation_id")
 
     def _poll_scoped(self, run_id: int | str, receipt: OperationReceipt, operation_key: str) -> Any:
         return self.service.poll_run(

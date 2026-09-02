@@ -476,7 +476,7 @@ class OrganizerStagingTaskReuseSafetyTests(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertFalse(result["queued"])
-        self.assertIn("scan path does not match V1 execution_plan", result["message"])
+        self.assertIn("扫描路径与 V1 execution_plan 不一致", result["message"])
         self.assertEqual(database.task_updates[-1][1]["status"], "waiting_review")
         self.assertEqual(database.job_updates[-1][1]["status"], "review")
 
@@ -498,7 +498,7 @@ class OrganizerStagingTaskReuseSafetyTests(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertFalse(result["queued"])
-        self.assertIn("scan path does not match V1 execution_plan", result["message"])
+        self.assertIn("扫描路径与 V1 execution_plan 不一致", result["message"])
         self.assertEqual(database.task_updates[-1][1]["status"], "waiting_review")
         self.assertEqual(database.job_updates[-1][1]["status"], "review")
 

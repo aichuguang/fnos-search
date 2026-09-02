@@ -664,7 +664,7 @@ class RcloneService:
         if not filename:
             return {
                 "success": False,
-                "message": "file event is missing a filename",
+                "message": "文件事件缺少文件名",
                 "status": self.status(),
             }
         job_id = self._int_value(file_event.get("job_id"))
@@ -672,7 +672,7 @@ class RcloneService:
         if not isinstance(job, dict):
             return {
                 "success": False,
-                "message": "file retry requires a persisted V1 import job",
+                "message": "单文件重试需要已入库的 V1 导入任务",
                 "status": self.status(),
             }
         if str(job.get("status") or "").strip().lower() in {
@@ -687,7 +687,7 @@ class RcloneService:
         }:
             return {
                 "success": False,
-                "message": "job is no longer in a retryable transfer phase",
+                "message": "任务已不在可重试的搬运阶段",
                 "status": self.status(),
             }
 
@@ -705,7 +705,7 @@ class RcloneService:
             return {
                 "success": False,
                 "rejected": True,
-                "message": "the V1 job strategy does not use rclone",
+                "message": "该 V1 任务策略不使用 rclone",
                 "status": self.status(),
             }
         try:
@@ -735,7 +735,7 @@ class RcloneService:
         ):
             return {
                 "success": False,
-                "message": "job state changed before the retry could start",
+                "message": "任务状态在重试启动前发生了变化",
                 "status": self.status(),
             }
         result = self.start(
@@ -894,7 +894,7 @@ class RcloneService:
                 "success": False,
                 "rejected": True,
                 "manual_review": True,
-                "message": "rclone cleanup requires a persisted V1 import job",
+                "message": "rclone 清理需要已入库的 V1 导入任务",
                 "items": [],
                 "warnings": [],
                 "errors": [],
@@ -960,7 +960,7 @@ class RcloneService:
         failed = [item for item in checks if not item.get("ok")]
         return {
             "success": not failed,
-            "message": "runtime check passed" if not failed else "runtime check failed",
+            "message": "运行时检查通过" if not failed else "运行时检查失败",
             "items": checks,
             "job_paths_checked": False,
         }
@@ -1454,7 +1454,7 @@ class RcloneService:
             return {
                 "success": True,
                 "skipped": True,
-                "message": "no validated V1 rclone descriptor was attached to this run",
+                "message": "本次运行未附带经过校验的 V1 rclone 描述符",
             }
         job_id = self._int_value(copy_run.get("job_id"))
         job = self.db.job_queries.get(job_id) if self.db and job_id > 0 else None
@@ -1471,7 +1471,7 @@ class RcloneService:
                     "success": False,
                     "rejected": True,
                     "job_id": job_id,
-                    "message": "the V1 job strategy does not use rclone",
+                    "message": "该 V1 任务策略不使用 rclone",
                 }
         return {
             "success": True,

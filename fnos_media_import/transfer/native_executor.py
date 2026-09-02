@@ -200,7 +200,7 @@ class NativeTransferExecutor:
         from fnos_media_import.transfer.verifier import VerifyRequest
 
         if not isinstance(request, VerifyRequest):
-            raise TypeError("NativeTransferExecutor.verify requires VerifyRequest")
+            raise TypeError("NativeTransferExecutor.verify 需要 VerifyRequest 参数")
         adapter = self._adapter()
         verify_op = getattr(adapter, "verify_native_result", None)
         if not callable(verify_op):

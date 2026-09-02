@@ -397,7 +397,7 @@ class OrganizerAtomicBatchRenameDatabaseTests(unittest.TestCase):
 
         self.assertFalse(result["success"], result)
         self.assertTrue(result.get("conflict"))
-        self.assertIn("escaped frozen organizer root", result["message"])
+        self.assertIn("越出冻结 organizer root", result["message"])
 
     def test_approve_rejects_duplicate_targets(self) -> None:
         task_id = self._create_task(mapping_status="ready")

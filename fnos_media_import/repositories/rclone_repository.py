@@ -357,7 +357,7 @@ class RcloneRepository:
         key = str(operation_key or "").strip()
         normalized_job_id = int(job_id or 0)
         if not key or normalized_job_id <= 0:
-            raise ValueError("scoped rclone run requires operation_key and job_id")
+            raise ValueError("限定范围的 rclone run 需要 operation_key 和 job_id")
         descriptor_json = json.dumps(
             copy_descriptor if isinstance(copy_descriptor, dict) else {},
             ensure_ascii=False,
@@ -374,7 +374,7 @@ class RcloneRepository:
             if row is not None:
                 existing = self._decode_run(row)
                 if int(existing.get("job_id") or 0) != normalized_job_id:
-                    raise ValueError("rclone operation_key already belongs to another job")
+                    raise ValueError("rclone operation_key 已属于其他任务")
                 existing_json = json.dumps(
                     existing.get("copy_descriptor") or {},
                     ensure_ascii=False,
@@ -382,7 +382,7 @@ class RcloneRepository:
                     separators=(",", ":"),
                 )
                 if existing_json != descriptor_json:
-                    raise ValueError("rclone operation_key descriptor mismatch")
+                    raise ValueError("rclone operation_key 描述符不一致")
                 if str(existing.get("status") or "").lower() == "failed":
                     conn.execute(
                         "UPDATE rclone_runs SET status='queued', trigger_reason=?, "
@@ -469,7 +469,7 @@ class RcloneRepository:
             "failed",
             "success",
         }:
-            raise ValueError(f"unsupported rclone run status: {status}")
+            raise ValueError(f"不支持的 rclone run 状态：{status}")
         now = utc_now()
         with self._connection_factory() as conn:
             cursor = conn.execute(

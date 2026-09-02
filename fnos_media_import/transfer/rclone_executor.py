@@ -295,7 +295,7 @@ def _resolve_openlist_plan_path(
     if not callable(frozen):
         raise TransferError(
             ErrorCode.OPENLIST_UNAVAILABLE,
-            "locator resolver does not support frozen OpenList revisions",
+            "locator resolver 不支持冻结的 OpenList 修订",
         )
     try:
         value = frozen(
@@ -329,7 +329,7 @@ def _split_resolved_remote(resolver: Any, value: Any) -> tuple[str, str]:
         else:
             text = str(value or "").strip().replace("\\", "/")
             if ":" not in text.split("/", 1)[0]:
-                raise ValueError("resolved remote path is missing a remote name")
+                raise ValueError("解析后的 remote 路径缺少 remote 名称")
             remote, path = text.split(":", 1)
             path = "/" + path.strip("/")
     except Exception as exc:  # noqa: BLE001

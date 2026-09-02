@@ -56,11 +56,11 @@ class _FrozenImporterAdapter:
         source_record_service: Any,
     ) -> None:
         if not callable(importer_factory):
-            raise TypeError("importer_factory must be callable")
+            raise TypeError("importer_factory 必须可调用")
         if not callable(account_importer_factory):
-            raise TypeError("account_importer_factory must be callable")
+            raise TypeError("account_importer_factory 必须可调用")
         if source_record_service is None:
-            raise TypeError("source_record_service is required")
+            raise TypeError("缺少 source_record_service")
         self._importer_factory = importer_factory
         self._account_importer_factory = account_importer_factory
         self._source_records = source_record_service
@@ -231,7 +231,7 @@ class _FrozenImporterAdapter:
 
     def verify_native_result(self, request: VerifyRequest) -> TransferVerifyResult:
         if not isinstance(request, VerifyRequest):
-            raise TypeError("verify_native_result requires VerifyRequest")
+            raise TypeError("verify_native_result 需要 VerifyRequest 参数")
         receipt = request.operation
         if not isinstance(receipt, OperationReceipt):
             return TransferVerifyResult(

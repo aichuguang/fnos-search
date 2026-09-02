@@ -210,15 +210,15 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
         if candidate and candidate_version == EXECUTION_PLAN_VERSION and _as_int(persisted, 0) == EXECUTION_PLAN_VERSION:
             plan = candidate
         elif persisted in (None, "", 0, "0"):
-            raise JobPlanError("job is missing a V1 execution_plan")
+            raise JobPlanError("任务缺少 V1 execution_plan")
         else:
-            raise JobPlanError(f"job plan version {persisted!r} is not supported V1")
+            raise JobPlanError(f"任务计划版本 {persisted!r} 不是受支持的 V1")
 
     raw_data = _raw_data(raw_job)
     plan_ref = raw_data.get("execution_plan_ref") if isinstance(raw_data.get("execution_plan_ref"), dict) else {}
     declared_ref_hash = str(plan_ref.get("plan_hash") or "").strip()
     if declared_ref_hash and declared_ref_hash != compute_persisted_plan_hash(plan):
-        raise JobPlanError("job execution_plan_ref hash does not match import_execution_plans")
+        raise JobPlanError("任务 execution_plan_ref hash 与 import_execution_plans 不一致")
 
     missing: list[str] = []
     job_id = _as_int(raw_job.get("id"), 0)

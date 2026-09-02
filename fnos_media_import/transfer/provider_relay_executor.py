@@ -102,17 +102,17 @@ class ProviderRelayExecutor:
 
     def _relay_dir(self) -> str:
         if getattr(self, "plan", None) is None:
-            raise TransferError(ErrorCode.INVALID_PLAN, "relay executor is not bound to a plan")
+            raise TransferError(ErrorCode.INVALID_PLAN, "relay 执行器未绑定计划")
         expected_name = f"job-{int(self.plan.job_id)}"
         frozen = self.plan.local_temp
         frozen_path = ""
         if isinstance(frozen, dict):
             kind = str(frozen.get("kind") or "local").strip().lower()
             if kind not in {"local", "relay"}:
-                raise TransferError(ErrorCode.INVALID_PLAN, "relay local_temp must be a local/relay target")
+                raise TransferError(ErrorCode.INVALID_PLAN, "relay local_temp 必须是 local/relay 目标")
             namespace_id = str(frozen.get("namespace_id") or "").strip().lower()
             if namespace_id and not namespace_id.startswith("local:"):
-                raise TransferError(ErrorCode.INVALID_PLAN, "relay local_temp must use a local namespace")
+                raise TransferError(ErrorCode.INVALID_PLAN, "relay local_temp 必须使用 local 命名空间")
             frozen_path = self._normalize_root(frozen.get("path"))
 
         if self.relay_root:
@@ -120,17 +120,17 @@ class ProviderRelayExecutor:
             if frozen_path and self._normalize_root(frozen_path) != candidate:
                 raise TransferError(
                     ErrorCode.INVALID_PLAN,
-                    "frozen relay local_temp does not match the configured relay root",
+                    "冻结的 relay local_temp 与配置的 relay 根目录不一致",
                 )
             return candidate
 
         if not frozen_path:
-            raise TransferError(ErrorCode.INVALID_PLAN, "relay_root or plan.local_temp is required")
+            raise TransferError(ErrorCode.INVALID_PLAN, "缺少 relay_root 或 plan.local_temp")
         parts = [part for part in frozen_path.split("/") if part]
         if not parts or parts[-1] != expected_name:
-            raise TransferError(ErrorCode.INVALID_PLAN, f"relay local_temp must end with {expected_name}")
+            raise TransferError(ErrorCode.INVALID_PLAN, f"relay local_temp 必须以 {expected_name} 结尾")
         if any(part in {".", ".."} for part in parts):
-            raise TransferError(ErrorCode.INVALID_PLAN, "relay local_temp contains traversal segments")
+            raise TransferError(ErrorCode.INVALID_PLAN, "relay local_temp 包含路径穿越段")
         return frozen_path
 
     def materialize_source(self) -> OperationReceipt:
@@ -187,7 +187,7 @@ class ProviderRelayExecutor:
 
     def poll(self, receipt: OperationReceipt) -> OperationStatus:
         if not isinstance(receipt, OperationReceipt):
-            return OperationStatus("unknown", "relay receipt is invalid", error_code=ErrorCode.RESULT_UNKNOWN)
+            return OperationStatus("unknown", "relay 回执无效", error_code=ErrorCode.RESULT_UNKNOWN)
         step = str((receipt.metadata or {}).get("step") or "download").strip().lower()
         if step == "download":
             try:
@@ -215,7 +215,7 @@ class ProviderRelayExecutor:
             return self._poll_upload(receipt)
         return OperationStatus(
             "unknown",
-            f"unknown relay receipt step: {step}",
+            f"未知的 relay 回执步骤：{step}",
             error_code=ErrorCode.RESULT_UNKNOWN,
         )
 
@@ -224,7 +224,7 @@ class ProviderRelayExecutor:
         if not callable(check):
             return DownloadStatus(
                 "unknown",
-                "rclone adapter does not expose a scoped download status check",
+                "rclone 适配器未提供限定的下载状态查询",
                 ErrorCode.RESULT_UNKNOWN,
             )
         value = check(receipt)
@@ -321,7 +321,7 @@ class ProviderRelayExecutor:
         if outcome is None:
             return OperationStatus(
                 "unknown",
-                "upload receipt has no durable outcome or scoped checker",
+                "上传回执缺少持久结果，也没有限定的状态查询器",
                 error_code=ErrorCode.RESULT_UNKNOWN,
             )
         return self._upload_status(outcome)
@@ -362,19 +362,19 @@ class ProviderRelayExecutor:
         if not isinstance(target, dict):
             raise TransferError(
                 ErrorCode.INVALID_PLAN,
-                "Provider relay requires an explicit destination_final",
+                "Provider relay 需要明确的 destination_final",
             )
         namespace_id = str(target.get("namespace_id") or "").strip()
         path = str(target.get("path") or "").strip()
         if not namespace_id or not path:
             raise TransferError(
                 ErrorCode.INVALID_PLAN,
-                "destination_final must include namespace_id and path",
+                "destination_final 必须包含 namespace_id 和 path",
             )
         if not namespace_id.lower().startswith("native:"):
             raise TransferError(
                 ErrorCode.INVALID_PLAN,
-                "relay destination_final must use a native namespace",
+                "relay destination_final 必须使用 native 命名空间",
             )
         return dict(target)
 

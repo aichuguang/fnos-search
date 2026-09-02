@@ -106,7 +106,7 @@ class AppSettingsRepository:
             }
             updates, delete_keys = updater(copy.deepcopy(previous))
             if not isinstance(updates, dict) or not isinstance(delete_keys, set):
-                raise TypeError("app settings updater must return (dict, set)")
+                raise TypeError("应用设置 updater 必须返回 (dict, set)")
             for key in delete_keys:
                 connection.execute("DELETE FROM app_settings WHERE key = ?", (str(key),))
             for key, value in updates.items():

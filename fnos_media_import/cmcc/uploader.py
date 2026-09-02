@@ -301,7 +301,7 @@ class CmccUploader:
     ) -> CmccUploadResult:
         file_path = Path(local_file)
         if not file_path.exists() or not file_path.is_file():
-            return CmccUploadResult(False, "failed", f"local file does not exist: {file_path}")
+            return CmccUploadResult(False, "failed", f"本地文件不存在：{file_path}")
 
         file_stat = file_path.stat()
         size = file_stat.st_size
@@ -348,7 +348,7 @@ class CmccUploader:
             return CmccUploadResult(
                 True,
                 "done",
-                "already verified by local manifest",
+                "本地 manifest 已验证完成",
                 mode="manifest",
                 file_id=str(manifest.get("file_id") or ""),
                 upload_id=str(manifest.get("upload_id") or ""),
@@ -384,7 +384,7 @@ class CmccUploader:
                 parent_file_id = self.client.ensure_path(parent_path)
 
         if not parent_file_id:
-            return CmccUploadResult(False, "failed", "target parent file id/path is not configured")
+            return CmccUploadResult(False, "failed", "未配置目标父目录 ID/路径")
 
         exists = self._find_existing(parent_file_id, name)
         if self._existing_matches(exists, size):
@@ -399,7 +399,7 @@ class CmccUploader:
             return CmccUploadResult(
                 True,
                 "done",
-                "same file already exists in CMCC cloud",
+                "移动云盘云端已存在相同文件",
                 mode="existing",
                 file_id=str(exists.get("file_id") or ""),
                 parent_file_id=parent_file_id,
@@ -413,7 +413,7 @@ class CmccUploader:
             return CmccUploadResult(
                 False,
                 "failed",
-                f"target file exists with different or unknown size: {name}",
+                f"目标文件已存在但大小不同或未知：{name}",
                 mode="existing_conflict",
                 file_id=str(exists.get("file_id") or ""),
                 parent_file_id=parent_file_id,
@@ -511,7 +511,7 @@ class CmccUploader:
             return CmccUploadResult(
                 True,
                 "done",
-                "same file already exists in CMCC cloud",
+                "移动云盘云端已存在相同文件",
                 mode="existing",
                 file_id=file_id,
                 upload_id=upload_id,
@@ -539,7 +539,7 @@ class CmccUploader:
             return CmccUploadResult(
                 True,
                 "done",
-                "CMCC hash rapid upload completed",
+                "移动云盘 hash 秒传完成",
                 mode="rapid",
                 file_id=file_id,
                 upload_id=upload_id,
@@ -567,7 +567,7 @@ class CmccUploader:
             return CmccUploadResult(
                 False,
                 "rapid_miss",
-                "rapid upload not hit; rapid_only refused real upload",
+                "秒传未命中；rapid_only 拒绝真实上传",
                 mode="rapid_only",
                 file_id=file_id,
                 upload_id=upload_id,
@@ -630,14 +630,14 @@ class CmccUploader:
         verified = self._find_existing(parent_file_id, name) if parent_file_id else {}
         if parent_file_id and not self._existing_matches(verified, size):
             detail = (
-                "cloud file exists but size does not match local file"
+                "云端文件已存在但大小与本地文件不一致"
                 if verified.get("exist")
-                else "cloud file is not visible after complete request"
+                else "完成上传后云端文件不可见"
             )
             return CmccUploadResult(
                 False,
                 "failed",
-                f"upload completed but verification failed: {detail}",
+                f"上传已完成但校验失败：{detail}",
                 mode="api_put",
                 file_id=file_id,
                 upload_id=upload_id,
@@ -746,13 +746,13 @@ class CmccUploader:
             if exists.get("exist") and exists.get("file_id"):
                 file_type = str(exists.get("file_type") or "").lower()
                 if file_type and "folder" not in file_type and "dir" not in file_type:
-                    raise CmccApiError(f"target path segment exists but is not a folder: {segment}")
+                    raise CmccApiError(f"目标路径段已存在但不是文件夹：{segment}")
                 current = str(exists["file_id"])
                 continue
             created = self.client.create_folder(name=segment, parent_file_id=current)
             current = str(created.get("fileId") or created.get("appFileId") or created.get("id") or "")
             if not current:
-                raise CmccApiError(f"create folder succeeded but no fileId returned: {segment}")
+                raise CmccApiError(f"创建文件夹成功但未返回 fileId：{segment}")
         return current
 
     @staticmethod

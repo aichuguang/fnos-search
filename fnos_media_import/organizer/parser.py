@@ -508,9 +508,9 @@ def category_target_root(category: dict[str, Any]) -> str:
     if value and value.lower() not in {"none", "null", "undefined"}:
         root = posixpath.normpath("/" + value.strip("/"))
         if root in {"", ".", "/"} or root.startswith("/../") or root == "/..":
-            raise ValueError("V1 paths.destination_final must be a non-root path")
+            raise ValueError("V1 paths.destination_final 不能是根路径")
         return root
-    raise ValueError("Organizer target root must come from V1 paths.destination_final")
+    raise ValueError("Organizer 目标根必须来自 V1 paths.destination_final")
 
 
 def standard_target_path(

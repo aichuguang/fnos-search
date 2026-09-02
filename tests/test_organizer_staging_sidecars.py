@@ -498,7 +498,7 @@ class StagingBoundaryTests(unittest.TestCase):
             "raw_data": {"staging_plan": {"enabled": True}},
         }
 
-        with self.assertRaisesRegex(OpenListError, "frozen V1 execution_plan"):
+        with self.assertRaisesRegex(OpenListError, "冻结的 V1 execution_plan"):
             service._target_category_for_task(
                 invalid_task,
                 service.categories["tv"],
@@ -510,7 +510,7 @@ class StagingBoundaryTests(unittest.TestCase):
                 **_video_mapping(),
                 "target_path": "/其它挂载/电视剧/藏海传 (2025)/Season 01/藏海传 (2025) - S01E01.mkv",
             },
-            "target path escaped frozen destination_final",
+            "越出冻结 destination_final",
         )
 
     def test_apply_rejects_skipped_mapping_source_outside_job_root(self) -> None:
@@ -520,7 +520,7 @@ class StagingBoundaryTests(unittest.TestCase):
                 "source_path": f"{FINAL_ROOT}/其它资源/越界文件.mkv",
                 "status": "skipped_existing",
             },
-            "source path escaped frozen organizer root",
+            "越出冻结 organizer root",
         )
 
     def test_apply_requires_file_paths_below_staging_roots_not_the_roots_themselves(self) -> None:
@@ -530,7 +530,7 @@ class StagingBoundaryTests(unittest.TestCase):
                     **_video_mapping(),
                     "source_path": JOB_ROOT,
                 },
-                "source path escaped frozen organizer root",
+                "越出冻结 organizer root",
             )
         with self.subTest(path="target_root"):
             self._assert_apply_rejects_mapping(
@@ -538,7 +538,7 @@ class StagingBoundaryTests(unittest.TestCase):
                     **_video_mapping(),
                     "target_path": FINAL_ROOT,
                 },
-                "target path escaped frozen destination_final",
+                "越出冻结 destination_final",
             )
 
 

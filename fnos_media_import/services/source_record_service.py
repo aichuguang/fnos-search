@@ -69,10 +69,10 @@ class SourceRecordService:
     ) -> SourceDescriptor:
         """Capture without opening/committing a nested transaction."""
         if connection is None:
-            raise ValueError("connection is required")
+            raise ValueError("缺少数据库连接")
         selection = source.selection or SelectionSnapshot.from_payload(source.provider_kind, record)
         if not selection.is_valid:
-            raise ValueError("selection snapshot hash is invalid")
+            raise ValueError("选择快照 hash 无效")
         # Keep one canonical selection alongside compatibility aliases used by
         # existing Provider importers. Credentials remain inside the encrypted
         # payload; they are never part of the selection/idempotency hash.
@@ -111,7 +111,7 @@ class SourceRecordService:
             for field, expected in identity_pairs:
                 actual = str(current[field] or "")
                 if actual != str(expected or ""):
-                    raise ValueError(f"source record identity mismatch: {field}")
+                    raise ValueError(f"来源记录标识不一致：{field}")
             existing = connection.execute(
                 "SELECT revision, selected_items_hash, expected_file_count, expected_total_bytes "
                 "FROM source_record_revisions "
@@ -186,7 +186,7 @@ class SourceRecordService:
         )
         value = json.loads(plaintext.decode("utf-8"))
         if not isinstance(value, dict):
-            raise ValueError("source snapshot must be an object")
+            raise ValueError("来源快照必须是对象")
         # Identity and integrity metadata are duplicated in the encrypted
         # payload and relational columns.  Require both copies to agree;
         # silently filling missing values would permit a split-brain snapshot.
@@ -194,24 +194,24 @@ class SourceRecordService:
             stored = str(row[field] or "")
             supplied = str(value.get(field) or "")
             if not stored or not supplied or stored != supplied:
-                raise ValueError(f"source snapshot identity mismatch: {field}")
+                raise ValueError(f"来源快照标识不一致：{field}")
         expected_record_id = _source_record_id(
             str(row["search_source_id"] or ""), str(row["canonical_source_id"] or "")
         )
         if expected_record_id != str(source_record_id):
-            raise ValueError("source snapshot record id mismatch")
+            raise ValueError("来源快照记录 ID 不一致")
         for field, column in (("expected_file_count", "expected_file_count"), ("expected_total_bytes", "expected_total_bytes")):
             try:
                 supplied = max(0, int(value.get(field) or 0))
                 stored = max(0, int(row[column] or 0))
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"source snapshot metadata invalid: {field}") from exc
+                raise ValueError(f"来源快照元数据无效：{field}") from exc
             if supplied != stored:
-                raise ValueError(f"source snapshot metadata mismatch: {field}")
+                raise ValueError(f"来源快照元数据不一致：{field}")
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         expected_hash = str(row["access_payload_hash"] or "")
         if not expected_hash or hashlib.sha256(encoded.encode("utf-8")).hexdigest() != expected_hash:
-            raise ValueError("source snapshot payload hash mismatch")
+            raise ValueError("来源快照 payload hash 不一致")
         selection_payload = value.get("selection") if isinstance(value.get("selection"), dict) else value
         selection = SelectionSnapshot.from_dict(
             selection_payload,
@@ -219,15 +219,15 @@ class SourceRecordService:
         )
         value["selection"] = selection.to_dict()
         if selection.selection_hash != str(row["selected_items_hash"] or ""):
-            raise ValueError("source snapshot selection hash mismatch")
+            raise ValueError("来源快照选择 hash 不一致")
         if not selection.is_valid:
-            raise ValueError("source snapshot selection hash is invalid")
+            raise ValueError("来源快照选择 hash 无效")
         try:
             stored_items = json.loads(str(row["selected_items_json"] or "[]"))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("source snapshot selected_items_json is invalid") from exc
+            raise ValueError("来源快照 selected_items_json 无效") from exc
         if stored_items != [*selection.selected_items]:
-            raise ValueError("source snapshot selected items mismatch")
+            raise ValueError("来源快照选中文件不一致")
         value.setdefault("selected_items", [*selection.selected_items])
         value.setdefault("ignore_files", list(selection.ignore_files))
         value.setdefault("provider_selection", selection.provider_selection)

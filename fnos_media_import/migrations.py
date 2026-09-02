@@ -20,7 +20,7 @@ class MigrationRunner:
         self._migrations = tuple(sorted(migrations, key=lambda item: item.version))
         versions = [item.version for item in self._migrations]
         if len(versions) != len(set(versions)) or any(version <= 0 for version in versions):
-            raise ValueError("migration versions must be positive and unique")
+            raise ValueError("迁移版本必须为正数且不重复")
 
     @property
     def latest_version(self) -> int:

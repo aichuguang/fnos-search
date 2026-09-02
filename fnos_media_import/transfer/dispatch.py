@@ -280,8 +280,8 @@ class TransferDispatchService:
                 job,
                 context="V1 Worker 执行前",
                 error=(
-                    "transfer execution strategy does not match immutable "
-                    f"execution_plan: {execution_strategy} != {plan_strategy}"
+                    "transfer execution strategy 与不可变 "
+                    f"execution_plan 不一致：{execution_strategy} != {plan_strategy}"
                 ),
                 execution_repository=self.executions,
             )

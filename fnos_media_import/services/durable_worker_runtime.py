@@ -165,7 +165,7 @@ class DurableWorkerRuntime:
         if not handler:
             transitioned = self._transition_failure(
                 task_id,
-                f"No Worker handler registered for task type: {task_type}",
+                f"没有为任务类型 {task_type} 注册 Worker 处理器",
                 terminal=True,
                 result={"worker_outcome": WORKER_BUSINESS_FAILED, "task_type": task_type},
             )
@@ -180,7 +180,7 @@ class DurableWorkerRuntime:
             elif isinstance(raw_result, dict):
                 result = raw_result
             else:
-                raise TypeError("Worker handler result must be a dictionary or None")
+                raise TypeError("Worker 处理器结果必须是字典或 None")
         except Exception as exc:  # noqa: BLE001
             self._record_task_error(task_id, task_type, exc)
             transitioned = self._transition_failure(
@@ -268,7 +268,7 @@ class DurableWorkerRuntime:
         try:
             result = handler(task.get("payload") or {}, task)
             if lost.is_set():
-                raise WorkerLeaseLostError(f"Worker task #{task_id} lost its lease during execution")
+                raise WorkerLeaseLostError(f"Worker 任务 #{task_id} 执行期间丢失租约")
             return result
         finally:
             stopped.set()

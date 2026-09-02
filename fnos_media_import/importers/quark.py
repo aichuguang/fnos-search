@@ -387,7 +387,7 @@ class QuarkImporter:
         from ..transfer.verifier import VerifyRequest
 
         if not isinstance(request, VerifyRequest):
-            raise TypeError("verify_native_result requires VerifyRequest")
+            raise TypeError("verify_native_result 需要 VerifyRequest 参数")
         receipt = request.operation
         status = self.poll_operation(receipt)
         if status.get("status") == "failed":

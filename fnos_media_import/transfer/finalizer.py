@@ -59,7 +59,7 @@ class TransferFinalizer:
                     "mount_revision": revision,
                 }
             if not source_exists:
-                return self._failed("staging source does not exist", code="VERIFY_MISMATCH")
+                return self._failed("暂存来源不存在", code="VERIFY_MISMATCH")
             if destination_exists:
                 return self._failed(
                     f"final destination already exists: {final['path']}",
@@ -96,11 +96,11 @@ class TransferFinalizer:
                     "destination": destination,
                 }
             if not source_exists:
-                return {"status": "failed", "message": "staging source does not exist"}
+                return {"status": "failed", "message": "暂存来源不存在"}
             if destination_exists:
                 return {
                     "status": "failed",
-                    "message": f"final destination already exists: {destination}",
+                    "message": f"最终目标已存在：{destination}",
                     "conflict": True,
                 }
             os.makedirs(os.path.dirname(destination), exist_ok=True)

@@ -588,7 +588,7 @@ class TransferPlan:
             else:
                 kind = "openlist"
         if kind not in {"local", "openlist", "native", "relay"}:
-            raise TransferError(ErrorCode.INVALID_PLAN, f"unsupported path kind: {kind}")
+            raise TransferError(ErrorCode.INVALID_PLAN, f"不支持的路径类型：{kind}")
         path = _norm_plan_path(
             value.get("path"),
             native_local=kind in {"local", "relay"},
