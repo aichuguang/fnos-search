@@ -90,6 +90,8 @@ docker compose ps
 curl -fsS "http://127.0.0.1:${APP_PORT:-5251}/readyz"
 docker compose logs --tail=200 fnos-media-import
 docker compose logs --tail=200 fnos-rclone-worker
+# 仅在启用 COMPOSE_PROFILES=pansou 时执行：
+docker compose logs --tail=200 pansou
 ```
 
 随后验证：

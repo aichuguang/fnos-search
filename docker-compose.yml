@@ -40,11 +40,39 @@ services:
       FNOS_PROCESS_ROLE: web
       RCLONE_WORKER_URL: http://fnos-rclone-worker:5251
       LOG_FILE: /app/logs/web.log
+      # 内置 PanSou 仅在 COMPOSE_PROFILES=pansou 启用时随编排启动；
+      # 后台"搜索与线路"保存过外部地址时以数据库配置为准。
+      PANSOU_BASE_URL: http://pansou:8888
+      PANSOU_USERNAME: "${PANSOU_USERNAME:-fnos-search}"
+      PANSOU_PASSWORD: "${PANSOU_PASSWORD:-fnos-search}"
     volumes:
       - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
       - "${APP_DATA_HOST_PATH:-./data}:/app/data"
       - "${APP_LOGS_HOST_PATH:-./logs}:/app/logs"
       - "${FNOS_RELAY_HOST_PATH:-./rclone/relay}:/data/relay"
+
+  # 可选内置 PanSou 聚合搜索（fish2018/pansou，纯 API 版）。
+  # 默认不启动；在 .env 加 COMPOSE_PROFILES=pansou 后随编排启动。
+  # 仅容器内网可达，不对宿主机开放端口；搜索缓存持久化在 PANSOU_CACHE_HOST_PATH。
+  pansou:
+    image: ${PANSOU_IMAGE:-ghcr.io/fish2018/pansou:latest}
+    container_name: fnos-pansou
+    profiles:
+      - pansou
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PORT: "8888"
+      AUTH_ENABLED: "true"
+      AUTH_USERS: "${PANSOU_USERNAME:-fnos-search}:${PANSOU_PASSWORD:-fnos-search}"
+      CACHE_PATH: /cache
+      # 国内直连网络访问 TG 频道通常受阻，需要代理时取消注释：
+      # PROXY: "socks5://host.docker.internal:7890"
+    volumes:
+      - "${PANSOU_CACHE_HOST_PATH:-./pansou/cache}:/cache"
 
   fnos-rclone-worker:
     <<: *app-common

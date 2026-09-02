@@ -47,6 +47,9 @@ services:
       FNOS_RELAY_ROOT: /data/relay
       FNOS_LOCAL_TARGET_ROOT: /storage-targets
       LOG_FILE: /app/logs/web.log
+      PANSOU_BASE_URL: http://pansou:8888
+      PANSOU_USERNAME: "${PANSOU_USERNAME:-fnos-search}"
+      PANSOU_PASSWORD: "${PANSOU_PASSWORD:-fnos-search}"
     volumes:
       - "${APP_CONFIG_HOST_PATH:-./config}:/app/config"
       - "${APP_DATA_HOST_PATH:-./data}:/app/data"
@@ -79,3 +82,23 @@ services:
       # 启用前先在 .env 中把 RCLONE_LOCAL_STORAGE_HOST_PATH 指向已挂载的目录，
       # 再取消下一行注释；容器内映射到 /storage-targets。
       # - "${RCLONE_LOCAL_STORAGE_HOST_PATH:-./rclone/local-storage}:/storage-targets"
+
+  # 与正式编排保持一致：可选内置 PanSou 聚合搜索（默认不启动）。
+  # 本地验证整体链路时用：docker compose -f docker-compose.yml -f compose.dev.yaml --profile pansou up -d --build
+  pansou:
+    image: ${PANSOU_IMAGE:-ghcr.io/fish2018/pansou:latest}
+    container_name: fnos-pansou
+    profiles:
+      - pansou
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PORT: "8888"
+      AUTH_ENABLED: "true"
+      AUTH_USERS: "${PANSOU_USERNAME:-fnos-search}:${PANSOU_PASSWORD:-fnos-search}"
+      CACHE_PATH: /cache
+    volumes:
+      - "${PANSOU_CACHE_HOST_PATH:-./pansou/cache}:/cache"

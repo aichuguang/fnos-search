@@ -15,7 +15,7 @@
 
 - 提供访客搜索和提交页面。
 - 提供管理员审核、任务重试、日志和运行状态页面。
-- 支持 PanSou 搜索，也可以启用 BTBTLA 作为补充磁链来源。
+- 支持 PanSou 聚合搜索（可选内置，一行开关启用），也可以启用 BTBTLA 作为补充磁链来源。
 - 支持夸克、139 移动云和 6盘等入库线路。
 - 支持访客按文件或文件夹选择需要入库的内容。
 - 支持 OpenList 目录整理，可按 TMDB 信息生成标准影视名称。
@@ -37,8 +37,9 @@
   → 媒体库更新
 ```
 
-项目不会自动提供 PanSou、OpenList 或第三方网盘账号。它负责把这些已有服务连接起来，
-并统一管理整个入库过程。
+PanSou 聚合搜索可作为可选内置服务随编排启动（默认关闭，在 `.env` 加 `COMPOSE_PROFILES=pansou`
+启用）；也可以在后台填写自建的外部 PanSou 地址。项目不会自动提供
+OpenList、第三方网盘账号或 TMDB Token。它负责把这些已有服务连接起来，并统一管理整个入库过程。
 
 ### 页面入口
 
@@ -66,7 +67,7 @@
 
 | 服务 | 是否必需 | 用途 |
 |---|---|---|
-| PanSou | 使用搜索功能时需要 | 搜索夸克、移动云、磁链等资源 |
+| PanSou | 可选 | 聚合搜索源。可在 `.env` 加 `COMPOSE_PROFILES=pansou` 启用内置容器（fish2018/pansou），也可以在后台改填自建外部 PanSou 地址 |
 | 内置夸克 Provider | 使用夸克线路时需要，在后台使用夸克 APP 扫码登录（自动提取并加密保存 Cookie） | 通过夸克官方网页 API 检查分享并原生转存 |
 | 内置天翼 Provider | 使用天翼线路时需要，在后台使用账号密码登录；风控时输入图片验证码 | 自动维护 Token，通过天翼网页 API 获取分享目录、原生转存并轮询校验 |
 | OpenList | 使用目录整理或 STRM 时需要 | 统一访问网盘、整理真实目录、生成 STRM |
@@ -107,7 +108,7 @@ docker compose up -d
 第一次启动会自动完成以下工作：
 
 - 拉取 `aichuguang/fnos-search:latest`。
-- 启动 Web 容器和独立的 rclone Worker 容器。
+- 启动 Web 容器和独立的 rclone Worker 容器；启用了 `COMPOSE_PROFILES=pansou` 时还会启动内置 PanSou 聚合搜索容器。
 - 创建数据库和全部表结构。
 - 创建默认持久化目录。
 - 校验你提供的 `FNOS_ROOT_KEY`，派生应用会话签名密钥，并生成 Worker 控制令牌。
@@ -183,7 +184,8 @@ docker exec fnos-rclone-worker rclone lsd "MP:" --config /config/rclone/rclone.c
 进入“系统设置”后，建议按以下顺序配置：
 
 1. 在“个人设置”修改管理员密码。
-2. 在“搜索与线路”填写 PanSou 地址。
+2. 搜索：默认不内置。想用内置 PanSou 时在 `.env` 加 `COMPOSE_PROFILES=pansou` 后重新编排；
+   使用自建外部 PanSou 时，在“搜索与线路”填写地址。
 3. 在“网盘入库 → 云盘账号”登录夸克、天翼、移动云或 6盘账号。
 4. 在“网盘入库 → OpenList”创建连接并检测挂载。
 5. 在“网盘入库 → 保存位置 / 入库规则”选择目标并生成分类目录。
@@ -227,6 +229,11 @@ cp .env.example .env
 | `RCLONE_LOCAL_STORAGE_HOST_PATH` | `./rclone/local-storage` | 按需 | 本地存储目标的宿主机挂载目录，挂载到 Worker 的 `/storage-targets`。仅当使用本地文件夹目标时配置，必须指向预先挂载的独立目录，不能复用 `APP_DATA_HOST_PATH`。 |
 | `FNOS_ROOT_KEY` | 无 | 必填 | 唯一的 32 字节根密钥，填写 64 位 hex。程序通过 HKDF-SHA256 为 Flask 会话、账号、OpenList、授权会话、来源快照和通知派生隔离子密钥。可用 `openssl rand -hex 32` 生成。 |
 | `RCLONE_WORKER_CONTROL_TOKEN` | 空，自动生成 | 新部署不要填写 | Web 与独立 rclone Worker 之间的内部 Bearer Token。留空时生成并保存到 `APP_DATA_HOST_PATH/.secrets/rclone_worker_control_token`，重新编排会继续使用原值。 |
+| `COMPOSE_PROFILES` | 空 | 按需 | 启用可选服务。填写 `pansou` 时编排会额外启动内置 PanSou 聚合搜索容器；留空则只有 Web 和 Worker 两个容器。 |
+| `PANSOU_USERNAME` | `fnos-search` | 按需 | 内置 PanSou 聚合搜索的登录账号。该服务仅容器内网可达，不对宿主机开放端口。 |
+| `PANSOU_PASSWORD` | `fnos-search` | 按需 | 内置 PanSou 聚合搜索的登录密码。修改后需要重新编排才能生效。 |
+| `PANSOU_IMAGE` | `ghcr.io/fish2018/pansou:latest` | 正式环境建议 | 内置 PanSou 镜像。固定为具体版本可避免重新编排时意外升级。 |
+| `PANSOU_CACHE_HOST_PATH` | `./pansou/cache` | 按需 | 内置 PanSou 搜索缓存目录，可清理。 |
 
 NAS 面板示例：
 
@@ -249,8 +256,25 @@ FNOS_ROOT_KEY=请填写64位hex根密钥
 面板的项目目录不直观时，建议六个目录变量全部填写绝对路径。最重要的是
 `APP_DATA_HOST_PATH`，重新编排时不能把它改到新的空目录。
 
-管理员初始账号固定为 `admin/admin`，首次登录后直接在管理后台修改。PanSou、OpenList、网盘、
-TMDB、通知和分类目录也全部在管理后台配置，不放进 `.env`。
+管理员初始账号固定为 `admin/admin`，首次登录后直接在管理后台修改。PanSou 内置服务默认关闭
+（`COMPOSE_PROFILES=pansou` 启用），OpenList、网盘、TMDB、通知和分类目录全部在管理后台配置，
+不放进 `.env`。
+
+内置 PanSou 说明：
+
+- 内置服务默认不启动。在 `.env` 加一行 `COMPOSE_PROFILES=pansou`（或每次启动命令加
+  `--profile pansou`）后重新编排，即随编排启动，应用自动通过容器内网地址 `http://pansou:8888`
+  连接，开箱即用。
+- 不启用内置服务时，在后台“搜索与线路”填写自建外部 PanSou 地址即可；两种方式不要同时指向
+  不同地址造成混淆。
+- 后台保存过外部 PanSou 地址的部署，数据库配置优先于编排默认值；想切回内置时，先启用
+  `COMPOSE_PROFILES=pansou`，再在“搜索与线路”把地址改回 `http://pansou:8888`
+  （不要留空，留空等于关闭搜索）。
+- 内置 PanSou 的 TG 频道搜索在国内直连网络下可能超时，插件搜索源不受影响；需要 TG 来源时，
+  在 `docker-compose.yml` 的 pansou 服务中取消 `PROXY` 注释并指向可用代理。
+- 内置镜像托管在 `ghcr.io`，个别国内网络拉取较慢或失败。此时把 `.env` 中的 `PANSOU_IMAGE`
+  改为可用的镜像代理地址（保持 `pansou:标签` 结尾），例如：
+  `PANSOU_IMAGE=ghcr.nju.edu.cn/fish2018/pansou:latest`。
 
 
 ### 更新版本
