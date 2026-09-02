@@ -200,14 +200,14 @@ class DurableWorkerRuntime:
         elif outcome == WORKER_RETRYABLE:
             transitioned = self._transition_failure(
                 task_id,
-                _result_error(result, "Worker task requested a retry"),
+                _result_error(result, "Worker 任务请求重试"),
                 retry_delay_seconds=delay,
                 result=result,
             )
         elif outcome == WORKER_BUSINESS_FAILED:
             transitioned = self._transition_failure(
                 task_id,
-                _result_error(result, "Worker task reported a business failure"),
+                _result_error(result, "Worker 任务报告业务失败"),
                 terminal=True,
                 result=result,
             )
@@ -286,7 +286,7 @@ class DurableWorkerRuntime:
         if not callable(defer):
             return self._transition_failure(
                 task_id,
-                "Worker repository does not support deferred tasks",
+                "Worker 仓库不支持延迟任务",
                 retry_delay_seconds=delay_seconds,
                 result=result,
             )

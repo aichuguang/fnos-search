@@ -525,7 +525,7 @@ class BtbtlaClient:
             _close_response(response)
             self._prepare_retry(attempt, url, f"HTTP {status_code}")
 
-        raise RuntimeError("BTBTLA request retry loop ended unexpectedly")
+        raise RuntimeError("BTBTLA 请求重试循环意外结束")
 
     def _prepare_retry(self, attempt: int, url: str, reason: str) -> None:
         with self._session_lock:

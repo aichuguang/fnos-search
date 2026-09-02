@@ -448,7 +448,7 @@ class TianyiCloudUploader:
                 content
             ):
                 raise TianyiApiError(
-                    "Cloud189 native upload probe could not verify the file",
+                    "天翼云原生上传探测未能验证文件",
                     code="UPLOAD_PROBE_VERIFY_FAILED",
                 )
             if callable(observer):
@@ -512,7 +512,7 @@ class TianyiCloudUploader:
                 )
                 if not cleaned:
                     raise TianyiApiError(
-                        "Cloud189 native upload probe cleanup was not confirmed",
+                        "天翼云原生上传探测清理未确认",
                         code="UPLOAD_PROBE_CLEANUP_FAILED",
                     )
             except Exception as exc:  # noqa: BLE001

@@ -165,7 +165,7 @@ class RcloneCallbackService:
                 "success": False,
                 "rejected": True,
                 "error_code": "rclone_job_required",
-                "message": "V1 rclone callback requires a matching job_id",
+                "message": "V1 rclone 回调需要匹配的 job_id",
                 "disposition": "rejected_unowned",
                 "delete_source_allowed": False,
             }, 409

@@ -264,7 +264,7 @@ class CmccClient:
             }
         }
         if not payload["getOutLinkInfoReq"]["linkID"]:
-            raise CmccApiError("139 share linkID is required")
+            raise CmccApiError("139 分享缺少 linkID")
         return self.share_post_json("/yun-share/richlifeApp/devapp/IOutLink/getOutLinkInfoV6", payload)
 
     def list_share_dir(self, link_id: str, *, password: str = "", pdir_fid: str = "root", page_size: int = 200) -> list[dict[str, Any]]:
@@ -300,7 +300,7 @@ class CmccClient:
             }
         }
         if not payload["createOuterLinkBatchOprTaskReq"]["taskInfo"]["contentInfoList"] and not payload["createOuterLinkBatchOprTaskReq"]["taskInfo"]["catalogInfoList"]:
-            raise CmccApiError("139 native save requires at least one file or folder path")
+            raise CmccApiError("139 原生保存至少需要一个文件或目录路径")
         return self.share_post_json("/yun-share/richlifeApp/devapp/IBatchOprTask/createOuterLinkBatchOprTask", payload)
 
     def get_task(self, task_id: str) -> dict[str, Any]:

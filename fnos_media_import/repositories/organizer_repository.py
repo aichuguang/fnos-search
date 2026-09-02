@@ -89,7 +89,7 @@ class OrganizerRepository:
 
         normalized_job_id = int(job_id)
         if normalized_job_id <= 0:
-            raise ValueError("job_id must be a positive integer")
+            raise ValueError("job_id 必须为正整数")
         now = utc_now()
         with self._connection_factory() as conn:
             # A unique index cannot be added safely because existing databases may

@@ -130,7 +130,7 @@ class HttpClient:
             response.close()
             self._wait_before_retry(attempt)
 
-        raise RuntimeError("HTTP retry loop exited unexpectedly")
+        raise RuntimeError("HTTP 重试循环异常退出")
 
     def _normalize_timeout(self, override: Any) -> tuple[float, float]:
         if isinstance(override, (tuple, list)) and len(override) == 2:

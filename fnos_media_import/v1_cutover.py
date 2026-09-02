@@ -1069,7 +1069,7 @@ def _assert_database_offline(path: Path) -> None:
         connection.execute("PRAGMA busy_timeout=200")
         checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         if checkpoint and int(checkpoint[0] or 0) != 0:
-            raise sqlite3.OperationalError("WAL checkpoint is busy")
+            raise sqlite3.OperationalError("WAL checkpoint 忙")
         connection.execute("BEGIN EXCLUSIVE")
         connection.rollback()
     except sqlite3.OperationalError as exc:

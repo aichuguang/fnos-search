@@ -727,7 +727,7 @@ class CmccUploader:
         return CmccUploadResult(
             True,
             "done",
-            "CMCC hash rapid upload completed",
+            "移动云哈希秒传完成",
             mode="rapid",
             file_id=file_id,
             upload_id=upload_id,
@@ -847,7 +847,7 @@ class CmccUploader:
         progress_label: str = "CMCC API PUT progress",
     ) -> None:
         if not file_id or not upload_id:
-            raise CmccApiError("CMCC WebAPI create response misses fileId/uploadId")
+            raise CmccApiError("移动云 WebAPI 创建响应缺少 fileId/uploadId")
         meter = _ProgressMeter(label=progress_label, total=size, callback=progress)
         done_ref = {"done": 0}
         meter.emit(0, force=True)
@@ -863,7 +863,7 @@ class CmccUploader:
             more = self.client.get_upload_urls(file_id=file_id, upload_id=upload_id, part_infos=batch_part_infos)
             more_upload_part_infos = _extract_part_infos(more)
             if not more_upload_part_infos:
-                raise CmccApiError(f"CMCC WebAPI getUploadUrl returned no partInfos for batch offset {start}")
+                raise CmccApiError(f"移动云 WebAPI getUploadUrl 未返回批次偏移 {start} 的 partInfos")
             self._upload_part_batch(
                 file_path=file_path,
                 all_part_infos=all_part_infos,
@@ -894,7 +894,7 @@ class CmccUploader:
                 or ""
             )
             if not upload_url:
-                raise CmccApiError(f"CMCC WebAPI returned empty uploadUrl for part {part_number}")
+                raise CmccApiError(f"移动云 WebAPI 返回的分片 {part_number} uploadUrl 为空")
             part_info = all_part_infos[part_number - 1]
             part_size = int(part_info.get("partSize") or part_info.get("part_size") or 0)
             hash_ctx = part_info.get("parallelHashCtx") if isinstance(part_info.get("parallelHashCtx"), dict) else {}

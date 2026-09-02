@@ -125,7 +125,7 @@ class TransferVerifier:
             if not require_non_empty:
                 return TransferVerifyResult(
                     "unknown",
-                    "plan has no frozen file count or total size",
+                    "计划缺少冻结的文件数或总大小",
                     file_count=listing.file_count,
                     total_size=listing.total_size,
                     code=ErrorCode.RESULT_UNKNOWN,

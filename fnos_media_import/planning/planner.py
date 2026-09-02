@@ -548,14 +548,14 @@ class ImportPlanner:
         if source.source_form == "magnet":
             if target_provider != "sixpan":
                 raise NativeTransferUnavailable(
-                    "magnet resources can only be routed to sixpan",
+                    "磁链资源只能保存到六盘",
                     code="MAGNET_TARGET_RESTRICTED",
                 )
             if category.native_locator is None:
-                raise NativeTransferUnavailable("magnet target lacks native_offline locator")
+                raise NativeTransferUnavailable("磁链目标缺少 native_offline 定位器")
             adapter = self.registry.get("sixpan")
             if not self._adapter_capabilities(adapter).supports_native_offline:
-                raise NativeTransferUnavailable("sixpan Adapter lacks native_offline capability")
+                raise NativeTransferUnavailable("六盘 Adapter 不支持 native_offline")
             return STRATEGY_NATIVE_OFFLINE
 
         if source.provider_kind == target_provider:
@@ -580,33 +580,33 @@ class ImportPlanner:
 
         if target_adapter is not None and target_caps.supports_relay_upload:
             if source_mount is None or not source_mount.get("readable"):
-                raise SourceLandingUnavailable("source has no readable landing mount")
+                raise SourceLandingUnavailable("来源缺少可读的落地区挂载")
             if destination_account is None:
                 raise DestinationAccountUnavailable(
-                    f"{target_provider} target has no bound account"
+                    f"{target_provider} 目标没有绑定账号"
                 )
             if category.native_locator is None:
                 raise DestinationAccountUnavailable(
-                    f"{target_provider} target lacks a native upload locator"
+                    f"{target_provider} 目标缺少原生上传定位器"
                 )
             uploader_factory = getattr(target_adapter, "relay_uploader", None)
             if not callable(uploader_factory) or uploader_factory() is None:
                 raise DestinationAccountUnavailable(
-                    f"{target_provider} Adapter lacks relay upload capability"
+                    f"{target_provider} Adapter 不支持中继上传"
                 )
             source_adapter = self.registry.get(source.provider_kind)
             if not self._adapter_capabilities(source_adapter).supports_source_materialization:
-                raise SourceLandingUnavailable("source Adapter cannot materialize to landing")
+                raise SourceLandingUnavailable("来源 Adapter 无法物化到落地区")
             return STRATEGY_RELAY_UPLOAD_PROVIDER
 
         if source_mount is None or not source_mount.get("readable"):
-            raise SourceLandingUnavailable("source has no readable landing mount")
+            raise SourceLandingUnavailable("来源缺少可读的落地区挂载")
         source_adapter = self.registry.get(source.provider_kind)
         if not self._adapter_capabilities(source_adapter).supports_source_materialization:
-            raise SourceLandingUnavailable("source Adapter cannot materialize to landing")
+            raise SourceLandingUnavailable("来源 Adapter 无法物化到落地区")
         if target_adapter is not None:
             if not target_caps.supports_rclone_dest:
-                raise OpenlistUnavailable("target Adapter does not support rclone destination")
+                raise OpenlistUnavailable("目标 Adapter 不支持 rclone 目标端")
         self._require_writable_target(category, target)
         return STRATEGY_RCLONE_COPY
 

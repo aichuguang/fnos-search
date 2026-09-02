@@ -131,7 +131,7 @@ def cmd_probe_create(args: argparse.Namespace) -> int:
                 {
                     "success": True,
                     "status": "created",
-                    "message": "CMCC WebAPI create request returned success",
+                    "message": "移动云 WebAPI 创建请求已成功",
                     "response": response,
                     "data_keys": sorted(str(key) for key in data.keys()),
                     "upload_url_detected": bool(upload_url),

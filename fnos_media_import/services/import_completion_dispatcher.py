@@ -106,7 +106,7 @@ class ImportCompletionDispatcher:
             "message",
             "V1 持久化传输任务已入队"
             if start_result.get("success")
-            else "V1 transfer queue is unavailable",
+            else "V1 传输队列不可用",
         )
         result["transfer_queue"] = start_result
         if job_id:

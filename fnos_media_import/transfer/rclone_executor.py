@@ -76,7 +76,7 @@ def build_managed_copy_run(plan: Any, locator_resolver: Any) -> dict[str, Any]:
     ):
         raise TransferError(
             ErrorCode.OPENLIST_UNAVAILABLE,
-            "V1 rclone requires a managed frozen-revision locator resolver",
+            "V1 rclone 需要托管冻结修订的定位器解析器",
         )
     raw = _raw_plan(plan)
     transfer = _mapping(raw.get("transfer"))

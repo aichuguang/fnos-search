@@ -203,7 +203,7 @@ class RepositorySet:
         connection_factory = getattr(database, "connect", None)
         backup = getattr(database, "backup_database", None)
         if not callable(connection_factory) or not callable(backup):
-            raise TypeError("RepositorySet requires database connect/backup factories")
+            raise TypeError("RepositorySet 需要数据库 connect/backup 工厂")
         return cls.build(connection_factory, backup)
 
     def connect(self) -> Any:

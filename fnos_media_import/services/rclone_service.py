@@ -186,7 +186,7 @@ class RcloneService:
             )
             if rejection:
                 raise ValueError(
-                    str(rejection.get("message") or "V1 execution plan unavailable")
+                    str(rejection.get("message") or "V1 执行计划不可用")
                 )
         resolver = getattr(self, "_v1_locator_resolver", None)
         if resolver is None:
@@ -920,7 +920,7 @@ class RcloneService:
             return {
                 "success": True,
                 "skipped": True,
-                "message": "the V1 job strategy has no rclone artifacts to clean",
+                "message": "V1 任务策略没有需要清理的 rclone 产物",
                 "items": [],
                 "warnings": [],
                 "errors": [],
@@ -1208,19 +1208,19 @@ class RcloneService:
     def _managed_locator(self) -> Any:
         resolver = getattr(self, "_v1_locator_resolver", None)
         if resolver is None:
-            raise ValueError("V1 rclone managed locator resolver is not bound")
+            raise ValueError("V1 rclone 托管定位器解析器未绑定")
         return resolver
 
     def _managed_remote_name(self) -> str:
         remote = str(getattr(self._managed_locator(), "remote_name", "") or "").strip()
         if not remote or not re.fullmatch(r"[A-Za-z0-9_.-]+", remote):
-            raise ValueError("V1 rclone managed remote name is invalid")
+            raise ValueError("V1 rclone 托管远端名称无效")
         return remote
 
     def _managed_config_path(self) -> str:
         path = str(getattr(self._managed_locator(), "config_path", "") or "").strip()
         if not path:
-            raise ValueError("V1 rclone managed config path is unavailable")
+            raise ValueError("V1 rclone 托管配置路径不可用")
         return path
 
     def _managed_relay_root(self) -> str:
@@ -1228,7 +1228,7 @@ class RcloneService:
             getattr(self._managed_locator(), "relay_root", "")
         )
         if not root:
-            raise ValueError("V1 rclone managed relay root is invalid")
+            raise ValueError("V1 rclone 托管中继根目录无效")
         return root
 
     def _cleanup_container_command(self, *arguments: str) -> list[str]:
@@ -1270,10 +1270,10 @@ class RcloneService:
     def _remote_path(self, value: str) -> str:
         path = self._clean_remote_file_path(value)
         if ":" not in path.split("/", 1)[0]:
-            raise ValueError("V1 cleanup path is missing the managed remote identity")
+            raise ValueError("V1 清理路径缺少托管远端标识")
         remote, relative = path.split(":", 1)
         if remote != self._managed_remote_name():
-            raise ValueError("V1 cleanup path uses a non-managed rclone remote")
+            raise ValueError("V1 清理路径使用了非托管的 rclone 远端")
         return f"{remote}:{relative}"
 
     @staticmethod
@@ -1480,7 +1480,7 @@ class RcloneService:
             "job_id": job_id,
             "run_id": run_id or 0,
             "exit_code": exit_code,
-            "message": "V1 durable transfer recovery owns retries",
+            "message": "V1 持久化传输恢复负责重试",
         }
 
 
@@ -2075,14 +2075,14 @@ class RcloneService:
         del category_filter
         copy_run = self._validated_copy_run(staging_run)
         if not copy_run:
-            raise ValueError("a validated V1 rclone descriptor is required")
+            raise ValueError("需要已校验的 V1 rclone 描述符")
         managed_remote = self._managed_remote_name()
         managed_config_path = self._managed_config_path()
         if copy_run["source_remote"] != managed_remote or (
             copy_run.get("target_remote")
             and copy_run["target_remote"] != managed_remote
         ):
-            raise ValueError("V1 rclone descriptor uses a non-managed remote")
+            raise ValueError("V1 rclone 描述符使用了非托管远端")
         relay_mode = bool(copy_run.get("relay_mode"))
         managed_relay_root = self._managed_relay_root() if relay_mode else ""
 
@@ -2194,7 +2194,7 @@ class RcloneService:
             execution_repository=TransferExecutionRepository(self.db) if self.db else None,
         )
         if rejection:
-            raise ValueError(str(rejection.get("message") or "V1 execution plan unavailable"))
+            raise ValueError(str(rejection.get("message") or "V1 执行计划不可用"))
         return self.build_v1_copy_run(job, plan)
 
 
@@ -2315,6 +2315,17 @@ class RcloneService:
             return ""
         return text.rstrip("/")
 
+    @staticmethod
+    def _plan_scoped_operation_key(value: Any) -> str:
+        # relay 下载/上传与来源物化使用带前缀的键（relay-dl:/relay-up:/landing:），
+        # 与冻结计划的基础幂等键同源；比对前必须剥离前缀（见
+        # execution_repository._operation_key_aliases 的同一约定）。
+        key = str(value or "").strip()
+        for prefix in ("landing:", "relay-dl:", "relay-up:"):
+            if key.startswith(prefix):
+                return key[len(prefix) :]
+        return key
+
     def _database_bound_staging_run(
         self,
         staging_run: dict[str, Any] | None,
@@ -2331,21 +2342,21 @@ class RcloneService:
             and submitted_operation_key
             and scoped_operation_key != submitted_operation_key
         ):
-            return {}, "submitted rclone operation_key conflicts with recovery metadata"
+            return {}, "提交的 rclone operation_key 与恢复运行元数据冲突"
         effective_operation_key = scoped_operation_key or submitted_operation_key
         requested = self._validated_copy_run(staging_run)
         if not requested:
-            return {}, "only a V1-derived rclone descriptor may be executed"
+            return {}, "只允许执行 V1 计划派生的 rclone 描述符"
         if not self.db:
-            return {}, "database is unavailable; the V1 plan cannot be verified"
+            return {}, "数据库不可用，无法校验 V1 计划"
 
         job_id = self._int_value(requested.get("job_id"))
         job = self.db.job_queries.get(job_id) if job_id > 0 else None
         if not isinstance(job, dict):
-            return {}, f"job #{job_id or '?'} does not exist"
+            return {}, f"任务 #{job_id or '?'} 不存在"
         status = str(job.get("status") or "").strip().lower()
         if self._staging_status_blocks_execution(status):
-            return {}, f"job #{job_id} status {status} blocks rclone execution"
+            return {}, f"任务 #{job_id} 状态 {status} 阻止 rclone 执行"
 
         from ..transfer.execution_repository import TransferExecutionRepository
 
@@ -2356,9 +2367,9 @@ class RcloneService:
             execution_repository=TransferExecutionRepository(self.db),
         )
         if rejection:
-            return {}, str(rejection.get("message") or "invalid V1 execution plan")
+            return {}, str(rejection.get("message") or "V1 执行计划无效")
         if not is_data_plane_strategy(plan_strategy(plan)):
-            return {}, f"job #{job_id} does not use an rclone V1 strategy"
+            return {}, f"任务 #{job_id} 未使用 rclone V1 策略"
         declared_operation_key = str(
             (
                 plan.get("transfer")
@@ -2367,8 +2378,10 @@ class RcloneService:
             ).get("idempotency_key")
             or ""
         ).strip()
-        if effective_operation_key and effective_operation_key != declared_operation_key:
-            return {}, "rclone operation_key differs from the frozen V1 plan"
+        if effective_operation_key and self._plan_scoped_operation_key(
+            effective_operation_key
+        ) != declared_operation_key:
+            return {}, "rclone operation_key 与冻结 V1 计划不一致"
         try:
             persisted = self._validated_copy_run(self.build_v1_copy_run(job, plan))
         except ValueError as exc:
@@ -2378,28 +2391,28 @@ class RcloneService:
                 context="rclone persisted descriptor derivation: ",
                 error=exc,
             )
-            return {}, f"job #{job_id} has an invalid V1 rclone descriptor: {exc}"
+            return {}, f"任务 #{job_id} 的 V1 rclone 描述符无效：{exc}"
         if not persisted:
-            return {}, f"job #{job_id} has no executable V1 rclone descriptor"
+            return {}, f"任务 #{job_id} 没有可执行的 V1 rclone 描述符"
         if self._copy_run_identity(requested) != self._copy_run_identity(persisted):
-            return {}, f"job #{job_id} rclone descriptor differs from its frozen V1 plan"
+            return {}, f"任务 #{job_id} 的 rclone 描述符与冻结 V1 计划不一致"
         if scoped_run_id > 0 or scoped_operation_key:
             if scoped_run_id <= 0 or not scoped_operation_key:
-                return {}, "scoped rclone descriptor requires run_id and operation_key"
+                return {}, "限定范围的 rclone 描述符需要 run_id 和 operation_key"
             run = self.db.rclone.get_rclone_run(scoped_run_id)
             if not isinstance(run, dict) or not run:
-                return {}, f"scoped rclone run #{scoped_run_id} does not exist"
+                return {}, f"限定范围的 rclone run #{scoped_run_id} 不存在"
             if int(run.get("job_id") or 0) != job_id:
-                return {}, "scoped rclone run belongs to another job"
+                return {}, "限定范围的 rclone run 属于其他任务"
             if str(run.get("operation_key") or "").strip() != scoped_operation_key:
-                return {}, "scoped rclone operation_key mismatch"
+                return {}, "限定范围的 rclone operation_key 不一致"
             frozen_descriptor = (
                 run.get("copy_descriptor")
                 if isinstance(run.get("copy_descriptor"), dict)
                 else {}
             )
             if self._copy_run_identity(frozen_descriptor) != self._copy_run_identity(persisted):
-                return {}, "scoped rclone run descriptor mismatch"
+                return {}, "限定范围的 rclone run 描述符不一致"
             persisted = {
                 **persisted,
                 "_scoped_run_id": scoped_run_id,
@@ -2506,7 +2519,7 @@ def _ensure_v1_runtime_config_inputs(
         ("cloud139", cloud139_config),
     ):
         if value:
-            raise ValueError(f"legacy runtime config {name} is unsupported in V1")
+            raise ValueError(f"V1 不支持旧版运行时配置 {name}")
     storage = storage_config if isinstance(storage_config, dict) else {}
     removed = [key for key in ("targets", "default_target") if key in storage]
     if removed:

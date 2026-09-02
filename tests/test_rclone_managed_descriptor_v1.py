@@ -298,7 +298,7 @@ class ManagedDescriptorTests(unittest.TestCase):
             def remote(**_kwargs):
                 return "LEGACY:/forged/job-7"
 
-        with self.assertRaisesRegex(TransferError, "managed frozen-revision"):
+        with self.assertRaisesRegex(TransferError, "托管冻结修订"):
             build_managed_copy_run(_plan(), _LegacyResolver())
 
     def test_mount_revision_mismatch_is_rejected(self) -> None:
@@ -495,7 +495,27 @@ class DatabaseBoundDescriptorTests(unittest.TestCase):
         )
 
         self.assertEqual(bound, {})
-        self.assertIn("operation_key differs", error)
+        self.assertIn("与冻结 V1 计划不一致", error)
+
+    def test_relay_download_prefixed_operation_key_matches_frozen_plan(self) -> None:
+        plan = _relay_plan()
+        # relay 策略的计划不允许携带 destination_staging（Provider 中继直接
+        # 上传到 native 目标），去掉后重算幂等键与完整性哈希再走冻结校验。
+        plan["paths"].pop("destination_staging", None)
+        plan["transfer"]["idempotency_key"] = compute_operation_key(plan)
+        plan = attach_plan_integrity(plan)
+        service = self._service(plan)
+        requested = build_managed_copy_run(plan, service._v1_locator_resolver)
+
+        bound, error = service._database_bound_staging_run(
+            requested,
+            submission_operation_key=f"relay-dl:{plan['transfer']['idempotency_key']}",
+        )
+
+        self.assertEqual(error, "")
+        self.assertEqual(
+            service._copy_run_identity(bound), service._copy_run_identity(requested)
+        )
 
     def test_forged_descriptor_never_replaces_database_descriptor(self) -> None:
         plan = _plan()
@@ -509,7 +529,7 @@ class DatabaseBoundDescriptorTests(unittest.TestCase):
         )
 
         self.assertEqual(bound, {})
-        self.assertIn("differs from its frozen V1 plan", error)
+        self.assertIn("rclone 描述符与冻结 V1 计划不一致", error)
 
 
 class ManagedRuntimeEnvironmentTests(unittest.TestCase):

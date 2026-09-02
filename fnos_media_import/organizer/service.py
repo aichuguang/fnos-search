@@ -1917,8 +1917,8 @@ class OrganizerService:
     def _openlist_visibility_source_message(self, task: dict[str, Any]) -> str:
         _job, plan, _rejection = self._task_v1_plan(task, reject=False)
         if plan:
-            return f"V1 {plan_strategy(plan)} import completed"
-        return "V1 import plan unavailable"
+            return f"V1 {plan_strategy(plan)} 导入已完成"
+        return "V1 导入计划不可用"
 
     def _task_retries_openlist_visibility(self, task: dict[str, Any]) -> bool:
         return self._task_waits_for_openlist_visibility(task)

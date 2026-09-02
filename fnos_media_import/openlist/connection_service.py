@@ -74,7 +74,7 @@ def env_master_key_provider(env_name: str = ROOT_KEY_ENV) -> MasterKeyProvider:
     """Return a provider that reads the single supported root-key variable."""
 
     if env_name != ROOT_KEY_ENV:
-        raise ValueError(f"OpenList credentials require {ROOT_KEY_ENV}")
+        raise ValueError(f"OpenList 凭据依赖环境变量 {ROOT_KEY_ENV}")
 
     def provider() -> str:
         return str(os.environ.get(ROOT_KEY_ENV) or "").strip()
