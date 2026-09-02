@@ -342,7 +342,7 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
         )
 
     def test_tianyi_native_save_stages_into_ingress_dir_before_category(self) -> None:
-        """原生转存先落 `分类/_入库暂存/job-N`，再由 Organizer 搬进正式分类目录。"""
+        """原生转存先落同级 `分类父目录/_入库暂存/分类/job-N`，再由 Organizer 搬进正式分类目录。"""
 
         tianyi_account = self._tianyi_account()
         self.connections.create_connection(
@@ -425,12 +425,12 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
         self.assertEqual(staging["locator_kind"], "folder_path")
         self.assertEqual(staging["role"], "native_staging")
         self.assertEqual(
-            staging["path"], f"root-folder-id::电影/{NATIVE_STAGING_DIR}/job-47"
+            staging["path"], f"root-folder-id::{NATIVE_STAGING_DIR}/电影/job-47"
         )
         self.assertEqual(staging["namespace_id"], paths["destination_final"]["namespace_id"])
         # Organizer 从 OpenList 侧看到同一个暂存目录，搬运目标是 organizer_final。
         self.assertEqual(
-            paths["organizer"]["path"], f"/tianyi/电影/{NATIVE_STAGING_DIR}/job-47"
+            paths["organizer"]["path"], f"/tianyi/{NATIVE_STAGING_DIR}/电影/job-47"
         )
         self.assertEqual(paths["organizer_final"]["path"], "/tianyi/电影")
         self.assertEqual(paths["organizer_final"]["kind"], "openlist")
@@ -447,7 +447,7 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
         submit = TransferPlan(plan).native_submit_locator()
         self.assertEqual(submit.kind, "folder_path")
         self.assertEqual(
-            submit.value, f"root-folder-id::电影/{NATIVE_STAGING_DIR}/job-47"
+            submit.value, f"root-folder-id::{NATIVE_STAGING_DIR}/电影/job-47"
         )
 
         # 暂存目录被改写成任意目录时必须失败。重新盖章 integrity，否则只是
@@ -553,13 +553,13 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
         self.assertEqual(paths["destination_final"]["path"], "/电视剧")
         self.assertEqual(
             paths["destination_staging"]["path"],
-            f"/电视剧/{NATIVE_STAGING_DIR}/job-2",
+            f"/{NATIVE_STAGING_DIR}/电视剧/job-2",
         )
         # OpenList 侧必须带上挂载根。
         self.assertEqual(paths["organizer_final"]["path"], "/离线下载/电视剧")
         self.assertEqual(
             paths["organizer"]["path"],
-            f"/离线下载/电视剧/{NATIVE_STAGING_DIR}/job-2",
+            f"/离线下载/{NATIVE_STAGING_DIR}/电视剧/job-2",
         )
 
         validate_plan(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from fnos_media_import.domain.models import SelectionSnapshot
-from fnos_media_import.planning import NATIVE_STAGING_DIR, native_staging_locator
+from fnos_media_import.planning import native_staging_locator, native_staging_path
 from fnos_media_import.planning.job_plan import (
     attach_plan_integrity,
     compute_operation_key,
@@ -93,8 +93,9 @@ def organizer_v1_plan(
             "path": str(destination_staging or organizer_root),
         }
     if native_staging and strategy in {"native_save", "native_offline"}:
-        # 原生入库暂存链路：Provider 先转存到「分类目录 / _入库暂存 / job-N」，
-        # Organizer 从 OpenList 侧看同一个目录，并搬进 organizer_final。
+        # 原生入库暂存链路：Provider 先转存到与分类目录同级的
+        # 「分类父目录/_入库暂存/分类名/job-N」，Organizer 从 OpenList 侧看
+        # 同一个目录，并搬进 organizer_final。
         staging_value = native_staging_locator(
             native_locator_kind, str(destination_final), f"job-{job_id}"
         )
@@ -119,7 +120,9 @@ def organizer_v1_plan(
             "storage_identity_id": storage_identity_id,
             "identity_root": identity_root,
         }
-        paths["organizer"]["path"] = f"{final_visible.rstrip('/')}/{NATIVE_STAGING_DIR}/job-{job_id}"
+        paths["organizer"]["path"] = native_staging_path(
+            final_visible, f"job-{job_id}"
+        )
     if strategy == "relay_upload_provider":
         paths["local_temp"] = {
             "kind": "relay",

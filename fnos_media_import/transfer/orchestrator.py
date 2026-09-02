@@ -581,8 +581,8 @@ class TransferOrchestrator:
     def _native_verify_locator(self, descriptor: dict[str, Any] | None) -> Any:
         """按被校验的目录选择原生定位器。
 
-        目标校验阶段校验的是入库暂存目录（分类目录 / _入库暂存 / job-N），最终
-        校验阶段才是分类目录。两者用同一个分类定位器会让 VerifyRequest 自相
+        目标校验阶段校验的是入库暂存目录（分类父目录 / _入库暂存 / 分类名 / job-N），
+        最终校验阶段才是分类目录。两者用同一个分类定位器会让 VerifyRequest 自相
         矛盾：descriptor 指暂存目录、locator 指分类目录。这里按 descriptor 取
         冻结计划里对应的原生定位器，保持两者一致。
         """

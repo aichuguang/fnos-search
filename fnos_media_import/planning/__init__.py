@@ -73,9 +73,11 @@ STAGING_DIR = "_fnos_staging"
 
 # 原生转存（native_save / native_offline）的入库暂存目录名。
 #
-# 原生链路没有 rclone 的挂载级暂存区：Provider 只能在自己的目录树里创建子目录，
-# 所以暂存目录必须是「分类目录 / <NATIVE_STAGING_DIR> / job-N」。这里使用冻结常量
-# 而不是 ORGANIZER_STAGING_DIR_NAME 配置值，否则管理员改配置会让已冻结的执行计划
+# 原生链路没有 rclone 的挂载级暂存区：Provider 只能在自己的目录树里创建子目录。
+# 暂存目录与分类目录同级（分类父目录 / <NATIVE_STAGING_DIR> / 分类名 / job-N），
+# 绝不嵌在分类目录里面：媒体库（如飞牛）按分类目录扫描，暂存嵌在分类内部会把
+# 搬运中的文件扫进库、入库后又失效。这里使用冻结常量而不是
+# ORGANIZER_STAGING_DIR_NAME 配置值，否则管理员改配置会让已冻结的执行计划
 # 校验失败。常量以 UTF-8 源码字面量声明，不经过任何 shell 拼接。
 NATIVE_STAGING_DIR = "_入库暂存"
 
@@ -277,29 +279,50 @@ def mount_webdav_root(mount: Any) -> str:
     return normalize_path(mount.get("webdav_root") or "/")
 
 
+def native_staging_path(category_path: Any, job: Any) -> str:
+    """由分类路径推导同级入库暂存路径（分类父目录 / _入库暂存 / 分类名 / job-N）。
+
+    暂存目录必须位于分类目录外面：媒体库（如飞牛）按分类目录扫描，暂存嵌在
+    分类内部会把搬运中的文件扫进库。返回空串表示无法派生（分类就是根目录）。
+    """
+
+    category = normalize_path(category_path)
+    leaf = path_leaf(category)
+    leaf_dir = str(job or "").strip().strip("/")
+    if not leaf or not leaf_dir:
+        return ""
+    parent = category.rsplit("/", 1)[0]
+    return normalize_path(f"{parent}/{NATIVE_STAGING_DIR}/{leaf}/{leaf_dir}")
+
+
 def native_staging_locator(locator_kind: Any, locator_value: Any, job: Any) -> str:
     """由分类原生定位器推导任务级入库暂存定位器值。
 
     规划器与校验器必须用同一个推导函数，否则冻结计划的暂存路径无法复核。
 
+    暂存目录与分类目录同级（分类父目录 / _入库暂存 / 分类名 / job-N），不嵌在
+    分类目录里面，避免媒体库按分类目录扫描时看到搬运中的文件。
     ``folder_path`` 是复合定位器 ``{root_folder_id}::{相对路径}``（天翼云），只在
-    相对路径一侧追加暂存段；``provider_path`` / ``path`` 是纯路径定位器，直接追加。
-    ``folder_id`` 之类的不透明 ID 无法派生子目录，返回空串表示不支持原生暂存。
+    相对路径一侧派生同级段；``provider_path`` / ``path`` 是纯路径定位器，取分类
+    父目录派生。``folder_id`` 之类的不透明 ID 无法派生子目录，返回空串表示不支持
+    原生暂存。
     """
 
     kind = str(locator_kind or "").strip()
     value = str(locator_value or "").strip()
-    leaf = str(job or "").strip().strip("/")
-    if not value or not leaf:
+    leaf_dir = str(job or "").strip().strip("/")
+    if not value or not leaf_dir:
         return ""
-    suffix = f"{NATIVE_STAGING_DIR}/{leaf}"
     if kind == "folder_path":
         root_folder_id, separator, relative = value.partition("::")
         if not separator or not root_folder_id.strip() or not relative.strip():
             return ""
-        return f"{root_folder_id}::{normalize_path(f'{relative}/{suffix}').lstrip('/')}"
+        staged = native_staging_path(relative, leaf_dir)
+        if not staged:
+            return ""
+        return f"{root_folder_id}::{staged.lstrip('/')}"
     if kind in {"provider_path", "path"}:
-        return normalize_path(f"{value}/{suffix}")
+        return native_staging_path(value, leaf_dir)
     return ""
 
 

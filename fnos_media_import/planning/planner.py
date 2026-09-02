@@ -19,7 +19,6 @@ from . import (
     DATA_PLANE_STRATEGIES,
     EXECUTION_PLAN_VERSION,
     INGRESS_DIR,
-    NATIVE_STAGING_DIR,
     STAGING_DIR,
     STRATEGY_EXECUTOR,
     STRATEGY_NATIVE_OFFLINE,
@@ -47,6 +46,7 @@ from . import (
     mount_webdav_root,
     native_namespace,
     native_staging_locator,
+    native_staging_path,
     normalize_path,
     openlist_namespace,
     is_relay_upload_strategy,
@@ -706,11 +706,13 @@ class ImportPlanner:
                 "locator_kind": native.kind,
             }
             if strategy in {STRATEGY_NATIVE_SAVE, STRATEGY_NATIVE_OFFLINE} and organizer_enabled:
-                # 原生转存先落到「分类目录 / _入库暂存 / job-N」，再由 OpenList
-                # Organizer 搬进正式分类目录。只有 Organizer 启用时才冻结暂存目录：
-                # 原生 Provider 没有 move 能力，TransferFinalizer 也没有 native 分支，
-                # Organizer 是唯一能把暂存搬走的执行者。否则保持直写分类目录，
-                # 避免出现「进了暂存却没人搬」的死链路。
+                # 原生转存先落到与分类目录同级的「分类父目录/_入库暂存/分类名/job-N」，
+                # 再由 OpenList Organizer 搬进正式分类目录。暂存必须在分类目录
+                # 外面：媒体库（如飞牛）按分类目录扫描，嵌在分类内部会把搬运中的
+                # 文件扫进库。只有 Organizer 启用时才冻结暂存目录：原生 Provider
+                # 没有 move 能力，TransferFinalizer 也没有 native 分支，Organizer
+                # 是唯一能把暂存搬走的执行者。否则保持直写分类目录，避免出现
+                # 「进了暂存却没人搬」的死链路。
                 staging_value = native_staging_locator(native.kind, native.value, job)
                 if staging_value:
                     destination_staging = {
@@ -842,29 +844,28 @@ class ImportPlanner:
                 None,
             )
         if staging_kind == "native":
-            # 原生暂存：Organizer 从 OpenList 侧看到同一个「分类目录/_入库暂存/job-N」，
-            # 并把文件搬到 OpenList 可见的正式分类目录 organizer_final。
-            # paths.destination_final 对天翼云是 ``{root_folder_id}::{相对路径}``
-            # 复合定位器，OpenList 无法直接把它当目标根使用，所以正式分类目录
-            # 必须单独冻结一份 OpenList 可见路径。
+            # 原生暂存：Organizer 从 OpenList 侧看到与分类目录同级的
+            # 「分类父目录/_入库暂存/分类名/job-N」，并把文件搬到 OpenList 可见的
+            # 正式分类目录 organizer_final。paths.destination_final 对天翼云是
+            # ``{root_folder_id}::{相对路径}`` 复合定位器，OpenList 无法直接把它当
+            # 目标根使用，所以正式分类目录必须单独冻结一份 OpenList 可见路径。
             final_path = mount_absolute_path(webdav_root, organizer_locator.path)
-            staging_path = normalize_path(
-                f"{final_path}/{NATIVE_STAGING_DIR}/{job}"
-            )
-            return (
-                {
-                    "kind": "openlist",
-                    "namespace_id": namespace,
-                    "path": staging_path,
-                    **extras,
-                },
-                {
-                    "kind": "openlist",
-                    "namespace_id": namespace,
-                    "path": final_path,
-                    **extras,
-                },
-            )
+            staging_path = native_staging_path(final_path, job)
+            if staging_path:
+                return (
+                    {
+                        "kind": "openlist",
+                        "namespace_id": namespace,
+                        "path": staging_path,
+                        **extras,
+                    },
+                    {
+                        "kind": "openlist",
+                        "namespace_id": namespace,
+                        "path": final_path,
+                        **extras,
+                    },
+                )
         # native 直写 / 中继策略：Organizer 直接看到最终目录。
         return (
             {

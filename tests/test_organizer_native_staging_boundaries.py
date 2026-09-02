@@ -1,12 +1,12 @@
 """原生转存入库暂存链路的 Organizer 边界用例。
 
-rclone 链路的暂存目录在分类目录之外（``/挂载/_fnos_staging/分类/job-N``），
-原生转存链路则相反：Provider 只能把文件转存进自己的分类目录，所以暂存目录被
-冻结成「分类目录 / _入库暂存 / job-N」，扫描根反而嵌套在搬运目标根内部。
+原生暂存目录与分类目录同级（``分类父目录/_入库暂存/分类名/job-N``）：暂存
+必须在分类目录外面，媒体库（如飞牛）按分类目录扫描时才不会把搬运中的文件
+扫进库。rclone 链路的挂载级暂存（``/挂载/_fnos_staging/分类/job-N``）同理。
 
-这套用例专门覆盖这个倒置形状：
+这套用例专门覆盖这个形状：
 * ``paths.organizer_final`` 必须压过天翼云式复合 ``destination_final``；
-* 扫描根只能精确等于嵌套暂存目录，不能是分类根；
+* 扫描根只能精确等于暂存目录，不能是分类根或暂存上层目录；
 * 暂存 → 分类目录的映射能过全部包含性校验，越界目标仍被拒；
 * 搬空目录清理被限制在暂存目录内，永远不会去删分类根。
 """
@@ -23,7 +23,7 @@ from fnos_media_import.organizer.parser import (
     V1_DESTINATION_IS_RESOURCE_FIELD,
 )
 from fnos_media_import.organizer.service import OrganizerService
-from fnos_media_import.planning import NATIVE_STAGING_DIR
+from fnos_media_import.planning import NATIVE_STAGING_DIR, native_staging_path
 from tests._organizer_v1_fixtures import (
     attach_organizer_v1_task,
     bind_task_openlist_resolver,
@@ -38,7 +38,7 @@ JOB_ID = 47
 # 目标根使用；这正是必须冻结 organizer_final 的原因。
 NATIVE_FINAL = "root-folder-id::电影"
 FINAL_ROOT = "/天翼/电影"
-STAGING_ROOT = f"{FINAL_ROOT}/{NATIVE_STAGING_DIR}/job-{JOB_ID}"
+STAGING_ROOT = native_staging_path(FINAL_ROOT, f"job-{JOB_ID}")
 RESOURCE_ROOT = f"{FINAL_ROOT}/流浪地球 (2019)"
 PLAN = organizer_v1_plan(
     JOB_ID,
@@ -146,7 +146,7 @@ class _ApplyBoundaryDatabase(RepositoryFakeMixin):
 
 
 class NativeStagingFrozenPathTests(unittest.TestCase):
-    def test_plan_freezes_staging_inside_the_final_category_directory(self) -> None:
+    def test_plan_freezes_staging_beside_the_final_category_directory(self) -> None:
         paths = PLAN["paths"]
 
         self.assertEqual(paths["organizer"]["path"], STAGING_ROOT)
@@ -154,10 +154,12 @@ class NativeStagingFrozenPathTests(unittest.TestCase):
         self.assertEqual(paths["destination_staging"]["role"], "native_staging")
         self.assertEqual(
             paths["destination_staging"]["path"],
-            f"{NATIVE_FINAL}/{NATIVE_STAGING_DIR}/job-{JOB_ID}",
+            f"root-folder-id::{NATIVE_STAGING_DIR}/电影/job-{JOB_ID}",
         )
-        # 与 rclone 形状相反：扫描根在搬运目标根内部。
-        self.assertTrue(STAGING_ROOT.startswith(f"{FINAL_ROOT}/"))
+        # 暂存必须与分类目录同级，绝不能嵌在分类目录里面，否则媒体库按分类
+        # 目录扫描会把搬运中的文件扫进库。
+        self.assertEqual(STAGING_ROOT, f"/天翼/{NATIVE_STAGING_DIR}/电影/job-{JOB_ID}")
+        self.assertFalse(STAGING_ROOT.startswith(f"{FINAL_ROOT}/"))
 
     def test_target_category_prefers_organizer_final_over_native_composite(self) -> None:
         service = _service()
@@ -185,7 +187,7 @@ class NativeStagingFrozenPathTests(unittest.TestCase):
 
 
 class NativeStagingScanRootTests(unittest.TestCase):
-    def test_scan_root_must_be_the_nested_staging_dir_not_the_category_root(self) -> None:
+    def test_scan_root_must_be_the_staging_dir_not_any_ancestor(self) -> None:
         service = _service()
         target_category = service._target_category_for_task(
             _task(),
@@ -199,8 +201,11 @@ class NativeStagingScanRootTests(unittest.TestCase):
         )
         unsafe_roots = (
             FINAL_ROOT,
-            f"{FINAL_ROOT}/{NATIVE_STAGING_DIR}",
+            f"/天翼/{NATIVE_STAGING_DIR}",
+            f"/天翼/{NATIVE_STAGING_DIR}/电影",
             f"{STAGING_ROOT}/LiuLangDiQiu.2019.2160p",
+            # 旧版嵌套形态（分类目录/_入库暂存/job-N）也必须被拒。
+            f"{FINAL_ROOT}/{NATIVE_STAGING_DIR}/job-{JOB_ID}",
         )
         for unsafe_root in unsafe_roots:
             with self.subTest(scan_root=unsafe_root), self.assertRaises(OpenListError):
@@ -222,13 +227,13 @@ class NativeStagingMappingBoundaryTests(unittest.TestCase):
         self._validate(_video_mapping())
 
     def test_target_left_inside_the_staging_dir_is_rejected(self) -> None:
-        # 暂存目录本身就在 final_root 之下，destination_final 包含性检查会放行，
-        # 必须由专门的暂存根检查拦住，否则文件永远留在 _入库暂存 里。
+        # 暂存目录在分类目录外面，留在暂存里的目标先撞 destination_final
+        # 包含性检查；专门的暂存根检查作为纵深防御兜底，防止映射被改写进暂存。
         service = _service()
         unsafe_targets = (
             f"{STAGING_ROOT}/流浪地球 (2019).mkv",
             f"{STAGING_ROOT}/流浪地球 (2019)/流浪地球 (2019).mkv",
-            f"{FINAL_ROOT}/{NATIVE_STAGING_DIR}/job-{JOB_ID}/深层/文件.mkv",
+            f"{STAGING_ROOT}/深层/文件.mkv",
         )
         for target_path in unsafe_targets:
             task = {
@@ -236,7 +241,7 @@ class NativeStagingMappingBoundaryTests(unittest.TestCase):
                 "mappings": [{"id": 91, **_video_mapping(), "target_path": target_path}],
             }
             with self.subTest(target_path=target_path), self.assertRaisesRegex(
-                OpenListError, "target path stayed inside frozen staging root"
+                OpenListError, "target path escaped frozen destination_final"
             ):
                 service._validate_v1_mapping_boundaries(task)
 
@@ -305,7 +310,12 @@ class NativeStagingOperationTests(unittest.TestCase):
 
         cleanup = [item["target_path"] for item in operations if item["type"] == "cleanup_empty_dir"]
         self.assertEqual(cleanup, [f"{STAGING_ROOT}/LiuLangDiQiu.2019.2160p"])
-        for unsafe in (FINAL_ROOT, STAGING_ROOT, f"{FINAL_ROOT}/{NATIVE_STAGING_DIR}"):
+        for unsafe in (
+            FINAL_ROOT,
+            STAGING_ROOT,
+            f"/天翼/{NATIVE_STAGING_DIR}",
+            f"/天翼/{NATIVE_STAGING_DIR}/电影",
+        ):
             self.assertNotIn(unsafe, cleanup)
         move_indexes = [i for i, item in enumerate(operations) if item["type"] == "move_file"]
         cleanup_indexes = [i for i, item in enumerate(operations) if item["type"] == "cleanup_empty_dir"]

@@ -141,8 +141,8 @@ class NativeTransferExecutor:
             )
         if self.strategy == "native_offline" and not caps.supports_native_offline:
             raise TransferError(ErrorCode.NATIVE_TRANSFER_UNAVAILABLE, "六盘不支持原生离线")
-        # 提交目录优先取冻结的原生入库暂存目录（分类目录 / _入库暂存 / job-N）；
-        # 没有暂存目录时 native_submit_locator() 退回分类定位器。
+        # 提交目录优先取冻结的原生入库暂存目录（分类父目录 / _入库暂存 / 分类名 /
+        # job-N）；没有暂存目录时 native_submit_locator() 退回分类定位器。
         locator = self.plan.native_submit_locator()
         idempotency_key = self.plan.idempotency_key
         try:

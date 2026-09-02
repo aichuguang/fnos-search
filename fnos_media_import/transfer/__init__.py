@@ -672,9 +672,9 @@ class TransferPlan:
     def native_submit_locator(self) -> NativeLocator:
         """原生转存的实际提交目录。
 
-        当计划冻结了原生入库暂存目录（分类目录 / _入库暂存 / job-N）时，Provider
-        必须把文件转存进暂存目录，之后由 OpenList Organizer 搬进正式分类目录；
-        没有暂存目录时退回分类定位器，保持直写分类目录的旧行为。
+        当计划冻结了原生入库暂存目录（分类父目录 / _入库暂存 / 分类名 / job-N）时，
+        Provider 必须把文件转存进暂存目录，之后由 OpenList Organizer 搬进正式分类
+        目录；没有暂存目录时退回分类定位器，保持直写分类目录的旧行为。
         """
 
         # 直接读冻结计划里的原始值：path() 会把定位器规范化成以 "/" 开头的

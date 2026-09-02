@@ -46,6 +46,7 @@ from . import (
     mount_webdav_root,
     namespace_kind,
     native_staging_locator,
+    native_staging_path,
     normalize_path,
     path_is_safe,
     path_leaf,
@@ -830,19 +831,13 @@ class PlanValidator:
             self._storage_identity_ref(label, namespace, path, bindings)
             for label, namespace, path, _kind in valid_refs
         ]
-        # 原生入库暂存目录故意嵌套在正式分类目录里面（分类/_入库暂存/job-N），
-        # 这对组合的「重叠」是设计要求而不是冲突，单独放行；其合法性由
-        # _native_staging_errors 逐项复核。
-        overlap_exempt: set[frozenset[str]] = set()
-        if strategy in {STRATEGY_NATIVE_SAVE, STRATEGY_NATIVE_OFFLINE} and staging and final:
-            if not self._native_staging_errors(strategy, staging, final, job):
-                overlap_exempt.add(frozenset({"destination_staging", "destination_final"}))
+        # 原生入库暂存目录与分类目录同级（分类父目录/_入库暂存/分类名/job-N），
+        # 二者在任何命名空间下都不重叠；其合法性由 _native_staging_errors
+        # 逐项复核。若暂存与分类目录出现重叠，直接按重叠冲突拒绝。
         for i in range(len(identity_refs)):
             for j in range(i + 1, len(identity_refs)):
                 label_a, namespace_a, path_a = identity_refs[i]
                 label_b, namespace_b, path_b = identity_refs[j]
-                if frozenset({label_a, label_b}) in overlap_exempt:
-                    continue
                 if paths_overlap(namespace_a, path_a, namespace_b, path_b):
                     errors.append(f"paths.{label_a} 与 paths.{label_b} 在同一命名空间重叠")
 
@@ -896,11 +891,11 @@ class PlanValidator:
                 errors.append(f"{strategy} 不允许数据面 landing/local_temp")
             if not final:
                 errors.append(f"{strategy} 缺少 destination_final")
-            # 原生转存允许一个「分类目录 / _入库暂存 / job-N」的任务级暂存目录：
-            # Provider 先把文件转存进去，再由 OpenList Organizer 搬进正式分类目录。
-            # 它不是数据面 staging（没有 rclone 搬运），所以必须逐项复核：命名空间与
-            # destination_final 完全一致、叶子是 job-N、且路径能由 destination_final
-            # 原样重新推导出来，防止冻结计划被改写成任意目录。
+            # 原生转存允许一个与分类目录同级的「分类父目录/_入库暂存/分类名/job-N」
+            # 任务级暂存目录：Provider 先把文件转存进去，再由 OpenList Organizer
+            # 搬进正式分类目录。它不是数据面 staging（没有 rclone 搬运），所以必须
+            # 逐项复核：命名空间与 destination_final 完全一致、叶子是 job-N、且路径
+            # 能由 destination_final 原样重新推导出来，防止冻结计划被改写成任意目录。
             if staging:
                 errors.extend(self._native_staging_errors(strategy, staging, final, job))
 
@@ -1502,9 +1497,9 @@ class PlanValidator:
             if path_leaf(path) != job:
                 errors.append("organizer path is not task-scoped")
         elif staging and staging_kind == "native":
-            # 原生入库暂存链路：Organizer 的扫描根是 OpenList 侧看到的同一个
-            # 「分类目录 / _入库暂存 / job-N」，搬运目标则是单独冻结的
-            # paths.organizer_final（destination_final 对天翼云是复合定位器，
+            # 原生入库暂存链路：Organizer 的扫描根是 OpenList 侧看到的、与分类
+            # 目录同级的「分类父目录/_入库暂存/分类名/job-N」，搬运目标则是单独
+            # 冻结的 paths.organizer_final（destination_final 对天翼云是复合定位器，
             # OpenList 不能直接当目标根使用）。
             organizer_final = _mapping(paths.get("organizer_final"))
             final_path = _str(organizer_final.get("path"))
@@ -1517,9 +1512,9 @@ class PlanValidator:
             if path_leaf(path) != job:
                 errors.append("organizer path is not task-scoped")
             if final_path and normalize_path(path) != normalize_path(
-                f"{final_path}/{NATIVE_STAGING_DIR}/{job}"
+                native_staging_path(final_path, job)
             ):
-                errors.append("Organizer path 不是 organizer_final 下的入库暂存目录")
+                errors.append("Organizer path 不是 organizer_final 同级的入库暂存目录")
             if (
                 locator is not None
                 and final_path
@@ -1543,7 +1538,7 @@ class PlanValidator:
         final: dict[str, Any],
         job: str,
     ) -> list[str]:
-        """复核原生入库暂存描述符（分类目录 / _入库暂存 / job-N）。
+        """复核原生入库暂存描述符（分类父目录 / _入库暂存 / 分类名 / job-N）。
 
         暂存目录必须能由 destination_final 原样重新推导出来，否则视为被改写。
         返回空列表表示该暂存描述符合法。

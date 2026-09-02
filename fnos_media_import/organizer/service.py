@@ -1904,10 +1904,10 @@ class OrganizerService:
                     "Organizer mapping target path escaped frozen destination_final: "
                     f"mapping_id={mapping.get('id') or '<unknown>'}, target={target_path}, destination_final={final_root or '<empty>'}"
                 )
-            # 原生转存链路的入库暂存目录嵌套在分类目录内部（分类目录 /
-            # _入库暂存 / job-N），所以「目标仍在暂存目录里」照样满足上面的
-            # destination_final 包含性检查。这种映射会让文件永远留在暂存目录，
-            # 必须单独拦下。rclone 链路的暂存目录在分类目录之外，此判断恒真。
+            # 原生转存链路的入库暂存目录与分类目录同级（分类父目录 /
+            # _入库暂存 / 分类名 / job-N），目标仍在暂存目录里时会先撞上面的
+            # destination_final 包含性检查。这里再单独拦一次作为纵深防御：
+            # 万一映射目标被改写进暂存目录，文件会永远留在 _入库暂存 里。
             if _path_is_same_or_child(target_path, job_root):
                 raise OpenListError(
                     "Organizer mapping target path stayed inside frozen staging root: "
