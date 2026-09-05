@@ -659,7 +659,9 @@ copy_wait_size_match() {
 # 管道（非终端），awk 默认按 4KB 块缓冲，不冲刷的话进度会长时间不可见。
 progress_filter() {
   # progress_direction 由调用处注入（下载/上传），缺省时退回“传输”。
-  awk -v progress_label="${RCLONE_PROGRESS_LABEL:-}" -v progress_direction="${RCLONE_PROGRESS_DIRECTION:-}" '
+  # progress_marker：首条统计行落盘的哨兵文件（缺省为空 = 不写），
+  # 供 copy_file 的慢源看门狗判断“是否已收到第一个数据”。
+  awk -v progress_label="${RCLONE_PROGRESS_LABEL:-}" -v progress_direction="${RCLONE_PROGRESS_DIRECTION:-}" -v progress_marker="${RCLONE_PROGRESS_MARKER:-}" '
     /NOTICE/ && /ETA/ {
       line = $0
       sub(/^.*NOTICE:[ \t]*/, "", line)
@@ -672,6 +674,10 @@ progress_filter() {
       # 二段=速度、其余并入进度”归一化，避免写死字段数漏匹配。
       n = split(line, parts, ",[ \t]*")
       if (n >= 3 && parts[n] ~ /^ETA[ \t]/) {
+        if (progress_marker != "" && marker_written != 1) {
+          print "" > progress_marker
+          marker_written = 1
+        }
         gsub(/^ETA[ \t]+/, "", parts[n])
         if (parts[n] == "-") {
           parts[n] = "计算中"
@@ -696,14 +702,38 @@ copy_file() {
   copy_dest_spec="$2"
   # POSIX sh 没有 PIPESTATUS / 进程替换：用 rc 文件从管道里带回 rclone 退出码。
   copy_rc_file="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-rc.XXXXXX")"
+  # 慢源看门狗哨兵：progress_filter 打出第一条统计行时才存在。源网盘取下载
+  # 链接可能耗时数分钟且期间 rclone 完全静默（2026-09-05 线上：下载文件后
+  # 等待近 3 分钟才出现首条进度），看门狗只在实际变慢时补一条中文提示。
+  copy_progress_marker="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-progress.XXXXXX")"
+  rm -f "$copy_progress_marker"
   RCLONE_PROGRESS_LABEL="$(basename "$copy_dest_spec")"
-  export RCLONE_PROGRESS_LABEL RCLONE_PROGRESS_DIRECTION
+  RCLONE_PROGRESS_MARKER="$copy_progress_marker"
+  export RCLONE_PROGRESS_LABEL RCLONE_PROGRESS_DIRECTION RCLONE_PROGRESS_MARKER
+  (
+    copy_waited=0
+    copy_slow_hinted=0
+    while [ "$copy_waited" -lt 300 ]; do
+      sleep 10 || exit 0
+      copy_waited=$((copy_waited + 10))
+      if [ -e "$copy_progress_marker" ]; then
+        exit 0
+      fi
+      if [ "$copy_waited" -ge 60 ] && [ "$copy_slow_hinted" -eq 0 ]; then
+        copy_slow_hinted=1
+        log "源端响应缓慢：${RCLONE_PROGRESS_LABEL} 已请求 ${copy_waited} 秒仍未开始传输，通常是源网盘在准备下载链接，请耐心等待"
+      fi
+    done
+  ) &
+  copy_watchdog_pid=$!
   {
     copy_file_once "$copy_source_spec" "$copy_dest_spec"
     echo "$?" >"$copy_rc_file"
   } 2>&1 | progress_filter >&2
+  kill "$copy_watchdog_pid" 2>/dev/null || true
+  wait "$copy_watchdog_pid" 2>/dev/null || true
   copy_rc="$(cat "$copy_rc_file" 2>/dev/null || echo 1)"
-  rm -f "$copy_rc_file"
+  rm -f "$copy_rc_file" "$copy_progress_marker"
   return "$copy_rc"
 }
 copy_file_once() {

@@ -588,6 +588,8 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         atexit.register(rclone_worker_client.close)
     rclone_controller = rclone_worker_client or rclone_service
     rclone_webdav_config_service = RcloneWebdavConfigService(lambda: rclone_service.config)
+    # run 启动前自动补写托管 Remote（MP），部署后不再需要手动点“检测 OpenList”。
+    rclone_service.set_webdav_config_service(rclone_webdav_config_service)
     update_service = UpdateService(
         update_repositories,
         app_config.raw,

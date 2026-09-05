@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -276,9 +277,61 @@ class RcloneWorkerSourceStabilityTests(unittest.TestCase):
             self.content.index("copy_file() {") : self.content.index("copy_scoped_job() {")
         ]
         self.assertIn(
-            "export RCLONE_PROGRESS_LABEL RCLONE_PROGRESS_DIRECTION",
+            "export RCLONE_PROGRESS_LABEL RCLONE_PROGRESS_DIRECTION RCLONE_PROGRESS_MARKER",
             copy_file,
         )
+
+    def test_progress_filter_writes_first_stats_marker(self) -> None:
+        awk = shutil.which("awk")
+        if not awk:  # pragma: no cover - Windows 开发机可能没有 awk
+            self.skipTest("awk not available on PATH")
+        program = self._awk_program()
+        with tempfile.TemporaryDirectory() as tmp:
+            # 用相对哨兵名并在临时目录内执行：Windows awk 会把带盘符的路径
+            # 当成普通文件名写到当前目录，污染仓库根。
+            completed = subprocess.run(
+                [
+                    awk,
+                    "-v",
+                    "progress_label=电影.mkv",
+                    "-v",
+                    "progress_direction=下载",
+                    "-v",
+                    "progress_marker=progress.marker",
+                    program,
+                ],
+                input="NOTICE: 电影.mkv: 45%, 3.04GiB/6.74GiB, 10.5MiB/s, ETA 5m32s\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+                check=True,
+                cwd=tmp,
+            )
+            self.assertEqual(completed.stderr, "")
+            marker = Path(tmp) / "progress.marker"
+            self.assertTrue(marker.exists(), "首条统计行必须落盘哨兵文件")
+            marker_created = self.content.index("print \"\" > progress_marker")
+            stats_branch = self.content.index("n >= 3 && parts[n] ~ /^ETA[ \\t]/")
+            self.assertLess(stats_branch, marker_created)
+
+    def test_copy_file_runs_slow_source_watchdog_until_first_progress(self) -> None:
+        copy_file = self.content[
+            self.content.index("copy_file() {") : self.content.index("copy_file_once() {")
+        ]
+        # 源网盘准备下载链接期间 rclone 完全静默（2026-09-05 线上等待近 3 分钟），
+        # 看门狗必须：10s 轮询哨兵、60s 无首字节提示一次、结束后回收进程与临时文件。
+        self.assertIn('copy_progress_marker="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-progress.XXXXXX")"', copy_file)
+        self.assertIn('rm -f "$copy_progress_marker"', copy_file)
+        self.assertIn("RCLONE_PROGRESS_MARKER", copy_file)
+        self.assertIn("sleep 10", copy_file)
+        self.assertIn("if [ -e \"$copy_progress_marker\" ]; then", copy_file)
+        self.assertIn("if [ \"$copy_waited\" -ge 60 ]", copy_file)
+        self.assertIn("源端响应缓慢", copy_file)
+        self.assertIn("通常是源网盘在准备下载链接", copy_file)
+        self.assertIn('kill "$copy_watchdog_pid" 2>/dev/null || true', copy_file)
+        self.assertIn('wait "$copy_watchdog_pid" 2>/dev/null || true', copy_file)
+        self.assertIn('rm -f "$copy_rc_file" "$copy_progress_marker"', copy_file)
 
     def _progress_filter_source(self) -> str:
         return self.content[
@@ -289,7 +342,8 @@ class RcloneWorkerSourceStabilityTests(unittest.TestCase):
         source = self._progress_filter_source()
         match = re.search(
             r"awk -v progress_label=\"\$\{RCLONE_PROGRESS_LABEL:-\}\""
-            r" -v progress_direction=\"\$\{RCLONE_PROGRESS_DIRECTION:-\}\" '\n(.*?)'\n\}",
+            r" -v progress_direction=\"\$\{RCLONE_PROGRESS_DIRECTION:-\}\""
+            r" -v progress_marker=\"\$\{RCLONE_PROGRESS_MARKER:-\}\" '\n(.*?)'\n\}",
             source,
             re.DOTALL,
         )

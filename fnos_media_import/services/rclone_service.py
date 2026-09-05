@@ -71,6 +71,7 @@ class RcloneService:
         self._v1_locator_resolver: Any = None
         self._v1_mount_service: Any = None
         self._v1_connection_service: Any = None
+        self._v1_webdav_config_service: Any = None
         if self.db is not None:
             from ..transfer.execution_repository import TransferExecutionRepository
 
@@ -158,6 +159,11 @@ class RcloneService:
         self._v1_locator_resolver = resolver
         self._v1_mount_service = mount_service
         self._v1_connection_service = connection_service
+
+    def set_webdav_config_service(self, service: Any) -> None:
+        """绑定 RcloneWebdavConfigService，用于运行前自动补写托管 Remote。"""
+
+        self._v1_webdav_config_service = service
 
     def _validated_v1_plan(self, job: dict[str, Any]) -> dict[str, Any]:
         repository = None
@@ -1243,6 +1249,97 @@ class RcloneService:
             raise ValueError("V1 rclone 托管配置路径不可用")
         return path
 
+    def _ensure_managed_remote_config(self) -> None:
+        """rclone run 启动前确保托管 Remote 已写入本机 rclone 配置。
+
+        持久卷丢失或全新部署时，托管 Remote（MP）以前只有管理员在管理后台
+        点一次“检测 OpenList”才会写入，否则首个搬运任务直接失败（didn't
+        find section in config file）。现在 run 启动前自检，缺失即用数据库
+        里的 OpenList 连接凭证自动重建。任何失败都只记录日志不阻断 run：
+        Worker 会输出 rclone 的真实错误供排查。
+        """
+
+        service = getattr(self, "_v1_webdav_config_service", None)
+        if service is None:
+            return
+        try:
+            remote_name = self._managed_remote_name()
+        except ValueError:
+            return
+        try:
+            state = service.status(remote_name)
+        except Exception as exc:  # noqa: BLE001 - 自检降级，不阻断搬运
+            if str(getattr(exc, "code", "")).upper() == "RCLONE_UNAVAILABLE":
+                return
+            self._append_log(f"检查托管 rclone Remote“{remote_name}”失败：{exc}")
+            return
+        if not isinstance(state, dict) or bool(state.get("configured")):
+            return
+        payload = self._managed_remote_credentials(remote_name)
+        if payload is None:
+            return
+        try:
+            service.save(payload)
+        except Exception as exc:  # noqa: BLE001 - 补写失败时由 rclone 真实错误兜底
+            self._append_log(
+                f"自动重建托管 rclone Remote“{remote_name}”失败：{exc}"
+            )
+            return
+        self._append_log(
+            f"托管 rclone Remote“{remote_name}”缺失，已按 OpenList 连接"
+            f"“{str(payload.get('_connection_name') or remote_name)}”自动重建，无需手动检测"
+        )
+
+    def _managed_remote_credentials(self, remote_name: str) -> dict[str, Any] | None:
+        connections = getattr(self, "_v1_connection_service", None)
+        list_connections = getattr(connections, "list_connections", None)
+        if not callable(list_connections):
+            return None
+        try:
+            rows = list_connections()
+        except Exception:  # noqa: BLE001 - 数据库暂不可用时保持原有失败路径
+            return None
+        candidates = [
+            row
+            for row in rows or []
+            if isinstance(row, dict)
+            and bool(row.get("enabled"))
+            and bool(row.get("credential_configured"))
+            and str(row.get("base_url") or "").strip()
+        ]
+        if not candidates:
+            return None
+        base_urls = {str(row.get("base_url") or "").strip().rstrip("/") for row in candidates}
+        if len(base_urls) > 1:
+            # 托管 Remote 只指向一个 OpenList；无法安全猜测时保持缺省行为，
+            # 由管理员在管理后台对该连接执行一次检测来消除歧义。
+            self._append_log(
+                "存在多个不同地址的 OpenList 连接，无法自动确定托管 rclone Remote"
+                "指向，请在管理后台对目标连接执行一次检测"
+            )
+            return None
+        connection = candidates[0]
+        connection_id = str(connection.get("connection_id") or "").strip()
+        resolve = getattr(connections, "resolve_credentials", None)
+        if not connection_id or not callable(resolve):
+            return None
+        try:
+            credentials = resolve(connection_id, int(connection.get("revision") or 1))
+        except Exception:  # noqa: BLE001 - 凭证解密失败时保持原有失败路径
+            return None
+        password = str((credentials or {}).get("password") or "")
+        username = str((credentials or {}).get("username") or "").strip()
+        base_url = str((credentials or {}).get("base_url") or "").strip()
+        if not password or not username or not base_url:
+            return None
+        return {
+            "remote_name": remote_name,
+            "url": base_url,
+            "username": username,
+            "password": password,
+            "_connection_name": str(connection.get("name") or connection_id),
+        }
+
     def _managed_relay_root(self) -> str:
         root = _safe_container_temp_root(
             getattr(self._managed_locator(), "relay_root", "")
@@ -1752,6 +1849,9 @@ class RcloneService:
             return
 
         try:
+            # 部署重建后 rclone.conf 可能缺少托管 Remote 段（此前要管理员手动
+            # 点一次“检测 OpenList”）：启动前自检并自动补写，失败不阻断 run。
+            self._ensure_managed_remote_config()
             result = self.process_runner.run(
                 command,
                 cwd=self.base_dir,
