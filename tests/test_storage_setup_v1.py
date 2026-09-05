@@ -985,6 +985,69 @@ class StorageSetupV1Tests(unittest.TestCase):
 
         self.assertEqual(len(self.mobile_uploader.probe_calls), 1)
 
+    def _mobile_location_with_stale_mount(self) -> tuple[str, dict[str, Any], str]:
+        account_id = self._account("mobile", "移动云主账号")
+        self.webdav.dirs.add("/移动")
+        self.service.save_openlist(
+            {"base_url": "http://openlist:5244/dav", "username": "admin", "password": "password"}
+        )
+        location = self.service.save_location(
+            {
+                "name": "移动云主盘",
+                "kind": "provider",
+                "account_id": account_id,
+                "connection_id": "openlist_main",
+                "webdav_root": "/移动",
+                "native_root": "root-folder-id",
+                "confirm_identity": True,
+            }
+        )
+        target = self.targets.get_target(location["destination_id"])
+        mount_id = self.service._target_mount_id(target)
+        # 模拟旧版本保存留下的坏状态：读取检测失败被持久化、身份未确认，
+        # 但 OpenList 连接与真实目录现在都是健康的。
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE openlist_mounts SET readable=0, identity_status='unverified' WHERE mount_id=?",
+                (mount_id,),
+            )
+        payload = {
+            "name": "移动云主盘",
+            "kind": "provider",
+            "account_id": account_id,
+            "connection_id": "openlist_main",
+            "webdav_root": "/移动",
+            "native_root": "root-folder-id",
+            "expected_revision": target.current_revision,
+            "confirm_identity": True,
+        }
+        return location["destination_id"], payload, mount_id
+
+    def test_stale_unreadable_mount_is_reprobed_before_identity_confirmation(self) -> None:
+        destination_id, payload, mount_id = self._mobile_location_with_stale_mount()
+
+        result = self.service.save_location(payload, destination_id)
+
+        mount = self.mounts.get_mount(mount_id)
+        self.assertTrue(result["success"])
+        self.assertTrue(mount["readable"])
+        self.assertEqual(mount["identity_status"], "declared")
+
+    def test_unreachable_openlist_on_confirm_still_fails_closed(self) -> None:
+        destination_id, payload, mount_id = self._mobile_location_with_stale_mount()
+
+        def refused(_path: str) -> list[dict[str, Any]]:
+            raise RuntimeError("[Errno 111] Connection refused")
+
+        self.webdav.list_dir = refused  # type: ignore[method-assign]
+
+        with self.assertRaises(StorageSetupError) as raised:
+            self.service.save_location(payload, destination_id)
+
+        self.assertEqual(raised.exception.code, "OPENLIST_PROBE_FAILED")
+        self.assertIn("读写检测未通过", str(raised.exception))
+        self.assertEqual(self.mounts.get_mount(mount_id)["identity_status"], "unverified")
+
     def test_tianyi_native_folder_browser_service_and_api(self) -> None:
         account_id = self._account("tianyi", "天翼主账号")
         root = self.service.list_account_folders(account_id)

@@ -279,6 +279,22 @@ class RcloneCallbackService:
         if normalized_status == CALLBACK_STATUS_STAGING_MANIFEST:
             if not job:
                 return {"success": False, "message": "任务不存在，已拒绝确认 rclone 文件清单"}, 404
+            terminal_status = str(job.get("status") or "").strip().lower()
+            if terminal_status in _IMMUTABLE_JOB_STATUSES:
+                db.job_commands.add_event(
+                    job_id,
+                    "warn",
+                    "任务已进入不可回退终态，迟到的 rclone 文件清单仅记录不覆盖状态",
+                    {**payload, "callback_disposition": "ignored_terminal"},
+                )
+                return {
+                    "success": True,
+                    "message": "任务已进入后续不可回退阶段，迟到文件清单已幂等确认",
+                    "ignored": True,
+                    "disposition": "ignored_terminal",
+                    "delete_source_allowed": False,
+                    "job": db.job_queries.get(job_id) or job,
+                }, 200
             return self._record_staging_manifest(job, payload, run_id, plan=plan)
         current_job_status = str(job.get("status") or "").strip().lower() if job else ""
         if (
@@ -358,8 +374,8 @@ class RcloneCallbackService:
             "delete_source_allowed": normalized_status in _COMPLETION_CALLBACK_STATUSES,
         }, 200
 
-    @staticmethod
     def _staging_file_callback_error(
+        self,
         job: dict[str, Any],
         source_path: str,
         target_path: str,
@@ -369,15 +385,14 @@ class RcloneCallbackService:
         strategy = plan_strategy(plan)
         if not is_data_plane_strategy(strategy):
             return "当前 V1 任务不是数据面传输策略，已拒绝文件回调"
-        source_job_root = _normalize_manifest_path(plan_path(plan, "source_landing").get("path"))
+        source_job_root, target_job_root = self._v1_callback_job_roots(job, plan)
         target_path_name = (
             "destination_staging"
             if strategy == "rclone_copy"
             else "local_temp"
         )
-        target_job_root = _normalize_manifest_path(
-            plan_path(plan, target_path_name).get("path")
-        )
+        if not target_job_root:
+            target_job_root = _normalize_manifest_path(plan_path(plan, target_path_name).get("path"))
         normalized_source = _normalize_manifest_path(source_path)
         normalized_target = _normalize_manifest_path(target_path)
         if not source_job_root or not target_job_root:
@@ -394,6 +409,47 @@ class RcloneCallbackService:
             )
         return ""
 
+    def _v1_callback_job_roots(
+        self,
+        job: dict[str, Any],
+        plan: dict[str, Any],
+    ) -> tuple[str, str]:
+        """Resolve callback roots in rclone's coordinate system.
+
+        V1 plans store OpenList paths, whereas the shell worker reports the
+        managed remote path (or an absolute local relay path).  The rclone
+        service is the authority for converting the frozen plan to that
+        execution descriptor.
+        """
+
+        builder = getattr(self.deps.rclone, "build_v1_copy_run", None)
+        if callable(builder):
+            try:
+                run = builder(job, plan)
+            except Exception:
+                run = None
+            if isinstance(run, dict):
+                job_name = str(
+                    run.get("job_dir_name") or f"job-{int(job.get('id') or 0)}"
+                ).strip("/")
+                source_root = _join_callback_root(run.get("source_root"), job_name)
+                target_root = _join_callback_root(
+                    run.get("local_target") or run.get("target_root"),
+                    job_name,
+                )
+                if source_root and target_root:
+                    return source_root, target_root
+        source = plan_path(plan, "source_landing")
+        strategy = plan_strategy(plan)
+        target = plan_path(
+            plan,
+            "destination_staging" if strategy == "rclone_copy" else "local_temp",
+        )
+        return (
+            _normalize_manifest_path(source.get("path")),
+            _normalize_manifest_path(target.get("path")),
+        )
+
     def _record_staging_manifest(
         self,
         job: dict[str, Any],
@@ -407,7 +463,7 @@ class RcloneCallbackService:
                 "success": False,
                 "message": "当前 V1 任务不是数据面传输策略，已拒绝文件清单",
             }, 409
-        job_root = _normalize_manifest_path(plan_path(plan, "source_landing").get("path"))
+        job_root, _target_root = self._v1_callback_job_roots(job, plan)
         if not job_root:
             return {
                 "success": False,
@@ -567,6 +623,14 @@ def _normalize_manifest_path(value: Any) -> str:
             return ""
         parts.append(part)
     return f"/{'/'.join(parts)}" if parts else ""
+
+
+def _join_callback_root(root: Any, job_name: str) -> str:
+    normalized_root = _normalize_manifest_path(root)
+    normalized_job = str(job_name or "").strip().strip("/")
+    if not normalized_root or not normalized_job:
+        return ""
+    return f"{normalized_root.rstrip('/')}/{normalized_job}"
 
 
 def _path_under(path: str, root: str) -> bool:

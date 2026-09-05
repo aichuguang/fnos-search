@@ -1415,6 +1415,105 @@
             }
         }
 
+        function openNoVideoSubmitWarning(publicId) {
+            const modal = $("noVideoSubmitConfirm");
+            if (!modal) return false;
+            const item = publicResourceById(publicId);
+            const detail = publicState.details[publicId]?.detail || {};
+            publicState.pendingNoVideoSubmit = { publicId };
+            if ($("noVideoSubmitResourceName")) {
+                $("noVideoSubmitResourceName").textContent = item?.title || detail.title || "未命名资源";
+            }
+            if ($("noVideoSubmitReason")) {
+                const { selectedFiles, knownFiles } = collectSubmissionEntries(publicId);
+                const files = selectedFiles.length ? selectedFiles : knownFiles;
+                const samples = files.slice(0, 3).map((entry) => entry.name).join("、");
+                $("noVideoSubmitReason").textContent = files.length
+                    ? `已识别文件示例：${samples}${files.length > 3 ? " 等" : ""}。`
+                    : "未识别到任何可入库文件，请确认分享内容。";
+            }
+            showPublicModal(modal, $("noVideoSubmitCancel"));
+            return true;
+        }
+
+        function closeNoVideoSubmitWarning(options = {}) {
+            hidePublicModal($("noVideoSubmitConfirm"), options);
+            publicState.pendingNoVideoSubmit = null;
+        }
+
+        function continueNoVideoSubmit() {
+            const pending = publicState.pendingNoVideoSubmit;
+            closeNoVideoSubmitWarning({ restoreFocus: false });
+            if (pending?.publicId) {
+                confirmPublicResourceSubmit(pending.publicId, "", { skipNoVideoWarning: true })
+                    .catch((error) => toast(error.message, "error"));
+            }
+        }
+
+        const VIDEO_FILE_EXTENSION_SET = new Set([
+            ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
+            ".m4v", ".rmvb", ".ts", ".iso",
+        ]);
+
+        function isPlayableVideoFileName(name) {
+            const text = String(name || "").trim().toLowerCase();
+            const dot = text.lastIndexOf(".");
+            return dot > 0 && VIDEO_FILE_EXTENSION_SET.has(text.slice(dot));
+        }
+
+        function isPreviewDirEntry(item) {
+            return Boolean(item && (item.is_dir || item.directory || item.type === "dir" || item.dir));
+        }
+
+        // 汇总本次提交能看到的文件：明确勾选了文件时提交范围就是勾选内容，
+        // 否则按整资源提交，用已加载的预览条目做尽力判断。只认识目录或没有
+        // 任何已加载文件时不提醒，避免对深层目录结构误报。
+        function collectSubmissionEntries(publicId) {
+            const selectedFiles = [];
+            const knownFiles = [];
+            const pushFile = (list, item) => {
+                const name = String(item?.name || item?.path || item?.title || "").trim();
+                if (name) list.push({ name, mediaType: String(item?.media_type || "") });
+            };
+            const detailState = publicState.details[publicId] || {};
+            const inspection = detailState.detail?.inspection || {};
+            (Array.isArray(inspection.items) ? inspection.items : []).forEach((item) => {
+                if (isPreviewDirEntry(item)) return;
+                pushFile(knownFiles, item);
+            });
+            Object.entries(publicState.filePreviews || {}).forEach(([key, value]) => {
+                if (!key.startsWith(`${publicId}:`)) return;
+                (Array.isArray(value?.items) ? value.items : []).forEach((item) => {
+                    if (isPreviewDirEntry(item)) return;
+                    pushFile(knownFiles, item);
+                });
+            });
+            const quarkState = publicState.quarkSelections?.[publicId] || {};
+            Object.values(quarkState.items || {}).forEach((item) => {
+                if (!item?.fid || isPreviewDirEntry(item)) return;
+                pushFile(selectedFiles, item);
+            });
+            ["cloud139Selections", "tianyiSelections"].forEach((field) => {
+                Object.values(publicState[field]?.[publicId]?.files || {}).forEach((item) => {
+                    if (!item) return;
+                    pushFile(selectedFiles, item);
+                });
+            });
+            const sixpanState = publicState.sixpanParses?.[sixpanPublicKey(publicId)] || {};
+            const sixpanFiles = (Array.isArray(sixpanState.items) ? sixpanState.items : []).filter((item) => item?.id && !isPreviewDirEntry(item));
+            const sixpanEffective = sixpanFiles.filter((item) => sixpanState.selected?.[item.id]);
+            (sixpanEffective.length ? sixpanEffective : sixpanFiles).forEach((item) => pushFile(knownFiles, item));
+            return { selectedFiles, knownFiles };
+        }
+
+        function submissionLacksPlayableVideo(publicId) {
+            const { selectedFiles, knownFiles } = collectSubmissionEntries(publicId);
+            const hasVideo = (entry) => entry.mediaType === "video" || isPlayableVideoFileName(entry.name);
+            if (selectedFiles.length) return !selectedFiles.some(hasVideo);
+            if (knownFiles.length) return !knownFiles.some(hasVideo);
+            return false;
+        }
+
         async function openPublicSubmitConfirm(publicId, options = {}) {
             const item = publicResourceById(publicId);
             if (!item) {
@@ -1501,13 +1600,16 @@
             openPublicSubmitConfirm(publicId);
         }
 
-        async function confirmPublicResourceSubmit(publicId, categoryValue) {
+        async function confirmPublicResourceSubmit(publicId, categoryValue, options = {}) {
             const category = categoryValue || $("publicConfirmCategory")?.value || categoryForPublicResource(publicId) || $("manualPublicCategory")?.value || "movie";
             const note = $("manualPublicNote")?.value || "";
             const captcha = captchaPayload();
             if (captcha.required && !captcha.valid) return;
             const notification = notificationPayload();
             if (notification === null) return;
+            if (!options.skipNoVideoWarning && submissionLacksPlayableVideo(publicId)) {
+                if (openNoVideoSubmitWarning(publicId)) return;
+            }
             setPublicConfirmError(null);
             if ($("publicConfirmSubmit")) $("publicConfirmSubmit").disabled = true;
             publicState.pendingSubmit = { ...(publicState.pendingSubmit || {}), publicId, category };
@@ -2015,6 +2117,11 @@
             openSixpanSlowWarning,
             closeSixpanSlowWarning,
             continueSixpanSlowSubmit,
+            isPlayableVideoFileName,
+            submissionLacksPlayableVideo,
+            openNoVideoSubmitWarning,
+            closeNoVideoSubmitWarning,
+            continueNoVideoSubmit,
             openPublicSubmitConfirm,
             closePublicSubmitConfirm,
             setPublicConfirmError,

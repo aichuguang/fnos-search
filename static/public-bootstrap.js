@@ -1,6 +1,6 @@
 (function () {
     function create(context) {
-        const { state, getElement, api, toast, syncSearchSourceOptions, enabledSearchSourceKeys, setPublicSearchStatus, stopPublicSearchSupplement, loadCaptcha, bindRecentRequests, bindRequestStatusPage, searchPublicResources, handleTmdbAction, selectedSearchSource, updateSearchSourceActiveState, loadPublicTrending, bindPublicTrending, detectManualPublicLink, submitManualPublicLink, handleSixpanParseClick, handleSixpanParseChange, queryRequestStatus, closePublicSubmitConfirm, closeSixpanSlowWarning, continueSixpanSlowSubmit, updatePublicConfirmWarning, confirmPublicResourceSubmit, trapPublicModalFocus } = context;
+        const { state, getElement, api, toast, syncSearchSourceOptions, enabledSearchSourceKeys, setPublicSearchStatus, stopPublicSearchSupplement, loadCaptcha, bindRecentRequests, bindRequestStatusPage, searchPublicResources, handleTmdbAction, selectedSearchSource, updateSearchSourceActiveState, loadPublicTrending, bindPublicTrending, detectManualPublicLink, submitManualPublicLink, handleSixpanParseClick, handleSixpanParseChange, queryRequestStatus, closePublicSubmitConfirm, closeSixpanSlowWarning, continueSixpanSlowSubmit, closeNoVideoSubmitWarning, continueNoVideoSubmit, updatePublicConfirmWarning, confirmPublicResourceSubmit, trapPublicModalFocus } = context;
         const publicState = state;
         const $ = getElement;
 
@@ -186,6 +186,12 @@
             $("sixpanSlowCancel")?.addEventListener("click", closeSixpanSlowWarning);
             $("sixpanSlowClose")?.addEventListener("click", closeSixpanSlowWarning);
             $("sixpanSlowContinue")?.addEventListener("click", continueSixpanSlowSubmit);
+            $("noVideoSubmitCancel")?.addEventListener("click", closeNoVideoSubmitWarning);
+            $("noVideoSubmitClose")?.addEventListener("click", closeNoVideoSubmitWarning);
+            $("noVideoSubmitContinue")?.addEventListener("click", continueNoVideoSubmit);
+            $("noVideoSubmitConfirm")?.addEventListener("click", (event) => {
+                if (event.target.id === "noVideoSubmitConfirm") closeNoVideoSubmitWarning();
+            });
             $("publicConfirmCategory")?.addEventListener("change", (event) => {
                 const value = event.target.value || "movie";
                 publicState.pendingSubmit = { ...(publicState.pendingSubmit || {}), category: value };
@@ -210,13 +216,19 @@
                 if (event.target.id === "sixpanSlowSubmitConfirm") closeSixpanSlowWarning();
             });
             document.addEventListener("keydown", (event) => {
-                const activeModal = !$("sixpanSlowSubmitConfirm")?.classList.contains("hidden")
-                    ? $("sixpanSlowSubmitConfirm")
-                    : !$("publicSubmitConfirm")?.classList.contains("hidden")
-                        ? $("publicSubmitConfirm")
-                        : null;
+                const activeModal = !$("noVideoSubmitConfirm")?.classList.contains("hidden")
+                    ? $("noVideoSubmitConfirm")
+                    : !$("sixpanSlowSubmitConfirm")?.classList.contains("hidden")
+                        ? $("sixpanSlowSubmitConfirm")
+                        : !$("publicSubmitConfirm")?.classList.contains("hidden")
+                            ? $("publicSubmitConfirm")
+                            : null;
                 trapPublicModalFocus(event, activeModal);
                 if (event.key === "Escape") {
+                    if (!$("noVideoSubmitConfirm")?.classList.contains("hidden")) {
+                        closeNoVideoSubmitWarning();
+                        return;
+                    }
                     if (!$("sixpanSlowSubmitConfirm")?.classList.contains("hidden")) {
                         closeSixpanSlowWarning();
                         return;

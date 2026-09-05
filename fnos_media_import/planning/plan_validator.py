@@ -800,6 +800,9 @@ class PlanValidator:
         relay_expected_kinds = {
             "source_landing": {"openlist"},
             "destination_final": {"native"},
+            # 启用 Organizer 时中继上传先写入任务级原生暂存目录；禁用
+            # Organizer 时该字段不允许出现（下方分支拒绝）。
+            "destination_staging": {"native"},
             "local_temp": {"relay"},
         }
         expected_kinds = {
@@ -880,8 +883,14 @@ class PlanValidator:
             elif path_leaf(staging.get("path")) != job:
                 errors.append("destination_staging 不是任务级目录")
         elif is_relay_upload_strategy(strategy):
-            if staging:
-                errors.append(f"{strategy} 不允许 destination_staging")
+            relay_organizer_enabled = bool(_mapping(plan.get("postprocess")).get("organizer_enabled"))
+            if staging and relay_organizer_enabled:
+                # 中继上传的入库暂存与原生转存共用同一套推导与复核规则：
+                # 必须能由 destination_final 原样重新推导出来，防止冻结计划
+                # 被改写成任意目录。
+                errors.extend(self._native_staging_errors(strategy, staging, final, job))
+            elif staging:
+                errors.append(f"{strategy} 只有启用 Organizer 时才允许 destination_staging")
             if not local_temp or not _str(local_temp.get("path")):
                 errors.append(f"{strategy} 缺少 local_temp")
             if not final:
@@ -899,8 +908,9 @@ class PlanValidator:
             if staging:
                 errors.extend(self._native_staging_errors(strategy, staging, final, job))
 
-        # destination_staging 是 rclone_copy 的任务级暂存目录；中继链路
-        # 直接写入冻结 destination_final，不得把 staging 当成必需步骤。
+        # destination_staging 是 rclone_copy 的任务级暂存目录；中继链路在
+        # 启用 Organizer 时先写入任务级原生暂存，未启用时直写冻结
+        # destination_final。
         if strategy == STRATEGY_RCLONE_COPY and not final:
             errors.append("rclone_copy 缺少 destination_final")
 

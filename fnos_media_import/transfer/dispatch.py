@@ -7,7 +7,7 @@ import posixpath
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from ..constants import (
     JOB_CANCELLED,
@@ -63,9 +63,14 @@ class TransferDispatchService:
         assignment_service: Any = None,
         execution_repository: TransferExecutionRepository | None = None,
         organizer_service: Any = None,
+        upload_log_bridge: Callable[[int, str], None] | None = None,
         relay_root: str = "/data/relay",
         local_target_root: str = "/storage-targets",
         execution_lease_seconds: int = 600,
+        source_visibility_timeout_seconds: int | None = None,
+        native_wait_timeout_seconds: int | None = None,
+        transfer_wait_timeout_seconds: int | None = None,
+        cancel_timeout_seconds: int | None = None,
     ) -> None:
         self.database = database
         self.accounts_service = accounts_service
@@ -78,9 +83,38 @@ class TransferDispatchService:
         self.assignment_service = assignment_service
         self.executions = execution_repository or TransferExecutionRepository(database)
         self.organizer_service = organizer_service
+        self.upload_log_bridge = upload_log_bridge
         self.relay_root = os.path.realpath(relay_root)
         self.local_target_root = os.path.realpath(local_target_root)
         self.execution_lease_seconds = max(60, int(execution_lease_seconds))
+        self.source_visibility_timeout_seconds = _configured_seconds(
+            source_visibility_timeout_seconds,
+            "TRANSFER_SOURCE_VISIBLE_TIMEOUT_SECONDS",
+            1800,
+            60,
+            7 * 24 * 3600,
+        )
+        self.native_wait_timeout_seconds = _configured_seconds(
+            native_wait_timeout_seconds,
+            "TRANSFER_NATIVE_WAIT_TIMEOUT_SECONDS",
+            7 * 24 * 3600,
+            60,
+            90 * 24 * 3600,
+        )
+        self.transfer_wait_timeout_seconds = _configured_seconds(
+            transfer_wait_timeout_seconds,
+            "TRANSFER_WAIT_TIMEOUT_SECONDS",
+            3 * 3600,
+            60,
+            30 * 24 * 3600,
+        )
+        self.cancel_timeout_seconds = _configured_seconds(
+            cancel_timeout_seconds,
+            "TRANSFER_CANCEL_TIMEOUT_SECONDS",
+            3600,
+            60,
+            7 * 24 * 3600,
+        )
         # Shared only by executors created by this dispatch composition root;
         # a fresh app/test composition must not inherit another process'
         # circuit-breaker state.
@@ -160,6 +194,7 @@ class TransferDispatchService:
                 raise TransferDispatchError(
                     f"{provider_kind or '目标 Provider'} 冻结账号中继上传器不可用"
                 )
+            job_id = int(plan.get("job_id") or 0)
             return {
                 strategy: ProviderRelayExecutor(
                     rclone_adapter,
@@ -168,9 +203,47 @@ class TransferDispatchService:
                     visibility_poller=lambda receipt: self._source_visible(plan, receipt),
                     relay_root=self.relay_root,
                     halted_account_ids=self._halted_relay_account_ids,
+                    progress_sink=self._upload_progress_bridge(job_id),
+                    event_sink=self._job_event_sink(job_id),
                 )
             }
         raise TransferDispatchError(f"未知传输策略：{strategy}")
+
+    def _upload_progress_bridge(self, job_id: int) -> Any:
+        """上传进度行送进 rclone 实时日志流（与下载阶段同一页面）。
+
+        桥接回调由组装根注入：分体部署时经 Worker 控制通道转发到 Worker
+        的日志缓冲；桥接失败静默丢弃，绝不拖累上传主流程。
+        """
+        bridge = self.upload_log_bridge
+        if job_id <= 0 or bridge is None:
+            return None
+
+        def sink(message: str) -> None:
+            try:
+                bridge(job_id, message)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return sink
+
+    def _job_event_sink(self, job_id: int) -> Any:
+        """上传里程碑（开始/完成/失败）写任务事件时间线；高频进度不进这里。"""
+
+        if job_id <= 0:
+            return None
+        job_commands = getattr(self.database, "job_commands", None)
+        add_event = getattr(job_commands, "add_event", None)
+        if not callable(add_event):
+            return None
+
+        def sink(level: str, message: str) -> None:
+            try:
+                add_event(job_id, level, message, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return sink
 
     def handle_worker(self, payload: dict[str, Any], _task: dict[str, Any]) -> dict[str, Any]:
         job_id = int(payload.get("job_id") or 0)
@@ -962,6 +1035,10 @@ class TransferDispatchService:
             ack_service=self.ack,
             organizer_service=self.organizer,
             finalizer_service=self.finalizer,
+            source_visibility_timeout_seconds=self.source_visibility_timeout_seconds,
+            native_wait_timeout_seconds=self.native_wait_timeout_seconds,
+            transfer_wait_timeout_seconds=self.transfer_wait_timeout_seconds,
+            cancel_timeout_seconds=self.cancel_timeout_seconds,
         )
 
     def _validation_deps(self) -> Any:
@@ -1185,7 +1262,10 @@ class _OrganizerAdapter:
                 job=job,
                 category_label=str(job.get("category_label") or ""),
                 root_path=str((plan.organizer_path or {}).get("path") or ""),
-                payload={"v1_transfer": True},
+                payload={
+                    "v1_transfer": True,
+                    "scan_filters": _plan_scan_filters(plan, job),
+                },
                 trigger_type="v1_transfer",
             )
             if not result.get("success") or result.get("skipped"):
@@ -1199,7 +1279,7 @@ class _OrganizerAdapter:
             )
             return OrganizeResult("pending", "Organizer 已创建", task_id=task_id)
         status = str(row["status"] or "").lower()
-        if status in {"done", "completed", "applied", "success"}:
+        if status in {"done", "completed", "applied", "success", "skipped"}:
             with self.database.connect() as connection:
                 mappings = connection.execute(
                     "SELECT target_path FROM organizer_mappings WHERE task_id=? ORDER BY target_path",
@@ -1217,15 +1297,151 @@ class _OrganizerAdapter:
                 )
             return OrganizeResult(
                 "done",
-                "Organizer 完成",
+                "Organizer 已完成（跳过整理）" if status == "skipped" else "Organizer 完成",
                 task_id=int(row["id"]),
                 final_path=final_path,
             )
         if status in {"failed", "cancelled", "error"}:
             return OrganizeResult("failed", str(row["error_message"] or "Organizer 失败"), retryable=False, task_id=int(row["id"]))
-        if status in {"review", "manual_review"}:
+        if status in {"review", "manual_review", "waiting_review"}:
             return OrganizeResult("unknown", "Organizer 等待人工复核", retryable=False, task_id=int(row["id"]))
         return OrganizeResult("pending", "Organizer 进行中", task_id=int(row["id"]))
+
+
+def _plan_scan_filters(plan: Any, job: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build scan_filters for the Organizer task from the frozen V1 plan.
+
+    Native strategies land files directly on the category root.  Without a
+    file manifest the Organizer refuses to recursively scan the whole
+    category directory (correct fail-closed behaviour).  The plan's frozen
+    selection snapshot is the authoritative manifest of what this job
+    submitted, so it feeds expected_names/expected_paths here.
+
+    Only category-root organizer paths receive filters: job-scoped roots
+    (job-<id>) are already scanned exhaustively and a hand-built manifest
+    might not match their verified layout.  File-mode
+    native saves land flat on the category root, so every path is
+    root/<name>; ``expected_count`` must equal the path count or the
+    Organizer discards the manifest as incomplete.
+
+    Folder selections are excluded because their nested contents are
+    unknown at submit time.  For those jobs the rclone worker has already
+    persisted the actual per-file manifest (callback_service stores it in
+    ``raw_data.rclone_staging_manifest``), and the relay upload preserves
+    that relative layout at the destination — so the manifest maps
+    1:1 onto precise expected_paths at Organizer time.  Relay jobs that
+    froze a native staging directory have a job-scoped Organizer root and
+    never reach the manifest mapping below.
+    """
+
+    raw = getattr(plan, "raw", None)
+    if not isinstance(raw, dict):
+        return {}
+    organizer_path = str((getattr(plan, "organizer_path", None) or {}).get("path") or "").strip()
+    job_id = int(getattr(plan, "job_id", 0) or 0)
+    if not organizer_path or job_id <= 0:
+        return {}
+    leaf = organizer_path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if leaf.casefold() == f"job-{job_id}".casefold():
+        return {}
+    source = raw.get("source") if isinstance(raw.get("source"), dict) else {}
+    selection = source.get("selection") if isinstance(source.get("selection"), dict) else {}
+    names = _selection_manifest_names(selection)
+    if not names:
+        provider_selection = (
+            selection.get("provider_selection")
+            if isinstance(selection.get("provider_selection"), dict)
+            else {}
+        )
+        for key in ("cloud139_selection", "tianyi_selection", "quark_selection", "generic_selection"):
+            candidate = provider_selection.get(key)
+            if isinstance(candidate, dict):
+                names.extend(_selection_manifest_names(candidate))
+    if not names:
+        return _manifest_scan_filters(job or {}, organizer_path)
+    root = "/" + organizer_path.replace("\\", "/").strip("/")
+    expected_names: list[str] = []
+    for name in names:
+        if name not in expected_names:
+            expected_names.append(name)
+    expected_paths = [f"{root}/{name}" for name in expected_names]
+    return {
+        "expected_names": expected_names,
+        "expected_paths": expected_paths,
+        "expected_count": len(expected_paths),
+    }
+
+
+def _manifest_scan_filters(job: dict[str, Any], organizer_root: str) -> dict[str, Any]:
+    """Derive precise expected_paths from the persisted rclone file manifest.
+
+    文件夹形态的保存在提交时无法展开嵌套内容，selection 清单为空，Organizer
+    会在分类根上拒绝无清单扫描。但中继下载前 rclone worker 已把真实文件清单
+    回调固化到 ``raw_data.rclone_staging_manifest.source_paths``；job 根下的
+    相对结构与上传到分类根后的布局一致（移动云上传按相对目录逐文件落盘），
+    剥掉 job 根前缀即可得到精确 expected_paths。
+    """
+
+    raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
+    manifest = (
+        raw_data.get("rclone_staging_manifest")
+        if isinstance(raw_data.get("rclone_staging_manifest"), dict)
+        else {}
+    )
+    source_paths = (
+        manifest.get("source_paths")
+        if isinstance(manifest.get("source_paths"), list)
+        else []
+    )
+    if not source_paths:
+        return {}
+    job_root = _normalize_manifest_filter_path(manifest.get("job_root"))
+    job_root_folded = job_root.casefold()
+    root = "/" + str(organizer_root or "").replace("\\", "/").strip("/")
+    expected_paths: list[str] = []
+    seen: set[str] = set()
+    for value in source_paths:
+        normalized = _normalize_manifest_filter_path(value)
+        if not normalized:
+            continue
+        rel = normalized
+        folded = normalized.casefold()
+        if job_root and (folded == job_root_folded or folded.startswith(f"{job_root_folded}/")):
+            rel = normalized[len(job_root) :].strip("/")
+        if not rel:
+            continue
+        path = f"{root}/{rel}"
+        if path.casefold() not in seen:
+            seen.add(path.casefold())
+            expected_paths.append(path)
+    if not expected_paths:
+        return {}
+    return {
+        "expected_paths": expected_paths,
+        "expected_count": len(expected_paths),
+    }
+
+
+def _normalize_manifest_filter_path(value: Any) -> str:
+    text = str(value or "").replace("\\", "/").strip()
+    while "//" in text:
+        text = text.replace("//", "/")
+    return text.strip("/")
+
+
+def _selection_manifest_names(selection: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for key in ("selected_files", "files", "selected_items"):
+        values = selection.get(key) if isinstance(selection.get(key), list) else []
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            if bool(item.get("is_dir") or item.get("directory") or item.get("type") in {"dir", "folder"}):
+                continue
+            name = str(item.get("name") or item.get("fileName") or "").strip()
+            if name:
+                names.append(name)
+    return names
 
 
 def _after(seconds: int) -> str:
@@ -1259,3 +1475,20 @@ def _common_target_root(paths: list[str]) -> str:
         return posixpath.commonpath(parents)
     except ValueError:
         return ""
+
+
+def _configured_seconds(
+    value: int | None,
+    env_name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    candidate: Any = value
+    if candidate is None:
+        candidate = os.getenv(env_name, str(default))
+    try:
+        parsed = int(candidate)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))

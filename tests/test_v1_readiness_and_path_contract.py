@@ -178,6 +178,172 @@ class V1PathContractTests(unittest.TestCase):
         )
         self.assertEqual(errors, [])
 
+    def test_planner_relay_with_organizer_freezes_native_staging(self) -> None:
+        planner = object.__new__(ImportPlanner)
+        planner.config = {"FNOS_RELAY_ROOT": "/data/relay"}
+        category = SimpleNamespace(
+            native_locator=NativeLocator("path", "/影视"),
+            rclone_locator=None,
+            organizer_locator=SimpleNamespace(
+                path="/影视",
+                mount_id="media",
+                connection_id="ol",
+            ),
+        )
+        target = SimpleNamespace(provider_kind="mobile", destination_id="mobile_main")
+        paths = planner._build_paths(
+            source=SourceDescriptor("quark", "share", "quark:share:1"),
+            target=target,
+            category=category,
+            category_key="movie",
+            job_id=7,
+            strategy="relay_upload_provider",
+            source_mount={
+                "namespace_id": "openlist:ol:source",
+                "readable": True,
+            },
+            organizer_mount={
+                "namespace_id": "openlist:ol:media",
+                "revision": 2,
+                "connection_id": "ol",
+                "connection_revision": 1,
+                "storage_identity_id": "provider:mobile:account:dst",
+                "identity_root": "/",
+            },
+            organizer_enabled=True,
+        )
+        staging = paths["destination_staging"]
+        self.assertIsNotNone(staging)
+        self.assertEqual(staging["kind"], "native")
+        self.assertEqual(staging["namespace_id"], "native:mobile:mobile_main")
+        self.assertEqual(staging["path"], "/_入库暂存/影视/job-7")
+        self.assertEqual(staging["role"], "native_staging")
+        self.assertEqual(staging["locator_kind"], "path")
+        self.assertEqual(paths["local_temp"]["path"], "/data/relay/job-7")
+        self.assertEqual(paths["destination_final"]["path"], "/影视")
+
+    def test_planner_relay_organizer_paths_use_native_staging_root(self) -> None:
+        planner = object.__new__(ImportPlanner)
+        planner.config = {"FNOS_RELAY_ROOT": "/data/relay"}
+        category = SimpleNamespace(
+            native_locator=NativeLocator("path", "/影视"),
+            rclone_locator=None,
+            organizer_locator=SimpleNamespace(
+                path="/影视",
+                mount_id="media",
+                connection_id="ol",
+            ),
+        )
+        organizer_mount = {
+            "namespace_id": "openlist:ol:media",
+            "revision": 2,
+            "connection_id": "ol",
+            "connection_revision": 1,
+            "storage_identity_id": "provider:mobile:account:dst",
+            "identity_root": "/",
+            "webdav_root": "/",
+        }
+        organizer, organizer_final = planner._build_organizer(
+            category,
+            "movie",
+            "job-7",
+            {
+                "kind": "native",
+                "namespace_id": "native:mobile:mobile_main",
+                "path": "/_入库暂存/影视/job-7",
+                "locator_kind": "path",
+                "role": "native_staging",
+            },
+            organizer_mount=organizer_mount,
+        )
+        self.assertEqual(organizer["kind"], "openlist")
+        self.assertEqual(organizer["path"], "/_入库暂存/影视/job-7")
+        self.assertEqual(organizer_final["path"], "/影视")
+
+    def test_plan_validator_relay_staging_requires_organizer(self) -> None:
+        validator = object.__new__(PlanValidator)
+        validator.config = {"FNOS_RELAY_ROOT": "/data/relay"}
+        validator.mount_service = _Mounts()
+
+        def _paths() -> dict:
+            return {
+                "source_landing": {
+                    "kind": "openlist",
+                    "namespace_id": "openlist:ol:source",
+                    "path": "/_fnos_ingress/job-7",
+                    "mount_id": "source",
+                    "mount_revision": 1,
+                    "connection_id": "ol",
+                    "connection_revision": 1,
+                    "storage_identity_id": "provider:quark:account:src",
+                    "identity_root": "/",
+                },
+                "destination_staging": {
+                    "kind": "native",
+                    "namespace_id": "native:mobile:mobile_main",
+                    "path": "/_入库暂存/影视/job-7",
+                    "locator_kind": "path",
+                    "role": "native_staging",
+                },
+                "destination_final": {
+                    "kind": "native",
+                    "namespace_id": "native:mobile:mobile_main",
+                    "path": "/影视",
+                },
+                "local_temp": {
+                    "kind": "relay",
+                    "namespace_id": "local:relay",
+                    "path": "/data/relay/job-7",
+                },
+            }
+
+        bindings = {
+            "source_mount_id": "source",
+            "source_mount_revision": 1,
+            "source_mount_namespace_id": "openlist:ol:source",
+            "source_mount_storage_identity_id": "provider:quark:account:src",
+            "source_mount_identity_root": "/",
+            "source_connection_id": "ol",
+            "source_connection_revision": 1,
+            "source_native_locator": {"kind": "path", "value": "/FNOS"},
+            "destination_mount_id": "destination",
+            "destination_mount_revision": 1,
+            "destination_mount_namespace_id": "openlist:ol:destination",
+            "destination_mount_storage_identity_id": "provider:mobile:account:dst",
+            "destination_mount_identity_root": "/",
+            "destination_connection_id": "ol",
+            "destination_connection_revision": 1,
+        }
+
+        errors: list[str] = []
+        validator._validate_paths(
+            plan={"job_id": 7},
+            source={},
+            destination={"provider_kind": "mobile", "account_id": "dst"},
+            target=None,
+            paths=_paths(),
+            bindings=bindings,
+            strategy="relay_upload_provider",
+            errors=errors,
+        )
+        self.assertTrue(
+            any("只有启用 Organizer" in message for message in errors),
+            errors,
+        )
+
+        errors_with_organizer: list[str] = []
+        validator._validate_paths(
+            plan={"job_id": 7, "postprocess": {"organizer_enabled": True}},
+            source={},
+            destination={"provider_kind": "mobile", "account_id": "dst"},
+            target=None,
+            paths=_paths(),
+            bindings=bindings,
+            strategy="relay_upload_provider",
+            errors=errors_with_organizer,
+        )
+        self.assertEqual(errors_with_organizer, [])
+
     def test_transfer_plan_and_job_reader_require_relay_local_temp(self) -> None:
         plan = {
             "version": 1,

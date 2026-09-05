@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from fnos_media_import.transfer import (
@@ -90,6 +91,10 @@ class TransferState:
     submission_fence: dict[str, Any] = field(default_factory=dict)
     organizer_task_id: int = 0
     organizer_final_path: str = ""
+    # Durable asynchronous wait bookkeeping.  Keeping this in the execution
+    # snapshot prevents a restart from resetting a stuck Provider operation.
+    phase_wait_started_at: dict[str, str] = field(default_factory=dict)
+    phase_wait_polls: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -129,6 +134,10 @@ class TransferOrchestrator:
         organizer_service: Any = None,
         finalizer_service: Any = None,
         retry_policy: RetryPolicy | None = None,
+        source_visibility_timeout_seconds: int = 1800,
+        native_wait_timeout_seconds: int = 7 * 24 * 3600,
+        transfer_wait_timeout_seconds: int = 3 * 3600,
+        cancel_timeout_seconds: int = 3600,
     ) -> None:
         self.plan = plan if isinstance(plan, TransferPlan) else TransferPlan.from_dict(plan)
         self.executors = dict(executors or {})
@@ -138,6 +147,12 @@ class TransferOrchestrator:
         self.organizer_service = organizer_service
         self.finalizer_service = finalizer_service
         self.retry_policy = retry_policy or RetryPolicy()
+        self.wait_timeouts = {
+            PHASE_SOURCE_WAITING_VISIBLE: max(60, int(source_visibility_timeout_seconds or 1800)),
+            PHASE_NATIVE_WAITING: max(60, int(native_wait_timeout_seconds or 7 * 24 * 3600)),
+            PHASE_TRANSFERRING: max(60, int(transfer_wait_timeout_seconds or 3 * 3600)),
+            PHASE_CANCEL_PENDING: max(60, int(cancel_timeout_seconds or 3600)),
+        }
         self.state = TransferState()
 
     # ------------------------------------------------------------------
@@ -165,6 +180,8 @@ class TransferOrchestrator:
             "submission_fence": dict(self.state.submission_fence),
             "organizer_task_id": self.state.organizer_task_id,
             "organizer_final_path": self.state.organizer_final_path,
+            "phase_wait_started_at": dict(self.state.phase_wait_started_at),
+            "phase_wait_polls": dict(self.state.phase_wait_polls),
         }
 
     def restore(self, state: dict[str, Any] | TransferState | None) -> "TransferOrchestrator":
@@ -212,6 +229,22 @@ class TransferOrchestrator:
         except (TypeError, ValueError):
             self.state.organizer_task_id = 0
         self.state.organizer_final_path = str(raw.get("organizer_final_path") or "")
+        self.state.phase_wait_started_at = {}
+        if isinstance(raw.get("phase_wait_started_at"), dict):
+            self.state.phase_wait_started_at = {
+                str(key): str(value)
+                for key, value in raw["phase_wait_started_at"].items()
+                if str(key).strip() and str(value).strip()
+            }
+        self.state.phase_wait_polls = {}
+        if isinstance(raw.get("phase_wait_polls"), dict):
+            for key, value in raw["phase_wait_polls"].items():
+                try:
+                    parsed = int(value or 0)
+                except (TypeError, ValueError):
+                    parsed = 0
+                if parsed > 0:
+                    self.state.phase_wait_polls[str(key)] = parsed
         receipt = raw.get("receipt")
         if isinstance(receipt, dict):
             try:
@@ -258,6 +291,10 @@ class TransferOrchestrator:
         if phase in TERMINAL_PHASES:
             return TransferStepResult(phase, self.state.message or f"任务已处于终态：{phase}", finished=True)
 
+        wait_guard = self._wait_guard(phase)
+        if wait_guard is not None:
+            return wait_guard
+
         if phase == PHASE_PLANNING:
             return self._step_planning()
         if phase == PHASE_SOURCE_MATERIALIZING:
@@ -288,6 +325,41 @@ class TransferOrchestrator:
             return self._step_cancel_pending()
         # 未知阶段：保守失败关闭
         return self._fail(TransferError(ErrorCode.INVALID_PLAN, f"未知阶段：{phase}"))
+
+    def _wait_guard(self, phase: str) -> TransferStepResult | None:
+        """Bound asynchronous polling phases across process restarts."""
+
+        timeout = self.wait_timeouts.get(phase)
+        if timeout is None:
+            return None
+        now = datetime.now(timezone.utc)
+        started_text = str(self.state.phase_wait_started_at.get(phase) or "").strip()
+        if not started_text:
+            self.state.phase_wait_started_at[phase] = now.isoformat(timespec="seconds")
+            started = now
+        else:
+            try:
+                started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                started = now
+                self.state.phase_wait_started_at[phase] = now.isoformat(timespec="seconds")
+        self.state.phase_wait_polls[phase] = int(self.state.phase_wait_polls.get(phase, 0) or 0) + 1
+        elapsed = max(0.0, (now - started).total_seconds())
+        if elapsed < timeout:
+            return None
+        label = {
+            PHASE_SOURCE_WAITING_VISIBLE: "来源落地区可见性等待",
+            PHASE_NATIVE_WAITING: "Provider 原生任务",
+            PHASE_TRANSFERRING: "传输任务",
+            PHASE_CANCEL_PENDING: "取消确认",
+        }.get(phase, phase)
+        return self._to_manual_review(
+            f"{label}超过最大等待时间（{timeout} 秒），已停止自动轮询，请人工核对",
+            review_from=phase,
+            error_code=ErrorCode.RESULT_UNKNOWN,
+        )
 
     # ------------------------------------------------------------------
     # planning
@@ -639,14 +711,11 @@ class TransferOrchestrator:
         executor = self._executor()
         if executor is None:
             return self._fail(TransferError(ErrorCode.NO_EXECUTOR, "目标校验阶段缺少执行器"))
-        # Relay uploads write directly to the mobile Provider final root.  A
-        # stale/hand-built plan may still carry a native destination_staging
-        # alias; never let that alias select the wrong verification target.
-        descriptor = (
-            self.plan.destination_final
-            if self.plan.strategy in _RELAY_UPLOAD_STRATEGIES
-            else self.plan.destination_staging or self.plan.destination_final
-        )
+        # 目标校验永远指向本次传输实际写入的目录：冻结了 destination_staging
+        # 就校验暂存（rclone_copy / 启用 Organizer 的中继上传 / 原生转存），
+        # 否则校验 destination_final（未启用 Organizer 的中继直写）。旧版
+        # 中继计划没有 staging，恢复快照自然落回 final 分支。
+        descriptor = self.plan.destination_staging or self.plan.destination_final
         native_target = self._is_native_descriptor(descriptor)
         verifier = getattr(executor, "verify", None) if native_target else self.verifier
         if verifier is None:
@@ -926,6 +995,11 @@ class TransferOrchestrator:
             return TransferStepResult(PHASE_RETRY_WAIT, "等待重试退避", finished=True, needs_wait=True)
         self.state.retry_ready = False
         retry_from = self.state.retry_from or PHASE_PLANNING
+        # A deliberate operator retry starts a fresh bounded wait window for
+        # the phase being retried; the previous window remains in audit fields
+        # only through the monotonic attempt counters.
+        self.state.phase_wait_started_at.pop(retry_from, None)
+        self.state.phase_wait_polls.pop(retry_from, None)
         self.state.phase = retry_from
         if self._retry_resets_receipt(retry_from) and not self.state.preserve_receipt_on_retry:
             self.state.receipt = None

@@ -218,6 +218,23 @@ class TransferExecutionRepository:
             raise ExecutionConflictError("执行状态保存后丢失")
         return latest
 
+    def clear_resume_backoff(self, job_id: int, phase: str) -> bool:
+        """Null out one phase's backoff timer so a wake-up can run immediately.
+
+        只清 ``resume_at``：phase、snapshot 与 claim fence 仍是权威状态。调用方
+        必须已确认执行正在等待的这次外部依赖（如 task-scoped rclone run）到达
+        终态——指数退避在那一刻起只会掩盖完成事件（封顶 300 秒）。
+        """
+        now = utc_now_iso()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE transfer_executions SET resume_at=NULL, updated_at=? "
+                "WHERE job_id=? AND phase=? AND resume_at IS NOT NULL",
+                (now, int(job_id), str(phase)),
+            )
+        return bool(cursor.rowcount)
+
     def list_due(self, *, now: str | None = None, limit: int = 100) -> list[TransferExecution]:
         """Return non-terminal executions that need a worker wake-up.
 

@@ -38,6 +38,7 @@ from fnos_media_import.transfer import (
     PHASE_NATIVE_WAITING,
     PHASE_PLANNING,
     PHASE_RETRY_WAIT,
+    PHASE_SOURCE_WAITING_VISIBLE,
     PHASE_TARGET_VERIFYING,
     PHASE_TRANSFERRING,
     TERMINAL_PHASES,
@@ -555,6 +556,50 @@ class _FakeUploader(RepositoryFakeMixin):
         return TransferVerifyResult("ok")
 
 
+class _RecordingRelayUploader(_FakeUploader):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.upload_targets: list[dict] = []
+        self.verify_targets: list[dict] = []
+
+    def upload_local_dir(self, *, local_dir, target_locator, idempotency_key, progress=None):
+        self.upload_targets.append(dict(target_locator))
+        return super().upload_local_dir(
+            local_dir=local_dir,
+            target_locator=target_locator,
+            idempotency_key=idempotency_key,
+            progress=progress,
+        )
+
+    def verify_target(self, **kwargs):
+        self.verify_targets.append(dict(kwargs["target_locator"]))
+        return super().verify_target(**kwargs)
+
+
+class _ProgressReportingUploader(_FakeUploader):
+    """模拟移动云/天翼云上传器：按给定序列触发进度回调。"""
+
+    def __init__(self, progress_values, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.progress_values = list(progress_values)
+
+    def upload_local_dir(self, *, local_dir, target_locator, idempotency_key, progress=None):
+        if callable(progress):
+            for value in self.progress_values:
+                progress(value)
+        return super().upload_local_dir(
+            local_dir=local_dir,
+            target_locator=target_locator,
+            idempotency_key=idempotency_key,
+        )
+
+
+class _RelayExecutorStub(RepositoryFakeMixin):
+    strategy = "relay_upload_provider"
+    needs_source_landing = True
+    plan = None
+
+
 class _FakeAlert(RepositoryFakeMixin):
     def __init__(self) -> None:
         self.calls = []
@@ -592,6 +637,92 @@ def _drive(orch: TransferOrchestrator, rounds: int = 40):
 # 测试
 # ---------------------------------------------------------------------------
 class NativeSaveFlowTests(unittest.TestCase):
+    def test_native_wait_timeout_moves_to_manual_review_without_polling(self) -> None:
+        adapter = _FakeNativeAdapter("quark", poll_status="running")
+        plan = make_plan(source_kind="quark", dest_kind="quark", strategy="native_save")
+        executor = NativeTransferExecutor({"quark": adapter}, strategy="native_save")
+        orch = TransferOrchestrator(
+            plan,
+            {"native_save": executor},
+            native_wait_timeout_seconds=60,
+        )
+        orch.restore(
+            {
+                "phase": PHASE_NATIVE_WAITING,
+                "receipt": {
+                    "operation_id": "op-save-quark",
+                    "status": "running",
+                    "provider_kind": "quark",
+                },
+                "phase_wait_started_at": {PHASE_NATIVE_WAITING: "2020-01-01T00:00:00Z"},
+            }
+        )
+
+        result = orch.step()
+
+        self.assertEqual(result.phase, PHASE_MANUAL_REVIEW)
+        self.assertEqual(orch.state.review_from, PHASE_NATIVE_WAITING)
+        self.assertEqual(adapter.poll_count, 0)
+
+    def test_source_visibility_timeout_moves_to_manual_review(self) -> None:
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="mobile",
+            strategy="relay_upload_provider",
+            landing="/landing/job-1",
+            final="/电影",
+            local_temp="/tmp/job-1",
+        )
+        executor = RcloneTransferExecutor(
+            _FakeRcloneService(),
+            _FakeResolver(),
+            source_materializer=_FakeMaterializer(),
+            visibility_poller=_visibility_poller(VisibilityStatus.pending),
+        )
+        orch = TransferOrchestrator(
+            plan,
+            {"relay_upload_provider": executor},
+            source_visibility_timeout_seconds=60,
+        )
+        orch.restore(
+            {
+                "phase": PHASE_SOURCE_WAITING_VISIBLE,
+                "receipt": {
+                    "operation_id": "landing-op",
+                    "status": "completed",
+                    "provider_kind": "quark",
+                },
+                "phase_wait_started_at": {PHASE_SOURCE_WAITING_VISIBLE: "2020-01-01T00:00:00Z"},
+            }
+        )
+
+        result = orch.step()
+
+        self.assertEqual(result.phase, PHASE_MANUAL_REVIEW)
+        self.assertEqual(orch.state.review_from, PHASE_SOURCE_WAITING_VISIBLE)
+
+    def test_cancel_pending_timeout_moves_to_manual_review(self) -> None:
+        adapter = _FakeNativeAdapter("quark", supports_cancel=False)
+        plan = make_plan(source_kind="quark", dest_kind="quark", strategy="native_save")
+        executor = NativeTransferExecutor({"quark": adapter}, strategy="native_save")
+        orch = TransferOrchestrator(plan, {"native_save": executor}, cancel_timeout_seconds=60)
+        orch.restore(
+            {
+                "phase": PHASE_CANCEL_PENDING,
+                "receipt": {
+                    "operation_id": "op-save-quark",
+                    "status": "running",
+                    "provider_kind": "quark",
+                },
+                "phase_wait_started_at": {PHASE_CANCEL_PENDING: "2020-01-01T00:00:00Z"},
+            }
+        )
+
+        result = orch.step()
+
+        self.assertEqual(result.phase, PHASE_MANUAL_REVIEW)
+        self.assertEqual(orch.state.review_from, PHASE_CANCEL_PENDING)
+
     def test_native_save_full_flow_completes(self) -> None:
         events = _EventLog()
         adapter = _FakeNativeAdapter("quark", events=events)
@@ -1242,6 +1373,177 @@ class ProviderRelayTests(unittest.TestCase):
         self.assertLess(order.index("ack"), order.index("cleanup"))
         local_dir = download.calls[0][1]
         self.assertEqual(local_dir, "/data/relay/job-1")
+
+    def test_relay_with_organizer_uploads_into_native_staging_then_organizes(self) -> None:
+        events = _EventLog()
+        download = _FakeDownloadAdapter(events=events)
+        uploader = _RecordingRelayUploader(events=events)
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="mobile",
+            strategy="relay_upload_provider",
+            landing="/_fnos_ingress/job-1",
+            final="/影视/电影",
+            local_temp="/data/relay/job-1",
+            organizer_enabled=True,
+        )
+        staging_path = "/_入库暂存/电影/job-1"
+        plan["paths"]["destination_staging"] = {
+            "kind": "native",
+            "namespace_id": "native:mobile:mobile_lib",
+            "path": staging_path,
+            "locator_kind": "path",
+            "role": "native_staging",
+        }
+        plan["paths"]["organizer"]["path"] = staging_path
+        plan["paths"]["organizer_final"] = {
+            "kind": "openlist",
+            "namespace_id": plan["paths"]["organizer"]["namespace_id"],
+            "path": "/影视/电影",
+        }
+        executor = ProviderRelayExecutor(
+            download,
+            uploader,
+            source_materializer=_FakeMaterializer(events=events),
+            visibility_poller=_visibility_poller(VisibilityStatus.visible, events),
+            relay_root="/data/relay",
+        )
+        organizer = _FakeOrganizer(status="done", events=events)
+        orch = TransferOrchestrator(
+            plan,
+            {"relay_upload_provider": executor},
+            verifier=TransferVerifier(target_lister=_FakeTargetLister(events=events)),
+            cleanup=_FakeCleanup(events=events),
+            ack_service=_FakeAck(events=events),
+            finalizer_service=_FakeFinalizer(),
+            organizer_service=organizer,
+        )
+        _drive(orch)
+        self.assertEqual(orch.state.phase, PHASE_COMPLETED)
+        self.assertEqual(uploader.upload_targets[0]["path"], staging_path)
+        self.assertEqual(uploader.verify_targets[0]["path"], staging_path)
+        self.assertEqual(organizer.calls, 1)
+        order = events.names()
+        self.assertLess(order.index("cmcc_upload"), order.index("cmcc_verify"))
+        self.assertLess(order.index("cmcc_verify"), order.index("organize"))
+
+    def test_relay_upload_progress_translated_to_chinese_events(self) -> None:
+        events = _EventLog()
+        milestone_events: list[tuple[str, str]] = []
+        progress_values = [
+            "CMCC API local hash progress: 电影.mkv: 3.04 GiB / 6.74 GiB, 45%, 10.5 MiB/s, ETA 5m32s",
+            "CMCC API PUT progress: 电影.mkv: 3.04 GiB / 6.74 GiB, 45%, 10.5 MiB/s, ETA 5m32s",
+            62.4,
+            "CMCC API create request: 电影.mkv, size=6.74 GiB",
+        ]
+        download = _FakeDownloadAdapter(events=events)
+        uploader = _ProgressReportingUploader(progress_values, events=events)
+        sink_lines: list[str] = []
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="mobile",
+            strategy="relay_upload_provider",
+            landing="/_fnos_ingress/job-1",
+            final="/移动云/电影",
+            local_temp="/data/relay/job-1",
+        )
+        executor = ProviderRelayExecutor(
+            download,
+            uploader,
+            source_materializer=_FakeMaterializer(events=events),
+            visibility_poller=_visibility_poller(VisibilityStatus.visible, events),
+            relay_root="/data/relay",
+            progress_sink=sink_lines.append,
+            progress_interval=0.0,
+            event_sink=lambda level, message: milestone_events.append((level, message)),
+        )
+        orch = TransferOrchestrator(
+            plan,
+            {"relay_upload_provider": executor},
+            verifier=TransferVerifier(target_lister=_FakeTargetLister(events=events)),
+            cleanup=_FakeCleanup(events=events),
+            ack_service=_FakeAck(events=events),
+            finalizer_service=_FakeFinalizer(),
+        )
+        _drive(orch)
+        self.assertEqual(orch.state.phase, PHASE_COMPLETED)
+        self.assertEqual(
+            sink_lines,
+            [
+                "秒传校验 电影.mkv：3.04 GiB / 6.74 GiB，45%",
+                "上传中 电影.mkv：3.04 GiB / 6.74 GiB，45%，速度 10.5 MiB/s，预计剩余 5m32s",
+                "上传中：62%",
+                "上传完成：成功",
+            ],
+        )
+        # 里程碑只进任务事件流：开始与完成两条，不含高频进度。
+        self.assertEqual(milestone_events, [("info", "开始上传到目标网盘"), ("info", "上传完成，准备整理")])
+
+    def test_relay_upload_progress_is_throttled_within_interval(self) -> None:
+        events = _EventLog()
+        progress_values = [
+            "CMCC API PUT progress: 电影.mkv: 3.04 GiB / 6.74 GiB, 45%, 10.5 MiB/s, ETA 5m32s",
+            "CMCC API PUT progress: 电影.mkv: 6.00 GiB / 6.74 GiB, 89%, 10.5 MiB/s, ETA 40s",
+            90.0,
+        ]
+        download = _FakeDownloadAdapter(events=events)
+        uploader = _ProgressReportingUploader(progress_values, events=events)
+        sink_lines: list[str] = []
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="mobile",
+            strategy="relay_upload_provider",
+            landing="/_fnos_ingress/job-1",
+            final="/移动云/电影",
+            local_temp="/data/relay/job-1",
+        )
+        executor = ProviderRelayExecutor(
+            download,
+            uploader,
+            source_materializer=_FakeMaterializer(events=events),
+            visibility_poller=_visibility_poller(VisibilityStatus.visible, events),
+            relay_root="/data/relay",
+            progress_sink=sink_lines.append,
+            progress_interval=3600.0,
+        )
+        orch = TransferOrchestrator(
+            plan,
+            {"relay_upload_provider": executor},
+            verifier=TransferVerifier(target_lister=_FakeTargetLister(events=events)),
+            cleanup=_FakeCleanup(events=events),
+            ack_service=_FakeAck(events=events),
+            finalizer_service=_FakeFinalizer(),
+        )
+        _drive(orch)
+        self.assertEqual(orch.state.phase, PHASE_COMPLETED)
+        # 节流只作用于高频进度行；上传完成终态行不节流。
+        self.assertEqual(sink_lines[0], "上传中 电影.mkv：3.04 GiB / 6.74 GiB，45%，速度 10.5 MiB/s，预计剩余 5m32s")
+        self.assertEqual(len(sink_lines), 2)
+        self.assertTrue(sink_lines[1].startswith("上传完成："))
+        self.assertTrue(sink_lines[0].startswith("上传中 电影.mkv："))
+
+    def test_relay_staging_without_organizer_is_rejected_by_plan_contract(self) -> None:
+        plan = make_plan(
+            source_kind="quark",
+            dest_kind="mobile",
+            strategy="relay_upload_provider",
+            landing="/_fnos_ingress/job-1",
+            final="/影视/电影",
+            local_temp="/data/relay/job-1",
+            organizer_enabled=False,
+        )
+        plan["paths"]["destination_staging"] = {
+            "kind": "native",
+            "namespace_id": "native:mobile:mobile_lib",
+            "path": "/_入库暂存/电影/job-1",
+            "locator_kind": "path",
+            "role": "native_staging",
+        }
+        with self.assertRaisesRegex(TransferError, "destination_staging"):
+            TransferOrchestrator(
+                plan,
+                {"relay_upload_provider": _RelayExecutorStub()},
+            )
 
     def test_relay_auth_expired_halts_and_alerts_no_retry(self) -> None:
         events = _EventLog()

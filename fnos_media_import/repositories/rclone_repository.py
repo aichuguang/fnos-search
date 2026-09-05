@@ -511,6 +511,20 @@ class RcloneRepository:
             )
             return int(cur.lastrowid)
 
+    def add_rclone_events(self, events: list[tuple[int, str, str]]) -> None:
+        """单事务批量落库 rclone 事件，供日志 sink 的后台 flusher 使用。"""
+        if not events:
+            return
+        now = utc_now()
+        with self._connection_factory() as conn:
+            conn.executemany(
+                """
+                INSERT INTO rclone_events (run_id, level, message, raw_data, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [(int(run_id), level, message, None, now) for run_id, level, message in events],
+            )
+
     def count_rclone_runs(self) -> int:
         with self._connection_factory() as conn:
             row = conn.execute("SELECT COUNT(*) AS total FROM rclone_runs").fetchone()

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -190,6 +192,109 @@ class RcloneWorkerSourceStabilityTests(unittest.TestCase):
         # two paths belong to different storage drivers.  Streaming through
         # rclone is the required cross-provider behavior.
         self.assertEqual(copy_file.count("--disable Copy"), 2)
+
+    def test_progress_lines_are_flushed_line_by_line(self) -> None:
+        progress_filter = self._progress_filter_source()
+
+        # progress_filter 的 stdout 接 Python 端捕获管道（非终端），awk 默认块
+        # 缓冲。没有逐行 fflush 的话，5 秒一条的传输进度会积压在缓冲区里，
+        # 管理后台长时间看不到任何进度（正是 2026-09-04 的线上问题）。
+        self.assertGreaterEqual(progress_filter.count("fflush()"), 2)
+
+    def test_progress_filter_translates_both_rclone_stats_field_layouts(self) -> None:
+        awk = shutil.which("awk")
+        if not awk:  # pragma: no cover - Windows 开发机可能没有 awk
+            self.skipTest("awk not available on PATH")
+        program = self._awk_program()
+        sample = "\n".join(
+            (
+                # rclone 3 段格式（带时间戳与文件名前缀）
+                "2026/09/04 19:40:00 NOTICE: 电影.mkv: 47% of 6.28GiB, 10.4MiB/s, ETA 9m32s",
+                # rclone 4 段格式（百分比 + 已传/总量）
+                "NOTICE: 电影.mkv: 45%, 3.04GiB/6.74GiB, 10.5MiB/s, ETA 5m32s",
+                # 传输刚起步，ETA 未知
+                "NOTICE: 电影.mkv: 0% of 6.74GiB, 0 B/s, ETA -",
+                # 非统计行原样透传
+                "2026/09/04 19:40:05 ERROR 电影.mkv: 404 not found",
+            )
+        ) + "\n"
+        completed = subprocess.run(
+            [awk, "-v", "progress_label=电影.mkv", "-v", "progress_direction=下载", program],
+            input=sample,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=True,
+        )
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(
+            completed.stdout.splitlines(),
+            [
+                "下载中 电影.mkv：47% of 6.28GiB，速度 10.4MiB/s，预计剩余 9m32s",
+                "下载中 电影.mkv：45%，3.04GiB/6.74GiB，速度 10.5MiB/s，预计剩余 5m32s",
+                "下载中 电影.mkv：0% of 6.74GiB，速度 0 B/s，预计剩余 计算中",
+                "2026/09/04 19:40:05 ERROR 电影.mkv: 404 not found",
+            ],
+        )
+
+    def test_progress_filter_falls_back_without_direction(self) -> None:
+        awk = shutil.which("awk")
+        if not awk:  # pragma: no cover - Windows 开发机可能没有 awk
+            self.skipTest("awk not available on PATH")
+        program = self._awk_program()
+        completed = subprocess.run(
+            [awk, "-v", "progress_label=电影.mkv", program],
+            input="NOTICE: 电影.mkv: 45%, 3.04GiB/6.74GiB, 10.5MiB/s, ETA 5m32s\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=True,
+        )
+        self.assertEqual(
+            completed.stdout.splitlines(),
+            ["传输中 电影.mkv：45%，3.04GiB/6.74GiB，速度 10.5MiB/s，预计剩余 5m32s"],
+        )
+
+    def test_scoped_job_labels_progress_direction_by_target_kind(self) -> None:
+        scoped = self.content[
+            self.content.index("copy_scoped_job() {") : self.content.index("acquire_lock() {")
+        ]
+        # 中继本地目标标“下载”，远端目标标“上传”；文件级日志与重试标签同向。
+        self.assertIn('copy_direction_label="下载"', scoped)
+        self.assertIn('copy_direction_label="上传"', scoped)
+        self.assertIn('log "${copy_direction_label}文件：', scoped)
+        self.assertIn('retry_count "${copy_direction_label} ', scoped)
+        # 中继链路结束≠任务完成：结束语必须说明“移交网盘上传”，不能让
+        # 用户在 rclone 日志页误以为下载结束就是整个任务结束。
+        self.assertIn(
+            'log "rclone 下载完成：${copy_job_dir}，下载 ${copied_count} 个文件，失败 ${failed_count} 个，已移交网盘上传"',
+            scoped,
+        )
+        copy_file = self.content[
+            self.content.index("copy_file() {") : self.content.index("copy_scoped_job() {")
+        ]
+        self.assertIn(
+            "export RCLONE_PROGRESS_LABEL RCLONE_PROGRESS_DIRECTION",
+            copy_file,
+        )
+
+    def _progress_filter_source(self) -> str:
+        return self.content[
+            self.content.index("progress_filter() {") : self.content.index("copy_file() {")
+        ]
+
+    def _awk_program(self) -> str:
+        source = self._progress_filter_source()
+        match = re.search(
+            r"awk -v progress_label=\"\$\{RCLONE_PROGRESS_LABEL:-\}\""
+            r" -v progress_direction=\"\$\{RCLONE_PROGRESS_DIRECTION:-\}\" '\n(.*?)'\n\}",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match, "progress_filter must embed an awk program")
+        return match.group(1)
 
 
 if __name__ == "__main__":

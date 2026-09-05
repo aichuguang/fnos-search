@@ -1605,6 +1605,33 @@ class StorageSetupService:
             else:
                 mount = old_mount
                 if explicit_confirm and mount and mount.get("identity_status") not in {"verified", "declared"}:
+                    # An older save may have persisted readable=False while the
+                    # aggregate operation still succeeded through the native
+                    # path.  This branch never re-probes, so confirm_identity
+                    # would reject forever on stale state.  Refresh the real
+                    # health once before confirming; a genuinely unreachable
+                    # OpenList still fails closed with the probe's message.
+                    if not bool(mount.get("readable")):
+                        connection_snapshot = self.connections.get_connection(connection_id)
+                        probe = self.mounts.probe_mount(
+                            mount["mount_id"],
+                            expected_revision=int(mount.get("revision") or 0) or None,
+                            expected_connection_revision=int(
+                                (connection_snapshot or {}).get("revision") or 0
+                            )
+                            or None,
+                            require_webdav_file_write=self._webdav_file_write_required(
+                                provider_kind
+                            ),
+                        )
+                        if not probe.get("ok"):
+                            raise StorageSetupError(
+                                probe.get("message") or "保存目录读写检测未通过",
+                                code="OPENLIST_PROBE_FAILED",
+                                status=503,
+                                retryable=True,
+                            )
+                        mount = self.mounts.get_mount(mount["mount_id"]) or mount
                     mount = self.mounts.confirm_identity(
                         mount["mount_id"],
                         expected_revision=int(mount.get("revision") or 0) or None,

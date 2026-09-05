@@ -97,7 +97,50 @@ def _callback_service(database: _CallbackDatabase) -> RcloneCallbackService:
     )
 
 
+def _callback_service_with_managed_rclone(database: _CallbackDatabase) -> RcloneCallbackService:
+    return RcloneCallbackService(
+        CallbackDependencies(
+            db=database,
+            rclone=SimpleNamespace(
+                build_v1_copy_run=lambda _job, _plan: {
+                    "job_dir_name": f"job-{JOB_ID}",
+                    "source_root": "/mounted/source/quark/tv",
+                    "target_root": "/mounted/destination/tv",
+                }
+            ),
+            safe_int=_safe_int,
+            callback_level=lambda _status: "info",
+            cancelled_status="cancelled",
+        )
+    )
+
+
 class RcloneStagingManifestCallbackTests(unittest.TestCase):
+    def test_manifest_uses_managed_rclone_coordinates_from_frozen_plan(self) -> None:
+        database = _CallbackDatabase(rclone_v1_job(_plan()))
+        service = _callback_service_with_managed_rclone(database)
+
+        response, status_code = service.handle(
+            {
+                "run_id": 1,
+                "job_id": JOB_ID,
+                "status": "staging_manifest",
+                "category": "tv",
+                "source_path": "/mounted/source/quark/tv",
+                "target_path": "/mounted/destination/tv",
+                "manifest_paths": [
+                    "/mounted/source/quark/tv/job-42/E01.mkv",
+                ],
+            }
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertTrue(response["success"])
+        self.assertEqual(
+            response["manifest"]["job_root"],
+            "/mounted/source/quark/tv/job-42",
+        )
+
     def test_manifest_callback_merges_paths_across_runs(self) -> None:
         database = _CallbackDatabase(rclone_v1_job(_plan(expected_file_count=3)))
         service = _callback_service(database)

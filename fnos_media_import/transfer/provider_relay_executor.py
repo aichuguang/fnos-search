@@ -13,7 +13,9 @@ adding another upload-capable Provider does not require another orchestrator.
 
 from __future__ import annotations
 
-from typing import Any
+import re
+import time
+from typing import Any, Callable
 
 from fnos_media_import.transfer import (
     CancelResult,
@@ -31,6 +33,18 @@ from fnos_media_import.transfer import (
 )
 
 __all__ = ["DownloadStatus", "ProviderRelayExecutor"]
+
+# 移动云 CmccUploader 的 _ProgressMeter 输出行（英文、格式固定）：
+# "{label}: {done} / {total}, {percent}%, {speed}/s, ETA {eta}"，
+# label 形如 "CMCC API PUT progress: 文件名" / "CMCC API local hash progress: 文件名"。
+_CMCC_PUT_PROGRESS_LINE = re.compile(
+    r"^CMCC API PUT progress: (?P<name>.*): (?P<done>.+) / (?P<total>[^,]+), "
+    r"(?P<percent>\d+)%, (?P<speed>.+)/s, ETA (?P<eta>.+)$"
+)
+_CMCC_HASH_PROGRESS_LINE = re.compile(
+    r"^CMCC API local hash progress: (?P<name>.*): (?P<done>.+) / (?P<total>[^,]+), "
+    r"(?P<percent>\d+)%, .+/s, ETA .+$"
+)
 
 
 class DownloadStatus:
@@ -58,6 +72,9 @@ class ProviderRelayExecutor:
         relay_root: str | None = None,
         alert_service: Any = None,
         halted_account_ids: set[str] | None = None,
+        progress_sink: Callable[[str], None] | None = None,
+        progress_interval: float = 5.0,
+        event_sink: Callable[[str, str], None] | None = None,
     ) -> None:
         self.rclone_adapter = rclone_adapter
         self.provider_uploader = provider_uploader
@@ -66,6 +83,9 @@ class ProviderRelayExecutor:
         self.relay_root = self._normalize_root(relay_root)
         self.alert_service = alert_service
         self.halted_account_ids = halted_account_ids if isinstance(halted_account_ids, set) else set()
+        self.progress_sink = progress_sink
+        self.progress_interval = max(float(progress_interval or 0.0), 0.0)
+        self.event_sink = event_sink
 
     def bind(self, plan: TransferPlan) -> "ProviderRelayExecutor":
         self.plan = plan
@@ -283,11 +303,13 @@ class ProviderRelayExecutor:
             "unknown",
         }:
             return previous
+        self._emit_event("info", "开始上传到目标网盘")
         try:
             outcome = self.provider_uploader.upload_local_dir(
                 local_dir=local_dir,
                 target_locator=target,
                 idempotency_key=operation_key,
+                progress=self._make_upload_progress_handler(),
             )
         except TransferError as exc:
             outcome = UploadOutcome("failed", exc.message, error_code=exc.code)
@@ -298,6 +320,12 @@ class ProviderRelayExecutor:
                 error_code=ErrorCode.NETWORK_TRANSIENT,
             )
         normalized = normalize_upload_outcome(outcome)
+        if normalized.status in {"done", "completed"}:
+            self._emit_progress(f"上传完成：{normalized.message or '成功'}")
+            self._emit_event("info", "上传完成，准备整理")
+        elif normalized.status in {"failed", "auth_expired"}:
+            self._emit_progress(f"上传失败：{normalized.message}")
+            self._emit_event("error", f"上传失败：{normalized.message}")
         metadata["upload_outcome"] = _upload_outcome_dict(normalized)
         if isinstance(fence, dict):
             fence["state"] = normalized.status
@@ -358,6 +386,25 @@ class ProviderRelayExecutor:
         return OperationStatus("running", outcome.message or f"{label}上传进行中")
 
     def _destination_target(self) -> dict[str, str]:
+        """上传与校验共同的目标定位器。
+
+        启用 Organizer 时中继上传写入冻结的任务级原生暂存目录
+        （分类父目录/_入库暂存/分类名/job-N），整理完成后由 Organizer 搬进
+        正式分类目录；未启用 Organizer 时直写 destination_final。
+
+        暂存值直接读冻结计划里的原始 paths 字典：``path()`` 会把定位器规范
+        化成以 "/" 开头的 POSIX 路径，而天翼云的 folder_path 是
+        ``{root_folder_id}::{相对路径}`` 复合定位器，加上前导 "/" 就解析不出
+        root_folder_id 了（与 ``native_submit_locator`` 同一约束）。
+        """
+
+        staging = self.plan.paths.get("destination_staging")
+        if isinstance(staging, dict) and str(staging.get("kind") or "") == "native":
+            value = str(staging.get("path") or "").strip()
+            if value:
+                target = dict(staging)
+                target["path"] = value
+                return target
         target = self.plan.destination_final
         if not isinstance(target, dict):
             raise TransferError(
@@ -377,6 +424,69 @@ class ProviderRelayExecutor:
                 "relay destination_final 必须使用 native 命名空间",
             )
         return dict(target)
+
+    def _emit_event(self, level: str, message: str) -> None:
+        """任务事件时间线只收里程碑（开始/完成/失败），高频进度走日志流。"""
+        if self.event_sink is None:
+            return
+        try:
+            self.event_sink(level, message)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _emit_progress(self, message: str) -> None:
+        if self.progress_sink is None or not message:
+            return
+        try:
+            self.progress_sink(message)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _make_upload_progress_handler(self) -> Callable[[Any], None]:
+        """把上传器进度回调归一化成中文事件并节流后送入 progress_sink。
+
+        不同 Provider 的回调形态不同：天翼云给整体百分比浮点，移动云给
+        _ProgressMeter 的英文进度行。这里统一翻译成用户可见中文；其余
+        诊断性输出（create request、raw response 等）不进事件流。
+        """
+
+        state = {"last_emit": 0.0}
+
+        def handler(value: Any) -> None:
+            if self.progress_sink is None:
+                return
+            message = self._format_upload_progress(value)
+            if not message:
+                return
+            now = time.monotonic()
+            if state["last_emit"] and now - state["last_emit"] < self.progress_interval:
+                return
+            state["last_emit"] = now
+            self._emit_progress(message)
+
+        return handler
+
+    def _format_upload_progress(self, value: Any) -> str:
+        if isinstance(value, bool):
+            return ""
+        if isinstance(value, (int, float)):
+            percent = max(0.0, min(100.0, float(value)))
+            return f"上传中：{percent:.0f}%"
+        text = str(value or "")
+        put = _CMCC_PUT_PROGRESS_LINE.match(text)
+        if put:
+            return (
+                f"上传中 {put.group('name')}：{put.group('done')} / {put.group('total')}，"
+                f"{put.group('percent')}%，速度 {put.group('speed')}/s，"
+                f"预计剩余 {put.group('eta')}"
+            )
+        hashed = _CMCC_HASH_PROGRESS_LINE.match(text)
+        if hashed:
+            return (
+                f"秒传校验 {hashed.group('name')}：{hashed.group('done')} / "
+                f"{hashed.group('total')}，{hashed.group('percent')}%"
+            )
+        return ""
 
     def _on_auth_expired(self) -> None:
         account_id = self.plan.destination_account_id or self.plan.destination_id

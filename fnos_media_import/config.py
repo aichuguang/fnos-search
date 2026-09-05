@@ -596,7 +596,7 @@ def _default_config() -> dict[str, Any]:
             "timeout": os.getenv("RCLONE_TIMEOUT", "10m"),
             "connect_timeout": os.getenv("RCLONE_CONNECT_TIMEOUT", "30s"),
             "replace_size_mismatch": os.getenv("RCLONE_REPLACE_SIZE_MISMATCH", "true"),
-            "source_settle_seconds": int(os.getenv("RCLONE_SOURCE_SETTLE_SECONDS", "30")),
+            "source_settle_seconds": int(os.getenv("RCLONE_SOURCE_SETTLE_SECONDS", "10")),
             "manual_source_settle_seconds": int(os.getenv("RCLONE_MANUAL_SOURCE_SETTLE_SECONDS", "0")),
             "source_settle_rounds": int(os.getenv("RCLONE_SOURCE_SETTLE_ROUNDS", "2")),
             "source_appear_wait_seconds": int(os.getenv("RCLONE_SOURCE_APPEAR_WAIT_SECONDS", "180")),

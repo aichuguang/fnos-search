@@ -2181,6 +2181,12 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             ),
             "stop": lambda: jsonify(rclone_service.stop()),
             "check": lambda: jsonify(rclone_service.check_environment()),
+            "append_log": lambda: jsonify(
+                rclone_service.append_external_log(
+                    str(_rclone_worker_payload().get("message") or ""),
+                    job_id=_safe_int(_rclone_worker_payload().get("job_id"), 0, 0, 999999999),
+                )
+            ),
             "cancel_job": _rclone_worker_cancel_job,
             "cleanup_cancelled_task": lambda: jsonify(
                 rclone_service.cleanup_cancelled_task(**_rclone_worker_payload())
@@ -2875,6 +2881,14 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         mount_service=v1_openlist_mounts,
         connection_service=v1_openlist_connections,
     )
+    # 上传进度桥接：分体部署时经 Worker 控制通道汇入 rclone 实时日志页；
+    # 一体部署（无独立 Worker）时直接写本地 rclone 日志缓冲。
+    def _upload_log_bridge(job_id: int, message: str) -> None:
+        if rclone_worker_client is not None:
+            rclone_worker_client.append_log(f"任务#{int(job_id)} {message}")
+        else:
+            rclone_service.append_external_log(message, job_id=int(job_id))
+
     v1_transfer_dispatch = TransferDispatchService(
         database=db,
         accounts_service=v1_accounts_service,
@@ -2887,6 +2901,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         assignment_service=v1_rules_service,
         execution_repository=v1_execution_repository,
         organizer_service=organizer_service,
+        upload_log_bridge=_upload_log_bridge,
     )
     app.extensions["v1_rclone_locator"] = v1_rclone_locator
     app.extensions["v1_transfer_dispatch"] = v1_transfer_dispatch
@@ -2937,6 +2952,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     app.extensions["transfer_recovery_scanner"] = transfer_recovery_scanner
     app.extensions["transfer_recovery_runtime"] = transfer_recovery_runtime
     atexit.register(transfer_recovery_runtime.shutdown)
+
+    # rclone run 到达终态时立即唤醒等待它的传输执行，而不是等 transferring
+    # 阶段的指数退避（长传输后封顶 300 秒）或 30 秒恢复扫描。
+    rclone_service.set_transfer_wakeup(transfer_recovery_scanner.wake_after_rclone_run)
 
     # The durable runtime is created earlier so all process roles share one
     # queue object; registering the handler now is safe because it is started

@@ -9,6 +9,7 @@ fallback.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..domain.models import AccountTestResult, NativeLocator, ProviderCapabilities
@@ -28,6 +29,7 @@ from ..transfer import (
     receipt_from_import_result,
 )
 from ..transfer.verifier import VerifyRequest
+from ..time_utils import utc_now_iso
 from .manifests import (
     MOBILE_MANIFEST,
     QUARK_MANIFEST,
@@ -381,6 +383,10 @@ class _FrozenImporterAdapter:
                 **dict(receipt.metadata or {}),
                 "account_id": request.account_id,
                 "account_revision": request.account_revision,
+                "submitted_at": str(
+                    (receipt.metadata or {}).get("submitted_at")
+                    or utc_now_iso()
+                ),
             },
         )
 
@@ -581,11 +587,38 @@ class SixPanProviderAdapter(_FrozenImporterAdapter):
         task_id = str(receipt.operation_id or receipt.external_ref or "").strip()
         if not callable(finder) or not callable(state_for) or not task_id:
             return super()._poll_provider_task(importer, receipt)
+        metadata = receipt.metadata if isinstance(receipt.metadata, dict) else {}
+        submitted_at = str(metadata.get("submitted_at") or "").strip()
+        try:
+            submitted_timeout = max(0, int(getattr(importer, "submitted_timeout_seconds", 0) or 0))
+        except (TypeError, ValueError):
+            submitted_timeout = 0
+        if submitted_timeout and submitted_at:
+            try:
+                started = datetime.fromisoformat(submitted_at.replace("Z", "+00:00"))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - started).total_seconds() >= submitted_timeout:
+                    return OperationStatus(
+                        "unknown",
+                        f"六盘离线任务超过最大等待时间（{submitted_timeout} 秒）",
+                        error_code=ErrorCode.RESULT_UNKNOWN,
+                    )
+            except (TypeError, ValueError):
+                pass
         task = finder(task_id)
         if not isinstance(task, dict):
+            missing_count = int(metadata.get("missing_polls") or 0) + 1
+            metadata["missing_polls"] = missing_count
+            try:
+                missing_limit = max(1, int(getattr(importer, "task_missing_poll_limit", 5) or 5))
+            except (TypeError, ValueError):
+                missing_limit = 5
+            if missing_count < missing_limit:
+                return OperationStatus("running", f"六盘任务暂未出现在任务列表（第 {missing_count} 次）")
             return OperationStatus(
                 "unknown",
-                "六盘任务未找到，无法确认离线结果",
+                "六盘任务多次未找到，无法确认离线结果",
                 error_code=ErrorCode.RESULT_UNKNOWN,
             )
         state = state_for(task)
@@ -597,9 +630,17 @@ class SixPanProviderAdapter(_FrozenImporterAdapter):
             return OperationStatus("failed", message or "六盘离线任务失败")
         if status == "running":
             return OperationStatus("running", message or "六盘离线任务进行中")
+        unknown_count = int(metadata.get("unknown_polls") or 0) + 1
+        metadata["unknown_polls"] = unknown_count
+        try:
+            unknown_limit = max(1, int(getattr(importer, "task_unknown_poll_limit", 5) or 5))
+        except (TypeError, ValueError):
+            unknown_limit = 5
+        if unknown_count < unknown_limit:
+            return OperationStatus("running", message or f"六盘离线任务状态暂不明确（第 {unknown_count} 次）")
         return OperationStatus(
             "unknown",
-            message or "六盘离线任务状态未知",
+            message or "六盘离线任务状态多次未知",
             error_code=ErrorCode.RESULT_UNKNOWN,
         )
 

@@ -84,6 +84,7 @@ class RcloneWorkerControlTests(unittest.TestCase):
                         "worker_status": lambda: jsonify(
                             {"success": True, "healthy": True, "status": "ready"}
                         ),
+                        "append_log": lambda: jsonify({"success": True}),
                     },
                 )
             )
@@ -116,6 +117,19 @@ class RcloneWorkerControlTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["healthy"])
+
+    def test_append_log_route_is_post_only_and_bearer_protected(self) -> None:
+        self.assertEqual(self.client.get("/api/internal/rclone/append-log").status_code, 405)
+        self.assertEqual(
+            self.client.post("/api/internal/rclone/append-log").status_code,
+            401,
+        )
+        response = self.client.post(
+            "/api/internal/rclone/append-log",
+            headers={"Authorization": "Bearer stable-token"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["success"])
 
 
 class RcloneWorkerClientTests(unittest.TestCase):
@@ -256,6 +270,48 @@ class RcloneWorkerClientTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "worker_unavailable")
         self.assertEqual(result["_http_status"], 503)
         self.assertEqual(len(session.calls), 3)
+
+    def test_append_log_posts_message_once_and_reports_success(self) -> None:
+        session = _Session(_Response({"success": True, "message": "已记录"}))
+        client = RcloneWorkerClient(
+            base_url="http://worker:5251",
+            token="secret",
+            database=object(),
+            session=session,
+        )
+
+        self.assertTrue(client.append_log("任务#4 上传中：45%"))
+
+        call = session.calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["url"], "http://worker:5251/api/internal/rclone/append-log")
+        self.assertEqual(call["json"], {"message": "任务#4 上传中：45%"})
+        self.assertEqual(len(session.calls), 1)
+
+    def test_append_log_fails_silently_when_worker_unreachable(self) -> None:
+        session = _SequenceSession([requests.ConnectionError("offline")])
+        client = RcloneWorkerClient(
+            base_url="http://worker:5251",
+            token="secret",
+            database=object(),
+            session=session,
+            sleep=lambda _delay: None,
+        )
+
+        self.assertFalse(client.append_log("任务#4 上传中：45%"))
+        self.assertEqual(len(session.calls), 1)
+
+    def test_append_log_ignores_empty_message(self) -> None:
+        session = _Session(_Response({"success": True}))
+        client = RcloneWorkerClient(
+            base_url="http://worker:5251",
+            token="secret",
+            database=object(),
+            session=session,
+        )
+
+        self.assertFalse(client.append_log("   "))
+        self.assertEqual(session.calls, [])
 
 
 class LocalRcloneExecutionTests(unittest.TestCase):

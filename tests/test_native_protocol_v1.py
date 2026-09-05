@@ -109,6 +109,15 @@ class _SixPanLifecycleImporter(RepositoryFakeMixin):
         return {"success": True}
 
 
+class _SixPanMissingTaskImporter(_SixPanLifecycleImporter):
+    task_missing_poll_limit = 2
+    submitted_timeout_seconds = 0
+
+    def find_task(self, task_id: str):
+        del task_id
+        return None
+
+
 class _MobileLifecycleImporter(RepositoryFakeMixin):
     def __init__(self, status: str = "completed") -> None:
         self.status = status
@@ -358,6 +367,22 @@ class NativeProtocolTests(unittest.TestCase):
         )
         self.assertEqual(adapter.cancel_operation(receipt).status, "cancel_pending")
         self.assertEqual(importer.deleted, [(["sixpan-task-3"], False)])
+
+    def test_sixpan_missing_task_is_bounded_before_manual_review(self) -> None:
+        importer = _SixPanMissingTaskImporter("unknown")
+        adapter = SixPanProviderAdapter(
+            importer_factory=lambda _account_id, _revision: importer,
+            account_importer_factory=lambda _values: importer,
+            source_record_service=_SourceRecords(),
+        )
+        receipt = _receipt("sixpan-task-missing", "sixpan")
+
+        first = adapter.poll_operation(receipt)
+        second = adapter.poll_operation(receipt)
+
+        self.assertEqual(first.status, "running")
+        self.assertEqual(second.status, "unknown")
+        self.assertEqual(second.error_code, ErrorCode.RESULT_UNKNOWN)
 
     def test_mobile_task_poll_and_verify_use_frozen_receipt(self) -> None:
         importer = _MobileLifecycleImporter("success")

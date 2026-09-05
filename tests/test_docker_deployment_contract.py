@@ -106,6 +106,10 @@ def test_optional_env_example_only_exposes_common_user_settings() -> None:
         "FNOS_ROOT_KEY",
         "FNOS_RELAY_HOST_PATH",
         "RCLONE_LOCAL_STORAGE_HOST_PATH",
+        "TRANSFER_SOURCE_VISIBLE_TIMEOUT_SECONDS",
+        "TRANSFER_NATIVE_WAIT_TIMEOUT_SECONDS",
+        "TRANSFER_WAIT_TIMEOUT_SECONDS",
+        "TRANSFER_CANCEL_TIMEOUT_SECONDS",
         "PANSOU_USERNAME",
         "PANSOU_PASSWORD",
     }
@@ -132,6 +136,8 @@ def test_data_mount_persists_database_and_generated_secrets() -> None:
     assert '"database_path": "data/app.db"' in config_source
     assert '"/app/data/.secrets/rclone_worker_control_token"' in entrypoint_source
     assert "_validate_root_key()" in entrypoint_source
+    assert '"/data/relay"' in entrypoint_source
+    assert "10001:10001" in (ROOT / "README.md").read_text(encoding="utf-8")
     assert "NOTIFICATION_ENCRYPTION_KEY" not in entrypoint_source
     assert "app_session_key = derive_key(root_key, PURPOSE_APP_SESSION).hex()" in app_source
     assert "app.secret_key = app_session_key" in app_source

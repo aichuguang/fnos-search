@@ -177,6 +177,22 @@ docker exec fnos-rclone-worker rclone listremotes --config /config/rclone/rclone
 docker exec fnos-rclone-worker rclone lsd "MP:" --config /config/rclone/rclone.conf
 ```
 
+如果日志出现 `didn't find section in config file ("MP")`，说明 Worker 当前挂载的
+`rclone.conf` 没有 `[MP]`，需要在“飞牛与 rclone”中重新保存并检测，或确认
+`RCLONE_CONFIG_HOST_PATH` 指向了实际配置目录。若随后出现
+`/data/relay/job-<id>: Permission denied`，则是 `FNOS_RELAY_HOST_PATH` 对应的宿主机目录
+不可由容器用户 `10001:10001` 写入；请先创建目录并授予该 UID/GID 写权限，再重新编排：
+
+```bash
+mkdir -p /你的目录/fnos-search/relay
+chown 10001:10001 /你的目录/fnos-search/relay
+chmod 770 /你的目录/fnos-search/relay
+docker compose up -d --force-recreate
+```
+
+新版本入口脚本会在 Worker 启动时自动修复 `/data/relay` 根目录权限；宿主机文件系统不允许
+容器内 `chown` 时，仍需按上面的方式预先设置权限。
+
 更详细的说明见 [rclone 配置](rclone/README.md)。
 
 ### 配置管理后台
@@ -331,6 +347,16 @@ curl -fsS "http://127.0.0.1:${APP_PORT:-5251}/readyz"
 也不能临时生成另一条值。程序只接受新版 `v2:<purpose>` 密文；旧 `v1`、`ol:v1` 和旧通知
 密文不会自动迁移或回退解密，相关账号、OpenList 连接或通知凭据必须在后台重新登录/保存。
 根密钥轮换需要先执行密文迁移，不能直接替换环境变量。
+
+Transfer 的来源可见性、Provider 原生任务、普通搬运和取消确认都有持久化最大等待时间，
+超时会进入人工复核，不会无限轮询。可通过以下环境变量调整（单位：秒）：
+
+| 变量 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `TRANSFER_SOURCE_VISIBLE_TIMEOUT_SECONDS` | `1800` | 来源落地区等待 OpenList 可见的最长时间。 |
+| `TRANSFER_NATIVE_WAIT_TIMEOUT_SECONDS` | `604800` | 夸克、天翼、六盘等原生任务最长等待时间。 |
+| `TRANSFER_WAIT_TIMEOUT_SECONDS` | `10800` | rclone/中继传输最长等待时间。 |
+| `TRANSFER_CANCEL_TIMEOUT_SECONDS` | `3600` | 外部取消确认最长等待时间。 |
 
 如果需要从源码构建：
 

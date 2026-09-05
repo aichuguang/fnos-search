@@ -115,6 +115,9 @@ def main() -> None:
         # config/data/logs 里保存应用配置和数据，需要修复已有文件。
         for value in ("/app/config", "/app/data", "/app/logs", "/home/app"):
             _prepare_path(Path(value), uid, gid, recursive=True)
+        # Web 与 Worker 共同挂载 relay；两种角色都可能参与任务清理，
+        # 因此共享根目录必须在角色分支之前完成属主修复。
+        _prepare_path(Path("/data/relay"), uid, gid, recursive=False)
         if runtime_role in {"all", "worker"}:
             # rclone 临时文件可能很大，只修复目录根，避免每次启动全量遍历。
             _prepare_path(Path("/config/rclone"), uid, gid, recursive=True)

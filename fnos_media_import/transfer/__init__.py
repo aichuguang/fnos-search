@@ -382,8 +382,9 @@ class TransferPlan:
     def _validate_path_contract(self) -> None:
         """Apply the same minimal path contract as Planner/PlanValidator.
 
-        Provider relay has no destination staging step: its frozen
-        paths are source landing, local relay cache and destination final.
+        Provider relay uploads into the frozen native destination.  When the
+        Organizer is enabled that destination is the task-level native staging
+        directory; without the Organizer it is ``destination_final`` directly.
         ``destination_staging`` is mandatory only for ``rclone_copy``.  The
         check is intentionally structural and does not consult live config.
         """
@@ -405,10 +406,14 @@ class TransferPlan:
         elif strategy in relay_strategies:
             required.append("local_temp")
 
-        if strategy in relay_strategies and self.paths.get("destination_staging") not in (None, {}):
+        if (
+            strategy in relay_strategies
+            and self.paths.get("destination_staging") not in (None, {})
+            and not self.organizer_enabled
+        ):
             raise TransferError(
                 ErrorCode.INVALID_PLAN,
-                f"{strategy} 不允许 destination_staging",
+                f"{strategy} 只有启用 Organizer 时才允许 destination_staging",
             )
 
         for key in required:

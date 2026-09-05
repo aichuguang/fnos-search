@@ -69,6 +69,25 @@ def _callback_service(database: _CallbackDatabase) -> RcloneCallbackService:
 
 
 class CallbackTerminalAckTests(unittest.TestCase):
+    def test_late_manifest_for_done_job_is_idempotently_accepted(self) -> None:
+        database = _CallbackDatabase("done")
+
+        response, status_code = _callback_service(database).handle(
+            {
+                "run_id": 9,
+                "job_id": 42,
+                "status": "staging_manifest",
+                "category": "tv",
+                "manifest_paths": ["/quark/tv/job-42/E01.mkv"],
+            }
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertTrue(response["success"])
+        self.assertTrue(response["ignored"])
+        self.assertEqual(response["disposition"], "ignored_terminal")
+        self.assertEqual(database.updates, [])
+
     def test_cancel_winning_between_read_and_status_write_is_not_revived(self) -> None:
         class RacingDatabase(_CallbackDatabase):
             def update_job_if_status(self, _job_id: int, _expected_statuses, **_changes) -> bool:

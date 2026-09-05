@@ -347,9 +347,11 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
 
     # Every V1 plan has an immutable final path. Data-plane strategies require
     # a task-scoped landing path.  rclone_copy also has a destination staging
-    # path; Provider relay deliberately does not because it uploads from
-    # the frozen local relay cache directly to the native destination.
+    # path; Provider relay uploads from the frozen local relay cache into the
+    # native destination, and when the Organizer is enabled that destination
+    # is a task-scoped native staging directory.
     relay_strategies = {"relay_upload_provider"}
+    relay_organizer_enabled = bool(_dict(plan.get("postprocess")).get("organizer_enabled"))
     required = ["destination_final"]
     if strategy == "rclone_copy" or strategy in relay_strategies:
         required.append("source_landing")
@@ -368,7 +370,11 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
         allowed = {
             "destination_final": {"native"} if strategy in {"native_save", "native_offline", *relay_strategies} else {"openlist", "local"},
             "source_landing": {"openlist"},
-            "destination_staging": {"openlist", "local"},
+            "destination_staging": (
+                {"openlist", "local"}
+                if strategy == "rclone_copy"
+                else {"native"}
+            ),
             "local_temp": {"relay"},
         }.get(key, set())
         if kind not in allowed:
@@ -379,8 +385,12 @@ def validated_v1_execution_plan_from_job(job: dict[str, Any] | None) -> dict[str
             leaf = str(ref.get("path") or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
             if leaf != f"job-{job_id}":
                 missing.append(f"paths.{key}.job_scope")
-    if strategy in relay_strategies and paths.get("destination_staging") not in (None, {}):
-        missing.append(f"paths.destination_staging must be empty for {strategy}")
+    if (
+        strategy in relay_strategies
+        and paths.get("destination_staging") not in (None, {})
+        and not relay_organizer_enabled
+    ):
+        missing.append(f"paths.destination_staging requires organizer for {strategy}")
     if missing:
         raise JobPlanError("V1 execution_plan missing/invalid fields: " + ",".join(dict.fromkeys(missing)))
     return plan

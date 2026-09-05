@@ -156,7 +156,7 @@ class OrganizerV1HardCutoverTests(unittest.TestCase):
                 year="2026",
                 ext=".mkv",
             ),
-            "/媒体/片名 (2026).mkv",
+            "/媒体/片名 (2026)/片名 (2026).mkv",
         )
 
     def test_unlinked_task_is_moved_to_review_without_openlist_execution(self) -> None:

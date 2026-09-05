@@ -21,9 +21,20 @@ class _Execution:
 class _Executions(RepositoryFakeMixin):
     def __init__(self, rows):
         self.rows = rows
+        self.cleared = []
 
     def list_due(self, **_kwargs):
         return list(self.rows)
+
+    def get(self, job_id):
+        for row in self.rows:
+            if row.job_id == job_id:
+                return row
+        return None
+
+    def clear_resume_backoff(self, job_id, phase):
+        self.cleared.append((job_id, phase))
+        return True
 
 
 class _Queue(RepositoryFakeMixin):
@@ -38,6 +49,41 @@ class _Queue(RepositoryFakeMixin):
 
 
 class TransferRecoveryTests(unittest.TestCase):
+    def test_wake_after_rclone_run_clears_backoff_and_requeues(self):
+        queue = _Queue()
+        executions = _Executions([_Execution(7, "transferring")])
+        scanner = TransferRecoveryScanner(executions, queue)
+
+        result = scanner.wake_after_rclone_run(7)
+
+        self.assertTrue(result["woken"])
+        self.assertEqual(executions.cleared, [(7, "transferring")])
+        self.assertEqual(queue.calls[0][0][0], "import_transfer_execute")
+        self.assertEqual(queue.calls[0][0][2], "import-transfer:7")
+        self.assertEqual(queue.calls[0][0][1], {"job_id": 7, "rclone_terminal": True})
+        self.assertEqual(queue.calls[0][1]["reactivate_terminal"], True)
+
+    def test_wake_after_rclone_run_leaves_other_phases_alone(self):
+        queue = _Queue()
+        executions = _Executions(
+            [
+                _Execution(8, "retry_wait"),
+                _Execution(9, "completed"),
+            ]
+        )
+        scanner = TransferRecoveryScanner(executions, queue)
+
+        retry_result = scanner.wake_after_rclone_run(8)
+        terminal_result = scanner.wake_after_rclone_run(9)
+        missing_result = scanner.wake_after_rclone_run(404)
+
+        self.assertFalse(retry_result["woken"])
+        self.assertIn("phase_not_transferring:retry_wait", retry_result["reason"])
+        self.assertFalse(terminal_result["woken"])
+        self.assertFalse(missing_result["woken"])
+        self.assertEqual(executions.cleared, [])
+        self.assertFalse(queue.calls)
+
     def test_requeues_due_execution_with_stable_key(self):
         queue = _Queue()
         scanner = TransferRecoveryScanner(

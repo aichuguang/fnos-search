@@ -20,6 +20,7 @@ const publicState = {
     manualLink: null,
     manualPreview: null,
     pendingSlowSubmit: null,
+    pendingNoVideoSubmit: null,
     searchSequence: 0,
     supplementTimer: null,
     supplementing: false,
@@ -236,7 +237,7 @@ function getPublicBootstrapModule() {
         loadCaptcha, bindRecentRequests, bindRequestStatusPage, searchPublicResources, handleTmdbAction, selectedSearchSource, updateSearchSourceActiveState,
         loadPublicTrending, bindPublicTrending,
         detectManualPublicLink, submitManualPublicLink, handleSixpanParseClick, handleSixpanParseChange, queryRequestStatus,
-        closePublicSubmitConfirm, closeSixpanSlowWarning, continueSixpanSlowSubmit, updatePublicConfirmWarning,
+        closePublicSubmitConfirm, closeSixpanSlowWarning, continueSixpanSlowSubmit, closeNoVideoSubmitWarning, continueNoVideoSubmit, updatePublicConfirmWarning,
         confirmPublicResourceSubmit, trapPublicModalFocus,
     });
     return publicBootstrapModule;
@@ -922,6 +923,26 @@ function closeSixpanSlowWarning(...args) {
 
 function continueSixpanSlowSubmit(...args) {
     return getPublicSubmitModule().continueSixpanSlowSubmit(...args);
+}
+
+function isPlayableVideoFileName(...args) {
+    return getPublicSubmitModule().isPlayableVideoFileName(...args);
+}
+
+function submissionLacksPlayableVideo(...args) {
+    return getPublicSubmitModule().submissionLacksPlayableVideo(...args);
+}
+
+function openNoVideoSubmitWarning(...args) {
+    return getPublicSubmitModule().openNoVideoSubmitWarning(...args);
+}
+
+function closeNoVideoSubmitWarning(...args) {
+    return getPublicSubmitModule().closeNoVideoSubmitWarning(...args);
+}
+
+function continueNoVideoSubmit(...args) {
+    return getPublicSubmitModule().continueNoVideoSubmit(...args);
 }
 
 function openPublicSubmitConfirm(...args) {

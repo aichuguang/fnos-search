@@ -172,7 +172,8 @@ class NativeStagingFrozenPathTests(unittest.TestCase):
         # destination_final 是 "root-folder-id::电影"，OpenList 不能拿它当目标根。
         self.assertEqual(target_category[V1_DESTINATION_FINAL_FIELD], FINAL_ROOT)
         self.assertEqual(target_category["source_category_root_path"], STAGING_ROOT)
-        self.assertTrue(target_category[V1_DESTINATION_IS_RESOURCE_FIELD])
+        # organizer_final 是分类根而非作品资源根，目标路径必须补作品名层。
+        self.assertFalse(target_category[V1_DESTINATION_IS_RESOURCE_FIELD])
 
     def test_runtime_target_root_override_cannot_redirect_native_staging_plan(self) -> None:
         service = _service()

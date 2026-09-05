@@ -948,7 +948,10 @@ class OpenListMountService:
             if not row["account_id"] and not row["storage_identity_id"]:
                 raise OpenListValidationError("mount 缺少可确认的存储身份")
             if not row["last_tested_at"] or not bool(row["readable"]):
-                raise OpenListValidationError("mount 必须先通过读取检测，才能确认存储身份")
+                raise OpenListValidationError(
+                    "OpenList 目录当前读取不可用（常见原因：连接地址在容器内不可达），"
+                    "请先在连接设置中修正 OpenList 地址并重新检测保存位置，再勾选确认存储身份"
+                )
             snapshot_row = conn.execute(
                 "SELECT config_json FROM openlist_mount_revisions "
                 "WHERE mount_id=? AND revision=?",

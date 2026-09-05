@@ -20,7 +20,7 @@ RCLONE_LOW_LEVEL_RETRIES="${RCLONE_LOW_LEVEL_RETRIES:-3}"
 RCLONE_TIMEOUT="${RCLONE_TIMEOUT:-10m}"
 RCLONE_CONNECT_TIMEOUT="${RCLONE_CONNECT_TIMEOUT:-30s}"
 RCLONE_LIST_MAX_DURATION="${RCLONE_LIST_MAX_DURATION:-10m}"
-RCLONE_SOURCE_SETTLE_SECONDS="${RCLONE_SOURCE_SETTLE_SECONDS:-30}"
+RCLONE_SOURCE_SETTLE_SECONDS="${RCLONE_SOURCE_SETTLE_SECONDS:-10}"
 RCLONE_SOURCE_SETTLE_ROUNDS="${RCLONE_SOURCE_SETTLE_ROUNDS:-2}"
 RCLONE_SOURCE_APPEAR_WAIT_SECONDS="${RCLONE_SOURCE_APPEAR_WAIT_SECONDS:-180}"
 RCLONE_SOURCE_APPEAR_POLL_SECONDS="${RCLONE_SOURCE_APPEAR_POLL_SECONDS:-15}"
@@ -294,15 +294,15 @@ PY_REMOTE_PATHS
 stable_file_list() {
   remote="$1"
   job_name="$2"
-  settle_seconds="${RCLONE_SOURCE_SETTLE_SECONDS:-30}"
+  settle_seconds="${RCLONE_SOURCE_SETTLE_SECONDS:-10}"
   settle_rounds="${RCLONE_SOURCE_SETTLE_ROUNDS:-2}"
   appear_wait="${RCLONE_SOURCE_APPEAR_WAIT_SECONDS:-180}"
   appear_poll="${RCLONE_SOURCE_APPEAR_POLL_SECONDS:-15}"
-  case "$settle_seconds" in ''|*[!0-9]*) settle_seconds=30 ;; esac
+  case "$settle_seconds" in ''|*[!0-9]*) settle_seconds=10 ;; esac
   case "$settle_rounds" in ''|*[!0-9]*) settle_rounds=2 ;; esac
   case "$appear_wait" in ''|*[!0-9]*) appear_wait=180 ;; esac
   case "$appear_poll" in ''|*[!0-9]*) appear_poll=15 ;; esac
-  [ "$settle_seconds" -gt 0 ] || settle_seconds=30
+  [ "$settle_seconds" -gt 0 ] || settle_seconds=10
   [ "$settle_rounds" -gt 0 ] || settle_rounds=1
   [ "$appear_poll" -gt 0 ] || appear_poll=15
 
@@ -411,6 +411,7 @@ import os
 import posixpath
 import re
 import sys
+import urllib.error
 import urllib.request
 
 url = os.environ["CALLBACK_URL"]
@@ -478,6 +479,16 @@ request = urllib.request.Request(
 try:
     with urllib.request.urlopen(request, timeout=10) as response:
         response_body = response.read()
+except urllib.error.HTTPError as exc:
+    try:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        detail = ""
+    print(
+        f"HTTP Error {exc.code}: {detail or exc.reason or 'server rejected callback'}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 except Exception as exc:  # noqa: BLE001
     print(exc, file=sys.stderr)
     sys.exit(1)
@@ -640,7 +651,62 @@ copy_wait_size_match() {
     wait_remote_size_match "$copy_target_spec" "$copy_expected_size" "$copy_label"
   fi
 }
+# rclone 原生统计只输出英文且不支持本地化；--stats-one-line 让每次统计只占一行，
+# 这里把该行翻译成中文进度（方向词由调用处经 RCLONE_PROGRESS_DIRECTION 注入：
+# 下载/上传，缺省退回“传输”），其余输出（错误、NOTICE 摘要等）原样透传，
+# 保证排障信息不受翻译影响。
+# 注意：输出必须逐行 fflush。progress_filter 的 stdout 接到 Python 端的捕获
+# 管道（非终端），awk 默认按 4KB 块缓冲，不冲刷的话进度会长时间不可见。
+progress_filter() {
+  # progress_direction 由调用处注入（下载/上传），缺省时退回“传输”。
+  awk -v progress_label="${RCLONE_PROGRESS_LABEL:-}" -v progress_direction="${RCLONE_PROGRESS_DIRECTION:-}" '
+    /NOTICE/ && /ETA/ {
+      line = $0
+      sub(/^.*NOTICE:[ \t]*/, "", line)
+      # 单文件 copyto 的统计行自带 "<文件名>: " 前缀，剥掉避免与中文标签重复。
+      if (line ~ /^[^,]*:[ \t]/) {
+        sub(/^[^,]*:[ \t]*/, "", line)
+      }
+      # 统计行逗号字段数随 rclone 版本不同（3 段 "<进度>,<速度>,ETA <剩余>" 或
+      # 4 段 "<进度>,<已传/总量>,<速度>,ETA <剩余>"），按“末段=ETA、倒数第
+      # 二段=速度、其余并入进度”归一化，避免写死字段数漏匹配。
+      n = split(line, parts, ",[ \t]*")
+      if (n >= 3 && parts[n] ~ /^ETA[ \t]/) {
+        gsub(/^ETA[ \t]+/, "", parts[n])
+        if (parts[n] == "-") {
+          parts[n] = "计算中"
+        }
+        speed = parts[n-1]
+        progress = parts[1]
+        for (i = 2; i < n - 1; i++) {
+          progress = progress "，" parts[i]
+        }
+        direction = (progress_direction == "" ? "传输" : progress_direction)
+        printf "%s中%s：%s，速度 %s，预计剩余 %s\n", \
+          direction, (progress_label == "" ? "" : " " progress_label), progress, speed, parts[n]
+        fflush()
+        next
+      }
+    }
+    { print; fflush() }
+  '
+}
 copy_file() {
+  copy_source_spec="$1"
+  copy_dest_spec="$2"
+  # POSIX sh 没有 PIPESTATUS / 进程替换：用 rc 文件从管道里带回 rclone 退出码。
+  copy_rc_file="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-rc.XXXXXX")"
+  RCLONE_PROGRESS_LABEL="$(basename "$copy_dest_spec")"
+  export RCLONE_PROGRESS_LABEL RCLONE_PROGRESS_DIRECTION
+  {
+    copy_file_once "$copy_source_spec" "$copy_dest_spec"
+    echo "$?" >"$copy_rc_file"
+  } 2>&1 | progress_filter >&2
+  copy_rc="$(cat "$copy_rc_file" 2>/dev/null || echo 1)"
+  rm -f "$copy_rc_file"
+  return "$copy_rc"
+}
+copy_file_once() {
   copy_source_spec="$1"
   copy_dest_spec="$2"
   if [ -n "$RCLONE_UPLOAD_MAX_DURATION" ] && [ "$RCLONE_UPLOAD_MAX_DURATION" != "0" ]; then
@@ -657,6 +723,7 @@ copy_file() {
       --contimeout "$RCLONE_CONNECT_TIMEOUT" \
       --max-duration "$RCLONE_UPLOAD_MAX_DURATION" \
       --stats 5s \
+      --stats-one-line \
       --stats-log-level NOTICE
   else
     rclone_cmd copyto "$copy_source_spec" "$copy_dest_spec" \
@@ -671,6 +738,7 @@ copy_file() {
       --timeout "$RCLONE_TIMEOUT" \
       --contimeout "$RCLONE_CONNECT_TIMEOUT" \
       --stats 5s \
+      --stats-one-line \
       --stats-log-level NOTICE
   fi
 }
@@ -764,6 +832,16 @@ copy_scoped_job() {
       return 1
     fi
   fi
+
+  # 本地中继目标 = 从源网盘下载；远端目标 = 流式上传到目标网盘。
+  # 进度行与文件级日志共用该方向词，避免“传输中”分不清上传还是下载。
+  if [ "$copy_is_local" -eq 1 ]; then
+    copy_direction_label="下载"
+  else
+    copy_direction_label="上传"
+  fi
+  RCLONE_PROGRESS_DIRECTION="$copy_direction_label"
+  export RCLONE_PROGRESS_DIRECTION
 
   if [ "$copy_is_local" -eq 1 ]; then
     log "rclone_copy 模式启动：${source_remote_dir} -> ${copy_target_dir}"
@@ -879,13 +957,13 @@ copy_scoped_job() {
       continue
     fi
 
-    log "复制文件：${file} size=${source_size}"
+    log "${copy_direction_label}文件：${file} size=${source_size}"
     if [ "$copy_is_local" -eq 1 ]; then
       copy_local_parent="$(dirname "$target_file")"
       container_exec mkdir -p "$copy_local_parent" >/dev/null 2>&1 || true
     fi
 
-    if retry_count "复制 ${copy_basename}" "$MAX_RETRIES" copy_file "$source_file_remote" "$target_file"; then
+    if retry_count "${copy_direction_label} ${copy_basename}" "$MAX_RETRIES" copy_file "$source_file_remote" "$target_file"; then
       :
     else
       copy_result=$?
@@ -942,7 +1020,13 @@ EOF
   stop_if_requested
   rclone_cmd rmdirs "$source_remote_dir" --leave-root >/dev/null 2>&1 || true
 
-  log "rclone_copy 任务结束：${copy_job_dir}，复制 ${copied_count} 个文件，失败 ${failed_count} 个文件"
+  if [ "$copy_is_local" -eq 1 ] && [ "$RCLONE_COPY_RELAY_MODE" = "true" ]; then
+    # 下载只是中继链路第一段：结束后还有网盘 API 上传与整理，
+    # 结束语必须如实说明“移交”，不能让用户误以为整个任务已完成。
+    log "rclone 下载完成：${copy_job_dir}，下载 ${copied_count} 个文件，失败 ${failed_count} 个，已移交网盘上传"
+  else
+    log "rclone_copy 任务结束：${copy_job_dir}，${copy_direction_label} ${copied_count} 个文件，失败 ${failed_count} 个文件"
+  fi
   [ "$failed_count" -eq 0 ]
 }
 acquire_lock() {

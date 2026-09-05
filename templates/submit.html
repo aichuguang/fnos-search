@@ -320,6 +320,32 @@
         </div>
     </div>
 
+    <div id="noVideoSubmitConfirm" class="public-confirm-mask hidden" role="dialog" aria-modal="true" aria-labelledby="noVideoSubmitTitle" tabindex="-1">
+        <div class="public-confirm-dialog glass-panel no-video-dialog">
+            <div class="public-confirm-head">
+                <div>
+                    <h2 id="noVideoSubmitTitle">未检测到可播放的影视文件</h2>
+                </div>
+                <button class="icon-btn secondary" type="button" id="noVideoSubmitClose" aria-label="关闭">×</button>
+            </div>
+            <div class="public-confirm-body">
+                <div class="confirm-resource-name">
+                    <span>资源名称：</span>
+                    <strong id="noVideoSubmitResourceName">-</strong>
+                </div>
+                <div class="notice-box warning slow-submit-warning">
+                    <strong>当前提交好像不含可播放的影视资源，请确认是否提交？</strong>
+                    <p>已识别的文件中没有 MP4、MKV、ISO 等常见影视格式，可能只是压缩包、图片或其他内容。</p>
+                    <p id="noVideoSubmitReason"></p>
+                </div>
+            </div>
+            <div class="public-confirm-actions">
+                <button type="button" id="noVideoSubmitCancel">取消，再检查一下</button>
+                <button class="secondary" type="button" id="noVideoSubmitContinue">仍要提交</button>
+            </div>
+        </div>
+    </div>
+
     <div id="globalLoading" class="global-loading hidden" role="status" aria-live="polite" aria-label="正在处理">
         <div class="global-loading-card glass-panel">
             <div class="global-loading-orbit" aria-hidden="true">
@@ -353,11 +379,11 @@
     <script src="/static/ui-core.js?v=20260808-request-core-v015"></script>
     <script src="/static/resource-search-workbench.js?v=20260809-v1-cutover-v001"></script>
     <script src="/static/public-search.js?v=20260901-category-ref-v001"></script>
-    <script src="/static/public-submit.js?v=20260809-v1-cutover-v001"></script>
+    <script src="/static/public-submit.js?v=20260902-no-video-warn-v002"></script>
     <script src="/static/public-trending.js?v=20260804-config-center-v004"></script>
-    <script src="/static/public-bootstrap.js?v=20260826-tmdb-modal-v002"></script>
+    <script src="/static/public-bootstrap.js?v=20260902-no-video-warn-v002"></script>
     <script src="/static/ui-select.js?v=20260711-public-bootstrap-v014"></script>
     <script src="/static/ui-dialog.js?v=20260901-full-backup-v001"></script>
-    <script src="/static/public.js?v=20260826-tmdb-picker-v001"></script>
+    <script src="/static/public.js?v=20260902-no-video-warn-v002"></script>
 </body>
 </html>

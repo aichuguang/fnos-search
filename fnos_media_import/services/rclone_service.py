@@ -131,6 +131,10 @@ class RcloneService:
             cleanup_temp_dirs=self._delete_empty_local_temp_dirs,
         )
 
+    def set_transfer_wakeup(self, callback: Any) -> None:
+        """rclone run 终态后立即唤醒对应传输执行（app 组装根晚绑定）。"""
+        self.run_completion.set_transfer_wakeup(callback)
+
     def set_v1_locator_resolver(
         self,
         resolver: Any,
@@ -846,6 +850,22 @@ class RcloneService:
     def get_logs(self, limit: int = 200) -> list[str]:
         return self.log_sink.list(limit)
 
+    def append_external_log(self, message: str, *, job_id: int = 0) -> dict[str, Any]:
+        """主应用侧（网盘 API 上传等）日志行写入 rclone 实时日志流。
+
+        供 Worker 控制端点调用，把非 rclone 阶段的传输进度汇入同一个
+        实时日志页（下载/上传/整理全链路一屏可读）。
+        """
+        text = str(message or "").strip()
+        if not text:
+            return {"success": False, "message": "日志内容为空"}
+        if len(text) > 2000:
+            text = text[:2000]
+        if job_id > 0:
+            text = f"任务#{int(job_id)} {text}"
+        self._append_log(text)
+        return {"success": True, "message": "已记录"}
+
     def list_runs(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         if not self.db:
             return []
@@ -1316,6 +1336,7 @@ class RcloneService:
             self._shutdown_requested = True
         self.run_queue.request_stop()
         self._cancel_all_staging_retries()
+        self.log_sink.close()
 
     def is_running_locked(self) -> bool:
         return bool(self.worker_thread and self.worker_thread.is_alive())
@@ -2133,7 +2154,7 @@ class RcloneService:
             "RCLONE_TIMEOUT": self.config.get("timeout", "10m"),
             "RCLONE_CONNECT_TIMEOUT": self.config.get("connect_timeout", "30s"),
             "RCLONE_REPLACE_SIZE_MISMATCH": self.config.get("replace_size_mismatch", "true"),
-            "RCLONE_SOURCE_SETTLE_SECONDS": self.config.get("source_settle_seconds", 30),
+            "RCLONE_SOURCE_SETTLE_SECONDS": self.config.get("source_settle_seconds", 10),
             "RCLONE_MANUAL_SOURCE_SETTLE_SECONDS": self.config.get("manual_source_settle_seconds", 0),
             "RCLONE_SOURCE_SETTLE_ROUNDS": self.config.get("source_settle_rounds", 2),
             "RCLONE_SOURCE_APPEAR_WAIT_SECONDS": self.config.get("source_appear_wait_seconds", 180),

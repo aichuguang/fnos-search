@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..time_utils import utc_now_iso
-from . import TERMINAL_PHASES
+from . import PHASE_TRANSFERRING, TERMINAL_PHASES
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,34 @@ class TransferRecoveryScanner:
         self.worker_tasks = worker_tasks
         self.max_attempts = max(1, int(max_attempts))
         self.task_key_prefix = str(task_key_prefix or "import-transfer").strip() or "import-transfer"
+
+    def wake_after_rclone_run(self, job_id: int) -> dict[str, Any]:
+        """Wake one execution whose transferring wait ended with the rclone run.
+
+        rclone run 到达终态的那一刻，transferring 阶段的指数退避就不再有
+        意义；不清退避的话，执行最长要再等 300 秒才会在下一次轮询中发现
+        完成。只唤醒仍在 ``transferring`` 且非终态的执行，其他阶段（重试、
+        人工审核等）的退避保持原样。
+        """
+        normalized = int(job_id or 0)
+        if normalized <= 0:
+            return {"woken": False, "reason": "invalid_job_id"}
+        execution = self.executions.get(normalized)
+        phase = str(getattr(execution, "phase", "") or "") if execution is not None else ""
+        if execution is None or phase in TERMINAL_PHASES:
+            return {"woken": False, "reason": "no_active_execution"}
+        if phase != PHASE_TRANSFERRING:
+            return {"woken": False, "reason": f"phase_not_transferring:{phase}"}
+        self.executions.clear_resume_backoff(normalized, PHASE_TRANSFERRING)
+        key = f"{self.task_key_prefix}:{normalized}"
+        _task_id, created = self.worker_tasks.enqueue(
+            self.TASK_TYPE,
+            {"job_id": normalized, "rclone_terminal": True},
+            key,
+            max_attempts=self.max_attempts,
+            reactivate_terminal=True,
+        )
+        return {"woken": True, "enqueued": bool(created), "job_id": normalized}
 
     def scan_once(self, *, now: str | None = None, limit: int = 100) -> RecoveryScanResult:
         due = self.executions.list_due(now=now or utc_now_iso(), limit=max(0, int(limit)))

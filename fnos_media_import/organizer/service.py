@@ -783,16 +783,26 @@ class OrganizerService:
                             extra["organized_target_path"] = organized_target_path
                         if target_dirs:
                             extra["target_dirs"] = target_dirs
+                        v1_linked = self._has_linked_transfer_execution(task)
                         if organizer_status == "skipped":
                             extra["organizer_skipped"] = True
-                            recovery_message = "服务重启后根据已跳过的 Organizer 任务补写入库完成状态"
+                            recovery_message = (
+                                "服务重启后恢复已跳过的 Organizer 任务，等待 Transfer 完成最终收尾"
+                                if v1_linked
+                                else "服务重启后根据已跳过的 Organizer 任务补写入库完成状态"
+                            )
                         else:
-                            recovery_message = "服务重启后根据已完成的 Organizer 任务补写入库完成状态"
+                            recovery_message = (
+                                "服务重启后恢复已完成的 Organizer 任务，等待 Transfer 完成最终收尾"
+                                if v1_linked
+                                else "服务重启后根据已完成的 Organizer 任务补写入库完成状态"
+                            )
+                        linked_status = JOB_CONFIRMING if v1_linked else JOB_DONE
                         try:
                             recovered = self._sync_linked_job(
                                 task,
-                                status=JOB_DONE,
-                                stage="done",
+                                status=linked_status,
+                                stage="confirming" if v1_linked else "done",
                                 message=recovery_message,
                                 extra=extra,
                             )
@@ -1843,6 +1853,41 @@ class OrganizerService:
         _job, plan, _rejection = self._task_v1_plan(task, reject=False)
         return bool(plan)
 
+    def _has_linked_transfer_execution(self, task: dict[str, Any]) -> bool:
+        """Check whether this Organizer task belongs to durable V1 transfer."""
+
+        job_id = _safe_positive_int((task or {}).get("job_id"))
+        if not job_id:
+            return False
+        repository = getattr(self, "_execution_repository", None)
+        if repository is not None:
+            try:
+                execution = repository.get(job_id)
+                phase = str(getattr(execution, "phase", "") or "").strip().lower()
+                return execution is not None and phase not in {
+                    "completed",
+                    "failed",
+                    "manual_review",
+                    "cancelled",
+                }
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            with self.db.connect() as connection:
+                row = connection.execute(
+                    "SELECT phase FROM transfer_executions WHERE job_id=? LIMIT 1",
+                    (job_id,),
+                ).fetchone()
+                phase = str((row["phase"] if row is not None else "") or "").strip().lower()
+                return bool(row is not None and phase not in {
+                    "completed",
+                    "failed",
+                    "manual_review",
+                    "cancelled",
+                })
+        except Exception:  # noqa: BLE001
+            return False
+
     def _validated_task_v1_plan(self, task: dict[str, Any]) -> dict[str, Any]:
         _job, plan, _rejection = self._task_v1_plan(task, reject=False)
         return plan or {}
@@ -2853,11 +2898,19 @@ class OrganizerService:
         )
         if updated is False:
             return {"success": False, "conflict": True, "message": "任务状态已变化，请刷新后重试"}
+        # V1 Transfer owns final verification, ACK and cleanup.  Organizer
+        # must leave the linked Job in a non-terminal state until that tail
+        # phase completes; standalone legacy tasks may still report done.
+        linked_status = JOB_CONFIRMING if self._has_linked_transfer_execution(task) else JOB_DONE
         self._sync_linked_job(
             task,
-            status=JOB_DONE,
-            stage="done",
-            message="资源已位于正式分类目录，已按管理员要求跳过命名整理",
+            status=linked_status,
+            stage="confirming" if linked_status == JOB_CONFIRMING else "done",
+            message=(
+                "资源已位于正式分类目录，等待 Transfer 完成最终校验和清理"
+                if linked_status == JOB_CONFIRMING
+                else "资源已位于正式分类目录，已按管理员要求跳过命名整理"
+            ),
             extra={"organizer_passthrough": False, "organizer_skipped": True},
         )
         return {
@@ -4192,7 +4245,7 @@ class OrganizerService:
         source_base, source_season = extract_season_from_title(task.get("source_keyword") or "")
         season_hint = _first_not_none(parsed_season_hint, root_season, title_season, task_title_season, source_season)
         confidence = max([item.confidence for item in parsed] or [40])
-        tmdb_item = self._match_tmdb(
+        tmdb_match_score, tmdb_item = self._match_tmdb(
             task,
             title_candidate,
             year_candidate,
@@ -4238,8 +4291,13 @@ class OrganizerService:
         ai_year = str(ai_suggestion.get("year") or "").strip()
         ai_season = _first_not_none(_optional_non_negative_int(ai_suggestion.get("season")), ai_title_season)
         season_hint = _first_not_none(season_hint, ai_season)
+        # AI 校准标题经 TMDB 精确确认后，置信度按实际命中的查询分数计入。
+        # 否则跨语言资源（文件名 "Dear You"、TMDB 中文标题“给阿嬷的情书”）在
+        # 4316 处只能按原始候选打分（40+年份25+类型12=77），永远低于 85 的
+        # 自动执行线，导致每个正确的任务都要人工确认。
+        ai_tmdb_match_score: float | None = None
         if (not tmdb_item or score_tmdb_result(title_candidate, year_candidate, category_key, tmdb_item, has_episodes) < 85) and ai_title:
-            ai_tmdb_item = self._match_tmdb(
+            ai_tmdb_match_score, ai_tmdb_item = self._match_tmdb(
                 task,
                 ai_title,
                 ai_year or year_candidate,
@@ -4261,6 +4319,10 @@ class OrganizerService:
             media_type = "movie"
         if tmdb_item:
             confidence = max(confidence, score_tmdb_result(title_candidate, year_candidate, category_key, tmdb_item, has_episodes))
+            if ai_tmdb_match_score is not None:
+                # TMDB 已对 AI 校准标题做精确确认（≥85 才会返回命中），
+                # 该分数就是这次匹配的真实证据强度，计入总置信度。
+                confidence = max(confidence, ai_tmdb_match_score)
         if ai_suggestion.get("confidence"):
             try:
                 confidence = max(confidence, _confidence_percent(ai_suggestion["confidence"]))
@@ -4822,14 +4884,19 @@ class OrganizerService:
             evidence=task_evidence,
             raw_data=raw_data,
         )
+        linked_status = JOB_CONFIRMING if self._has_linked_transfer_execution(task) else JOB_DONE
         self._sync_linked_job(
             task,
-            status=JOB_DONE,
-            stage="done",
+            status=linked_status,
+            stage="confirming" if linked_status == JOB_CONFIRMING else "done",
             message=(
-                "标准目录确认成功，OpenList 文件夹刷新已触发，整理入库完成；STRM 由 OpenList 后台处理"
-                if completed_state
-                else "标准目录复扫确认成功，完整整理入库完成"
+                "标准目录确认成功，等待 Transfer 完成最终校验、ACK 和清理"
+                if linked_status == JOB_CONFIRMING
+                else (
+                    "标准目录确认成功，OpenList 文件夹刷新已触发，整理入库完成；STRM 由 OpenList 后台处理"
+                    if completed_state
+                    else "标准目录复扫确认成功，完整整理入库完成"
+                )
             ),
             extra={
                 "confirmation": confirmation,
@@ -5500,9 +5567,11 @@ class OrganizerService:
             scoped.pop(key, None)
         scoped["source_category_root_path"] = organizer_root
         scoped[V1_DESTINATION_FINAL_FIELD] = final_root
-        # Preserve the current V1 contract: destination_final is the immutable
-        # root into which this task writes its standardized files.
-        scoped[V1_DESTINATION_IS_RESOURCE_FIELD] = True
+        # V1 计划冻结的 final root 永远是分类根（如 /移动云/电视剧），不是
+        # 追更场景的「资源根」（如 /移动云/电视剧/藏锋 (2026)）。按分类根
+        # 语义生成目标路径：standard_target_path 会补上作品名层，否则剧集会
+        # 落到 <分类根>/Season 01/ 下，媒体库无法归属作品。
+        scoped[V1_DESTINATION_IS_RESOURCE_FIELD] = False
         return scoped
 
     def _match_tmdb(
@@ -5515,7 +5584,7 @@ class OrganizerService:
         has_episodes: bool,
         *,
         extra_queries: list[Any] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[float, dict[str, Any] | None]:
         queries = [title, f"{title} {year}".strip(), *(extra_queries or []), task.get("source_keyword"), task.get("title")]
         best: tuple[float, dict[str, Any] | None] = (0, None)
         for query in _dedupe_texts(str(item or "").strip() for item in queries if str(item or "").strip()):
@@ -5538,8 +5607,8 @@ class OrganizerService:
         if best[0] < 85:
             # 分数不足的“命中”多半是通用词/垃圾词同名条目（如标题就叫“电视剧”），
             # 直接当作未命中返回，让上层走 AI 兜底，而不是拿虚高可信度挡在门外。
-            return None
-        return best[1]
+            return 0.0, None
+        return best
 
 
     def _target_create_stop_root(self, target_path: str, category_root: str, resource_root: str) -> str:

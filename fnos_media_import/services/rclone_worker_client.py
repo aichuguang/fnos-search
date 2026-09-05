@@ -161,6 +161,26 @@ class RcloneWorkerClient:
             return response["items"]
         return response
 
+    def append_log(self, message: str) -> bool:
+        """把主应用侧的传输日志行送进 Worker 的 rclone 实时日志流。
+
+        进度行尽力而为：Worker 不可用或请求失败时静默丢弃，
+        绝不能拖累上传主流程。
+        """
+        text = str(message or "").strip()
+        if not text:
+            return False
+        try:
+            response = self._request(
+                "POST",
+                "/api/internal/rclone/append-log",
+                payload={"message": text[:2000]},
+                timeout_seconds=5,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(response.get("success"))
+
     def list_runs(self, *, limit: int, offset: int) -> list[dict[str, Any]]:
         return self.database.rclone.list_rclone_runs(limit=limit, offset=offset)
 
