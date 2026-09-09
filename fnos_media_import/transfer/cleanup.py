@@ -21,6 +21,7 @@ __all__ = [
     "CleanupResult",
     "FilesystemOps",
     "LocalFilesystemOps",
+    "OpenListFilesystemOps",
     "CompositeFilesystemOps",
     "TransferCleanupService",
 ]
@@ -113,6 +114,72 @@ class LocalFilesystemOps(FilesystemOps):
             return {"ok": True, "skipped": True, "message": f"本地路径不存在，视为已清理：{real}"}
         shutil.rmtree(real, ignore_errors=False)
         return {"ok": True, "message": f"已递归删除任务级目录：{real}"}
+
+
+class OpenListFilesystemOps(FilesystemOps):
+    """OpenList 远端删除适配器：按冻结挂载删除任务级落地区目录。
+
+    2026-09-05 线上事故：relay / rclone_copy 计划的 source_landing 是
+    openlist 描述符，而组合根从未装配 OpenList 删除适配器，导致每次入库
+    成功后清理阶段必然报「OpenList 删除适配器未配置」并耗尽重试，把已
+    入库的任务标记为失败。这里补上真实适配器：挂载与修订都取冻结计划
+    descriptor，不读实时配置；删除范围仍由 ``_job_scope_check`` 先行限定
+    为 ``job-<id>`` 叶子。
+    """
+
+    def __init__(self, mount_service: Any) -> None:
+        self.mount_service = mount_service
+
+    def resolve_real(self, descriptor: dict[str, str]) -> str:
+        return str(descriptor.get("path") or "")
+
+    def delete_tree(self, descriptor: dict[str, str]) -> dict[str, Any]:
+        mount_id = str(descriptor.get("mount_id") or "").strip()
+        path = str(descriptor.get("path") or "").strip()
+        if not mount_id or not path:
+            return {
+                "ok": False,
+                "refused": True,
+                "message": "OpenList 落地目录缺少挂载信息，拒绝删除",
+            }
+        try:
+            revision = int(descriptor.get("mount_revision") or 0)
+        except (TypeError, ValueError):
+            revision = 0
+        try:
+            client, mount = self.mount_service.client_for_mount(
+                mount_id, revision=revision or None
+            )
+            resolver = getattr(self.mount_service, "resolve_mount_absolute_path", None)
+            if callable(resolver):
+                absolute = resolver(mount, path)
+            else:
+                root = str(mount.get("webdav_root") or "/")
+                absolute = normalize_join(root, path)
+            if not client.exists(absolute):
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "message": f"远端目录不存在，视为已清理：{absolute}",
+                }
+            client.delete(absolute)
+            return {"ok": True, "message": f"已删除远端任务级目录：{absolute}"}
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "retryable": True,
+                "message": f"OpenList 远端目录删除失败：{exc}",
+            }
+
+
+def normalize_join(root: str, path: str) -> str:
+    text = str(path or "").strip()
+    root = str(root or "/").strip() or "/"
+    if not text:
+        return root
+    if text == root or text.startswith(f"{root}/"):
+        return text
+    return f"{root}/{text.lstrip('/')}"
 
 
 class CompositeFilesystemOps(FilesystemOps):

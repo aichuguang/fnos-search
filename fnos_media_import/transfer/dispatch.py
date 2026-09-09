@@ -33,7 +33,12 @@ from . import (
     PHASE_NATIVE_SUBMITTING,
     PHASE_TRANSFERRING,
 )
-from .cleanup import CompositeFilesystemOps, LocalFilesystemOps, TransferCleanupService
+from .cleanup import (
+    CompositeFilesystemOps,
+    LocalFilesystemOps,
+    OpenListFilesystemOps,
+    TransferCleanupService,
+)
 from .execution_repository import ExecutionConflictError, TransferExecutionRepository
 from .finalizer import TransferFinalizer
 from .native_executor import NativeSourceMaterializer, NativeTransferExecutor
@@ -121,7 +126,10 @@ class TransferDispatchService:
         self._halted_relay_account_ids: set[str] = set()
         local_ops = LocalFilesystemOps((self.relay_root, self.local_target_root))
         self.cleanup = TransferCleanupService(
-            CompositeFilesystemOps(local_ops=local_ops),
+            CompositeFilesystemOps(
+                openlist_ops=OpenListFilesystemOps(mount_service),
+                local_ops=local_ops,
+            ),
             local_roots=(self.relay_root, self.local_target_root),
             relay_root=self.relay_root,
         )
