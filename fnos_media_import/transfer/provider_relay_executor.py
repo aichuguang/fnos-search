@@ -191,6 +191,7 @@ class ProviderRelayExecutor:
         progress_interval: float = 5.0,
         progress_heartbeat_seconds: float = 30.0,
         event_sink: Callable[[str, str], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.rclone_adapter = rclone_adapter
         self.provider_uploader = provider_uploader
@@ -204,6 +205,7 @@ class ProviderRelayExecutor:
         heartbeat = float(progress_heartbeat_seconds or 30.0)
         self.progress_heartbeat_seconds = heartbeat if math.isfinite(heartbeat) and heartbeat > 0 else 30.0
         self.event_sink = event_sink
+        self.cancel_requested = cancel_requested
         self._sequential = None
 
     def bind(self, plan: TransferPlan) -> "ProviderRelayExecutor":
@@ -216,6 +218,10 @@ class ProviderRelayExecutor:
             from .sequential_relay import SequentialRelay
 
             self._sequential = SequentialRelay(self)
+            if getattr(self.rclone_adapter, "supports_bounded_prefetch", False) is True:
+                from .bounded_relay import BoundedRelay
+
+                self._sequential = BoundedRelay(self)
         self._migrate_legacy_auth_halt()
         return self
 
@@ -483,6 +489,7 @@ class ProviderRelayExecutor:
     def _upload(
         self, receipt: OperationReceipt, *, relative_paths: list[str] | None = None,
         operation_key: str | None = None,
+        progress_identity: dict[str, Any] | None = None,
     ) -> UploadOutcome:
         local_dir = self._relay_dir()
         target = self._destination_target()
@@ -514,8 +521,15 @@ class ProviderRelayExecutor:
             fence.setdefault("operation_key", operation_key)
             fence.setdefault("state", "prepared")
         self._emit_event("info", "开始上传到目标网盘")
+        def emit_upload(message: str) -> None:
+            # Capture the file identity now: queued log delivery can outlive
+            # this upload, and a parallel download has a different run id.
+            if progress_identity is not None:
+                message = "relay-progress: " + json.dumps({**progress_identity, "message": message}, ensure_ascii=False)
+            self._emit_progress(message)
+
         progress_stream = _UploadProgressStream(
-            self._emit_progress if self.progress_sink is not None else None,
+            emit_upload if self.progress_sink is not None else None,
             self.progress_heartbeat_seconds,
         )
         progress_stream.start(f"开始上传：{self._provider_label()}（准备校验本地文件并提交网盘）")

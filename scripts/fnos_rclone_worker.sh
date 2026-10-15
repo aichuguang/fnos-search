@@ -7,7 +7,7 @@
 
 set -eu
 
-SCRIPT_VERSION="v1.3-sequential-relay"
+SCRIPT_VERSION="v1.4-bounded-relay"
 STOP_REQUESTED=0
 
 RCLONE_CONFIG_PATH="${RCLONE_CONFIG_PATH:-/config/rclone/rclone.conf}"
@@ -186,6 +186,9 @@ retry_count() {
     fi
     if [ "$rc" -eq 74 ]; then
       log "${name} 因目标空间不足停止，不再重复下载；请释放中继盘空间后重试"
+      return "$rc"
+    fi
+    if [ "$rc" -eq 75 ]; then
       return "$rc"
     fi
     if [ "$attempt" -ge "$max_attempts" ]; then
@@ -789,11 +792,52 @@ copy_file() {
   rm -f "$copy_rc_file" "$copy_progress_marker" "$RCLONE_STORAGE_FULL_MARKER"
   return "$copy_rc"
 }
+relay_copy_cmd() {
+  if [ "${copy_relay_version:-1}" != "2" ]; then
+    rclone_cmd "$@"
+    return "$?"
+  fi
+  if relay_file_state check-space; then :; else return "$?"; fi
+  # Use the exact child PID, never a process-wide signal: an unrelated Job's
+  # upload and all acknowledged cache files must remain untouched.
+  relay_guard_marker="${copy_rc_file}.relay-deferred"
+  # A bounded slot owns one deterministic local path. Random .partial names
+  # would leave unaccounted bytes and block safe resumption after a space stop.
+  rclone "$@" --inplace --config "$RCLONE_CONFIG_PATH" --cache-dir "$RCLONE_CACHE_DIR" &
+  relay_copy_pid=$!
+  (
+    relay_guard_sleep=""
+    trap 'if [ -n "$relay_guard_sleep" ]; then kill "$relay_guard_sleep" 2>/dev/null || true; wait "$relay_guard_sleep" 2>/dev/null || true; fi; exit 0' INT TERM
+    while kill -0 "$relay_copy_pid" 2>/dev/null; do
+      if relay_file_state check-space; then
+        :
+      else
+        relay_guard_rc=$?
+        printf '%s\n' "$relay_guard_rc" >"$relay_guard_marker"
+        kill -TERM "$relay_copy_pid" 2>/dev/null || true
+        exit 0
+      fi
+      sleep 1 &
+      relay_guard_sleep=$!
+      wait "$relay_guard_sleep" || exit 0
+      relay_guard_sleep=""
+    done
+  ) &
+  relay_guard_pid=$!
+  if wait "$relay_copy_pid"; then relay_copy_rc=0; else relay_copy_rc=$?; fi
+  kill "$relay_guard_pid" 2>/dev/null || true
+  wait "$relay_guard_pid" 2>/dev/null || true
+  if [ -f "$relay_guard_marker" ]; then
+    relay_copy_rc="$(cat "$relay_guard_marker")"
+    rm -f "$relay_guard_marker"
+  fi
+  return "$relay_copy_rc"
+}
 copy_file_once() {
   copy_source_spec="$1"
   copy_dest_spec="$2"
   if [ -n "$RCLONE_UPLOAD_MAX_DURATION" ] && [ "$RCLONE_UPLOAD_MAX_DURATION" != "0" ]; then
-    rclone_cmd copyto "$copy_source_spec" "$copy_dest_spec" \
+    relay_copy_cmd copyto "$copy_source_spec" "$copy_dest_spec" \
       --transfers 1 \
       --checkers 1 \
       --no-traverse \
@@ -809,7 +853,7 @@ copy_file_once() {
       --stats-one-line \
       --stats-log-level NOTICE
   else
-    rclone_cmd copyto "$copy_source_spec" "$copy_dest_spec" \
+    relay_copy_cmd copyto "$copy_source_spec" "$copy_dest_spec" \
       --transfers 1 \
       --checkers 1 \
       --no-traverse \
@@ -848,6 +892,10 @@ prepare_relay_file() {
       relay_prepare_rc=$?
     fi
     if [ "$relay_prepare_rc" -ne 75 ]; then return "$relay_prepare_rc"; fi
+    if [ "${copy_relay_version:-1}" = "2" ]; then
+      log "RELAY_CACHE_DEFERRED: 中继缓存预算暂不可用，释放下载锁并交回队列等待"
+      return 75
+    fi
     if [ "$relay_waited" -ge "$relay_wait_limit" ]; then
       log "等待其它任务释放中继缓存超时，本轮未下载，保留来源供人工核对"
       return 1
@@ -1045,7 +1093,28 @@ copy_scoped_job() {
       log "当前文件已有持久回执，不重复下载，交由中继协调器核验上传和清理"
       return 0
     fi
-    log "逐文件中继：本轮仅下载 ${copy_file_list}，上传、远端验证和缓存释放后才处理下一文件"
+    # Freeze the new budget before even the first file is downloaded. A v1
+    # store remains readable, but new workers must not bypass the v2 quota.
+    if relay_file_state enable; then
+      :
+    else
+      relay_enable_rc=$?
+      if [ "$relay_enable_rc" -eq 75 ]; then
+        log "RELAY_CACHE_DEFERRED: 等待其它任务释放中继缓存，尚未下载首文件，交回调度队列"
+        return 75
+      fi
+      log "有界中继预算初始化失败，保留现有文件并停止下载"
+      return "$relay_enable_rc"
+    fi
+    if ! copy_relay_version="$(relay_file_state version)"; then
+      log "逐文件中继版本核验失败，保留现有文件并停止下载"
+      return 1
+    fi
+    if [ "$copy_relay_version" = "2" ]; then
+      log "有界中继预下载：本轮仅下载 ${copy_file_list}，上传、验证和清理仍逐文件有序执行"
+    else
+      log "逐文件中继：本轮仅下载 ${copy_file_list}，上传、远端验证和缓存释放后才处理下一文件"
+    fi
   fi
 
   copied_count=0
@@ -1095,6 +1164,7 @@ copy_scoped_job() {
       else
         relay_prepare_rc=$?
         if is_interrupted_rc "$relay_prepare_rc"; then return "$relay_prepare_rc"; fi
+        if [ "$relay_prepare_rc" -eq 75 ]; then return 75; fi
         log "当前文件空间或状态检查失败，停止本轮搬运；保留来源，不重试下载也不处理下一文件"
         return 1
       fi
@@ -1114,6 +1184,10 @@ copy_scoped_job() {
       :
     else
       copy_result=$?
+      if [ "${copy_relay_version:-1}" = "2" ] && { [ "$copy_result" -eq 75 ] || [ "$copy_result" -eq 74 ]; }; then
+        log "RELAY_CACHE_DEFERRED: 中继盘空间安全余量不足，停止当前下载并保留来源及缓存，等待重新调度"
+        return 75
+      fi
       if is_interrupted_rc "$copy_result"; then
         log "复制被停止请求中断，保留源端：${file}"
         callback_app "stopped" "$RCLONE_ONLY_CATEGORY" "$copy_basename" "$target_callback_path" "$source_callback_path" "复制被停止请求中断，保留源端" || true

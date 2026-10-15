@@ -12,6 +12,113 @@ from tests.test_rclone_live_progress_ui import ROOT, RcloneUiHarness
 
 @unittest.skipUnless(shutil.which("node"), "Node is required for the transfer-center UI regression")
 class TransferCenterUiTests(RcloneUiHarness, unittest.TestCase):
+    def test_pipeline_renders_two_real_file_lanes_with_independent_staleness_and_buffer(self) -> None:
+        result = self.run_ui("""
+transfer.relay_buffer = { enabled: true, depth: 2, ready: 1, reserved: 1, waiting: true };
+transfer.download = { state: 'running', active: true, scope: 'file', filename: 'Next Episode.mkv',
+    percent: 20, speed_bps: 1048576, updated_at: 'download-time', stale: false, age_seconds: 1 };
+Object.assign(transfer.upload, { active: true, stale: true, age_seconds: 30, updated_at: 'upload-time' });
+ui.renderRcloneStatus({ ...statusValue, transfers: [transfer] });
+process.stdout.write(JSON.stringify({ ...snapshot(), ids: jobIds(), download: metric('download'), upload: metric('upload') }));
+""")
+        self.assertEqual(result["ids"], ["15"])
+        self.assertEqual(result["status"].count('class="rclone-transfer-metric"'), 2)
+        self.assertIn("预下载缓存 1 / 2", result["status"])
+        self.assertIn("等待缓存释放", result["status"])
+        self.assertIn("Next Episode.mkv", result["download"])
+        self.assertNotIn("Example.mkv", result["download"])
+        self.assertIn("Example.mkv", result["upload"])
+        self.assertNotIn("Next Episode.mkv", result["upload"])
+        self.assertIn('aria-valuenow="20"', result["download"])
+        self.assertIn('aria-valuenow="45"', result["upload"])
+        self.assertIn("1 MiB/s", result["download"])
+        self.assertNotIn("256 KiB/s", result["upload"])
+        self.assertIn("download-time", result["download"])
+        self.assertIn("upload-time", result["upload"])
+        self.assertIn("反馈较旧", result["upload"])
+        self.assertNotIn("反馈较旧", result["download"])
+
+    def test_pipeline_hash_is_the_only_outbound_lane_and_unknown_download_is_not_invented(self) -> None:
+        result = self.run_ui("""
+transfer.relay_buffer = { enabled: true, depth: 2, ready: 0, reserved: 2, waiting: false };
+transfer.stage = 'hash';
+transfer.download = { state: 'waiting', active: true, scope: 'file', filename: 'Next.mkv' };
+transfer.hash = { state: 'running', active: true, scope: 'file', filename: 'Current.mkv', percent: 65, bytes_done: 650 };
+transfer.upload.active = false;
+ui.renderRcloneStatus({ ...statusValue, transfers: [transfer] });
+process.stdout.write(JSON.stringify({ ...snapshot(), download: metric('download'), upload: metric('upload'), hash: metric('hash') }));
+""")
+        self.assertEqual(result["status"].count('class="rclone-transfer-metric"'), 2)
+        self.assertEqual(result["upload"], "")
+        self.assertIn("Next.mkv", result["download"])
+        self.assertNotIn("aria-valuenow", result["download"])
+        self.assertNotIn("rclone-progress-fill", result["download"])
+        self.assertIn("已校验", result["hash"])
+        self.assertNotIn("已传输", result["hash"])
+        self.assertIn("不是已上传字节", result["hash"])
+
+    def test_dual_lanes_require_pipeline_or_explicit_concurrent_activity_not_old_running_state(self) -> None:
+        result = self.run_ui("""
+transfer.download.state = 'running';
+ui.renderRcloneStatus({ ...statusValue, transfers: [transfer] });
+const legacy = snapshot();
+transfer.upload.active = true;
+transfer.download.active = true;
+ui.renderRcloneStatus({ ...statusValue, transfers: [transfer] });
+const concurrent = snapshot();
+transfer.download.stale = true;
+ui.renderRcloneStatus({ ...statusValue, transfers: [transfer] });
+process.stdout.write(JSON.stringify({ legacy, concurrent, stale: snapshot() }));
+""")
+        self.assertEqual(result["legacy"]["status"].count('class="rclone-transfer-metric"'), 1)
+        self.assertEqual(result["concurrent"]["status"].count('class="rclone-transfer-metric"'), 2)
+        self.assertEqual(result["stale"]["status"].count('class="rclone-transfer-metric"'), 1)
+        self.assertNotIn("预下载缓存", result["legacy"]["status"])
+
+    def test_pipeline_business_phases_hide_all_old_lanes_and_cache_notice(self) -> None:
+        result = self.run_ui("""
+const results = {};
+for (const stage of ['organizing', 'target_verifying', 'manual_review', 'failed', 'completed']) {
+    ui.renderRcloneStatus({ ...statusValue, transfers: [{ ...transfer, stage,
+        relay_buffer: { enabled: true, depth: 2, ready: 1, waiting: true },
+        download: { ...transfer.download, state: 'running', active: true },
+        upload: { ...transfer.upload, active: true },
+    }] });
+    results[stage] = snapshot();
+}
+process.stdout.write(JSON.stringify(results));
+""")
+        for rendered in result.values():
+            self.assertNotIn('role="progressbar"', rendered["status"])
+            self.assertNotIn("预下载缓存", rendered["status"])
+            self.assertNotIn("等待缓存释放", rendered["status"])
+
+    def test_pipeline_filename_is_escaped_in_its_own_lane(self) -> None:
+        result = self.run_ui("""
+const marker = '<img src=x onerror="alert(1)">';
+transfer.relay_buffer = { enabled: true, depth: 1, ready: 0, waiting: false };
+transfer.upload.filename = marker;
+ui.renderRcloneStatus({ ...statusValue, transfers: [transfer] });
+process.stdout.write(JSON.stringify({ html: metric('upload'), marker, escaped: FnosUI.escapeHtml(marker) }));
+""")
+        self.assertIn(result["escaped"], result["html"])
+        self.assertNotIn(result["marker"], result["html"])
+
+    def test_zero_prefetch_shows_only_current_file_without_cache_or_parallel_claims(self) -> None:
+        result = self.run_ui("""
+transfer.relay_buffer = { enabled: true, depth: 0, ready: 0, reserved: 0, waiting: true };
+transfer.download = { state: 'running', active: true, filename: 'Old.mkv', percent: 80 };
+transfer.upload.active = true;
+ui.renderRcloneStatus({ ...statusValue, transfers: [transfer] });
+process.stdout.write(JSON.stringify({ ...snapshot(), download: metric('download'), upload: metric('upload') }));
+""")
+        self.assertEqual(result["status"].count('class="rclone-transfer-metric"'), 1)
+        self.assertEqual(result["download"], "")
+        self.assertIn("Example.mkv", result["upload"])
+        self.assertNotIn("预下载缓存", result["status"])
+        self.assertNotIn("等待缓存释放", result["status"])
+        self.assertNotIn("并行", result["status"])
+
     def test_hash_capacity_is_labelled_checked_not_transferred(self) -> None:
         result = self.run_ui("""
 transfer.stage = 'hash';

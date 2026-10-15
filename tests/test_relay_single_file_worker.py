@@ -76,16 +76,20 @@ copy_scoped_job
             again = self._run(folder)
             self.assertEqual(again.returncode, 0, again.stderr)
             self.assertEqual(len((root / "copy-calls").read_text().splitlines()), 1)
-            skipped_ahead = self._run(folder, index=1)
-            self.assertNotEqual(skipped_ahead.returncode, 0)
-            self.assertFalse((root / "relay/job-1/02.mkv").exists())
+            prefetched = self._run(folder, index=1)
+            self.assertEqual(prefetched.returncode, 0, prefetched.stderr)
+            self.assertTrue((root / "relay/job-1/02.mkv").exists())
+            self.assertEqual(len((root / "copy-calls").read_text().splitlines()), 2)
+            updated = RelayFileState(str(root / "relay/job-1"), job_id=1, plan_key="plan:one").load()
+            self.assertEqual([item["state"] for item in updated["files"]], ["downloaded", "downloaded"])
 
     def test_preflight_disk_shortage_does_not_start_copy(self):
         with tempfile.TemporaryDirectory(prefix="relay-full-") as folder:
             result = self._run(folder, size=10**18)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((Path(folder) / "copy-calls").exists())
-            self.assertIn("空间不足", result.stderr)
+            self.assertEqual(result.returncode, 75)
+            self.assertIn("缓存预算不足", result.stderr)
 
     def test_storage_full_exit_is_not_retried(self):
         with tempfile.TemporaryDirectory(prefix="relay-enospc-") as folder:

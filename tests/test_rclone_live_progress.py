@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import threading
 import unittest
 from contextlib import contextmanager
@@ -55,6 +56,8 @@ class RcloneLiveProgressTests(unittest.TestCase):
         self.assertEqual(item["download"], {
             "state": "running", "scope": "file", "filename": "示例影片.mkv", "percent": 25,
             "bytes_done": 1048576, "bytes_total": 4194304, "speed_bps": 524288, "eta_seconds": 62,
+            "file_id": None, "run_id": 7, "active": True,
+            "updated_at": "1970-01-01T00:01:40.000+00:00", "age_seconds": 0, "stale": False,
         })
         self.assertFalse(item["completed"])
         self.assertIsNone(item["upload"]["bytes_total"])
@@ -248,6 +251,143 @@ class RcloneLiveProgressTests(unittest.TestCase):
         self.assertTrue(all(not key.startswith("_") for item in items for key in item))
         self.assertFalse(self.record("ordinary diagnostics", job_id=999))
         self.assertEqual(len(self.progress.snapshot()), 50)
+
+    def relay(self, kind, **values):
+        return self.record(f"relay-{kind}: " + json.dumps({"job_id": 15, **values}))
+
+    def pipeline(self):
+        self.relay("buffer", enabled=True, depth=2, ready=1, reserved=1, waiting=False, reason="prefetch")
+
+    def test_pipeline_keeps_upload_file_and_clock_while_next_download_run_starts(self):
+        self.pipeline()
+        self.relay("file", channel="upload", filename="Episode 1.mkv", file_id="up:1", run_id=7)
+        self.relay("progress", filename="Episode 1.mkv", file_id="up:1", message=UPLOAD.replace("示例影片", "Episode 1"))
+        self.now += 20
+        self.relay("file", channel="download", filename="Episode 2.mkv", file_id="dl:2", run_id=8)
+        self.record("开始执行 rclone 搬运任务，新文件", current_run_id=8)
+        self.record(DOWNLOAD.replace("示例影片", "Episode 2"), current_run_id=8)
+        item = self.item()
+        self.assertEqual(item["run_id"], 8)
+        self.assertEqual(item["upload"]["filename"], "Episode 1.mkv")
+        self.assertEqual(item["upload"]["run_id"], 7)
+        self.assertEqual(item["upload"]["file_id"], "up:1")
+        self.assertEqual(item["upload"]["percent"], 50)
+        self.assertTrue(item["upload"]["active"])
+        self.assertTrue(item["upload"]["stale"])
+        self.assertEqual(item["upload"]["age_seconds"], 20)
+        self.assertIsNone(item["upload"]["speed_bps"])
+        self.assertEqual(item["download"]["filename"], "Episode 2.mkv")
+        self.assertEqual(item["download"]["file_id"], "dl:2")
+        self.assertEqual(item["download"]["run_id"], 8)
+        self.assertFalse(item["download"]["stale"])
+        self.assertEqual(item["download"]["speed_bps"], 524288)
+        self.assertFalse(item["stale"])
+        self.assertFalse(item["completed"])
+
+    def test_pipeline_file_completion_does_not_block_the_next_file_or_other_lane(self):
+        self.pipeline()
+        self.record(DOWNLOAD)
+        self.record(UPLOAD)
+        self.record(HANDOFF)
+        self.assertTrue(self.item()["upload"]["active"])
+        self.assertFalse(self.item()["download"]["active"])
+        self.assertEqual(self.item()["stage"], "transferring")
+        self.record("上传完成：本文件完成")
+        self.assertEqual(self.item()["stage"], "transferring")
+        self.assertFalse(self.item()["completed"])
+        self.assertTrue(self.record(DOWNLOAD.replace("示例影片", "另一文件")))
+        self.assertTrue(self.record(UPLOAD.replace("示例影片", "另一文件").replace("50%", "10%")))
+        self.assertEqual(self.item()["upload"]["percent"], 10)
+        self.assertTrue(self.item()["download"]["active"])
+        self.record("入库阶段：target_verifying；任务已进入正式校验")
+        self.assertFalse(self.record(DOWNLOAD))
+        self.assertFalse(self.relay("buffer", enabled=True, depth=2, ready=2, reserved=0, waiting=True))
+
+    def test_zero_prefetch_keeps_sequential_file_identity_without_closing_the_job(self):
+        self.assertTrue(self.relay("buffer", enabled=True, depth=0, ready=0, reserved=0, waiting=False))
+        self.relay("file", channel="upload", filename="first.mkv", file_id="up:1")
+        self.relay("progress", filename="first.mkv", file_id="up:1", message="上传完成：本文件完成")
+        self.assertEqual(self.item()["stage"], "transferring")
+        self.assertEqual(self.item()["relay_buffer"]["depth"], 0)
+        self.relay("file", channel="upload", filename="second.mkv", file_id="up:2")
+        self.assertFalse(self.relay("progress", filename="first.mkv", file_id="up:1", message="上传完成：迟到重复完成"))
+        self.assertTrue(self.relay("progress", filename="second.mkv", file_id="up:2", message="上传中：10%"))
+        self.assertEqual(self.item()["upload"]["file_id"], "up:2")
+        self.assertEqual(self.item()["upload"]["percent"], 10)
+        self.assertFalse(self.item()["completed"])
+        self.assertFalse(self.relay("buffer", enabled=True, depth=0, ready=1, reserved=0, waiting=False))
+
+    def test_context_reset_has_no_old_metrics_and_repeated_context_is_idempotent(self):
+        self.pipeline()
+        self.relay("file", channel="upload", filename="folder/first.mkv", file_id="up:1", run_id=7)
+        self.record(UPLOAD.replace("示例影片", "first"))
+        self.assertEqual(self.item()["upload"]["filename"], "folder/first.mkv")
+        self.now += 10
+        self.relay("file", channel="upload", filename="folder/first.mkv", file_id="up:1", run_id=7)
+        self.assertEqual(self.item()["upload"]["percent"], 50)
+        self.assertEqual(self.item()["upload"]["age_seconds"], 10)
+        self.record(UPLOAD.replace("示例影片", "first"))
+        self.assertEqual(self.item()["upload"]["age_seconds"], 10)
+        self.relay("file", channel="upload", filename="folder/second.mkv", file_id="up:2", run_id=8)
+        self.assertIsNone(self.item()["upload"]["percent"])
+        self.assertIsNone(self.item()["upload"]["bytes_done"])
+        self.assertIsNone(self.item()["upload"]["speed_bps"])
+        self.assertFalse(self.record(UPLOAD.replace("示例影片", "first")))
+        self.assertTrue(self.record(UPLOAD.replace("示例影片", "second")))
+        self.assertEqual(self.item()["upload"]["file_id"], "up:2")
+
+    def test_delayed_wrapped_upload_events_cannot_close_or_overwrite_the_next_file(self):
+        self.pipeline()
+        self.relay("file", channel="upload", filename="same.mkv", file_id="up:2", run_id=8)
+        self.relay("progress", filename="same.mkv", file_id="up:2", message="上传中：20%")
+        before = self.item()
+        for message in ("开始上传：云盘", "上传中：100%", HEARTBEAT, "上传完成：旧文件完成"):
+            with self.subTest(message=message):
+                self.assertFalse(self.relay("progress", filename="same.mkv", file_id="up:1", message=message))
+        self.assertEqual(self.item(), before)
+        self.assertEqual(self.item()["upload"]["percent"], 20)
+        self.assertEqual(self.item()["upload"]["filename"], "same.mkv")
+        self.assertFalse(self.relay("progress", filename="same.mkv", file_id="up:2", message="入库阶段：completed"))
+
+    def test_pipeline_hash_and_heartbeat_are_independent_of_download(self):
+        self.pipeline()
+        self.relay("file", channel="upload", filename="示例影片.mkv", file_id="up:1", run_id=7)
+        self.relay("progress", filename="示例影片.mkv", file_id="up:1", message=HASH)
+        self.now += 30
+        self.record(DOWNLOAD.replace("示例影片", "next"), current_run_id=8)
+        self.record("本地校验仍在执行：等待本地文件")
+        item = self.item()
+        self.assertEqual(item["hash"]["run_id"], 7)
+        self.assertTrue(item["hash"]["stale"])
+        self.assertEqual(item["hash"]["state"], "waiting")
+        self.assertTrue(item["hash"]["active"])
+        self.assertFalse(item["upload"]["active"])
+        self.assertIsNone(item["upload"]["bytes_done"])
+        self.assertFalse(item["download"]["stale"])
+        self.assertEqual(item["download"]["speed_bps"], 524288)
+        self.relay("progress", filename="示例影片.mkv", file_id="up:1", message=UPLOAD)
+        self.assertFalse(self.item()["hash"]["active"])
+        self.assertTrue(self.item()["download"]["active"])
+        self.assertTrue(self.item()["upload"]["active"])
+
+    def test_buffer_is_read_only_detached_and_scoped_without_refreshing_byte_age(self):
+        self.record(DOWNLOAD)
+        before = self.item()
+        self.now += 20
+        self.relay("buffer", enabled=True, depth=2, ready=1, reserved=1, waiting=True, reason="full")
+        item = self.item()
+        self.assertEqual(item["stage"], before["stage"])
+        self.assertEqual(item["updated_at"], before["updated_at"])
+        self.assertEqual(item["download"]["age_seconds"], 20)
+        self.assertTrue(item["download"]["stale"])
+        self.assertEqual(item["relay_buffer"]["ready"], 1)
+        item["relay_buffer"]["ready"] = 99
+        self.assertEqual(self.item()["relay_buffer"]["ready"], 1)
+        self.assertFalse(self.relay("buffer", enabled=True, depth=2, ready=3, reserved=0, waiting=True))
+        self.assertFalse(self.relay("buffer", enabled=True, depth=2, ready=True, reserved=0, waiting=True))
+        self.assertTrue(self.progress.record('relay-buffer: {"job_id": 16, "enabled": true, "depth": 1, "ready": 0, "reserved": 1, "waiting": false}', current_job_id=15, current_run_id=7))
+        self.assertIsNone(self.item(16)["run_id"])
+        self.assertFalse(self.record('relay-buffer: {"job_id": 16, "depth": 1, "ready": 0, "reserved": 1, "waiting": false}', job_id=15))
 
 
 class RcloneLiveProgressIntegrationTests(unittest.TestCase):

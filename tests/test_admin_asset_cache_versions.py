@@ -40,7 +40,7 @@ class AdminAssetCacheVersionTests(unittest.TestCase):
             if asset in {"admin.js", "admin-bootstrap.js", "admin-rclone.js"}:
                 version = "20261014-transfer-center-v009"
             if asset == "admin-rclone.js":
-                version = "20261015-transfer-polish-v012"
+                version = "20261015-relay-prefetch-v013"
             self.assertEqual(match.group(1), version, f"{asset}: {match.group(1)}")
 
         css_match = re.search(r'/static/product\.css\?v=([^"\s]+)', source)
@@ -49,7 +49,7 @@ class AdminAssetCacheVersionTests(unittest.TestCase):
 
         transfer_css_match = re.search(r'/static/admin-transfers\.css\?v=([^"\s]+)', source)
         self.assertIsNotNone(transfer_css_match, "admin-transfers.css")
-        self.assertEqual(transfer_css_match.group(1), "20261015-transfer-polish-v012")
+        self.assertEqual(transfer_css_match.group(1), "20261015-relay-prefetch-v013")
 
         workbench_match = re.search(
             r'/static/resource-search-workbench\.js\?v=([^"\s]+)', source

@@ -98,6 +98,10 @@
             environmentDone: "环境检查完成",
             checkPass: "通过",
             checkFail: "失败",
+            parallelUpload: "下载 / 上传并行",
+            parallelHash: "下载 / 校验并行",
+            relayBuffer: "预下载缓存",
+            relayWaiting: "等待缓存释放",
         });
         const TRANSFER_STAGES = Object.freeze({
             planning: "准备传输",
@@ -366,7 +370,7 @@
             return `${rounded} ${PROGRESS_COPY.seconds}`;
         }
 
-        function renderTransferMetric(kind, value) {
+        function renderTransferMetric(kind, value, showFilename = false) {
             const metric = value && typeof value === "object" ? value : {};
             const rawPercent = metricNumber(metric.percent);
             const percent = rawPercent !== null && rawPercent <= 100 ? rawPercent : null;
@@ -375,16 +379,19 @@
                 return `<div class="transfer-phase-summary">${PROGRESS_COPY[kind]} · ${percent === null ? PROGRESS_COPY.confirmedNoMetrics : METRIC_STATES.completed}<small>${PROGRESS_COPY.phaseEnded}</small></div>`;
             }
             const percentText = percent === null ? PROGRESS_COPY.waiting : `${Number(percent.toFixed(1))}%`;
-            const speed = metricNumber(metric.speed_bps);
+            const stale = metric.stale === true;
+            const speed = stale ? null : metricNumber(metric.speed_bps);
             const speedText = speed === null ? PROGRESS_COPY.unknown : `${metricBytes(speed)}/s`;
-            const remainingText = metricDuration(metric.eta_seconds);
+            const remainingText = metricDuration(stale ? null : metric.eta_seconds);
             const scope = metric.scope === "file" ? PROGRESS_COPY.fileScope : PROGRESS_COPY.stageScope;
             const stageState = percent === 100 ? PROGRESS_COPY.awaitingResult : METRIC_STATES[String(metric.state || "").toLowerCase()] || PROGRESS_COPY.waiting;
-            return `<section class="rclone-transfer-metric" data-transfer-metric="${kind}">
+            const age = metricNumber(metric.age_seconds);
+            return `<section class="rclone-transfer-metric" data-transfer-metric="${kind}" data-metric-stale="${stale}">
                 <div class="transfer-metric-heading">
                     <div class="transfer-metric-label"><strong>${PROGRESS_COPY[kind]}</strong><small>${scope}</small></div>
                     <div class="transfer-metric-value${percent === null ? " is-unknown" : ""}"><strong>${percentText}</strong><small>${stageState}</small></div>
                 </div>
+                ${showFilename && metric.filename ? `<div class="transfer-current-file transfer-channel-file"><small>${PROGRESS_COPY.file}</small><span title="${escapeHtml(metric.filename)}">${escapeHtml(metric.filename)}</span></div>` : ""}
                 <div class="rclone-progress-track" role="progressbar" aria-label="${PROGRESS_COPY[kind]} · ${scope}"
                     data-measured="${percent !== null}" aria-valuemin="0" aria-valuemax="100" ${percent === null ? `aria-valuetext="${percentText}"` : `aria-valuenow="${percent}" aria-valuetext="${percentText}"`}>
                     ${percent === null ? "" : `<div class="rclone-progress-fill" style="width:${percent}%;"></div>`}
@@ -396,6 +403,8 @@
                 </div>
                 ${percent === 100 ? `<p class="transfer-metric-note">${PROGRESS_COPY.bytesAwaiting}</p>` : ""}
                 ${kind === "hash" ? `<p class="transfer-metric-note">${PROGRESS_COPY.hashOnly}</p>` : ""}
+                ${metric.updated_at ? `<small class="transfer-channel-feedback">${PROGRESS_COPY.lastFeedback}：${escapeHtml(formatDate(metric.updated_at))}${age === null ? "" : ` · ${PROGRESS_COPY.age} ${metricDuration(age)}`}</small>` : ""}
+                ${stale ? `<small class="transfer-stale">${PROGRESS_COPY.stale}</small>` : ""}
             </section>`;
         }
 
@@ -422,6 +431,42 @@
             return null;
         }
 
+        function transferChannels(transfer) {
+            const stage = transferStage(transfer);
+            if (transferEnded(transfer) || transferNeedsAttention(transfer) || POST_TRANSFER_STAGES.has(stage)
+                || !["download", "downloading", "waiting_download", "waiting_upload", "hash", "hashing",
+                    "preparing_upload", "upload", "uploading", "transferring"].includes(stage)) return [];
+            const pipeline = transfer.relay_buffer?.enabled === true;
+            const active = ["download", "hash", "upload"].filter((kind) => {
+                const metric = transfer[kind] || {};
+                return ["running", "waiting"].includes(String(metric.state || "").toLowerCase())
+                    && (pipeline ? metric.active !== false : metric.active === true && metric.stale !== true);
+            });
+            // Hash and upload are two phases of one outbound file, not two
+            // transfer lanes. Old snapshots without explicit activity retain
+            // their single-stage rendering instead of reviving stale download.
+            const outbound = active.filter((kind) => kind !== "download").sort((left, right) =>
+                String(transfer[right]?.updated_at || "").localeCompare(String(transfer[left]?.updated_at || ""))
+                || Number(right === transferChannel(transfer)) - Number(left === transferChannel(transfer)))[0];
+            const lanes = [...(active.includes("download") ? ["download"] : []), ...(outbound ? [outbound] : [])];
+            if (pipeline && transfer.relay_buffer.depth === 0) {
+                const current = transferChannel(transfer);
+                return lanes.includes(current) ? [current] : lanes.slice(0, 1);
+            }
+            if (pipeline || lanes.length > 1) return lanes;
+            const channel = transferChannel(transfer);
+            return channel ? [channel] : [];
+        }
+
+        function renderRelayBuffer(transfer) {
+            const buffer = transfer.relay_buffer;
+            if (!buffer || buffer.enabled !== true || transferEnded(transfer) || transferNeedsAttention(transfer)
+                || POST_TRANSFER_STAGES.has(transferStage(transfer))) return "";
+            if (![1, 2].includes(buffer.depth) || !Number.isInteger(buffer.ready)
+                || buffer.ready < 0 || buffer.ready > buffer.depth) return "";
+            return `<div class="transfer-relay-buffer" role="status"><span>${PROGRESS_COPY.relayBuffer} ${buffer.ready} / ${buffer.depth}</span>${buffer.waiting === true ? `<span class="transfer-relay-waiting">${PROGRESS_COPY.relayWaiting}</span>` : ""}</div>`;
+        }
+
         function transferFilename(transfer) {
             const channel = transferChannel(transfer);
             return transfer[channel]?.filename || transfer.upload?.filename || transfer.hash?.filename || transfer.download?.filename || "";
@@ -430,12 +475,16 @@
         function renderTransferSteps(transfer) {
             const stage = transferStage(transfer);
             const channel = transferChannel(transfer);
+            const parallelPhase = transfer.relay_buffer?.enabled === true && !POST_TRANSFER_STAGES.has(stage)
+                && transfer.completed !== true;
+            const lanes = parallelPhase ? transferChannels(transfer) : [];
             const current = transfer.completed === true ? 3 : POST_TRANSFER_STAGES.has(stage) ? 2
                 : ["hash", "upload"].includes(channel) || stage === "waiting_upload" ? 1 : 0;
             const labels = [PROGRESS_COPY.stepDownload, PROGRESS_COPY.stepUpload, PROGRESS_COPY.stepOrganize, PROGRESS_COPY.stepComplete];
             return `<ol class="transfer-steps" aria-label="${PROGRESS_COPY.stageOnly}">${labels.map((label, index) => {
-                const done = index < current || transfer.completed === true;
-                const active = index === current && !done;
+                const done = !parallelPhase && (index < current || transfer.completed === true);
+                const active = parallelPhase ? (index === 0 && lanes.includes("download"))
+                    || (index === 1 && lanes.some((kind) => kind !== "download")) : index === current && !done;
                 return `<li class="${done ? "is-done" : active ? "is-current" : ""}"${active ? ' aria-current="step"' : ""}><span class="transfer-step-dot" aria-hidden="true">${done ? "✓" : index + 1}</span><span>${label}${done ? `<span class="sr-only"> · ${METRIC_STATES.completed}</span>` : ""}</span></li>`;
             }).join("")}</ol>`;
         }
@@ -461,25 +510,30 @@
         function renderLiveTransfer(transfer) {
             const stage = transferStage(transfer);
             const attention = transferNeedsAttention(transfer);
-            const label = TRANSFER_STAGES[stage] || PROGRESS_COPY.waiting;
-            const channel = transferChannel(transfer);
+            const channels = transferChannels(transfer);
+            const dual = channels.length > 1;
+            const pipeline = transfer.relay_buffer?.enabled === true;
+            const label = dual ? PROGRESS_COPY[channels.includes("hash") ? "parallelHash" : "parallelUpload"]
+                : TRANSFER_STAGES[stage] || PROGRESS_COPY.waiting;
+            const channel = channels[0] || null;
             const filename = transferFilename(transfer);
             const title = transfer.title || transfer.job_title || filename || `${PROGRESS_COPY.job} #${transfer.job_id || PROGRESS_COPY.unknown}`;
             const age = metricNumber(transfer.age_seconds);
             const feedbackTime = transfer.updated_at ? formatDate(transfer.updated_at) : PROGRESS_COPY.noFeedbackTime;
-            const stale = !attention && transfer.stale === true;
+            const stale = !attention && transfer.stale === true && !dual;
             const phaseHint = attention ? PROGRESS_COPY.needsAction : POST_TRANSFER_STAGES.has(stage) ? PROGRESS_COPY.organizingHint
                 : stage.startsWith("native_") ? PROGRESS_COPY.nativeHint : PROGRESS_COPY.waitingHint;
             const tone = attention ? "is-attention" : "is-active";
-            return `<article class="rclone-live-transfer transfer-card${attention ? " is-attention" : ""}" data-transfer-job-id="${escapeHtml(transfer.job_id)}" data-transfer-completed="false" data-transfer-channel="${channel || "none"}" data-transfer-stale="${stale}">
+            return `<article class="rclone-live-transfer transfer-card${attention ? " is-attention" : ""}" data-transfer-job-id="${escapeHtml(transfer.job_id)}" data-transfer-completed="false" data-transfer-channel="${channels.join(",") || "none"}" data-transfer-stale="${stale}" data-transfer-pipeline="${pipeline}">
                 <header class="transfer-card-header">
                     <span class="transfer-file-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="m10 8 6 4-6 4V8Z"/></svg></span>
                     <div class="transfer-card-heading"><h3 title="${escapeHtml(title)}">${escapeHtml(title)}</h3><div class="transfer-card-meta">${PROGRESS_COPY.job} #${escapeHtml(transfer.job_id || PROGRESS_COPY.unknown)}${transfer.run_id ? ` <span>·</span> ${PROGRESS_COPY.run} #${escapeHtml(transfer.run_id)}` : ""}</div></div>
                     <span class="transfer-stage-badge ${tone}">${escapeHtml(label)}</span>
                     ${transfer.job_id ? `<button type="button" class="secondary mini transfer-detail-button" data-transfer-job="${escapeHtml(transfer.job_id)}">${PROGRESS_COPY.details}</button>` : ""}
                 </header>
-                ${channel && filename && filename !== title ? `<div class="transfer-current-file"><small>${PROGRESS_COPY.currentFile}</small><span title="${escapeHtml(filename)}">${escapeHtml(filename)}</span></div>` : ""}
-                ${channel && !attention ? `<div class="transfer-metrics">${renderTransferMetric(channel, transfer[channel])}</div>` : `<div class="transfer-phase-summary">${escapeHtml(label)}<small>${phaseHint}</small></div>`}
+                ${channel && !dual && !pipeline && filename && filename !== title ? `<div class="transfer-current-file"><small>${PROGRESS_COPY.currentFile}</small><span title="${escapeHtml(filename)}">${escapeHtml(filename)}</span></div>` : ""}
+                ${channels.length ? `<div class="transfer-metrics${dual ? " is-parallel" : ""}">${channels.map((kind) => renderTransferMetric(kind, transfer[kind], dual || pipeline)).join("")}</div>` : `<div class="transfer-phase-summary">${escapeHtml(label)}<small>${phaseHint}</small></div>`}
+                ${renderRelayBuffer(transfer)}
                 <footer class="transfer-card-footer"><small class="transfer-feedback">${PROGRESS_COPY.lastFeedback}：${escapeHtml(feedbackTime)}${age === null ? "" : ` · ${PROGRESS_COPY.age} ${metricDuration(age)}`}</small>${stale ? `<small class="transfer-stale">${PROGRESS_COPY.stale}</small>` : ""}</footer>
                 ${renderTransferRecord(transfer)}
             </article>`;

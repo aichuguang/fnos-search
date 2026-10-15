@@ -119,6 +119,10 @@ class RcloneService:
         # Keep that hand-off visible so an idempotent retry cannot enqueue the
         # same Job again in the pop-before-start window.
         self._reserved_full_staging_job_id = 0
+        self._active_scoped_run_identity: tuple[int, str] | None = None
+        self._reserved_scoped_run_identity: tuple[int, str] | None = None
+        self._queued_scoped_run_identities: set[tuple[int, str]] = set()
+        self._stop_requested_run_ids: set[int] = set()
         self._active_run_reason = ""
         self._stop_requested_job_ids: set[int] = set()
         self._shutdown_requested = False
@@ -465,8 +469,29 @@ class RcloneService:
                 "message": "rclone 运行状态已更新，按最新状态确认取消",
                 "run_id": normalized,
             }
-        outcome = self.cancel_job(job_id, stop_running=True)
-        active = bool(outcome.get("active_match"))
+        # A file receipt is narrower than its Job: do not stop the preceding
+        # file or discard sibling prefetches when cancelling only this run.
+        process_to_stop = None
+        with self.lock:
+            identity = getattr(self, "_active_scoped_run_identity", None)
+            active = identity == (normalized, actual) and self.run_state.status in {"starting", RCLONE_RUN_RUNNING}
+            if identity is None:
+                active = (
+                    self._int_value(getattr(self.run_state, "current_run_id", 0)) == normalized
+                    and self._int_value(getattr(self, "_active_staging_job_id", 0)) == job_id
+                )
+            timer = getattr(self, "_deferred_run_timers", {}).pop(normalized, None)
+            getattr(self, "_deferred_run_attempts", {}).pop(normalized, None)
+            if active:
+                stop_requests = getattr(self, "_stop_requested_run_ids", set())
+                stop_requests.add(normalized)
+                self._stop_requested_run_ids = stop_requests
+                if self.process_controller.is_active(self.process):
+                    process_to_stop = self.process
+        if timer is not None:
+            timer.cancel()
+        if process_to_stop is not None:
+            self.process_controller.terminate(process_to_stop)
         if not active:
             self.db.rclone.mark_scoped_rclone_run_status(
                 normalized,
@@ -478,7 +503,7 @@ class RcloneService:
         return {
             "success": True,
             "status": "cancel_pending" if active else "cancelled",
-            "message": str(outcome.get("message") or "已请求取消 rclone 运行"),
+            "message": "已请求取消回执限定的 rclone 运行，其他运行不受影响",
             "run_id": normalized,
         }
 
@@ -615,13 +640,18 @@ class RcloneService:
                         "status": self.status_locked(),
                     }
             full_staging_run = staging_job_id > 0 and file_retry is None
+            scoped_identity = self._scoped_descriptor_identity(staging_run)
             if staging_run:
                 self._cancel_staging_retry_locked(staging_job_id)
             if self.is_running_locked():
                 active_staging_job_id = self._int_value(
                     getattr(self, "_active_full_staging_job_id", 0)
                 )
-                if full_staging_run and active_staging_job_id == staging_job_id:
+                active_duplicate = (
+                    scoped_identity == getattr(self, "_active_scoped_run_identity", None)
+                    if scoped_identity else active_staging_job_id == staging_job_id
+                )
+                if full_staging_run and active_duplicate:
                     self._append_log(
                         f"任务 #{staging_job_id} 的 rclone 搬运已在运行，忽略重复启动请求：{reason}"
                     )
@@ -637,7 +667,11 @@ class RcloneService:
                 reserved_staging_job_id = self._int_value(
                     getattr(self, "_reserved_full_staging_job_id", 0)
                 )
-                if full_staging_run and reserved_staging_job_id == staging_job_id:
+                reserved_duplicate = (
+                    scoped_identity == getattr(self, "_reserved_scoped_run_identity", None)
+                    if scoped_identity else reserved_staging_job_id == staging_job_id
+                )
+                if full_staging_run and reserved_duplicate:
                     self._append_log(
                         f"任务 #{staging_job_id} 的 rclone 搬运已从队列取出并准备启动，忽略重复请求：{reason}"
                     )
@@ -651,7 +685,18 @@ class RcloneService:
                         "message": f"任务 #{staging_job_id} 的 rclone 搬运正在准备启动，无需重复入队",
                         "status": self.status_locked(),
                     }
-                if full_staging_run:
+                if scoped_identity:
+                    queued = getattr(self, "_queued_scoped_run_identities", set())
+                    enqueued = scoped_identity not in queued
+                    if enqueued:
+                        self.run_queue.enqueue(
+                            reason=reason, file_retry=file_retry,
+                            category_filter=category_filter, queued_at=self._now(),
+                            staging_run=staging_run,
+                        )
+                        queued.add(scoped_identity)
+                        self._queued_scoped_run_identities = queued
+                elif full_staging_run:
                     _, enqueued = self.run_queue.enqueue_if_staging_job_absent(
                         reason=reason,
                         file_retry=file_retry,
@@ -711,6 +756,11 @@ class RcloneService:
         if isinstance(stop_requests, set) and previous_job_id > 0 and previous_job_id != next_job_id:
             stop_requests.discard(previous_job_id)
         self._active_staging_job_id = next_job_id
+        previous_identity = getattr(self, "_active_scoped_run_identity", None)
+        self._active_scoped_run_identity = self._scoped_descriptor_identity(persisted_staging_run)
+        if previous_identity != self._active_scoped_run_identity and previous_identity:
+            getattr(self, "_stop_requested_run_ids", set()).discard(previous_identity[0])
+        self._reserved_scoped_run_identity = None
         self._active_full_staging_job_id = (
             self._int_value((persisted_staging_run or {}).get("job_id"))
             if persisted_staging_run and file_retry is None
@@ -725,6 +775,13 @@ class RcloneService:
         )
         self.run_state.mark_starting()
         self.worker_thread.start()
+
+    @classmethod
+    def _scoped_descriptor_identity(cls, descriptor: dict[str, Any] | None) -> tuple[int, str] | None:
+        run = descriptor or {}
+        run_id = cls._int_value(run.get("_scoped_run_id"))
+        key = str(run.get("_operation_key") or "").strip()
+        return (run_id, key) if run_id > 0 and key else None
 
     def start_file_retry(self, file_event: dict[str, Any]) -> dict[str, Any]:
         filename = str(file_event.get("filename") or "").strip()
@@ -829,6 +886,7 @@ class RcloneService:
                     "status": self.status_locked(),
                 }
             self.run_queue.request_stop()
+            getattr(self, "_queued_scoped_run_identities", set()).clear()
             self._append_log("收到停止请求，正在终止 rclone 搬运脚本")
             self.process_controller.terminate(self.process)
             return {
@@ -860,6 +918,10 @@ class RcloneService:
         with self.lock:
             self._cancel_staging_retry_locked(normalized_job_id)
             removed = self.run_queue.remove_job(normalized_job_id)
+            for item in removed:
+                getattr(self, "_queued_scoped_run_identities", set()).discard(
+                    self._scoped_descriptor_identity(item.staging_run)
+                )
             active_job_id = self._int_value(getattr(self, "_active_staging_job_id", 0))
             active_match = active_job_id == normalized_job_id
             stop_sent = False
@@ -1499,6 +1561,7 @@ class RcloneService:
     def shutdown(self) -> None:
         with self.lock:
             self._shutdown_requested = True
+            getattr(self, "_queued_scoped_run_identities", set()).clear()
         self.run_queue.request_stop()
         self._cancel_all_staging_retries()
         self._cancel_all_deferred_runs()
@@ -1525,6 +1588,8 @@ class RcloneService:
                     else 0
                 )
                 self._reserved_full_staging_job_id = reserved_job_id
+                self._reserved_scoped_run_identity = self._scoped_descriptor_identity(next_run.staging_run)
+                getattr(self, "_queued_scoped_run_identities", set()).discard(self._reserved_scoped_run_identity)
 
             staging_run = next_run.staging_run
             if not staging_run:
@@ -1543,6 +1608,12 @@ class RcloneService:
                     self._clear_reserved_full_staging_job(reserved_job_id)
                     continue
             if staging_run:
+                scoped_run_id = self._int_value(staging_run.get("_scoped_run_id"))
+                if scoped_run_id > 0 and self.db:
+                    scoped_status = str((self.db.rclone.get_rclone_run(scoped_run_id) or {}).get("status") or "").lower()
+                    if scoped_status in {"cancel_pending", "cancelled", "canceled", RCLONE_RUN_SUCCESS, RCLONE_RUN_FAILED}:
+                        self._clear_reserved_full_staging_job(reserved_job_id)
+                        continue
                 persisted, staging_error = self._database_bound_staging_run(staging_run)
                 job_id = self._int_value(staging_run.get("job_id"))
                 scoped_run_id = self._int_value(staging_run.get("_scoped_run_id"))
@@ -1603,6 +1674,7 @@ class RcloneService:
         with self.lock:
             if self._int_value(getattr(self, "_reserved_full_staging_job_id", 0)) == normalized_job_id:
                 self._reserved_full_staging_job_id = 0
+                self._reserved_scoped_run_identity = None
 
     def _release_current_worker_locked(self) -> None:
         if getattr(self, "worker_thread", None) is threading.current_thread():
@@ -1611,6 +1683,11 @@ class RcloneService:
             self._active_staging_job_id = 0
             self._active_full_staging_job_id = 0
             self._reserved_full_staging_job_id = 0
+            completed_identity = getattr(self, "_active_scoped_run_identity", None)
+            self._active_scoped_run_identity = None
+            self._reserved_scoped_run_identity = None
+            if completed_identity:
+                getattr(self, "_stop_requested_run_ids", set()).discard(completed_identity[0])
             self._active_run_reason = ""
             stop_requests = getattr(self, "_stop_requested_job_ids", None)
             if isinstance(stop_requests, set) and completed_job_id > 0:
@@ -1826,12 +1903,13 @@ class RcloneService:
         reason: str,
         *,
         pending_finish_error: str | None = None,
+        cache_wait: bool = False,
     ) -> dict[str, Any]:
-        """脚本拿不到互斥锁（exit 75）时把持久 run 延后重新提交。
+        """Worker 因锁或中继预算暂不可用（exit 75）时延后重新提交。
 
         完成服务已把 run 回滚到 queued。这里只负责隔一段退避后再走一遍
-        ``start``；超过上限仍拿不到锁，说明有别的 rclone 进程长期占着锁，
-        此时把 run 标 failed 并唤醒传输，交给编排器按普通失败处理。
+        ``start``；只有锁等待计入有限重试预算。中继缓存预算等待是正常
+        流控，不会标 failed 或唤醒整任务完成，也不丢失部分文件回执。
         """
         descriptor = dict(staging_run) if isinstance(staging_run, dict) else {}
         if run_id <= 0 or not descriptor:
@@ -1841,10 +1919,13 @@ class RcloneService:
             if getattr(self, "_shutdown_requested", False):
                 return {"success": False, "message": "rclone 服务正在关闭，放弃延后重排"}
             attempts = getattr(self, "_deferred_run_attempts", {})
-            attempt = int(attempts.get(run_id, 0) or 0) + 1
+            # Cache backpressure is an ordinary pipeline state, not a failed
+            # attempt. Keep its bounded polling interval without spending the
+            # unrelated lock-contention retry budget.
+            attempt = 1 if cache_wait else int(attempts.get(run_id, 0) or 0) + 1
             attempts[run_id] = attempt
             self._deferred_run_attempts = attempts
-            exhausted = attempt > max_attempts
+            exhausted = not cache_wait and attempt > max_attempts
         if exhausted:
             message = (
                 f"rclone 延后重排已达 {max_attempts} 次上限，run #{run_id} 未能启动，"
@@ -1864,12 +1945,12 @@ class RcloneService:
         if not exhausted:
             self._append_log(
                 f"rclone 运行暂未启动，run #{run_id} 将在 {delay} 秒后重新排队"
-                f"（第 {attempt}/{max_attempts} 次）"
+                + ("（等待中继缓存预算）" if cache_wait else f"（第 {attempt}/{max_attempts} 次）")
             )
         timer = threading.Timer(
             delay,
             self._resume_deferred_run,
-            args=(run_id, descriptor, reason, pending_finish_error),
+            args=(run_id, descriptor, reason, pending_finish_error, cache_wait),
         )
         timer.daemon = True
         with self.lock:
@@ -1896,12 +1977,13 @@ class RcloneService:
         descriptor: dict[str, Any],
         reason: str,
         pending_finish_error: str | None = None,
+        cache_wait: bool = False,
     ) -> None:
         with self.lock:
             getattr(self, "_deferred_run_timers", {}).pop(run_id, None)
             if getattr(self, "_shutdown_requested", False):
                 return
-            exhausted = int(getattr(self, "_deferred_run_attempts", {}).get(run_id, 0)) > self._staging_retry_max_attempts()
+            exhausted = not cache_wait and int(getattr(self, "_deferred_run_attempts", {}).get(run_id, 0)) > self._staging_retry_max_attempts()
         try:
             if pending_finish_error is not None:
                 self.run_completion.persist_result(run_id, RCLONE_EXIT_LOCK_BUSY, pending_finish_error)
@@ -1928,7 +2010,7 @@ class RcloneService:
         except Exception as exc:  # noqa: BLE001 - a Timer has no caller to retry it
             self._append_log(f"run #{run_id} 延后重排暂时失败，将继续退避：{exc}")
             self._schedule_deferred_run(
-                run_id, descriptor, reason, pending_finish_error=pending_finish_error,
+                run_id, descriptor, reason, pending_finish_error=pending_finish_error, cache_wait=cache_wait,
             )
 
     def _fail_deferred_run(self, run_id: int, message: str) -> None:
@@ -2207,22 +2289,35 @@ class RcloneService:
                     code = "RCLONE_SYNC_FAILED"
                 self._finish(2, f"{_REMOTE_ADMISSION_FAILED}（{code}）")
                 return
+            relay_cache_wait = False
+
+            def process_line(line: str) -> None:
+                nonlocal relay_cache_wait
+                if "RELAY_CACHE_DEFERRED" in line and bool((staging_run or {}).get("relay_mode")):
+                    relay_cache_wait = True
+                self._append_log(line)
+
             result = self.process_runner.run(
                 command,
                 cwd=self.base_dir,
                 env=env,
-                on_line=self._append_log,
+                on_line=process_line,
                 on_started=self._set_process,
             )
             if result.not_started and scoped_run_id > 0:
                 pending_finish_error = None
+                deferred_error = (
+                    "中继缓存预算或空间安全余量暂不可用，本次下载延后重新排队"
+                    if relay_cache_wait else result.error
+                )
                 try:
-                    self._finish(result.exit_code, result.error)
+                    self._finish(result.exit_code, deferred_error)
                 except Exception as exc:  # noqa: BLE001 - do not lose scheduling during completion persistence
-                    pending_finish_error = result.error
+                    pending_finish_error = deferred_error
                     self._append_log(f"run #{scoped_run_id} 未启动状态暂未落库，将延后重试：{exc}")
                 self._schedule_deferred_run(
                     scoped_run_id, staging_run, reason, pending_finish_error=pending_finish_error,
+                    cache_wait=relay_cache_wait,
                 )
             else:
                 self._finish(result.exit_code, result.error)
@@ -2243,6 +2338,10 @@ class RcloneService:
             active_job_id = self._int_value(getattr(self, "_active_staging_job_id", 0))
             stop_requests = getattr(self, "_stop_requested_job_ids", set())
             should_stop = active_job_id > 0 and active_job_id in stop_requests
+            active_identity = getattr(self, "_active_scoped_run_identity", None)
+            should_stop = should_stop or bool(
+                active_identity and active_identity[0] in getattr(self, "_stop_requested_run_ids", set())
+            )
         if should_stop:
             self._append_log(
                 f"任务 #{active_job_id} 在 rclone 进程启动前已被取消，正在定向终止该进程"

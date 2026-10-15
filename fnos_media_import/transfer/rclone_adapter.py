@@ -39,6 +39,7 @@ class RcloneOperationAdapter:
     """
 
     supports_sequential_relay = True
+    supports_bounded_prefetch = True
 
     def __init__(self, service: Any, locator_resolver: Any) -> None:
         self.service = service
@@ -223,6 +224,9 @@ class RcloneOperationAdapter:
             return CancelResult("not_cancellable", "rclone 适配器未绑定计划", operation_id=getattr(receipt, "operation_id", ""))
         if not isinstance(receipt, OperationReceipt):
             return CancelResult("not_cancellable", "rclone 回执无效", operation_id="")
+        receipt_job = (receipt.metadata or {}).get("job_id")
+        if receipt_job is not None and str(receipt_job) != str(self.plan.job_id):
+            return CancelResult("not_cancellable", "rclone 回执属于其他任务", operation_id=receipt.operation_id)
         run_id = self._run_id((receipt.metadata or {}).get("run_id"))
         if not run_id:
             return CancelResult("not_cancellable", "rclone 回执缺少持久 run_id", operation_id=receipt.operation_id)

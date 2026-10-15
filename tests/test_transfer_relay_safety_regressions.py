@@ -289,7 +289,7 @@ class LegacyWorkerCompatibilityTests(unittest.TestCase):
         empty_branch = script.split('if [ -z "$copy_file_list" ]; then', 1)[1].split('log "rclone_copy 源文件数', 1)[0]
         self.assertIn('"$RCLONE_COPY_RELAY_MODE" = "true"', empty_branch)
         self.assertIn("return 1", empty_branch)
-        self.assertIn('SCRIPT_VERSION="v1.3-sequential-relay"', script)
+        self.assertIn('SCRIPT_VERSION="v1.4-bounded-relay"', script)
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("flock"), "requires Linux flock runtime")
     def test_busy_lock_is_exit_75_and_released_lock_is_reusable(self):

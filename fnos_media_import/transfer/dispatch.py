@@ -227,9 +227,14 @@ class TransferDispatchService:
                     halted_account_ids=self._halted_relay_account_ids,
                     progress_sink=self._upload_progress_bridge(job_id),
                     event_sink=self._job_event_sink(job_id),
+                    cancel_requested=lambda: self._relay_cancel_requested(job_id),
                 )
             }
         raise TransferDispatchError(f"未知传输策略：{strategy}")
+
+    def _relay_cancel_requested(self, job_id: int) -> bool:
+        job = self.database.job_queries.get(job_id)
+        return not isinstance(job, dict) or str(job.get("status") or "").lower() in {"cancelled", "canceled", "rejected"}
 
     def _upload_progress_bridge(self, job_id: int) -> Any:
         """上传进度行送进 rclone 实时日志流（与下载阶段同一页面）。

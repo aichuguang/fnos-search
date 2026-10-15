@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import threading
@@ -106,10 +107,63 @@ def _channel() -> dict[str, Any]:
     return {
         "state": "unknown", "scope": "file", "filename": None, "percent": None,
         "bytes_done": None, "bytes_total": None, "speed_bps": None, "eta_seconds": None,
+        "file_id": None, "run_id": None, "active": False,
     }
 
 
 def _event(message: str) -> dict[str, Any] | None:
+    if message.startswith("relay-progress:"):
+        try:
+            payload = json.loads(message[len("relay-progress:"):].strip())
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or _positive_id(payload.get("job_id")) is None:
+            return None
+        if not all(isinstance(payload.get(key), str) and payload[key].strip() for key in ("file_id", "filename", "message")):
+            return None
+        nested_message = payload["message"]
+        # Only wrap ordinary upload observations, never durable milestones or
+        # another protocol envelope supplied by a provider diagnostic.
+        if nested_message.startswith("relay-"):
+            return None
+        nested = _event(nested_message)
+        if nested is None or nested["kind"] not in {"upload_start", "progress", "heartbeat", "channel_done"}:
+            return None
+        if nested.get("channel", nested.get("heartbeat_channel")) not in {"upload", "hash"}:
+            return None
+        return {**nested, "job_id": payload["job_id"], "identity": {
+            "file_id": payload["file_id"][:2048], "filename": payload["filename"][:2048],
+            "run_id": _positive_id(payload.get("run_id")),
+        }}
+    for prefix, kind in (("relay-buffer:", "buffer"), ("relay-file:", "file_context")):
+        if not message.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(message[len(prefix):].strip())
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or _positive_id(payload.get("job_id")) is None:
+            return None
+        if kind == "buffer":
+            depth, ready, reserved = (payload.get(key) for key in ("depth", "ready", "reserved"))
+            if (type(depth) is not int or depth not in {0, 1, 2}
+                    or type(ready) is not int or ready < 0 or ready > depth
+                    or type(reserved) is not int or reserved < 0 or reserved > depth
+                    or type(payload.get("waiting")) is not bool):
+                return None
+            return {"kind": kind, "job_id": payload["job_id"], "values": {
+                "enabled": payload.get("enabled") is True, "depth": depth, "ready": ready,
+                "reserved": reserved, "waiting": payload["waiting"], "reason": str(payload.get("reason") or "")[:512],
+            }}
+        channel = payload.get("channel")
+        filename, file_id = payload.get("filename"), payload.get("file_id")
+        if channel not in {"download", "upload"} or not isinstance(filename, str) or not filename.strip():
+            return None
+        if not isinstance(file_id, str) or not file_id.strip():
+            return None
+        return {"kind": kind, "job_id": payload["job_id"], "stage": channel, "channel": channel,
+                "values": {"filename": filename[:2048], "file_id": file_id[:2048],
+                           "run_id": _positive_id(payload.get("run_id")), "state": "waiting"}}
     milestone = _MILESTONE.fullmatch(message)
     if milestone:
         phase = milestone["phase"]
@@ -119,7 +173,7 @@ def _event(message: str) -> dict[str, Any] | None:
     if message.startswith("开始上传：") or message.startswith("开始上传:"):
         return {"kind": "upload_start", "stage": "upload", "channel": "upload", "values": {"state": "waiting"}}
     if message.startswith("上传请求仍在执行：") or message.startswith("上传请求仍在执行:"):
-        return {"kind": "heartbeat", "stage": "upload"}
+        return {"kind": "heartbeat", "stage": "upload", "heartbeat_channel": "upload"}
     if message.startswith(("等待进度：", "等待进度:", "进度暂未变化：", "进度暂未变化:")):
         return {"kind": "heartbeat", "stage": "download", "heartbeat_channel": "download"}
     if message.startswith(("本地校验仍在执行：", "本地校验仍在执行:")):
@@ -179,7 +233,17 @@ class RcloneLiveProgress:
     ) -> bool:
         target_job, context_job, text = log_scope(message, job_id=job_id, current_job_id=current_job_id)
         event = _event(text)
-        if target_job is None or event is None:
+        if event is None:
+            return False
+        protocol_job = _positive_id(event.get("job_id"))
+        if protocol_job is not None:
+            # Structured relay logs carry their own task identity. An explicit
+            # bridge scope must agree; the current download can be another job.
+            explicit_job, _, _ = log_scope(message, job_id=job_id)
+            if explicit_job is not None and explicit_job != protocol_job:
+                return False
+            target_job = protocol_job
+        if target_job is None:
             return False
         if event["kind"] == "milestone" and trusted_milestone is not True:
             return False
@@ -190,91 +254,166 @@ class RcloneLiveProgress:
         timestamp = self._utc_now().isoformat(timespec="milliseconds")
         with self._lock:
             previous = self._tasks.get(target_job)
-            reset = event["kind"] == "milestone" and event["stage"] in _START_PHASES
-            new_run = event["kind"] == "start" and run_id is not None and (previous is None or previous["run_id"] != run_id)
-            terminal_update = event["kind"] == "milestone" and event["stage"] in _TERMINAL_PHASES
+            kind = event["kind"]
+            reset = kind == "milestone" and event["stage"] in _START_PHASES
+            new_run = kind == "start" and run_id is not None and (previous is None or previous["run_id"] != run_id)
+            terminal_update = kind == "milestone" and event["stage"] in _TERMINAL_PHASES
             if previous and previous["stage"] in _TERMINAL_PHASES and not (reset or new_run):
                 if not terminal_update or previous["stage"] == "completed":
                     return False
-            if previous and previous["stage"] in _POST_TRANSFER_PHASES and event["kind"] != "milestone" and not new_run:
+            if previous and previous["stage"] in _POST_TRANSFER_PHASES and kind != "milestone" and not new_run:
                 return False
-            if previous is None or (reset and event["stage"] == "planning") or new_run:
-                item = {"job_id": target_job, "run_id": run_id, "completed": False, **{name: _channel() for name in _CHANNELS}}
+            pipeline = bool(previous and previous.get("relay_buffer", {}).get("enabled") is True)
+            keep_upload = new_run and pipeline and previous["stage"] not in _TERMINAL_PHASES | _POST_TRANSFER_PHASES
+            if previous is None or (reset and event["stage"] == "planning") or (new_run and not keep_upload):
+                item = {"job_id": target_job, "run_id": run_id, "stage": "transferring", "completed": False,
+                        **{name: _channel() for name in _CHANNELS}}
             else:
                 item = previous
-                if run_id is not None:
+                if run_id is not None and (kind == "start" or event.get("channel") == "download"):
                     item["run_id"] = run_id
+            if reset:
+                item.pop("relay_buffer", None)
+                item.pop("_file_contexts", None)
+                pipeline = False
+            if kind == "buffer":
+                item["relay_buffer"] = {**event["values"], "updated_at": timestamp}
+                item.setdefault("updated_at", timestamp)
+                item.setdefault("message", "")
+                item.setdefault("_seen_at", now)
+                self._remember(target_job, item)
+                return True
+            identity = event.get("identity")
+            if identity:
+                contexts = item.setdefault("_file_contexts", {})
+                current_identity = contexts.get("upload")
+                if current_identity and current_identity["file_id"] != identity["file_id"]:
+                    return False
+                if current_identity is None:
+                    contexts["upload"] = identity
+            if new_run and keep_upload:
+                context = item.get("_file_contexts", {}).get("download", {})
+                if context.get("run_id") not in {None, run_id}:
+                    item["_file_contexts"].pop("download", None)
+                    context = {}
+                item["download"] = {**_channel(), **context}
+            if kind == "start" and run_id is not None:
+                context = item.get("_file_contexts", {}).get("download")
+                if context is not None:
+                    context["run_id"] = run_id
             channel = event.get("channel")
             if channel:
-                if item[channel]["state"] == "completed" and event["kind"] == "progress":
-                    return False
-                if event["kind"] == "channel_done":
-                    item[channel]["state"] = "completed"
-                    item[channel]["speed_bps"] = None
-                    item[channel]["eta_seconds"] = None
+                old_values = item[channel]
+                contexts = item.setdefault("_file_contexts", {})
+                context_key = "upload" if channel == "hash" else channel
+                if kind == "file_context":
+                    context = {key: event["values"][key] for key in ("filename", "file_id", "run_id")}
+                    if contexts.get(context_key) == context:
+                        return True
+                    contexts[context_key] = context
+                context = contexts.get(context_key, {})
+                if kind == "channel_done":
+                    old_values.update(state="completed", active=False, speed_bps=None, eta_seconds=None,
+                                      updated_at=timestamp)
+                    if channel == "upload":
+                        item["hash"].update(active=False, speed_bps=None, eta_seconds=None)
                 else:
-                    old_values = item[channel]
                     values = dict(event["values"])
+                    filename = values.get("filename")
+                    if context and values.get("scope") == "stage":
+                        values["scope"] = "file"
+                    if context and filename and kind != "file_context":
+                        expected = context["filename"].replace("\\", "/")
+                        observed = filename.replace("\\", "/")
+                        if observed not in {expected, expected.rsplit("/", 1)[-1]}:
+                            return False
+                        values["filename"] = context["filename"]
+                    next_file = bool(filename and filename != old_values.get("filename") and not context)
+                    if old_values["state"] == "completed" and kind == "progress" and not next_file:
+                        return False
                     changed = any(
                         values.get(key) is not None and values.get(key) != old_values.get(key)
                         for key in ("filename", "percent", "bytes_done", "bytes_total")
                     )
-                    if changed or event["kind"] in {"initial", "upload_start"}:
-                        item["_progress_at"] = now
-                        item.pop("_waiting_channel", None)
-                    elif event["kind"] == "progress" and (
-                        item.get("_waiting_channel") == channel
-                        or now - item.get("_progress_at", now) > self._stale_after
+                    progress_at = old_values.get("_progress_at", now)
+                    waiting = old_values.get("_waiting", False)
+                    if changed or kind in {"initial", "upload_start", "file_context"}:
+                        progress_at, waiting = now, False
+                    elif kind == "progress" and (
+                        waiting or now - progress_at > self._stale_after
                     ):
                         values.update(state="waiting", speed_bps=None, eta_seconds=None)
                     # Each observation describes one file, not aggregate task
-                    # bytes. A new file must not inherit the previous metrics.
-                    item[channel] = {**_channel(), **values}
-                item["_active_channel"] = channel
-            if event["kind"] == "heartbeat":
-                active = event.get("heartbeat_channel") or item.get("_active_channel", event["stage"])
-                if item[active]["state"] not in {"completed", "failed", "manual_review", "cancelled"}:
-                    item["_waiting_channel"] = active
+                    # bytes. Channel clocks/identity never follow another lane.
+                    identity_run = context.get("run_id") if context else (run_id if channel == "download" or not pipeline else None)
+                    item[channel] = {**_channel(), **values, **context, "run_id": identity_run,
+                                     "active": True, "updated_at": timestamp, "_seen_at": now,
+                                     "_progress_at": progress_at, "_waiting": waiting}
+                if kind != "channel_done":
+                    for other in _CHANNELS:
+                        if other != channel and (not pipeline or {other, channel} <= {"hash", "upload"}):
+                            item[other]["active"] = False
+                    if kind in {"upload_start", "file_context"} and channel == "upload":
+                        # A new file's preparation cannot retain an old hash.
+                        item["hash"] = _channel()
+            if kind == "heartbeat":
+                active = event["heartbeat_channel"]
+                if item[active]["state"] in {"running", "waiting"} and item[active]["active"]:
+                    item[active]["_waiting"] = True
                     item[active]["state"] = "waiting"
                     item[active]["speed_bps"] = None
                     item[active]["eta_seconds"] = None
-            stage = item["stage"] if event["kind"] == "heartbeat" and "stage" in item else event["stage"]
+                    item[active]["updated_at"] = timestamp
+            stage = item["stage"] if kind == "heartbeat" else event["stage"]
+            if pipeline and kind == "channel_done":
+                # A file/run boundary is not the task's verification boundary.
+                stage = "transferring"
             if stage in _TERMINAL_PHASES:
                 for name in _CHANNELS:
                     if item[name]["state"] in {"waiting", "running"}:
                         item[name]["state"] = stage
-                        item[name]["speed_bps"] = None
-                        item[name]["eta_seconds"] = None
+                    item[name].update(active=False, speed_bps=None, eta_seconds=None)
             elif stage in _POST_TRANSFER_PHASES:
                 for name in _CHANNELS:
-                    item[name]["speed_bps"] = None
-                    item[name]["eta_seconds"] = None
+                    item[name].update(active=False, speed_bps=None, eta_seconds=None)
             item.update({
                 "stage": stage, "completed": stage == "completed",
                 "updated_at": timestamp, "message": text,
             })
-            if event["kind"] in {"milestone", "start", "initial", "upload_start", "channel_done"} or "_seen_at" not in item:
+            if kind in {"milestone", "start", "initial", "upload_start", "channel_done", "file_context"} or "_seen_at" not in item:
                 item["_seen_at"] = now
-            self._tasks[target_job] = item
-            self._tasks.move_to_end(target_job)
-            while len(self._tasks) > self._max_tasks:
-                self._tasks.popitem(last=False)
+            self._remember(target_job, item)
         return True
+
+    def _remember(self, job_id: int, item: dict[str, Any]) -> None:
+        self._tasks[job_id] = item
+        self._tasks.move_to_end(job_id)
+        while len(self._tasks) > self._max_tasks:
+            self._tasks.popitem(last=False)
 
     def snapshot(self) -> list[dict[str, Any]]:
         now = self._monotonic()
         with self._lock:
             result = []
             for item in reversed(self._tasks.values()):
-                age = max(0.0, now - item.get("_progress_at", item["_seen_at"]))
+                clocks = [value["_progress_at"] for name in _CHANNELS
+                          if (value := item[name]).get("active") and "_progress_at" in value]
+                age = max(0.0, now - max(clocks or [item["_seen_at"]]))
                 stale = age > self._stale_after and item["stage"] not in _TERMINAL_PHASES
-                channels = {name: dict(item[name]) for name in _CHANNELS}
-                if stale:
-                    for values in channels.values():
+                channels = {}
+                for name in _CHANNELS:
+                    source = item[name]
+                    values = {key: value for key, value in source.items() if not key.startswith("_")}
+                    channel_age = max(0.0, now - source.get("_progress_at", now)) if source["active"] else None
+                    channel_stale = channel_age is not None and channel_age > self._stale_after
+                    values.update(age_seconds=round(channel_age, 3) if channel_age is not None else None, stale=channel_stale)
+                    if channel_stale or not source["active"]:
                         values.update(speed_bps=None, eta_seconds=None)
+                    channels[name] = values
                 result.append({
                     **{key: value for key, value in item.items() if not key.startswith("_")},
                     **channels,
+                    **({"relay_buffer": dict(item["relay_buffer"])} if "relay_buffer" in item else {}),
                     "age_seconds": round(age, 3),
                     "stale": stale,
                 })

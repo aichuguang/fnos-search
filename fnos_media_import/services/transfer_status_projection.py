@@ -101,7 +101,13 @@ def project_transfer_status(
                 "state": "unknown", "scope": "file", "filename": None,
                 "percent": None, "bytes_done": None, "bytes_total": None,
                 "speed_bps": None, "eta_seconds": None,
+                "file_id": None, "run_id": None, "active": False, "stale": False, "age_seconds": None,
             }
+        buffer = observation.get("relay_buffer")
+        if preserve_metrics and isinstance(buffer, dict):
+            item["relay_buffer"] = dict(buffer)
+        else:
+            item.pop("relay_buffer", None)
         if not preserve_metrics:
             item.update(
                 updated_at=record.get("state_updated_at") or record.get("job_updated_at"),
