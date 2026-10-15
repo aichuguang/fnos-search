@@ -99,6 +99,9 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
             self.db_path,
             Path(f"{self.db_path}-wal"),
             Path(f"{self.db_path}-shm"),
+            *(Path(f"{self.db_path}.openlist-{suffix}") for suffix in (
+                "change.lock", "remote.lock", "owner.json", "remote-state.json",
+            )),
         ):
             try:
                 candidate.unlink()
@@ -188,6 +191,7 @@ class MultilinkV1IntegrationTests(unittest.TestCase):
         updated = self.accounts.refresh_runtime_credentials(
             account_id,
             {"cookie": "sid=refreshed-cookie"},
+            expected_revision=before.account_revision,
         )
 
         current = self.targets.resolve_binding("quark_main", 1)

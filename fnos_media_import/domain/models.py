@@ -559,3 +559,5 @@ class AccountTestResult:
     identity_hint: str = ""
     message: str = ""
     errors: list[str] = field(default_factory=list)
+    # A trusted Provider subject, never a nickname or an editable display hint.
+    identity_id: str = ""

@@ -81,6 +81,11 @@ class ImportService:
     def create_internal_import_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.job_creation.create_internal(payload)
 
+    def create_public_request_import_job(
+        self, payload: dict[str, Any], *, request_token: str
+    ) -> dict[str, Any]:
+        return self.job_creation.create_internal(payload, public_request_token=request_token)
+
     def retry_job(self, job_id: int) -> dict[str, Any]:
         return self.job_retry.retry(job_id)
 

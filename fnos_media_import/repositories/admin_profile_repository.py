@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from .app_settings_repository import AppSettingsRepository
 
@@ -20,6 +20,13 @@ class AdminProfileRepository:
 
     def save_profile(self, profile: dict[str, Any]) -> None:
         self._settings.set_many({self.PROFILE_KEY: dict(profile)})
+
+    def update_profile_atomic(self, updater: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
+        def _update(value: Any, _existed: bool) -> dict[str, Any]:
+            return updater(dict(value) if isinstance(value, dict) else {})
+
+        _, _, updated = self._settings.update_atomic(self.PROFILE_KEY, _update)
+        return dict(updated)
 
     def get_branding(self) -> dict[str, Any]:
         value = self._settings.get_all().get(self.BRANDING_KEY)

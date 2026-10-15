@@ -256,6 +256,10 @@ class GuestRequestCommandRepository:
         request_updates: dict[str, Any] | None = None,
         emit: Callable[[sqlite3.Connection], Any] | None = None,
     ) -> str:
+        # Serialize the read/check/bind sequence with orphan cancellation's
+        # guarded UPDATE. A status check outside this transaction is racy.
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
         raw_text = json.dumps(raw_data, ensure_ascii=False) if raw_data is not None else None
         event_text = json.dumps(event_data, ensure_ascii=False) if event_data is not None else None
         now = _utc_now()
@@ -270,6 +274,11 @@ class GuestRequestCommandRepository:
         allowed_statuses = expected_statuses or {"submitted"}
         if str(row["status"] or "") not in allowed_statuses:
             return "state_conflict"
+        job = connection.execute("SELECT status FROM import_jobs WHERE id=?", (int(job_id),)).fetchone()
+        if job is None:
+            return "missing"
+        if str(job["status"] or "").strip().lower() in {"cancelled", "rejected"}:
+            return "job_state_conflict"
         request_updates = request_updates or {}
         connection.execute(
             """

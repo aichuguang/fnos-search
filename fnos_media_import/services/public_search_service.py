@@ -62,12 +62,16 @@ class PublicSearchService:
         existing = self._deps.cache_queries.find_active_by_urls(cache_key, urls)
         cache_records: list[tuple[str, dict[str, Any]]] = []
         public_items: list[dict[str, Any]] = []
+        new_count = 0
         for item in items:
             cached = existing.get(str(item.get("url") or ""))
             public_id = str((cached or {}).get("public_id") or "")
             if not public_id:
                 public_id = self._deps.new_public_id()
-                cache_records.append((public_id, item))
+                new_count += 1
+            # A reused ID must describe this response and get its full advertised
+            # lifetime, even if its previous row expires during the search.
+            cache_records.append((public_id, item))
             public_items.append(
                 self._deps.present_item(item, public_id=public_id, hide_full_links=hide_full_links)
             )
@@ -83,8 +87,8 @@ class PublicSearchService:
             service_ms,
             cache_ms,
             len(public_items),
-            len(cache_records),
-            len(public_items) - len(cache_records),
+            new_count,
+            len(public_items) - new_count,
         )
         return {
             "success": True,

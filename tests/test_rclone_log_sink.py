@@ -5,6 +5,7 @@ import time
 import unittest
 
 from fnos_media_import.services.rclone_log_sink import RcloneLogSink
+from fnos_media_import.services.rclone_service import RcloneService
 
 
 class _GateRepository:
@@ -63,7 +64,8 @@ class RcloneLogSinkAsyncPersistenceTests(unittest.TestCase):
         sink.close(timeout=5)
 
         flushed = [event for batch in database.rclone.batches for event in batch]
-        self.assertEqual(flushed, [(4, "info", f"进度 {index}") for index in range(4)])
+        self.assertEqual([event[:3] for event in flushed], [(4, "info", f"进度 {index}") for index in range(4)])
+        self.assertTrue(all(len(event) == 4 and event[3] for event in flushed))
 
     def test_close_flushes_remaining_events(self) -> None:
         database = _GateDatabase()
@@ -75,8 +77,8 @@ class RcloneLogSinkAsyncPersistenceTests(unittest.TestCase):
         sink.close(timeout=5)
 
         flushed = [event for batch in database.rclone.batches for event in batch]
-        self.assertEqual(flushed[0], (9, "info", "下载中：50%"))
-        self.assertEqual(flushed[1], (9, "error", "失败：目标端校验未通过"))
+        self.assertEqual(flushed[0][:3], (9, "info", "下载中：50%"))
+        self.assertEqual(flushed[1][:3], (9, "error", "失败：目标端校验未通过"))
 
     def test_flush_failure_is_swallowed(self) -> None:
         database = _GateDatabase()
@@ -116,8 +118,6 @@ class RcloneServiceExternalLogTests(unittest.TestCase):
     """主应用上传进度经 append_external_log 汇入 rclone 实时日志流。"""
 
     def _service(self) -> RcloneService:
-        from fnos_media_import.services.rclone_service import RcloneService
-
         service = RcloneService.__new__(RcloneService)
         service.log_sink = RcloneLogSink()
         return service

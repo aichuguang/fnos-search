@@ -263,6 +263,10 @@ class OrganizerWorkerScheduleTests(unittest.TestCase):
             def get_task(_task_id: int) -> dict:
                 return task
 
+            @staticmethod
+            def approve_task(_task_id: int) -> dict:
+                return {"success": True}
+
         class FakeDispatcher:
             @staticmethod
             def organizer_apply(task_id: int) -> dict:
@@ -286,7 +290,7 @@ class OrganizerWorkerScheduleTests(unittest.TestCase):
         self.assertEqual(result["retry_mode"], "resume_apply")
         self.assertEqual(calls, [("apply", 93)])
 
-    def test_failed_operation_retry_keeps_rescan_path(self) -> None:
+    def test_failed_operation_retry_keeps_saved_plan(self) -> None:
         calls: list[tuple] = []
         task = {
             "id": 94,
@@ -300,9 +304,13 @@ class OrganizerWorkerScheduleTests(unittest.TestCase):
             def get_task(_task_id: int) -> dict:
                 return task
 
+            @staticmethod
+            def approve_task(_task_id: int) -> dict:
+                return {"success": True}
+
         class FakeDispatcher:
             @staticmethod
-            def organizer_process(*args, **kwargs) -> dict:
+            def organizer_apply(*args, **kwargs) -> dict:
                 calls.append((args, kwargs))
                 return {"success": True, "queued": True}
 
@@ -316,8 +324,8 @@ class OrganizerWorkerScheduleTests(unittest.TestCase):
         result, status_code = service.retry(94)
 
         self.assertEqual(status_code, 200)
-        self.assertEqual(result["retry_mode"], "rescan")
-        self.assertEqual(calls, [((94,), {"auto_apply": True, "respect_schedule": False})])
+        self.assertEqual(result["retry_mode"], "resume_apply")
+        self.assertEqual(calls, [((94,), {})])
 
     def test_lease_loss_before_operation_status_write_resumes_apply_for_reconciliation(self) -> None:
         task = {
@@ -333,6 +341,10 @@ class OrganizerWorkerScheduleTests(unittest.TestCase):
             @staticmethod
             def get_task(_task_id: int) -> dict:
                 return task
+
+            @staticmethod
+            def approve_task(_task_id: int) -> dict:
+                return {"success": True}
 
         class FakeDispatcher:
             @staticmethod

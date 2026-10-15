@@ -413,12 +413,14 @@ class RcloneTransferExecutor:
         visibility_poller: Any = None,
         verifier: Any = None,
         target_lister: Any = None,
+        copy_manifest_verifier: Any = None,
     ) -> None:
         self.rclone = rclone_service_adapter
         self.locator_resolver = locator_resolver
         self.source_materializer = source_materializer
         self.visibility_poller = visibility_poller
         self.verifier = verifier
+        self.copy_manifest_verifier = copy_manifest_verifier
         if self.verifier is None and target_lister is not None:
             from fnos_media_import.transfer.verifier import TransferVerifier
 
@@ -459,6 +461,10 @@ class RcloneTransferExecutor:
         return VisibilityStatus.pending
 
     # -- 传输 --
+    def prepare_submission(self) -> dict[str, Any]:
+        """Resolve the frozen copy paths without submitting a data-plane operation."""
+        return self.build_copy_run()
+
     def submit(self, existing_receipt: OperationReceipt | None = None) -> OperationReceipt:
         if existing_receipt is not None:
             return existing_receipt
@@ -501,6 +507,13 @@ class RcloneTransferExecutor:
             expected_total_size=expected_total_size,
             checksum=checksum,
         )
+
+    def verify_copy_manifest(self, receipt: OperationReceipt | None, *, final: bool = False) -> TransferVerifyResult:
+        if not callable(self.copy_manifest_verifier):
+            return TransferVerifyResult(
+                "unknown", "暂存核验缺少成功运行关联的任务级文件清单", code=ErrorCode.RESULT_UNKNOWN,
+            )
+        return self.copy_manifest_verifier(self.plan, receipt, final=final)
 
     def cancel(self, receipt: OperationReceipt) -> CancelResult:
         cancel_op = getattr(self.rclone, "cancel", None)

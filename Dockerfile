@@ -27,6 +27,9 @@ WORKDIR /app
 
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 
+# The worker relies on kernel-released file locks, not persistent mkdir locks.
+RUN command -v flock >/dev/null
+
 COPY requirements.txt .
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG PIP_EXTRA_INDEX_URLS="https://mirrors.aliyun.com/pypi/simple https://mirrors.cloud.tencent.com/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple"

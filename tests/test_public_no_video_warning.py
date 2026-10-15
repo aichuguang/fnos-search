@@ -95,8 +95,10 @@ class PublicNoVideoWarningTests(unittest.TestCase):
     def test_static_assets_version_bumped(self) -> None:
         request_template = Path("templates/request_status.html").read_text(encoding="utf-8")
         marker = "20260902-no-video-warn-v002"
-        self.assertEqual(self.submit_template.count(marker), 3)
-        self.assertEqual(request_template.count(marker), 3)
+        self.assertEqual(self.submit_template.count(marker), 2)
+        self.assertEqual(request_template.count(marker), 2)
+        for template in (self.submit_template, request_template):
+            self.assertIn('/static/public-submit.js?v=20261012-quark-selection-v008', template)
 
 
 if __name__ == "__main__":

@@ -197,6 +197,42 @@ class JobCommandRepository:
             self._emit_status_transition(connection, previous, values_to_write, cursor.rowcount)
             return cursor.rowcount == 1
 
+    def update_if_status_and_unbound(
+        self,
+        job_id: int,
+        expected_statuses: set[str] | list[str] | tuple[str, ...],
+        **updates: Any,
+    ) -> str:
+        """Claim orphan compensation atomically against guest-request binding."""
+        statuses = sorted({str(value or "").strip() for value in expected_statuses if str(value or "").strip()})
+        if not updates or not statuses:
+            return "state_conflict"
+        values_to_write = {**updates, "updated_at": _utc_now()}
+        assignments: list[str] = []
+        values: list[Any] = []
+        for key, value in values_to_write.items():
+            if key == "raw_data" and value is not None:
+                value = json.dumps(value, ensure_ascii=False)
+            assignments.append(f"{key} = ?")
+            values.append(value)
+        placeholders = ",".join("?" for _ in statuses)
+        values.extend([int(job_id), *statuses])
+        with self._connection_factory() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM guest_requests WHERE job_id=? LIMIT 1", (int(job_id),)
+            ).fetchone():
+                return "bound"
+            previous = self._transition_row(connection, job_id)
+            cursor = connection.execute(
+                f"UPDATE import_jobs SET {', '.join(assignments)} "
+                f"WHERE id=? AND status IN ({placeholders}) "
+                "AND NOT EXISTS (SELECT 1 FROM guest_requests WHERE job_id=import_jobs.id)",
+                values,
+            )
+            self._emit_status_transition(connection, previous, values_to_write, cursor.rowcount)
+            return "updated" if cursor.rowcount == 1 else "state_conflict"
+
     def update_unless_status_with_connection(
         self,
         connection: sqlite3.Connection,

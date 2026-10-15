@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import asdict
 from typing import Any, Callable
 
@@ -33,6 +34,15 @@ class AssignmentConflictError(AssignmentError):
     """当前 assignment 已被其他管理员修改，调用方必须重新读取。"""
 
     code = "ASSIGNMENT_CONFLICT"
+    status = 409
+
+
+class AssignmentSnapshotRequiredError(AssignmentError):
+    code = "ASSIGNMENT_SNAPSHOT_REQUIRED"
+    status = 428
+
+
+_UNSPECIFIED_REVISION = object()
 
 
 def assignment_id(search_source_id: str, category_key: str) -> str:
@@ -141,6 +151,78 @@ class SourceAssignmentService:
             ).fetchall()
         return [self._decode(row) for row in rows]
 
+    def snapshot(self) -> dict[str, Any]:
+        """Read rows and their CAS token from one SQLite snapshot, without writes."""
+        with self.database.connect() as connection:
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                "SELECT * FROM source_destination_assignments ORDER BY search_source_id, category_key"
+            ).fetchall()
+            token = self._snapshot_token(connection, rows)
+        return {"assignments": [self._decode(row) for row in rows], "routing_token": token}
+
+    @staticmethod
+    def _snapshot_token(connection: Any, rows: list[Any]) -> str:
+        high_water: dict[str, int] = {}
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_destination_assignment_revisions'"
+        ).fetchone():
+            high_water = {
+                str(row["assignment_id"]): int(row["revision"] or 0)
+                for row in connection.execute(
+                    "SELECT assignment_id, MAX(revision) AS revision "
+                    "FROM source_destination_assignment_revisions GROUP BY assignment_id"
+                ).fetchall()
+            }
+        current = []
+        for row in rows:
+            source, category = str(row["search_source_id"]), str(row["category_key"])
+            revision = int(row["revision"] or 1)
+            stable_id = assignment_id(source, category)
+            # Legacy current rows may not yet have been backfilled. A read must
+            # not write history, or change its token when the first writer does.
+            high_water[stable_id] = max(high_water.get(stable_id, 0), revision)
+            current.append([source, category, str(row["destination_id"]), bool(row["enabled"]), revision])
+        encoded = json.dumps(
+            {"current": sorted(current), "history": sorted(high_water.items())},
+            ensure_ascii=True, separators=(",", ":"),
+        ).encode("utf-8")
+        return "routes-v1:" + hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def validate_snapshot_token(value: Any, *, required: bool = False) -> str | None:
+        if value is None or value == "":
+            if required:
+                raise AssignmentSnapshotRequiredError("缺少完整路由快照，请刷新配置并核对后再保存")
+            return None
+        if not isinstance(value, str) or len(value) != 74 or not value.startswith("routes-v1:"):
+            raise AssignmentConflictError("路由快照格式已失效，请刷新配置并核对后再保存")
+        if any(character not in "0123456789abcdef" for character in value[10:]):
+            raise AssignmentConflictError("路由快照格式已失效，请刷新配置并核对后再保存")
+        return value
+
+    @classmethod
+    def _check_snapshot(cls, connection: Any, rows: list[Any], expected_token: str | None) -> None:
+        if expected_token is not None and cls._snapshot_token(connection, rows) != expected_token:
+            raise AssignmentConflictError("入库规则已被其他操作修改，未写入任何变更；请刷新并核对当前规则")
+
+    @staticmethod
+    def _check_revision(expected: Any, current: Any, source: str, category: str) -> None:
+        if expected is _UNSPECIFIED_REVISION:
+            return
+        actual = int(current["revision"]) if current is not None else None
+        if expected is not None:
+            try:
+                if isinstance(expected, bool) or int(expected) <= 0:
+                    raise ValueError
+                expected = int(expected)
+            except (TypeError, ValueError) as exc:
+                raise AssignmentError("路由 expected_revision 必须为正整数或 null（尚不存在）") from exc
+        if actual != expected:
+            raise AssignmentConflictError(
+                f"assignment {source}/{category} revision conflict: expected {expected}, actual {actual}"
+            )
+
     def get_assignment(
         self, search_source_id: str, category_key: str
     ) -> SourceDestinationAssignment | None:
@@ -184,7 +266,13 @@ class SourceAssignmentService:
     ) -> dict[str, Any] | None:
         return self.get_revision(assignment_id(search_source_id, category_key), revision)
 
-    def replace(self, assignments: list[dict[str, Any]]) -> list[SourceDestinationAssignment]:
+    def replace(
+        self, assignments: list[dict[str, Any]], *, expected_token: str | None = None,
+        require_snapshot: bool = False,
+    ) -> list[SourceDestinationAssignment]:
+        # Unversioned internal bootstrap/fixture calls remain supported. Every
+        # HTTP replacement opts into require_snapshot and cannot take that path.
+        expected_token = self.validate_snapshot_token(expected_token, required=require_snapshot)
         parsed = [self._parse(item) for item in assignments]
         keys = {(item.search_source_id, item.category_key) for item in parsed}
         if len(keys) != len(parsed):
@@ -198,17 +286,11 @@ class SourceAssignmentService:
                 (str(row["search_source_id"]), str(row["category_key"])): row
                 for row in connection.execute("SELECT * FROM source_destination_assignments").fetchall()
             }
+            self._check_snapshot(connection, list(current_rows.values()), expected_token)
             for payload, item in zip(assignments, parsed):
-                expected = payload.get("expected_revision", payload.get("revision"))
-                if expected in (None, ""):
-                    continue
+                expected = payload.get("expected_revision", payload.get("revision", _UNSPECIFIED_REVISION))
                 current = current_rows.get((item.search_source_id, item.category_key))
-                actual = int(current["revision"]) if current is not None else None
-                if actual != int(expected):
-                    raise AssignmentConflictError(
-                        f"assignment {item.search_source_id}/{item.category_key} revision conflict: "
-                        f"expected {expected}, actual {actual}"
-                    )
+                self._check_revision(expected, current, item.search_source_id, item.category_key)
 
             desired_keys = {(item.search_source_id, item.category_key) for item in parsed}
             for item in parsed:
@@ -254,7 +336,8 @@ class SourceAssignmentService:
         destination_id: str,
         *,
         enabled: bool = True,
-        expected_revision: int | None = None,
+        expected_revision: Any = _UNSPECIFIED_REVISION,
+        expected_token: str | None = None,
     ) -> SourceDestinationAssignment:
         item = SourceDestinationAssignment(
             search_source_id=str(search_source_id or "").strip(),
@@ -265,21 +348,20 @@ class SourceAssignmentService:
             updated_at=utc_now_iso(),
         )
         self._validate(item)
+        expected_token = self.validate_snapshot_token(expected_token)
         now = item.updated_at
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._ensure_history(connection)
+            self._check_snapshot(
+                connection, connection.execute("SELECT * FROM source_destination_assignments").fetchall(), expected_token,
+            )
             current = connection.execute(
                 "SELECT * FROM source_destination_assignments "
                 "WHERE search_source_id=? AND category_key=?",
                 (item.search_source_id, item.category_key),
             ).fetchone()
-            actual = int(current["revision"]) if current is not None else None
-            if expected_revision is not None and actual != int(expected_revision):
-                raise AssignmentConflictError(
-                    f"assignment {item.search_source_id}/{item.category_key} revision conflict: "
-                    f"expected {expected_revision}, actual {actual}"
-                )
+            self._check_revision(expected_revision, current, item.search_source_id, item.category_key)
             if (
                 current is not None
                 and str(current["destination_id"]) == item.destination_id
@@ -332,22 +414,22 @@ class SourceAssignmentService:
         search_source_id: str,
         category_key: str,
         *,
-        expected_revision: int | None = None,
+        expected_revision: Any = _UNSPECIFIED_REVISION,
+        expected_token: str | None = None,
     ) -> bool:
+        expected_token = self.validate_snapshot_token(expected_token)
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._ensure_history(connection)
+            self._check_snapshot(
+                connection, connection.execute("SELECT * FROM source_destination_assignments").fetchall(), expected_token,
+            )
             row = connection.execute(
                 "SELECT revision FROM source_destination_assignments "
                 "WHERE search_source_id=? AND category_key=?",
                 (str(search_source_id), str(category_key)),
             ).fetchone()
-            actual = int(row["revision"]) if row is not None else None
-            if expected_revision is not None and actual != int(expected_revision):
-                raise AssignmentConflictError(
-                    f"assignment {search_source_id}/{category_key} revision conflict: "
-                    f"expected {expected_revision}, actual {actual}"
-                )
+            self._check_revision(expected_revision, row, search_source_id, category_key)
             cursor = connection.execute(
                 "DELETE FROM source_destination_assignments "
                 "WHERE search_source_id=? AND category_key=?",
@@ -398,19 +480,23 @@ class SourceAssignmentService:
         item = self.get_assignment(search_source_id, category_key)
         if item is None or not item.enabled:
             return None
-        target = self.target_service.get_target(item.destination_id)
+        return item.destination_id if self._target_is_ready(item.destination_id) else None
+
+    def _target_is_ready(self, destination_id: str) -> bool:
+        target = self.target_service.get_target(destination_id)
         if target is None or not target.enabled:
-            return None
+            return False
         try:
-            self.target_service.resolve_binding(item.destination_id, target.current_revision)
+            self.target_service.resolve_binding(destination_id, target.current_revision)
         except (TargetValidationError, TargetNotFoundError):
-            return None
-        return item.destination_id
+            return False
+        return True
 
     def matrix(self) -> dict[str, Any]:
+        snapshot = self.snapshot()
         assignments = {
             (item.search_source_id, item.category_key): item
-            for item in self.list_assignments()
+            for item in snapshot["assignments"]
         }
         rows: list[dict[str, Any]] = []
         sources = self.sources()
@@ -419,9 +505,7 @@ class SourceAssignmentService:
             for category_key in CATEGORY_KEYS:
                 item = assignments.get((source_id, category_key))
                 destination_id = item.destination_id if item and item.enabled else None
-                ready = bool(destination_id and self.resolve_destination(
-                    source_id, source["source_form"], category_key, "admin"
-                ))
+                ready = bool(destination_id and self._target_is_ready(destination_id))
                 cells.append(
                     {
                         "category_key": category_key,
@@ -436,6 +520,7 @@ class SourceAssignmentService:
             "sources": [{"search_source_id": key, **value} for key, value in sources.items()],
             "categories": list(CATEGORY_KEYS),
             "rows": rows,
+            "routing_token": snapshot["routing_token"],
         }
 
     def _parse(self, payload: dict[str, Any]) -> SourceDestinationAssignment:
@@ -486,6 +571,7 @@ def assignment_to_dict(item: SourceDestinationAssignment) -> dict[str, Any]:
 __all__ = [
     "AssignmentError",
     "AssignmentConflictError",
+    "AssignmentSnapshotRequiredError",
     "SEARCH_SOURCES",
     "SourceAssignmentService",
     "assignment_id",

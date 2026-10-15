@@ -783,7 +783,8 @@ class OrganizerService:
                             extra["organized_target_path"] = organized_target_path
                         if target_dirs:
                             extra["target_dirs"] = target_dirs
-                        v1_linked = self._has_linked_transfer_execution(task)
+                        linked_status = self._linked_completion_status(task)
+                        v1_linked = linked_status != JOB_DONE
                         if organizer_status == "skipped":
                             extra["organizer_skipped"] = True
                             recovery_message = (
@@ -797,12 +798,11 @@ class OrganizerService:
                                 if v1_linked
                                 else "服务重启后根据已完成的 Organizer 任务补写入库完成状态"
                             )
-                        linked_status = JOB_CONFIRMING if v1_linked else JOB_DONE
                         try:
                             recovered = self._sync_linked_job(
                                 task,
                                 status=linked_status,
-                                stage="confirming" if v1_linked else "done",
+                                stage=linked_status,
                                 message=recovery_message,
                                 extra=extra,
                             )
@@ -986,6 +986,9 @@ class OrganizerService:
             return False
         raw_data = job.get("raw_data") if isinstance(job, dict) and isinstance(job.get("raw_data"), dict) else {}
         completion = raw_data.get("completion") if isinstance(raw_data.get("completion"), dict) else {}
+        if status == JOB_DONE and "rollback" in completion:
+            completion = {key: value for key, value in completion.items() if key != "rollback"}
+            raw_data = {**raw_data, "completion": completion}
         payload = {
             "stage": stage,
             "official_save_path": completion.get("official_save_path") or (job or {}).get("target_path") or "",
@@ -997,6 +1000,8 @@ class OrganizerService:
             "message": message,
             **(extra or {}),
         }
+        if isinstance(completion.get("rollback"), dict) and status != JOB_DONE:
+            payload["rollback"] = completion["rollback"]
         updates = {
             "status": status,
             "error_message": error_message,
@@ -1240,7 +1245,42 @@ class OrganizerService:
         return self.db.organizer.get_organizer_task(task_id)
 
     def list_runs(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-        return self.db.organizer.list_organizer_runs(limit=limit, offset=offset)
+        runs = self.db.organizer.list_organizer_runs(limit=limit, offset=offset)
+        tasks: dict[int, dict[str, Any]] = {}
+        for run in runs:
+            summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+            if run.get("status") == "running" or summary.get("kind") == "rollback":
+                continue
+            task_id = int(run.get("task_id") or 0)
+            if task_id not in tasks:
+                tasks[task_id] = self.db.organizer.get_organizer_task(task_id) or {}
+            # Keep the existing UI's rollback button usable for an acknowledged
+            # retry whose move was reconciled as skipped instead of repeated.
+            run["undo_data"] = self._run_undo_with_recovery(run, tasks[task_id])
+        return runs
+
+    @staticmethod
+    def _run_undo_with_recovery(run: dict[str, Any], task: dict[str, Any]) -> list[dict[str, Any]]:
+        undo = list(run.get("undo_data") or [])
+        covered: set[str] = set()
+        for item in undo:
+            if not isinstance(item, dict):
+                continue
+            parts = (item.get("items") or []) if item.get("type") == "move_file_batch" else [item]
+            covered.update(
+                normalize_path(part.get("target_path") or "") for part in parts
+                if isinstance(part, dict) and (item.get("type") in {"move_file", "move_file_batch"})
+            )
+        recovered: list[dict[str, Any]] = []
+        for operation in reversed(task.get("operations") or []):
+            source = normalize_path(operation.get("source_path") or "")
+            if (
+                operation.get("run_id") == run.get("id") and operation.get("type") == "move_file"
+                and operation.get("status") in {"done", "skipped"} and source not in covered
+            ):
+                recovered.append({"type": "move_file", "source_path": operation.get("target_path"), "target_path": source})
+                covered.add(source)
+        return recovered + undo
 
     def create_manual_task(self, payload: dict[str, Any], *, defer_process: bool = False) -> dict[str, Any]:
         _ = payload, defer_process
@@ -1866,9 +1906,6 @@ class OrganizerService:
                 phase = str(getattr(execution, "phase", "") or "").strip().lower()
                 return execution is not None and phase not in {
                     "completed",
-                    "failed",
-                    "manual_review",
-                    "cancelled",
                 }
             except Exception:  # noqa: BLE001
                 pass
@@ -1881,12 +1918,29 @@ class OrganizerService:
                 phase = str((row["phase"] if row is not None else "") or "").strip().lower()
                 return bool(row is not None and phase not in {
                     "completed",
-                    "failed",
-                    "manual_review",
-                    "cancelled",
                 })
         except Exception:  # noqa: BLE001
             return False
+
+    def _linked_completion_status(self, task: dict[str, Any]) -> str:
+        if not self._has_linked_transfer_execution(task):
+            return JOB_DONE
+        repository = getattr(self, "_execution_repository", None)
+        if repository is None:
+            from ..transfer.execution_repository import TransferExecutionRepository
+
+            repository = TransferExecutionRepository(self.db)
+        resume = getattr(repository, "resume_after_organizer_completion", None)
+        if callable(resume):
+            try:
+                resume(int(task["job_id"]), int(task["id"]))
+                execution = repository.get(int(task["job_id"]))
+                if execution is not None and execution.phase in {"failed", "manual_review", "cancelled"}:
+                    return JOB_REVIEW
+            except Exception:  # noqa: BLE001 - completed Organizer is not an application ACK
+                logger.exception("organizer_transfer_completion_resume_failed task_id=%s", task.get("id"))
+                return JOB_REVIEW
+        return JOB_CONFIRMING
 
     def _validated_task_v1_plan(self, task: dict[str, Any]) -> dict[str, Any]:
         _job, plan, _rejection = self._task_v1_plan(task, reject=False)
@@ -1932,7 +1986,7 @@ class OrganizerService:
             if not isinstance(mapping, dict):
                 continue
             status = str(mapping.get("status") or "")
-            if status not in {"ready", "skipped_existing"}:
+            if status not in {"ready", "skipped_existing", "delete_ad"}:
                 continue
             source_path = normalize_path(mapping.get("source_path") or "")
             target_path = normalize_path(mapping.get("target_path") or "")
@@ -1944,6 +1998,10 @@ class OrganizerService:
                     "Organizer 映射来源路径越出冻结 organizer root："
                     f"mapping_id={mapping.get('id') or '<unknown>'}, source={source_path}, organizer_root={job_root or '<empty>'}"
                 )
+            if status == "delete_ad":
+                # Deletion has no final target, but its source must still be a
+                # file inside this task's immutable staging boundary.
+                continue
             if not final_root or not _is_child_path(target_path, final_root):
                 raise OpenListError(
                     "Organizer 映射目标路径越出冻结 destination_final："
@@ -2340,6 +2398,9 @@ class OrganizerService:
             }
         if str(task.get("status") or "") == "done":
             return {"success": True, "task_id": task_id, "status": "done", "message": "标准化任务已完成，无需重复扫描"}
+        recovery_conflict = self._mapping_recovery_conflict(task)
+        if recovery_conflict:
+            return recovery_conflict
         claimable_statuses = {
             "pending",
             "stabilizing",
@@ -2746,12 +2807,17 @@ class OrganizerService:
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer approve")
         if rejection:
             return rejection
+        rollback_conflict = _unfinished_rollback_conflict(task)
+        if rollback_conflict:
+            return rollback_conflict
         status = str(task.get("status") or "").strip().lower()
         if status in {"scanning", "executing"}:
             return {"success": False, "conflict": True, "message": f"任务正在{'扫描' if status == 'scanning' else '执行'}，不能修改或放行"}
         if status in {"done", "skipped", "cancelled"}:
             return {"success": False, "conflict": True, "message": f"任务已处于 {status}，不能再放行"}
         approved_mappings = [dict(mapping) for mapping in task.get("mappings") or []]
+        if not approved_mappings:
+            return {"success": False, "conflict": True, "message": "没有可确认的整理映射，请先重新识别"}
         blocked = [
             mapping
             for mapping in approved_mappings
@@ -2787,7 +2853,16 @@ class OrganizerService:
                 target_category,
                 include_auto_delete=True,
             )
+            operations = _preserve_completed_operations(operations, task.get("operations") or [])
             evidence = dict(task.get("evidence") or {}) if isinstance(task.get("evidence"), dict) else {}
+            evidence["manual_approval"] = {
+                "revision": expected_revision + 1,
+                "confirmed_at": _utc_now_text(),
+                "deletion_count": sum(item.get("status") == "delete_ad" for item in approved_mappings),
+            }
+            evidence["problem_summary"] = _mapping_problem_summary(
+                approved_mappings, max(float(task.get("confidence") or 0), 88), {}
+            )
             updated = self.db.organizer.update_organizer_mappings_and_plan(
                 task_id,
                 mapping_updates=mapping_updates,
@@ -2798,6 +2873,7 @@ class OrganizerService:
                 task_updates={
                     "status": "manual_confirmed",
                     "confidence": max(float(task.get("confidence") or 0), 88),
+                    "error_message": "",
                 },
                 clear_scan_lease=True,
             )
@@ -2841,7 +2917,7 @@ class OrganizerService:
             raise OpenListError(f"存在 {len(duplicates)} 个重复目标路径，不能批准")
 
     def skip_task(self, task_id: int) -> dict[str, Any]:
-        task = self.db.organizer.get_organizer_task(task_id, include_children=False)
+        task = self.db.organizer.get_organizer_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer skip")
@@ -2869,6 +2945,26 @@ class OrganizerService:
                     "success": False,
                     "conflict": True,
                     "message": f"任务已处于 {status}，不能再执行直通入库",
+                }
+            recovery_conflict = self._mapping_recovery_conflict(task)
+            if recovery_conflict:
+                return recovery_conflict
+            unconfirmed_run_ids = sorted({
+                run_id
+                for operation in task.get("operations") or []
+                if operation.get("type") == "move_file" and operation.get("status") == "failed"
+                if (run_id := _safe_positive_int(operation.get("run_id")))
+            })
+            if unconfirmed_run_ids:
+                return {
+                    "success": False,
+                    "conflict": True,
+                    "code": "MOVE_RESULT_UNCONFIRMED",
+                    "run_ids": unconfirmed_run_ids,
+                    "message": (
+                        f"run #{unconfirmed_run_ids[0]} 存在结果未确认的移动，不能重建直通计划。"
+                        "请先点击「重试」完成文件位置对账，再决定回滚或跳过整理。"
+                    ),
                 }
             try:
                 with self._task_openlist_scope(task, execution_plan, context="Organizer skip"):
@@ -2901,14 +2997,14 @@ class OrganizerService:
         # V1 Transfer owns final verification, ACK and cleanup.  Organizer
         # must leave the linked Job in a non-terminal state until that tail
         # phase completes; standalone legacy tasks may still report done.
-        linked_status = JOB_CONFIRMING if self._has_linked_transfer_execution(task) else JOB_DONE
+        linked_status = self._linked_completion_status(task)
         self._sync_linked_job(
             task,
             status=linked_status,
-            stage="confirming" if linked_status == JOB_CONFIRMING else "done",
+            stage=linked_status,
             message=(
                 "资源已位于正式分类目录，等待 Transfer 完成最终校验和清理"
-                if linked_status == JOB_CONFIRMING
+                if linked_status != JOB_DONE
                 else "资源已位于正式分类目录，已按管理员要求跳过命名整理"
             ),
             extra={"organizer_passthrough": False, "organizer_skipped": True},
@@ -3066,13 +3162,24 @@ class OrganizerService:
             "preserve_names": True,
             "skip_openlist_strm_refresh": True,
         }
-        evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
+        expected_revision = _safe_positive_int(task.get("revision"))
+        if not expected_revision:
+            raise OpenListError("Organizer 任务版本缺失")
+        evidence = dict(task.get("evidence")) if isinstance(task.get("evidence"), dict) else {}
+        evidence.pop("execution_approval", None)
+        # Choosing passthrough explicitly approves this replacement plan, not
+        # the previous plan whose approval belongs to an older revision.
+        evidence["manual_approval"] = {
+            "revision": expected_revision + 1,
+            "confirmed_at": now,
+            "deletion_count": 0,
+        }
         replaced = self.db.organizer.replace_organizer_plan(
             task_id,
             files=files,
             mappings=mappings,
             operations=operations,
-            expected_revision=_safe_positive_int(task.get("revision")),
+            expected_revision=expected_revision,
             expected_status=str(task.get("status") or ""),
             task_updates={
                 "status": "manual_confirmed",
@@ -3129,6 +3236,11 @@ class OrganizerService:
             return {"success": False, "message": f"标准化任务已{'取消' if status == 'cancelled' else '跳过'}，不再执行"}
         if status == "done":
             return {"success": True, "task_id": task_id, "status": "done", "message": "标准化任务已完成，无需重复执行"}
+        if _manual_approval_required(task):
+            return {
+                "success": False, "conflict": True, "task_id": task_id,
+                "status": status, "message": "整理计划正在扫描、尚未确认或已修改，请刷新后确认当前计划",
+            }
         blocked = [m for m in task.get("mappings") or [] if str(m.get("status")) in {"conflict", "need_edit"}]
         if blocked:
             if not self._update_organizer_task_from_snapshot(
@@ -3147,11 +3259,18 @@ class OrganizerService:
             # 必须把 run 持久化与任务进入 executing 放在同一个数据库 claim 中。
             # 否则进程若在后台线程真正开始前退出，启动恢复只能看到一个没有 run
             # 的 executing 任务，无法安全回收，会永久停留在“整理中”。
-            run_id, active_run = self._claim_organizer_run(task_id)
+            run_id, active_run = self._claim_organizer_run(
+                task_id, expected_revision=_safe_positive_int(task.get("revision")) or None
+            )
             if not run_id:
                 with self._background_apply_lock:
                     self._background_apply_tasks.discard(task_id)
                 current_status = str((active_run or {}).get("task_status") or "executing")
+                if (active_run or {}).get("conflict"):
+                    return {
+                        "success": False, "conflict": True, "task_id": task_id,
+                        "status": current_status, "message": "整理计划已变化，请刷新后确认当前计划",
+                    }
                 if current_status == "missing":
                     return {"success": False, "task_id": task_id, "message": "标准化任务不存在"}
                 if current_status == "done":
@@ -3315,15 +3434,25 @@ class OrganizerService:
                 ({**item, **updates} if int(item.get("id") or 0) == int(mapping_id) else dict(item))
                 for item in task_before.get("mappings") or []
             ]
+            recovery_conflict = self._mapping_recovery_conflict(task_before, updated_mappings)
+            if recovery_conflict:
+                return recovery_conflict
             try:
                 category = self.categories.get(str(task_before.get("category") or ""), {})
                 target_category = self._target_category_for_task(task_before, category)
                 operations = self._operations_for_mappings(
                     updated_mappings,
                     target_category,
-                    include_auto_delete=False,
+                    include_auto_delete=True,
                 )
+                operations = _preserve_completed_operations(operations, task_before.get("operations") or [])
+                operations = [op for op in operations if op.get("type") != "delete_file" or op.get("status") in {"done", "skipped"}]
                 evidence = dict(task_before.get("evidence") or {}) if isinstance(task_before.get("evidence"), dict) else {}
+                evidence.pop("manual_approval", None)
+                evidence.pop("execution_approval", None)
+                evidence["problem_summary"] = _mapping_problem_summary(
+                    updated_mappings, float(task_before.get("confidence") or 0), {}
+                )
                 episode_completeness = _episode_completeness_report(
                     str(task_before.get("category") or ""),
                     updated_mappings,
@@ -3339,6 +3468,7 @@ class OrganizerService:
                     evidence=evidence,
                     expected_status=str(task_before.get("status") or ""),
                     expected_revision=expected_revision,
+                    task_updates={"status": "waiting_review", "error_message": ""},
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -3425,6 +3555,10 @@ class OrganizerService:
             mapping_updates.append({"id": int(mapping["id"]), "updates": updates})
             updated_mappings.append(updated)
 
+        recovery_conflict = self._mapping_recovery_conflict(task, updated_mappings)
+        if recovery_conflict:
+            return recovery_conflict
+
         target_owners: dict[str, int] = {}
         for mapping in updated_mappings:
             target_path = str(mapping.get("target_path") or "").strip()
@@ -3444,8 +3578,15 @@ class OrganizerService:
             target_owners[target_key] = mapping_id
 
         try:
-            operations = self._operations_for_mappings(updated_mappings, target_category, include_auto_delete=False)
+            operations = self._operations_for_mappings(updated_mappings, target_category, include_auto_delete=True)
+            operations = _preserve_completed_operations(operations, task.get("operations") or [])
+            operations = [op for op in operations if op.get("type") != "delete_file" or op.get("status") in {"done", "skipped"}]
             evidence = dict(task.get("evidence") or {}) if isinstance(task.get("evidence"), dict) else {}
+            evidence.pop("manual_approval", None)
+            evidence.pop("execution_approval", None)
+            evidence["problem_summary"] = _mapping_problem_summary(
+                updated_mappings, float(task.get("confidence") or 0), {}
+            )
             episode_completeness = _episode_completeness_report(
                 str(task.get("category") or ""),
                 updated_mappings,
@@ -3466,6 +3607,7 @@ class OrganizerService:
                 evidence=evidence,
                 expected_status=str(task.get("status") or ""),
                 expected_revision=_safe_positive_int(task.get("revision")) or None,
+                task_updates={"status": "waiting_review", "error_message": ""},
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("organizer_batch_mapping_write_failed task_id=%s", task_id)
@@ -3481,6 +3623,60 @@ class OrganizerService:
             "message": f"已批量更新 {len(mapping_updates)} 条映射",
             "changed": len(mapping_updates),
             "task": self.db.organizer.get_organizer_task(task_id),
+        }
+
+    def _mapping_recovery_conflict(
+        self, task: dict[str, Any], mappings: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        pending = _unfinished_rollback_conflict(task)
+        if pending:
+            return pending
+        completed: dict[str, dict[str, Any]] = {}
+        getter = getattr(self.db.organizer, "list_organizer_runs_by_task_ids", None)
+        runs = getter([int(task["id"])]) if callable(getter) else []
+        # Run history survives older mapping edits that accidentally discarded
+        # completed operations. It is the authority for the file's last move.
+        for run in sorted(runs or [], key=lambda item: int(item.get("id") or 0)):
+            summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+            rollback = summary.get("rollback") if isinstance(summary.get("rollback"), dict) else {}
+            if summary.get("kind") == "rollback" or rollback.get("status") == "completed":
+                continue
+            for inverse in run.get("undo_data") or []:
+                if not isinstance(inverse, dict):
+                    continue
+                items = (inverse.get("items") or []) if inverse.get("type") == "move_file_batch" else [inverse]
+                for item in items:
+                    if not isinstance(item, dict) or (inverse.get("type") not in {"move_file", "move_file_batch"}):
+                        continue
+                    completed[normalize_path(item.get("target_path") or "")] = {
+                        "target_path": normalize_path(item.get("source_path") or ""), "run_id": run.get("id"),
+                    }
+        for op in task.get("operations") or []:
+            if op.get("type") == "move_file" and op.get("status") in {"done", "skipped"}:
+                completed.setdefault(normalize_path(op.get("source_path") or ""), op)
+        proposed = {normalize_path(item.get("source_path") or ""): item for item in mappings or []}
+        affected = [
+            value for source, value in completed.items()
+            if mappings is None or (
+                source in proposed and (
+                    normalize_path(proposed[source].get("target_path") or "") != normalize_path(value.get("target_path") or "")
+                    or str(proposed[source].get("status") or "") != "ready"
+                )
+            )
+        ]
+        if not affected:
+            return None
+        run_ids = sorted({_safe_positive_int(item.get("run_id")) for item in affected} - {None}, reverse=True)
+        paths = _dedupe_texts(str(item.get("target_path") or "") for item in affected)
+        run_label = "、".join(f"run #{value}" for value in run_ids)
+        recovery = (
+            f"请打开 Organizer「执行记录」，先对 {run_label} 点击「回滚」，完成后再修改或确认执行"
+            if run_ids else "请先将已移动文件安全恢复到本任务暂存目录后再重新识别；当前记录缺少可自动回滚的 run"
+        )
+        return {
+            "success": False, "conflict": True, "code": "MOVED_MAPPING_REQUIRES_ROLLBACK",
+            "message": f"文件已整理到 {paths[0] if paths else '最终目录'}，不能直接修改目标或重扫空暂存目录。{recovery}",
+            "rollback_run_ids": run_ids, "current_paths": paths,
         }
 
     def _recalculate_mapping_target_if_needed(self, mapping: dict[str, Any], updates: dict[str, Any], task: dict[str, Any], target_category: dict[str, Any]) -> str:
@@ -3574,10 +3770,23 @@ class OrganizerService:
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer apply")
         if rejection:
             return rejection
+        if not run_id and _manual_approval_required(task):
+            return {
+                "success": False, "conflict": True, "task_id": task_id,
+                "status": str(task.get("status") or "waiting_review"),
+                "message": "整理计划正在扫描、尚未确认或已修改，请刷新后确认当前计划",
+            }
         if not run_id:
-            run_id, active_run = self._claim_organizer_run(task_id)
+            run_id, active_run = self._claim_organizer_run(
+                task_id, expected_revision=_safe_positive_int(task.get("revision")) or None
+            )
             if not run_id:
                 current_status = str((active_run or {}).get("task_status") or "executing")
+                if (active_run or {}).get("conflict"):
+                    return {
+                        "success": False, "conflict": True, "task_id": task_id,
+                        "status": current_status, "message": "整理计划已变化，请刷新后确认当前计划",
+                    }
                 if current_status == "done":
                     return {
                         "success": True,
@@ -3906,6 +4115,31 @@ class OrganizerService:
                 self._sync_linked_job(task, status=JOB_REVIEW, stage="review", message=message, level=EVENT_WARN, error_message=message, extra={"confirmation": confirmation})
                 logger.warning("organizer_apply_confirm_failed task_id=%s message=%s", task_id, message)
                 return {"success": False, "task_id": task_id, "run_id": run_id, "message": message, "summary": summary}
+            if confirmation.get("cleanup_only"):
+                message = "广告清理完成，没有保留的视频文件，本次未入库"
+                task_evidence = {**task_evidence, "cleanup_only": True}
+                summary = {**summary, "cleanup_only": True}
+                self._finalize_organizer_run_and_task(
+                    run_id,
+                    task_id,
+                    run_status="done",
+                    task_status="done",
+                    summary=summary,
+                    undo_data=undo,
+                    evidence=task_evidence,
+                )
+                self._sync_linked_job(
+                    task,
+                    status=JOB_CANCELLED,
+                    stage="cancelled",
+                    message=message,
+                    extra={"cleanup_only": True, "confirmation": confirmation},
+                )
+                return {
+                    "success": True, "task_id": task_id, "run_id": run_id,
+                    "status": "done", "cleanup_only": True, "message": message,
+                    "summary": summary, "fnos_refresh_scheduled": False,
+                }
             # 标准目录确认后只触发一次 OpenList 文件夹刷新。OpenList 接受刷新
             # 即表示 Organizer 的职责完成；STRM 生成、同步及后续维护由 OpenList
             # 自己异步处理，不再阻塞入库任务终态。
@@ -3978,11 +4212,14 @@ class OrganizerService:
         finally:
             self.db.organizer.release_organizer_locks(run_id=run_id, lock_keys=acquired)
 
-    def _claim_organizer_run(self, task_id: int) -> tuple[int | None, dict[str, Any] | None]:
+    def _claim_organizer_run(
+        self, task_id: int, *, expected_revision: int | None = None
+    ) -> tuple[int | None, dict[str, Any] | None]:
         run_id, active_run = self.db.organizer.claim_organizer_run(
             task_id,
             owner_id=getattr(self, "owner_id", "organizer"),
             lease_seconds=self._organizer_run_lease_seconds(),
+            expected_revision=expected_revision,
         )
         return _safe_positive_int(run_id), active_run if isinstance(active_run, dict) else None
 
@@ -4132,6 +4369,30 @@ class OrganizerService:
         targets = _dedupe_texts(str(item.get("target_path") or "") for item in ready_mappings if str(item.get("target_path") or "").strip())
         video_targets = [path for path in targets if posixpath.splitext(basename(path))[1].lower() in VIDEO_EXTENSIONS]
         if not video_targets:
+            mappings = [item for item in task.get("mappings") or [] if isinstance(item, dict)]
+            deletions = [item for item in mappings if item.get("status") == "delete_ad"]
+            cleanup_only = bool(deletions) and all(item.get("status") in {"delete_ad", "skipped"} for item in mappings)
+            if cleanup_only:
+                evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
+                approval = evidence.get("manual_approval") if isinstance(evidence.get("manual_approval"), dict) else {}
+                if _safe_positive_int(approval.get("revision")) != _safe_positive_int(task.get("revision")) or not approval:
+                    return {
+                        "success": False, "cleanup_only": True,
+                        "message": "当前计划只删除广告、不保留视频，请确认后完成清理（不会标记为已入库）",
+                        "target_paths": targets,
+                    }
+                remaining = [
+                    str(item.get("source_path") or "") for item in deletions
+                    if not self._wait_for_openlist_absence(str(item.get("source_path") or ""))
+                ]
+                return {
+                    "success": not remaining, "cleanup_only": True,
+                    "message": "已确认广告文件删除完成，本次没有视频入库" if not remaining else "广告文件仍可见，请稍后继续确认清理结果",
+                    "deleted_count": len(deletions) - len(remaining),
+                    "confirmed_count": 0, "expected_count": 0,
+                    "confirmed_paths": [], "target_dirs": [], "organized_target_path": "",
+                    "failed": [{"path": path, "type": "deletion_pending", "message": "广告文件仍可见"} for path in remaining],
+                }
             return {"success": False, "message": "没有可确认的视频目标文件", "target_paths": targets}
         confirmed: list[str] = []
         failed: list[dict[str, Any]] = []
@@ -4175,6 +4436,10 @@ class OrganizerService:
         )
         if not matched_run:
             return {"success": False, "message": "运行记录不存在"}
+        summary = matched_run.get("summary") if isinstance(matched_run.get("summary"), dict) else {}
+        previous = summary.get("rollback") if isinstance(summary.get("rollback"), dict) else {}
+        if previous.get("status") == "completed":
+            return {"success": True, "already_rolled_back": True, "done": 0, "errors": []}
         task_id = _safe_positive_int(matched_run.get("task_id"))
         task = self.db.organizer.get_organizer_task(task_id) if task_id else None
         if not task:
@@ -4185,27 +4450,180 @@ class OrganizerService:
         )
         if rejection:
             return rejection
-        undo_items = matched_run.get("undo_data") or []
-        if not undo_items:
-            return {"success": True, "done": 0, "errors": []}
+        undo_items = self._run_undo_with_recovery(matched_run, task)
+        inverse_items: list[dict[str, Any]] = []
+        staging_root = normalize_path(task.get("openlist_root_path") or "")
+        final_root = normalize_path(self._v1_target_root(_plan or {}))
+        for inverse in undo_items:
+            if not isinstance(inverse, dict):
+                return {"success": False, "message": "回滚记录格式不正确，未执行文件操作"}
+            if inverse.get("type") == "move_file_batch":
+                items = inverse.get("items") if isinstance(inverse.get("items"), list) else []
+                if not items or any(not isinstance(item, dict) for item in items):
+                    return {"success": False, "message": "批量回滚记录为空或格式不正确"}
+                inverse_items.extend({**item, "type": "move_file"} for item in items)
+            else:
+                inverse_items.append(dict(inverse))
+        for inverse in inverse_items:
+            target = normalize_path(inverse.get("target_path") or "")
+            source = normalize_path(inverse.get("source_path") or "")
+            if inverse.get("type") == "move_file":
+                allowed = _is_child_path(source, final_root) and _is_child_path(target, staging_root)
+            else:
+                allowed = inverse.get("type") == "remove_empty_directory" and _is_child_path(target, final_root)
+            if not allowed:
+                return {"success": False, "conflict": True, "message": "回滚路径越出本任务冻结的暂存或最终目录，已拒绝执行"}
+        covered_sources = {
+            normalize_path(item.get("target_path") or "") for item in inverse_items if item.get("type") == "move_file"
+        }
+        if any(
+            op.get("run_id") == wanted_run_id and op.get("type") == "move_file" and op.get("status") == "failed"
+            and normalize_path(op.get("source_path") or "") not in covered_sources
+            for op in task.get("operations") or []
+        ):
+            return {
+                "success": False, "conflict": True,
+                "message": f"run #{wanted_run_id} 仍有移动结果未确认；请先对 task #{task_id} 点击「重试」完成位置对账，再从执行记录回滚对应运行",
+            }
+        if not inverse_items:
+            return {"success": True, "done": 0, "errors": [], "message": "本次没有可撤销的移动；已删除的广告无法恢复"}
+        rollback_run_id: int | None = None
         done = 0
-        errors = []
+        acquired: list[str] = []
         try:
             with self._task_openlist_scope(task, _plan or {}, context="Organizer rollback"):
-                for op in undo_items:
-                    try:
-                        self._execute_inverse(op)
+                rollback_run_id, claim = self.db.organizer.claim_organizer_rollback(
+                    wanted_run_id, owner_id=getattr(self, "owner_id", "organizer"),
+                    expected_revision=_safe_positive_int(task.get("revision")) or 1,
+                    lease_seconds=self._organizer_run_lease_seconds(), total_count=len(inverse_items),
+                    undo_data=inverse_items,
+                    target_paths=_dedupe_texts(
+                        str(item.get("source_path") or "") for item in inverse_items if item.get("type") == "move_file"
+                    ),
+                )
+                if not rollback_run_id:
+                    return claim
+                task = self.db.organizer.get_organizer_task(task_id) or task
+                done = int(claim.get("completed_count") or 0)
+                with OrganizerRunLease(
+                    repository=self.db.organizer, run_id=rollback_run_id,
+                    owner_id=getattr(self, "owner_id", "organizer"),
+                    lease_seconds=self._organizer_run_lease_seconds(),
+                    heartbeat_interval_seconds=self._organizer_run_heartbeat_interval(),
+                ) as lease:
+                    acquired = self._acquire_organizer_locks(
+                        task, rollback_run_id, self._lock_keys({**task, "operations": inverse_items}), lease=lease,
+                    )
+                    for inverse in inverse_items[done:]:
+                        self._ensure_task_active(task_id, allowed_statuses={"executing"})
+                        lease.ensure_owned()
+                        self._execute_rollback_inverse(inverse, staging_root, wanted_run_id, lease, task_id)
+                        lease.ensure_owned()
+                        if not self.db.organizer.update_organizer_rollback_progress(
+                            rollback_run_id, source_run_id=wanted_run_id,
+                            owner_id=getattr(self, "owner_id", "organizer"), completed_count=done + 1,
+                        ):
+                            raise OrganizerRunLeaseLost("回滚租约已失效，已停止后续文件操作")
                         done += 1
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(str(exc))
-                        break
+                    if not self.db.organizer.update_organizer_rollback_progress(
+                        rollback_run_id, source_run_id=wanted_run_id,
+                        owner_id=getattr(self, "owner_id", "organizer"), completed_count=done, status="completed",
+                    ):
+                        raise OrganizerRunLeaseLost("回滚完成状态未能落库，请继续该 run 的回滚以完成对账")
         except FrozenOpenListResolutionError as exc:
             return self._reject_frozen_openlist_task(
                 task,
                 context="Organizer rollback",
                 error=exc,
             )
-        return {"success": not errors, "done": done, "errors": errors}
+        except Exception as exc:  # noqa: BLE001
+            message = f"回滚尚未完成：{exc}；请在执行记录中继续回滚 run #{wanted_run_id}"
+            if rollback_run_id:
+                try:
+                    self.db.organizer.update_organizer_rollback_progress(
+                        rollback_run_id, source_run_id=wanted_run_id,
+                        owner_id=getattr(self, "owner_id", "organizer"), completed_count=done,
+                        status="failed", error_message=message,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("organizer_rollback_checkpoint_failed run_id=%s", rollback_run_id)
+            return {"success": False, "done": done, "errors": [str(exc)], "message": message, "run_id": wanted_run_id}
+        finally:
+            if rollback_run_id:
+                self.db.organizer.release_organizer_locks(run_id=rollback_run_id, lock_keys=acquired)
+        try:
+            self._sync_linked_guest_requests(int(task.get("job_id") or 0), status=JOB_REVIEW, organizer_task_id=task_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("organizer_rollback_guest_sync_failed task_id=%s", task_id, exc_info=True)
+        return {
+            "success": True, "done": done, "errors": [], "run_id": wanted_run_id, "rollback_run_id": rollback_run_id,
+            "message": "回滚完成，可修改或确认计划后重新执行；已删除的广告无法恢复",
+        }
+
+    def _execute_rollback_inverse(
+        self, inverse: dict[str, Any], staging_root: str, source_run_id: int,
+        lease: OrganizerRunLease, task_id: int,
+    ) -> None:
+        def ensure_active() -> None:
+            lease.ensure_owned()
+            self._ensure_task_active(task_id, allowed_statuses={"executing"})
+
+        target = normalize_path(inverse.get("target_path") or "")
+        if inverse["type"] == "remove_empty_directory":
+            if not self.openlist.exists(target) or self.openlist.list_dir(target, refresh=True):
+                return
+            ensure_active()
+            self.openlist.remove_empty_directory(target)
+            if not self._wait_for_openlist_absence(target):
+                raise RuntimeError(f"回滚目录清理结果尚不可见：{target}")
+            return
+        source = normalize_path(inverse.get("source_path") or "")
+        digest = hashlib.sha256(f"{source_run_id}|{source}|{target}".encode("utf-8")).hexdigest()[:20]
+        holding_dir = join_path(staging_root, f".organizer-rollback-{digest}")
+        held_source = join_path(holding_dir, basename(source))
+        held_target = join_path(holding_dir, basename(target))
+        locations = [path for path in _dedupe_texts([source, held_source, held_target, target]) if self.openlist.exists(path)]
+        if locations == [target]:
+            return  # The previous request succeeded but its reply/checkpoint was lost.
+        if len(locations) != 1:
+            raise RuntimeError(f"回滚文件存在冲突或位置不明，拒绝覆盖：{source} -> {target}")
+        current = locations[0]
+        item = self.openlist.get_item(current)
+        if item is not None and bool(getattr(item, "is_dir", False)):
+            raise RuntimeError(f"回滚只允许移动文件：{current}")
+        for path in _dedupe_texts([
+            *_create_dir_chain(dirname(target), dirname(staging_root)),
+            *_create_dir_chain(holding_dir, dirname(staging_root)),
+        ]):
+            if not self.openlist.exists(path):
+                ensure_active()
+                self.openlist.mkdir(path)
+                if not self._wait_for_openlist_path(path):
+                    raise RuntimeError(f"回滚暂存目录尚不可见：{path}")
+        if current == source:
+            ensure_active()
+            self.openlist.move(source, holding_dir, overwrite=False, skip_existing=True, merge=True)
+            if not self._wait_for_openlist_path(held_source) or not self._wait_for_openlist_absence(source):
+                raise RuntimeError(f"回滚暂存移动尚未确认：{source}")
+            current = held_source
+        if current != held_target:
+            ensure_active()
+            self.openlist.rename(current, basename(target), overwrite=False)
+            if not self._wait_for_openlist_path(held_target) or not self._wait_for_openlist_absence(current):
+                raise RuntimeError(f"回滚改名尚未确认：{current}")
+        ensure_active()
+        if self.openlist.exists(target):
+            raise RuntimeError(f"回滚目标已存在，拒绝覆盖：{target}")
+        self.openlist.move(held_target, dirname(target), overwrite=False, skip_existing=True, merge=True)
+        if not self._wait_for_openlist_path(target) or not self._wait_for_openlist_absence(held_target):
+            raise RuntimeError(f"回滚目标尚未确认：{target}")
+        try:
+            ensure_active()
+            self.openlist.remove_empty_directory(holding_dir)
+        except (OrganizerRunLeaseLost, OrganizerTaskCancelled):
+            raise
+        except Exception:  # noqa: BLE001
+            logger.debug("organizer_rollback_holding_cleanup_failed path=%s", holding_dir, exc_info=True)
 
     def _build_plan(
         self,
@@ -4254,6 +4672,8 @@ class OrganizerService:
             has_episodes,
             extra_queries=[item.get("query") for item in title_candidates],
         )
+        if tmdb_item:
+            confidence = max(confidence, tmdb_match_score)
         ai_suggestion: dict[str, Any] = {}
         ai_trace: dict[str, Any] = {"configured": self.ai.configured, "attempted": False, "used": False, "reason": ""}
         if (not tmdb_item or confidence < 75) and self.ai.configured:
@@ -4308,6 +4728,7 @@ class OrganizerService:
             )
             if ai_tmdb_item:
                 tmdb_item = ai_tmdb_item
+                tmdb_match_score = ai_tmdb_match_score or 0
         title = str((tmdb_item or {}).get("title") or ai_title or title_candidate or task_title_base or source_base or root_name).strip()
         year = str((tmdb_item or {}).get("year") or ai_suggestion.get("year") or year_candidate or "").strip()
         media_type = str((tmdb_item or {}).get("media_type") or ai_suggestion.get("media_type") or inferred_media_type)
@@ -4318,7 +4739,9 @@ class OrganizerService:
             # 例如 “H.265” 曾被误识别成 E265，导致电影落到 Season 01。
             media_type = "movie"
         if tmdb_item:
-            confidence = max(confidence, score_tmdb_result(title_candidate, year_candidate, category_key, tmdb_item, has_episodes))
+            # The accepted match may come from a clean filename or an alternate
+            # title, rather than the first (often noisy) share-title candidate.
+            confidence = max(confidence, tmdb_match_score, score_tmdb_result(title_candidate, year_candidate, category_key, tmdb_item, has_episodes))
             if ai_tmdb_match_score is not None:
                 # TMDB 已对 AI 校准标题做精确确认（≥85 才会返回命中），
                 # 该分数就是这次匹配的真实证据强度，计入总置信度。
@@ -4460,6 +4883,10 @@ class OrganizerService:
         operations = self._operations_for_mappings(mappings, target_category)
         blocked = [item for item in mappings if item["status"] in {"conflict", "need_edit"}]
         auto_delete_count = len([item for item in mappings if item["status"] == "delete_ad"])
+        auto_apply_confidence = float(self.organizer_config.get("auto_apply_confidence") or 85)
+        problem_summary = _mapping_problem_summary(
+            mappings, confidence, ai_suggestion, auto_apply_confidence=auto_apply_confidence
+        )
         episode_completeness = _episode_completeness_report(category_key, mappings)
         evidence = {
             "title": title,
@@ -4476,7 +4903,7 @@ class OrganizerService:
                 "message": "剧集类整理中，未识别集数且小于 50MB 的视频/压缩包判定为广告并自动彻底删除",
                 "count": auto_delete_count,
             },
-            "problem_summary": _mapping_problem_summary(mappings, confidence, ai_suggestion),
+            "problem_summary": problem_summary,
         }
         if episode_completeness:
             evidence["episode_completeness"] = episode_completeness
@@ -4486,13 +4913,13 @@ class OrganizerService:
             "tmdb_id": (tmdb_item or {}).get("id"),
             "tmdb_title": (tmdb_item or {}).get("title") or "",
             "tmdb_year": (tmdb_item or {}).get("year") or "",
-            "auto_applicable": confidence >= float(self.organizer_config.get("auto_apply_confidence") or 85) and not blocked and not bool(ai_suggestion.get("requires_review")),
+            "auto_applicable": confidence >= auto_apply_confidence and not blocked and not bool(ai_suggestion.get("requires_review")) and any(item["status"] == "ready" for item in mappings),
             "blocked_count": len(blocked),
             "auto_delete_count": auto_delete_count,
             "companion_file_count": len(companion_plan_files),
             "file_count": len(files),
             "operation_count": len(operations),
-            "problem_summary": _mapping_problem_summary(mappings, confidence, ai_suggestion),
+            "problem_summary": problem_summary,
             "evidence": evidence,
         }
         if episode_completeness:
@@ -4884,14 +5311,14 @@ class OrganizerService:
             evidence=task_evidence,
             raw_data=raw_data,
         )
-        linked_status = JOB_CONFIRMING if self._has_linked_transfer_execution(task) else JOB_DONE
+        linked_status = self._linked_completion_status(task)
         self._sync_linked_job(
             task,
             status=linked_status,
-            stage="confirming" if linked_status == JOB_CONFIRMING else "done",
+            stage=linked_status,
             message=(
                 "标准目录确认成功，等待 Transfer 完成最终校验、ACK 和清理"
-                if linked_status == JOB_CONFIRMING
+                if linked_status != JOB_DONE
                 else (
                     "标准目录确认成功，OpenList 文件夹刷新已触发，整理入库完成；STRM 由 OpenList 后台处理"
                     if completed_state
@@ -5899,7 +6326,14 @@ class OrganizerService:
                 raise SkipOperation("缺少源文件路径")
             if not self.openlist.exists(source):
                 raise SkipOperation("源文件已不存在，视为已删除")
+            get_item = getattr(self.openlist, "get_item", None)
+            if callable(get_item):
+                source_item = get_item(source)
+                if source_item is not None and bool(getattr(source_item, "is_dir", False)):
+                    raise RuntimeError(f"广告删除只允许文件，拒绝删除目录：{source}")
             self.openlist.remove_file(source)
+            if not self._wait_for_openlist_absence(source):
+                raise RuntimeError(f"删除后广告文件仍可见：{source}")
             return None
         raise RuntimeError(f"未知操作类型：{op_type}")
 
@@ -7452,7 +7886,64 @@ def _size_text(size: Any) -> str:
     return f"{value}B"
 
 
-def _mapping_problem_summary(mappings: list[dict[str, Any]], confidence: float, ai_suggestion: dict[str, Any]) -> dict[str, Any]:
+def _manual_approval_required(task: dict[str, Any]) -> bool:
+    status = str(task.get("status") or "")
+    if status in {"done", "executing", "cancelled", "skipped"}:
+        return False
+    if _unfinished_rollback_conflict(task) or status not in {"waiting_review", "failed", "manual_confirmed", "auto_approved"}:
+        return True
+    evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
+    approval = evidence.get("manual_approval") or evidence.get("execution_approval")
+    approval = approval if isinstance(approval, dict) else {}
+    if status in {"manual_confirmed", "auto_approved"} and not approval:
+        return False
+    revision = _safe_positive_int(task.get("revision"))
+    return not revision or _safe_positive_int(approval.get("revision")) != revision
+
+
+def _unfinished_rollback_conflict(task: dict[str, Any]) -> dict[str, Any] | None:
+    evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
+    rollback = evidence.get("rollback") if isinstance(evidence.get("rollback"), dict) else {}
+    if rollback.get("status") not in {"running", "failed"}:
+        return None
+    run_id = _safe_positive_int(rollback.get("run_id"))
+    return {
+        "success": False, "conflict": True, "code": "ROLLBACK_INCOMPLETE",
+        "message": f"run #{run_id} 的回滚尚未完成；请在 Organizer「执行记录」再次点击该 run 的「回滚」，完成后再修改或确认计划",
+        "rollback_run_ids": [run_id] if run_id else [],
+    }
+
+
+def _preserve_completed_operations(
+    operations: list[dict[str, Any]], previous: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    def identity(item: dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(item.get("type") or ""),
+            normalize_path(item.get("source_path") or ""),
+            normalize_path(item.get("target_path") or ""),
+        )
+
+    completed = {
+        identity(item): item for item in previous
+        if str(item.get("status") or "") in {"done", "skipped"}
+    }
+    result: list[dict[str, Any]] = []
+    for operation in operations:
+        old = completed.get(identity(operation))
+        if old and (old.get("raw_data") or {}) == (operation.get("raw_data") or {}):
+            operation = {
+                **operation,
+                **{key: old.get(key) for key in ("status", "run_id", "undo_data", "error_message")},
+            }
+        result.append(operation)
+    return result
+
+
+def _mapping_problem_summary(
+    mappings: list[dict[str, Any]], confidence: float, ai_suggestion: dict[str, Any],
+    *, auto_apply_confidence: float = 85,
+) -> dict[str, Any]:
     need_episode = [item for item in mappings if item.get("status") == "need_edit"]
     conflicts = [item for item in mappings if item.get("status") == "conflict"]
     auto_delete = [item for item in mappings if item.get("status") == "delete_ad"]
@@ -7462,9 +7953,14 @@ def _mapping_problem_summary(mappings: list[dict[str, Any]], confidence: float, 
     if conflicts:
         issues.append({"type": "conflict", "count": len(conflicts), "message": f"{len(conflicts)} 个文件目标路径冲突，需要确认是否同集多版本或改目标路径"})
     if auto_delete:
-        issues.append({"type": "auto_delete_ad", "count": len(auto_delete), "message": f"{len(auto_delete)} 个未识别集数且小于 50MB 的广告小文件已自动彻底删除，无需人工处理"})
-    if confidence < 75 or ai_suggestion.get("requires_review"):
-        issues.append({"type": "low_confidence", "count": 1, "message": "标题/TMDB/AI 置信度偏低，建议确认标准标题、年份和季号"})
+        issues.append({"type": "auto_delete_ad", "count": len(auto_delete), "message": f"{len(auto_delete)} 个文件计划按广告删除；确认执行后才会实际删除"})
+    if confidence < auto_apply_confidence or ai_suggestion.get("requires_review"):
+        message = (
+            f"识别置信度 {confidence:g}，低于自动整理阈值 {auto_apply_confidence:g}；请确认标准标题、年份和季号"
+            if confidence < auto_apply_confidence
+            else "AI 标记当前识别结果需要人工复核；请确认标准标题、年份和季号"
+        )
+        issues.append({"type": "low_confidence", "count": 1, "message": message})
     return {"count": sum(int(item.get("count") or 0) for item in issues), "issues": issues}
 
 

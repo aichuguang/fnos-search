@@ -214,7 +214,7 @@ def create_storage_setup_blueprint(context: StorageSetupBlueprintContext) -> Blu
 
     @protected
     def save_routes() -> Any:
-        return guarded(lambda: jsonify(service.save_routes(json_payload())))
+        return guarded(lambda: jsonify(service.save_routes(json_payload(), require_snapshot=True)))
 
     @protected
     def preflight() -> Any:

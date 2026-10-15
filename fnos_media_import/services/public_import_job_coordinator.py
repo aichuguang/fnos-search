@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .import_job_service import V1PlanningError
+from ..repositories.worker_task_repository import WorkerTaskConflictError
+from .import_job_service import PUBLIC_REQUEST_OWNER_KEY, V1PlanningError, public_request_owner
 
 
 @dataclass(frozen=True)
@@ -51,18 +52,25 @@ class PublicImportJobCoordinator:
         request_token: str,
         submit_payload: dict[str, Any],
         request_updates: dict[str, Any] | None = None,
+        retry_failed: bool = False,
+        connection: Any = None,
     ) -> PublicImportJobResult:
+        if retry_failed and (connection is None or not self.worker_dispatcher):
+            raise WorkerTaskConflictError("当前没有可用的持久化重试入口，未改变原提交")
         if self.worker_dispatcher:
             queued = self.worker_dispatcher.public_import_create(
                 guest_request_id=guest_request_id,
                 request_token=request_token,
                 submit_payload=submit_payload,
                 request_updates=request_updates,
+                **({"retry_failed": True, "connection": connection} if retry_failed else {}),
             )
             if queued:
                 queued_request = None
                 mark_queued = getattr(self.submission_service(), "mark_worker_queued", None)
-                if callable(mark_queued):
+                # Explicit recovery commits the request transition and queue
+                # reactivation together in the approval service transaction.
+                if callable(mark_queued) and not retry_failed:
                     queued_request = mark_queued(
                         guest_request_id,
                         worker_task_id=int(queued.get("worker_task_id") or 0),
@@ -77,6 +85,8 @@ class PublicImportJobCoordinator:
                     bind_outcome="queued",
                     rclone_start=None,
                 )
+        if retry_failed:
+            raise WorkerTaskConflictError("持久队列未接收重试请求，未改变原提交")
         return self.execute_inline(
             guest_request_id=guest_request_id,
             request_token=request_token,
@@ -140,11 +150,31 @@ class PublicImportJobCoordinator:
                 compensation_request = current_request
         try:
             imports = self.import_service()
-            creator = getattr(imports, "create_internal_import_job", None)
-            if not callable(creator):
-                creator = imports.create_import_job
-            result = creator(payload)
+            creator = getattr(imports, "create_public_request_import_job", None)
+            if callable(creator):
+                result = creator(payload, request_token=request_token)
+            else:
+                creator = getattr(imports, "create_internal_import_job", None)
+                if not callable(creator):
+                    creator = imports.create_import_job
+                result = creator(payload)
             job = result.get("job") if isinstance(result.get("job"), dict) else {}
+            if not job.get("id"):
+                if result.get("retryable") is True and not mark_failure:
+                    return self._retryable_recovery_failure(
+                        result=result, job=job, request_item=None,
+                        message=str(result.get("message") or "创建入库任务暂时失败，稍后重试"),
+                        bind_outcome="creation_retryable",
+                    )
+                return self._planning_failed_result(
+                    guest_request_id=guest_request_id,
+                    request_item=None,
+                    error=V1PlanningError(
+                        str(result.get("message") or "创建入库任务未返回有效任务"),
+                        code=str(result.get("error_code") or "PLANNING_FAILED"),
+                    ),
+                    mark_failure=True,
+                )
             # The creation service returns the server-generated durable identity.
             expected_idempotency_key = str(
                 result.get("idempotency_key") or job.get("idempotency_key") or ""
@@ -152,6 +182,7 @@ class PublicImportJobCoordinator:
             owned_by_request = (
                 bool(expected_idempotency_key)
                 and str(job.get("idempotency_key") or "") == expected_idempotency_key
+                and _owned_by_public_request(job, request_token)
             )
             newly_created = result.get("created") is True and owned_by_request
             idempotent_retry = result.get("created") is False and owned_by_request
@@ -284,6 +315,7 @@ class PublicImportJobCoordinator:
                 job = result.get("job") if isinstance(result.get("job"), dict) else job
                 owned_by_request = (
                     str(job.get("idempotency_key") or "") == expected_idempotency_key
+                    and _owned_by_public_request(job, request_token)
                 )
                 if not owned_by_request:
                     return self._retryable_recovery_failure(
@@ -316,8 +348,8 @@ class PublicImportJobCoordinator:
 
             # A ``created=False`` result can mean either an exact replay of
             # this guest request or reuse of a same-resource job owned by
-            # somebody else.  Only the persisted idempotency key proves
-            # ownership.  ``start_rclone`` must remain job-idempotent because
+            # somebody else. Only the persisted request owner proves
+            # ownership. ``start_rclone`` must remain job-idempotent because
             # an earlier attempt may have started dispatch and crashed before
             # binding the guest request.
             manual_provider_review = bool(
@@ -353,6 +385,13 @@ class PublicImportJobCoordinator:
                 success=bool(result.get("success", True)),
                 request_updates=request_updates,
             )
+            if bind_outcome == "job_state_conflict":
+                return self._planning_failed_result(
+                    guest_request_id=guest_request_id,
+                    request_item=bound_request,
+                    error=V1PlanningError("正式任务已取消或拒绝，未绑定当前提交，请重新提交资源"),
+                    mark_failure=True,
+                )
             if bind_outcome != "bound":
                 self.warn(
                     "guest request job bind skipped: request_id=%s outcome=%s job_id=%s",
@@ -387,7 +426,9 @@ class PublicImportJobCoordinator:
                 guest_request_id=guest_request_id,
                 request_item=None,
                 error=exc,
-                mark_failure=mark_failure,
+                # This is a terminal business failure even on the first
+                # worker attempt; no later attempt will project its status.
+                mark_failure=True,
             )
         except Exception as exc:
             if mark_failure:
@@ -586,6 +627,24 @@ class PublicImportJobCoordinator:
             else job
         )
         if not (isinstance(compensation, dict) and compensation.get("cancelled") is True):
+            if isinstance(compensation, dict) and compensation.get("bound_elsewhere"):
+                return PublicImportJobResult(
+                    result={
+                        **result,
+                        "success": True,
+                        "worker_outcome": "completed",
+                        "job_retained_for_bound_request": True,
+                        "cancelled": False,
+                        "retryable": False,
+                        "terminal": True,
+                        "message": str(compensation.get("message") or "共享任务已有绑定提交，跳过取消补偿"),
+                    },
+                    job=cancelled_job,
+                    public_status=public_status,
+                    bound_request=request_item,
+                    bind_outcome=bind_outcome,
+                    rclone_start=rclone_start,
+                )
             latest_status = _normalized_status(cancelled_job.get("status"))
             compensation_message = str(
                 (compensation or {}).get("message") if isinstance(compensation, dict) else ""
@@ -695,6 +754,12 @@ class PublicImportJobCoordinator:
 
 def _normalized_status(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _owned_by_public_request(job: dict[str, Any], request_token: str) -> bool:
+    raw = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
+    owner = public_request_owner(request_token)
+    return bool(owner) and raw.get(PUBLIC_REQUEST_OWNER_KEY) == owner
 
 
 def _positive_job_id(job: dict[str, Any]) -> int:

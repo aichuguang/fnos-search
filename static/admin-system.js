@@ -133,15 +133,15 @@
             const total = Number(summary.cleanup_total || 0);
             const ok = await confirmDialog({
                 title: "清理历史记录",
-                message: `将删除 ${total} 条历史记录。\n会自动备份数据库，并保留定时追更订阅和来源。是否继续？`,
-                confirmText: "备份并清理",
+                message: `将直接删除 ${total} 条历史记录。\n定时追更订阅、来源和系统设置会保留。是否继续？`,
+                confirmText: "直接清理",
                 tone: "danger",
             });
             if (!ok) return;
             const data = await api("/api/admin/maintenance/cleanup-history", {
                 method: "POST",
-                body: JSON.stringify({ confirm: true, backup: true, vacuum: true }),
-                loadingMessage: "正在备份并清理历史记录...",
+                body: JSON.stringify({ confirm: true, backup: false, vacuum: true }),
+                loadingMessage: "正在清理历史记录...",
                 buttonLabel: "清理中...",
                 allowFailure: true,
             });

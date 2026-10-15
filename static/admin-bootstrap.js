@@ -1,6 +1,6 @@
 (function () {
     function create(context) {
-        const { state, getElement, api, toast, captureActionButton, loadOverview, loadRequests, loadJobs, loadUpdates, openUpdateEditor, runDueUpdates, loadTrending, runTrending, openTrendingScheduler, startRclone, stopRclone, checkRclone, loadRclone, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer, loadAdapters, loadMediaLibraries, refreshAllMedia, saveSettings, saveAllSettingsTransaction, saveProfile, uploadSiteLogo, saveSearchProviders, loadAdvancedConfig, saveAdvancedConfig, loadRcloneWebdavConfig, saveRcloneWebdavConfig, testRcloneWebdavConfig, exportAdvancedConfig, importAdvancedConfig, loadSecurityStatus, openAdvancedSecretManager, loadHistoryMaintenanceSummary, cleanupHistoryRecords, loadNotificationSettings, bindNotificationSettings, probeSixpan, testBtbtlaProxy, testOrganizerEndpoint, syncAdvancedDependencies, closeRawLogModal, startRcloneLivePolling } = context;
+        const { state, getElement, api, toast, captureActionButton, loadOverview, loadRequests, loadJobs, loadUpdates, openUpdateEditor, runDueUpdates, loadTrending, runTrending, openTrendingScheduler, startRclone, stopRclone, checkRclone, loadRclone, loadTransfers, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer, loadAdapters, loadMediaLibraries, refreshAllMedia, saveSettings, saveAllSettingsTransaction, saveProfile, uploadSiteLogo, saveSearchProviders, loadAdvancedConfig, saveAdvancedConfig, loadRcloneWebdavConfig, saveRcloneWebdavConfig, testRcloneWebdavConfig, exportAdvancedConfig, importAdvancedConfig, loadSecurityStatus, openAdvancedSecretManager, loadHistoryMaintenanceSummary, cleanupHistoryRecords, loadNotificationSettings, bindNotificationSettings, probeSixpan, testBtbtlaProxy, testOrganizerEndpoint, syncAdvancedDependencies, closeRawLogModal, startRcloneLivePolling } = context;
         const adminState = state;
         const $ = getElement;
 
@@ -14,6 +14,7 @@
                 media: loadMediaLibraries,
                 organizer: loadOrganizer,
                 rclone: loadRclone,
+                transfers: loadTransfers,
                 adapters: loadAdapters,
             }[name];
         }
@@ -281,6 +282,10 @@
             $("adminRcloneStopBtn")?.addEventListener("click", () => stopRclone().catch((error) => toast(error.message, "error")));
             $("adminRcloneCheckBtn")?.addEventListener("click", () => checkRclone().catch((error) => toast(error.message, "error")));
             $("loadRcloneBtn")?.addEventListener("click", () => loadRclone().catch((error) => toast(error.message, "error")));
+            $("loadTransfersBtn")?.addEventListener("click", () => loadTransfers().catch((error) => toast(error.message, "error")));
+            $("adminTransfersJobsBtn")?.addEventListener("click", () => activateTab("jobs"));
+            $("adminTransfersLogsBtn")?.addEventListener("click", () => activateTab("rclone"));
+            $("adminLogsTransfersBtn")?.addEventListener("click", () => activateTab("transfers"));
             $("taskLogSearchBtn")?.addEventListener("click", () => {
                 adminState.pagination.taskLogs.page = 1;
                 loadTaskLogs().catch((error) => toast(error.message, "error"));

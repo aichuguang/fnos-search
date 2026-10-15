@@ -4,13 +4,33 @@ import re
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+import requests
+
 from ..constants import JOB_FAILED, JOB_SUBMITTED
-from ..http_client import HttpClient, HttpJsonDecodeError
+from ..http_client import RETRYABLE_STATUS_CODES, HttpClient, HttpJsonDecodeError
 from ..media_path_rules import append_resource_dir, should_force_resource_dir
+from ..provider_errors import (
+    SHARE_INVALID_MESSAGE,
+    is_share_resource_unavailable,
+    provider_error_details,
+    share_error_details,
+)
 from .base import AdapterCheckResult, ImportResult
 
 class QuarkApiError(RuntimeError):
     """Raised when the Quark web API rejects a request."""
+
+    def __init__(
+        self, message: str, *, code: str = "", details: dict[str, Any] | None = None
+    ) -> None:
+        super().__init__(message)
+        self.code = str(code or getattr(type(self), "code", ""))
+        self.details = dict(details or {})
+        self.details = provider_error_details(self)
+
+
+class _QuarkSelectionError(QuarkApiError):
+    code = "SHARE_INVALID"
 
 
 class QuarkImporter:
@@ -144,11 +164,12 @@ class QuarkImporter:
                 or ""
             )
             suffix = f"：{identity}" if identity else ""
+            subject = str(data.get("uid") or data.get("user_id") or data.get("userId") or "").strip()
             return AdapterCheckResult(
                 True,
                 "ready",
                 f"夸克账号检测通过{suffix}",
-                {"identity_hint": identity} if identity else {},
+                {"identity_hint": identity, "identity_id": f"quark:uid:{subject}" if subject else ""},
             )
         except Exception as exc:  # noqa: BLE001
             return AdapterCheckResult(False, "probe_failed", f"夸克账号检测失败：{exc}")
@@ -196,15 +217,23 @@ class QuarkImporter:
                 "raw": detail,
             }
         except Exception as exc:  # noqa: BLE001
-            return False, {"success": False, "message": str(exc)}
+            details = provider_error_details(exc)
+            return False, {
+                "success": False, "message": str(exc),
+                "error_code": details["error_code"], "error_details": details,
+            }
 
     def list_files(self, pwd_id: str, fid: str, stoken: str) -> dict[str, Any]:
         if not self.cookie:
             return {"success": False, "message": self._configuration_message()}
         try:
-            return self._get_share_detail(pwd_id, fid or "0", stoken)
+            return self._get_share_detail(pwd_id, fid or "0", stoken, fetch_share=1)
         except Exception as exc:  # noqa: BLE001
-            return {"success": False, "message": f"夸克文件列表获取失败：{exc}"}
+            details = provider_error_details(exc)
+            return {
+                "success": False, "message": f"夸克文件列表获取失败：{exc}",
+                "error_code": details["error_code"], "error_details": details,
+            }
 
     def list_folders(self, parent_folder_id: str = "0") -> list[dict[str, Any]]:
         """List folders in the user's own Quark drive for the storage picker."""
@@ -253,11 +282,24 @@ class QuarkImporter:
         del category, pattern, replace
         if not self.cookie:
             return ImportResult(False, JOB_FAILED, self._configuration_message(), target_path=save_path)
-        selection = self._normalize_selection(quark_selection)
         try:
+            selection = self._normalize_selection(quark_selection)
             ok, checked = self.check_share(share_url, title, password=password)
             if not ok:
-                raise QuarkApiError(str(checked.get("message") or "夸克分享检查失败"))
+                raise QuarkApiError(
+                    str(checked.get("message") or "夸克分享检查失败"),
+                    code=str(checked.get("error_code") or ""),
+                    details=checked.get("error_details"),
+                )
+            selected = self._select_items(checked, selection)
+            if not selected:
+                raise _QuarkSelectionError("分享中没有可转存的文件，或所选文件已失效")
+            # One save retains the user's selected subtree as its context;
+            # descendant IDs/tokens remain explicit, never replaced by a folder.
+            source_parent_fid = (
+                self._file_item(selection.get("base_dir") or {})["fid"]
+                if selection["mode"] == "subdir_items" else "0"
+            )
             file_count = self._extract_file_count(checked)
             effective_path = (
                 append_resource_dir(save_path, title)
@@ -265,9 +307,6 @@ class QuarkImporter:
                 else save_path
             )
             target_fid = self._resolve_target_fid(effective_path)
-            selected = self._select_items(checked, selection)
-            if not selected:
-                raise QuarkApiError("分享中没有可转存的文件，或所选文件已失效")
             result = self._post(
                 "/1/clouddrive/share/sharepage/save",
                 {
@@ -276,7 +315,7 @@ class QuarkImporter:
                     "to_pdir_fid": target_fid,
                     "pwd_id": checked["pwd_id"],
                     "stoken": checked["stoken"],
-                    "pdir_fid": "0",
+                    "pdir_fid": source_parent_fid,
                     "scene": "link",
                 },
                 params={
@@ -314,6 +353,7 @@ class QuarkImporter:
                 JOB_FAILED,
                 f"夸克转存失败：{exc}",
                 target_path=save_path,
+                raw_data={"provider": "quark", **provider_error_details(exc)},
             )
 
     def materialize_resource(
@@ -424,9 +464,9 @@ class QuarkImporter:
                 timeout=self.timeout,
             )
         except HttpJsonDecodeError as exc:
-            raise QuarkApiError(
-                f"夸克 API 返回无效 JSON：HTTP {exc.status_code}"
-            ) from exc
+            raise self._invalid_json_error(exc, path=path) from exc
+        except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as exc:
+            raise self._transport_error(exc, path=path) from exc
         return self._validate_response(status, payload, path=path)
 
     def _post(
@@ -444,10 +484,35 @@ class QuarkImporter:
                 timeout=self.timeout,
             )
         except HttpJsonDecodeError as exc:
-            raise QuarkApiError(
-                f"夸克 API 返回无效 JSON：HTTP {exc.status_code}"
-            ) from exc
+            raise self._invalid_json_error(exc, path=path) from exc
+        except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as exc:
+            raise self._transport_error(exc, path=path) from exc
         return self._validate_response(status, value, path=path)
+
+    @staticmethod
+    def _transport_error(exc: BaseException, *, path: str) -> QuarkApiError:
+        return QuarkApiError(
+            str(exc), code="NETWORK_TRANSIENT",
+            details={"provider_path": urlparse(path).path, "exception_type": type(exc).__name__},
+        )
+
+    @staticmethod
+    def _invalid_json_error(exc: HttpJsonDecodeError, *, path: str) -> QuarkApiError:
+        message = f"夸克 API 返回无效 JSON：HTTP {exc.status_code}"
+        if is_share_resource_unavailable("quark", path=path, http_status=exc.status_code):
+            return QuarkApiError(
+                SHARE_INVALID_MESSAGE,
+                code="SHARE_INVALID",
+                details=share_error_details(
+                    "quark", path=path, http_status=exc.status_code,
+                    message=message,
+                ),
+            )
+        return QuarkApiError(
+            message,
+            code="NETWORK_TRANSIENT" if exc.status_code in RETRYABLE_STATUS_CODES else "INVALID_RESPONSE",
+            details={"http_status": exc.status_code, "provider_path": urlparse(path).path},
+        )
 
     @staticmethod
     def _validate_response(
@@ -456,25 +521,39 @@ class QuarkImporter:
         *,
         path: str = "",
     ) -> dict[str, Any]:
+        code = payload.get("code") if isinstance(payload, dict) else None
         if status in {401, 403}:
-            raise QuarkApiError("夸克 Cookie 已失效")
-        if status >= 400:
-            raise QuarkApiError(f"夸克 API HTTP {status}")
-        if not isinstance(payload, dict):
-            raise QuarkApiError("夸克 API 返回格式异常")
-        code = payload.get("code")
+            raise QuarkApiError("夸克 Cookie 已失效", code="AUTH_EXPIRED")
         if code in (40001, "40001"):
-            raise QuarkApiError("夸克 Cookie 已失效，请重新扫码登录")
+            raise QuarkApiError("夸克 Cookie 已失效，请重新扫码登录", code="AUTH_EXPIRED")
         # ``10000`` is overloaded: on a ``/share/`` path it means the share is
         # gone, everywhere else it means the cookie died.  Reporting a dead
         # share as an expired cookie sends the operator off to re-scan a QR
         # code that was never the problem.
-        if code in (41001, "41001", 41002, "41002", 41003, "41003") or (
-            code in (10000, "10000") and "/share/" in str(path or "")
+        message = QuarkImporter._extract_message(payload, f"夸克 API HTTP {status} code={code}")
+        if is_share_resource_unavailable(
+            "quark", path=path, http_status=status, code=code, message=message
         ):
-            raise QuarkApiError("夸克分享不存在或已失效，请重新搜索资源")
+            raise QuarkApiError(
+                SHARE_INVALID_MESSAGE,
+                code="SHARE_INVALID",
+                details=share_error_details(
+                    "quark", path=path, http_status=status, code=code, message=message,
+                ),
+            )
+        if status >= 400:
+            raise QuarkApiError(
+                f"夸克 API HTTP {status}",
+                code="NETWORK_TRANSIENT" if status in RETRYABLE_STATUS_CODES else f"HTTP_{status}",
+                details={
+                    "http_status": status, "provider_code": str(code if code is not None else ""),
+                    "provider_path": urlparse(path).path, "technical_message": message,
+                },
+            )
+        if not isinstance(payload, dict):
+            raise QuarkApiError("夸克 API 返回格式异常", code="INVALID_RESPONSE")
         if code in (10000, "10000"):
-            raise QuarkApiError("夸克 Cookie 已失效，请重新扫码登录")
+            raise QuarkApiError("夸克 Cookie 已失效，请重新扫码登录", code="AUTH_EXPIRED")
         # Quark's account endpoint uses the string ``OK`` for a successful
         # response, while other endpoints commonly use numeric ``0`` or a
         # ``success`` string.  Normalize only the documented success values;
@@ -482,7 +561,11 @@ class QuarkImporter:
         normalized_code = code.strip().lower() if isinstance(code, str) else code
         if normalized_code not in (None, 0, "0", "200", 200, "success", "ok"):
             raise QuarkApiError(
-                str(payload.get("message") or payload.get("msg") or f"夸克 API code={code}")
+                str(payload.get("message") or payload.get("msg") or f"夸克 API code={code}"),
+                details={
+                    "http_status": status, "provider_code": str(code if code is not None else ""),
+                    "provider_path": urlparse(path).path,
+                },
             )
         return payload
 
@@ -582,12 +665,12 @@ class QuarkImporter:
             rows = [row for row in rows if not self._file_item(row)["is_dir"]]
         elif mode == "subdir_items":
             base = selection.get("base_dir") if isinstance(selection.get("base_dir"), dict) else {}
-            base_fid = str(base.get("fid") or "")
+            base_fid = self._file_item(base)["fid"]
             if not base_fid:
-                raise QuarkApiError("未指定要展开的夸克文件夹")
+                raise _QuarkSelectionError("未指定要展开的夸克文件夹")
             listing = self.list_files(checked["pwd_id"], base_fid, checked["stoken"])
             if listing.get("success") is False:
-                raise QuarkApiError(str(listing.get("message") or "夸克子目录读取失败"))
+                raise QuarkApiError(f"夸克子目录读取失败：{listing.get('message') or '接口未返回有效列表'}")
             rows = self._select_subdir_rows(
                 checked,
                 base_fid,
@@ -596,31 +679,41 @@ class QuarkImporter:
             )
             selected_ids = set()
         if selected_ids:
+            available_ids = {self._file_item(row)["fid"] for row in rows}
+            if selected_ids - available_ids:
+                raise _QuarkSelectionError("所选夸克文件 ID 未匹配：条目已缺失、移动或类型变化，请重新确认选择；本次未提交转存")
             rows = [row for row in rows if str(self._file_item(row)["fid"]) in selected_ids]
+        if mode != "subdir_items":
+            rows = [{**row, "_selection_parent_fid": "0"} for row in rows]
         result: list[dict[str, str]] = []
         seen: set[str] = set()
         for row in rows:
             item = self._file_item(row)
             fid = str(item.get("fid") or "")
-            token = str(
-                self._find_first_value(
-                    row,
-                    {"share_fid_token", "fid_token", "fidToken", "shareFidToken"},
-                )
-                or ""
-            )
-            if fid and token and fid not in seen:
+            token = str(next((
+                row[key] for key in ("share_fid_token", "fid_token", "fidToken", "shareFidToken")
+                if row.get(key) not in (None, "")
+            ), "")).strip()
+            if not fid:
+                raise _QuarkSelectionError("所选夸克列表条目缺少文件 ID，请重新读取文件列表；本次未提交转存")
+            if not token:
+                raise _QuarkSelectionError("所选夸克文件的转存令牌缺失，请重新读取文件列表；本次未提交转存")
+            parent_fid = str(row.get("_selection_parent_fid") or "0")
+            if fid not in seen:
                 seen.add(fid)
-                result.append({"fid": fid, "fid_token": token})
+                result.append({"fid": fid, "fid_token": token, "pdir_fid": parent_fid})
         return result
 
-    @staticmethod
-    def _selection_ids(value: Any) -> set[str]:
-        return {
-            str(item.get("fid") or "")
-            for item in (value or [])
-            if isinstance(item, dict) and str(item.get("fid") or "")
-        }
+    @classmethod
+    def _selection_ids(cls, value: Any) -> set[str]:
+        if not isinstance(value, (list, tuple)) or not value:
+            raise _QuarkSelectionError("显式夸克选择不能为空，请至少选择一个有效条目")
+        ids: set[str] = set()
+        for item in value:
+            if not isinstance(item, dict) or not cls._file_item(item)["fid"]:
+                raise _QuarkSelectionError("夸克选择条目缺少有效文件 ID，不能退回整个分享")
+            ids.add(cls._file_item(item)["fid"])
+        return ids
 
     def _select_subdir_rows(
         self,
@@ -634,29 +727,23 @@ class QuarkImporter:
         - 带相对 path 的条目（支持多级目录）按 path 从 base 逐级查找。
         - 无 path 的条目回退到 base 直接子项按 fid 匹配（保持旧行为）。
         """
-        selected = [
-            item
-            for item in (selected_items or [])
-            if isinstance(item, dict) and str(item.get("fid") or "")
-        ]
-        if not selected:
-            return []
+        self._selection_ids(selected_items)
+        selected = list(selected_items)
         by_id = {str(self._file_item(row)["fid"]): row for row in base_rows}
+        listings = {base_fid: base_rows}
         result: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in selected:
-            fid = str(item.get("fid") or "")
+            fid = self._file_item(item)["fid"]
             path = str(item.get("path") or "").strip().strip("/")
             if path and "/" in path:
-                target = self._walk_to_fid(checked["pwd_id"], checked["stoken"], base_fid, path)
-                if target is not None:
-                    target_fid = str(self._file_item(target)["fid"] or "")
-                    if target_fid and target_fid not in seen:
-                        seen.add(target_fid)
-                        result.append(target)
-                continue
-            row = by_id.get(fid)
-            if row is not None and fid not in seen:
+                row = self._walk_to_fid(checked["pwd_id"], checked["stoken"], base_fid, path, listings=listings)
+            else:
+                found = by_id.get(fid)
+                row = {**found, "_selection_parent_fid": base_fid} if found is not None else None
+            if row is None or self._file_item(row)["fid"] != fid:
+                raise _QuarkSelectionError("所选夸克条目的路径与文件 ID 不再一致，或条目已缺失；本次未提交转存")
+            if fid not in seen:
                 seen.add(fid)
                 result.append(row)
         return result
@@ -667,30 +754,39 @@ class QuarkImporter:
         stoken: str,
         base_fid: str,
         path: str,
+        *,
+        listings: dict[str, list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any] | None:
         """从 base 目录按相对 path 逐级解析到目标文件行，支持任意层级。"""
         current = str(base_fid or "")
         current_row: dict[str, Any] | None = None
-        for segment in str(path or "").split("/"):
-            segment = str(segment or "").strip()
-            if not segment:
-                continue
+        segments = [segment.strip() for segment in str(path or "").split("/")]
+        if not segments or any(segment in {"", ".", ".."} for segment in segments):
+            raise _QuarkSelectionError("夸克选择路径无效，不能跨出已选父目录")
+        listings = listings if listings is not None else {}
+        for index, segment in enumerate(segments):
             if not current:
                 return None
-            listing = self.list_files(pwd_id, current, stoken)
-            if listing.get("success") is not True:
-                return None
+            if current not in listings:
+                listing = self.list_files(pwd_id, current, stoken)
+                # list_files has already validated Quark's code/status. Its
+                # real success payload has code=0 and no `success` boolean.
+                if listing.get("success") is False:
+                    raise QuarkApiError(f"夸克子目录读取失败：{listing.get('message') or '接口未返回有效列表'}")
+                listings[current] = self._extract_file_rows(listing)
             child = next(
                 (
                     row
-                    for row in self._extract_file_rows(listing)
+                    for row in listings[current]
                     if str(self._file_item(row).get("name") or "").strip() == segment
                 ),
                 None,
             )
             if child is None:
                 return None
-            current_row = child
+            if index < len(segments) - 1 and not self._file_item(child)["is_dir"]:
+                return None
+            current_row = {**child, "_selection_parent_fid": current}
             current = str(self._file_item(child).get("fid") or "")
             if not current:
                 return None
@@ -698,11 +794,15 @@ class QuarkImporter:
 
     @staticmethod
     def _normalize_selection(selection: dict[str, Any] | None) -> dict[str, Any]:
-        if not isinstance(selection, dict):
+        if selection is None or selection == {}:
             return {"mode": "all"}
-        mode = str(selection.get("mode") or "all")
+        if not isinstance(selection, dict):
+            raise _QuarkSelectionError("夸克选择格式无效，不能退回整个分享")
+        mode = str(selection.get("mode") or "all").strip().lower()
         if mode not in {"all", "root_dirs", "root_items", "subdir_items"}:
-            mode = "all"
+            raise _QuarkSelectionError("夸克选择模式无效，不能退回整个分享")
+        if mode == "all" and any(selection.get(key) for key in ("selected_dirs", "selected_items", "base_dir")):
+            raise _QuarkSelectionError("夸克选择缺少明确范围，不能把已选条目扩大为整个分享")
         return {**selection, "mode": mode}
 
     @classmethod
@@ -765,7 +865,7 @@ class QuarkImporter:
             or item.get("fileId")
             or item.get("id")
             or ""
-        )
+        ).strip()
         name = str(
             item.get("file_name")
             or item.get("fileName")
@@ -774,7 +874,10 @@ class QuarkImporter:
             or fid
             or "未命名文件"
         )
-        kind = str(item.get("file_type") or item.get("fileType") or item.get("type") or "").lower()
+        kind = str(next((
+            item[key] for key in ("file_type", "fileType", "type")
+            if item.get(key) not in (None, "")
+        ), "")).lower()
         dir_value = item.get("dir")
         is_dir = bool(
             dir_value in (True, 1, "1")

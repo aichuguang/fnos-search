@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +21,7 @@ from fnos_media_import.transfer import (
     ErrorCode,
     NativeLocator,
     OperationReceipt,
+    OperationStatus,
     OrganizeResult,
     PHASE_ACK_PENDING,
     PHASE_CANCELLED,
@@ -89,6 +90,9 @@ class TransferState:
     executor_strategy: str = ""
     cleanup: dict[str, Any] = field(default_factory=dict)
     submission_fence: dict[str, Any] = field(default_factory=dict)
+    submission_preflight: dict[str, Any] = field(default_factory=dict)
+    source_landing_evidence: dict[str, Any] = field(default_factory=dict)
+    last_submission_attempt: dict[str, Any] = field(default_factory=dict)
     organizer_task_id: int = 0
     organizer_final_path: str = ""
     # Durable asynchronous wait bookkeeping.  Keeping this in the execution
@@ -178,6 +182,9 @@ class TransferOrchestrator:
             "receipt": asdict(self.state.receipt) if self.state.receipt is not None else None,
             "cleanup": dict(self.state.cleanup),
             "submission_fence": dict(self.state.submission_fence),
+            "submission_preflight": dict(self.state.submission_preflight),
+            "source_landing_evidence": dict(self.state.source_landing_evidence),
+            "last_submission_attempt": dict(self.state.last_submission_attempt),
             "organizer_task_id": self.state.organizer_task_id,
             "organizer_final_path": self.state.organizer_final_path,
             "phase_wait_started_at": dict(self.state.phase_wait_started_at),
@@ -224,6 +231,9 @@ class TransferOrchestrator:
         self.state.executor_strategy = str(raw.get("executor_strategy") or "")
         self.state.cleanup = dict(raw.get("cleanup") or {})
         self.state.submission_fence = dict(raw.get("submission_fence") or {})
+        self.state.submission_preflight = dict(raw.get("submission_preflight") or {})
+        self.state.source_landing_evidence = dict(raw.get("source_landing_evidence") or {})
+        self.state.last_submission_attempt = dict(raw.get("last_submission_attempt") or {})
         try:
             self.state.organizer_task_id = int(raw.get("organizer_task_id") or 0)
         except (TypeError, ValueError):
@@ -265,6 +275,16 @@ class TransferOrchestrator:
 
     def mark_retry_ready(self) -> None:
         self.state.retry_ready = True
+
+    def prepare_submission(self) -> Any:
+        """Run only the executor's read-only transfer preflight, never submit here."""
+        if self.state.phase != PHASE_TRANSFERRING or self.state.receipt is not None:
+            raise TransferError(ErrorCode.INVALID_PLAN, "当前阶段不允许执行搬运前置校验")
+        executor = self._executor()
+        prepare = getattr(executor, "prepare_submission", None)
+        if not callable(prepare):
+            raise TransferError(ErrorCode.NO_EXECUTOR, "搬运执行器缺少只读提交前置校验")
+        return prepare()
 
     # ------------------------------------------------------------------
     # 主驱动
@@ -327,7 +347,7 @@ class TransferOrchestrator:
         return self._fail(TransferError(ErrorCode.INVALID_PLAN, f"未知阶段：{phase}"))
 
     def _wait_guard(self, phase: str) -> TransferStepResult | None:
-        """Bound asynchronous polling phases across process restarts."""
+        """Bound unresolved waits, not the runtime of a submitted transfer."""
 
         timeout = self.wait_timeouts.get(phase)
         if timeout is None:
@@ -346,6 +366,16 @@ class TransferOrchestrator:
                 started = now
                 self.state.phase_wait_started_at[phase] = now.isoformat(timespec="seconds")
         self.state.phase_wait_polls[phase] = int(self.state.phase_wait_polls.get(phase, 0) or 0) + 1
+        if (
+            phase == PHASE_TRANSFERRING
+            and self.state.receipt is not None
+            and str(self.state.receipt.operation_id or "").strip()
+        ):
+            # A large transfer can legitimately outlive this wait window.
+            # Poll the original receipt before deciding its outcome, including
+            # after a restart. Unknown/failed/cancelled results still use the
+            # normal safety paths; elapsed wall time is not failure evidence.
+            return None
         elapsed = max(0.0, (now - started).total_seconds())
         if elapsed < timeout:
             return None
@@ -463,7 +493,7 @@ class TransferOrchestrator:
             return self._fail(TransferError(ErrorCode.NO_EXECUTOR, "可见性等待阶段缺少执行器"))
         poller = getattr(executor, "wait_source_visible", None)
         if not callable(poller):
-            self.state.phase = PHASE_TRANSFERRING
+            self._handoff_source_landing(visible=False)
             return TransferStepResult(PHASE_TRANSFERRING, "无可见性检查，直接传输", finished=False)
         try:
             visibility = poller(self.state.receipt)
@@ -473,10 +503,7 @@ class TransferOrchestrator:
             return self._to_manual_review(f"OpenList 可见性检查异常：{exc}")
         status = _visibility_to_status(visibility)
         if status == VisibilityStatus.visible:
-            self.state.phase = PHASE_TRANSFERRING
-            # 物化 receipt 已完成使命：清空，让 transferring 阶段提交新的传输操作。
-            # 否则 transferring 会把「来源物化 receipt」误当作传输 receipt 去轮询。
-            self.state.receipt = None
+            self._handoff_source_landing(visible=True)
             return TransferStepResult(PHASE_TRANSFERRING, "来源 OpenList 可见且稳定", finished=False)
         if status == VisibilityStatus.missing:
             return self._handle_failure(
@@ -497,6 +524,30 @@ class TransferOrchestrator:
             finished=True,
             needs_wait=True,
         )
+
+    def _handoff_source_landing(self, *, visible: bool) -> None:
+        receipt = self.state.receipt
+        metadata = receipt.metadata if receipt is not None else {}
+        self.state.source_landing_evidence = {
+            "version": 1,
+            "job_id": self.plan.job_id,
+            "strategy": self.plan.strategy,
+            "plan_operation_key": self.plan.idempotency_key,
+            "operation_key": str(
+                metadata.get("operation_key") or metadata.get("idempotency_key")
+                or self.state.submission_fence.get("operation_key") or ""
+            ),
+            "receipt": asdict(receipt) if receipt is not None else None,
+            "submission_fence": dict(self.state.submission_fence),
+            "visible_at": datetime.now(timezone.utc).isoformat(timespec="seconds") if visible else None,
+            "visibility": "visible" if visible else "unchecked",
+        }
+        # The landing receipt/fence belong to the source side effect, not the
+        # subsequent copy. Keep that evidence but never poll it as a copy run.
+        self.state.receipt = None
+        self.state.submission_fence = {}
+        self.state.submission_preflight = {}
+        self.state.phase = PHASE_TRANSFERRING
 
     # ------------------------------------------------------------------
     # native_submitting / native_waiting
@@ -552,6 +603,7 @@ class TransferOrchestrator:
         except Exception as exc:  # noqa: BLE001
             return self._to_manual_review(f"原生轮询异常：{exc}")
         status = normalize_operation_status(status)
+        self._record_terminal_poll_result(receipt, status)
         if status.status == "completed":
             self.state.phase = PHASE_TARGET_VERIFYING
             return TransferStepResult(PHASE_TARGET_VERIFYING, "原生任务完成，进入目标校验", finished=False)
@@ -566,7 +618,9 @@ class TransferOrchestrator:
                 status.message or "原生任务失败",
                 retryable=self._code_retryable(status.error_code),
             )
-            return self._handle_failure(error, PHASE_NATIVE_WAITING)
+            # A confirmed terminal Provider failure is not a poll timeout.
+            # Retry the submission using its now-failed, still-scoped receipt.
+            return self._handle_failure(error, PHASE_NATIVE_SUBMITTING)
         return TransferStepResult(PHASE_NATIVE_WAITING, status.message or "原生任务进行中", finished=True, needs_wait=True)
 
     # ------------------------------------------------------------------
@@ -594,11 +648,11 @@ class TransferOrchestrator:
                 return self._handle_failure(self._receipt_error(receipt), PHASE_TRANSFERRING)
             if receipt.status == "unknown":
                 return self._to_manual_review("传输提交结果未知，保留来源")
-            if receipt.status == "completed":
+            if receipt.status == "completed" and not getattr(executor, "completion_requires_poll", False):
                 self.state.phase = PHASE_TARGET_VERIFYING
                 return TransferStepResult(PHASE_TARGET_VERIFYING, "传输已同步完成，进入目标校验", finished=False)
             return TransferStepResult(PHASE_TRANSFERRING, receipt.message or "传输已启动", finished=True, needs_wait=True)
-        if receipt.status == "completed":
+        if receipt.status == "completed" and not getattr(executor, "completion_requires_poll", False):
             self.state.phase = PHASE_TARGET_VERIFYING
             return TransferStepResult(PHASE_TARGET_VERIFYING, "传输已完成，进入目标校验", finished=False)
         try:
@@ -608,6 +662,7 @@ class TransferOrchestrator:
         except Exception as exc:  # noqa: BLE001
             return self._to_manual_review(f"传输轮询异常：{exc}")
         status = normalize_operation_status(status)
+        self._record_terminal_poll_result(receipt, status)
         if status.status == "completed":
             self.state.phase = PHASE_TARGET_VERIFYING
             return TransferStepResult(PHASE_TARGET_VERIFYING, "传输完成，进入目标校验", finished=False)
@@ -615,7 +670,10 @@ class TransferOrchestrator:
             self.state.phase = PHASE_CANCELLED
             return TransferStepResult(PHASE_CANCELLED, "传输已取消", finished=True)
         if status.status == "unknown":
-            return self._to_manual_review("传输结果未知，保留来源，进入人工复核")
+            return self._to_manual_review(
+                status.message or "传输结果未知，保留来源，进入人工复核",
+                error_code=status.error_code or ErrorCode.RESULT_UNKNOWN,
+            )
         if status.status == "failed":
             error = TransferError(
                 status.error_code or ErrorCode.NETWORK_TRANSIENT,
@@ -723,7 +781,17 @@ class TransferOrchestrator:
         if verifier is None:
             return self._to_manual_review("未配置目标校验器，无法确认目标")
         try:
-            result = self._invoke_verifier(verifier, descriptor=descriptor, native_target=native_target)
+            expected = self.plan.verification_expected()
+            verify_manifest = getattr(executor, "verify_copy_manifest", None)
+            if (
+                self.plan.strategy == "rclone_copy"
+                and int(expected["file_count"]) <= 0
+                and int(expected["total_size"]) <= 0
+                and callable(verify_manifest)
+            ):
+                result = verify_manifest(self.state.receipt)
+            else:
+                result = self._invoke_verifier(verifier, descriptor=descriptor, native_target=native_target)
         except TransferError as exc:
             if exc.code == ErrorCode.RESULT_UNKNOWN:
                 return self._to_manual_review(exc.message or "目标校验结果未知")
@@ -771,6 +839,19 @@ class TransferOrchestrator:
         if result.final_path:
             self.state.organizer_final_path = result.final_path
         if result.status == "done":
+            if result.cleanup_only:
+                self.state.phase = PHASE_CANCELLED
+                self.state.message = result.message or "广告清理完成，没有保留的视频文件，本次未入库"
+                self.state.error_code = ""
+                self.state.target_verified = False
+                self.state.final_verified = False
+                self.state.app_acked = False
+                self.state.cleanup = {
+                    "skipped": True,
+                    "cleanup_only": True,
+                    "reason": "仅完成已批准的广告清理，未执行入库 ACK 或额外来源/缓存清理",
+                }
+                return TransferStepResult(PHASE_CANCELLED, self.state.message, finished=True)
             self.state.phase = PHASE_FINAL_VERIFYING
             return TransferStepResult(PHASE_FINAL_VERIFYING, "整理完成，进入最终校验", finished=False)
         if result.status == "pending":
@@ -853,12 +934,29 @@ class TransferOrchestrator:
             and not native_target
         )
         try:
-            result = self._invoke_verifier(
-                verifier,
-                descriptor=descriptor,
-                native_target=native_target,
-                require_non_empty=counts_unknown,
-            )
+            verify_organized = getattr(self.organizer_service, "verify_final", None) if self.plan.organizer_enabled else None
+            verify_copy = getattr(executor, "verify_copy_manifest", None)
+            if callable(verify_organized):
+                result = verify_organized(
+                    self.plan,
+                    organizer_task_id=self.state.organizer_task_id,
+                    verifier=verifier,
+                )
+            elif (
+                not self.plan.organizer_enabled
+                and self.plan.strategy == "rclone_copy"
+                and int(expected["file_count"]) <= 0
+                and int(expected["total_size"]) <= 0
+                and callable(verify_copy)
+            ):
+                result = verify_copy(self.state.receipt, final=True)
+            else:
+                result = self._invoke_verifier(
+                    verifier,
+                    descriptor=descriptor,
+                    native_target=native_target,
+                    require_non_empty=counts_unknown,
+                )
         except Exception as exc:  # noqa: BLE001
             return self._to_manual_review(f"最终目录校验异常：{exc}")
         result = self._normalize_verify_result(result)
@@ -1002,7 +1100,42 @@ class TransferOrchestrator:
         self.state.phase_wait_polls.pop(retry_from, None)
         self.state.phase = retry_from
         if self._retry_resets_receipt(retry_from) and not self.state.preserve_receipt_on_retry:
-            self.state.receipt = None
+            receipt = self.state.receipt
+            if receipt is not None and receipt.status in {"failed", "cancelled"}:
+                fence = dict(self.state.submission_fence)
+                if fence:
+                    operation_key = self.plan.idempotency_key
+                    if retry_from == PHASE_SOURCE_MATERIALIZING:
+                        operation_key = f"landing:{operation_key}"
+                    elif retry_from == PHASE_TRANSFERRING and self.plan.strategy in _RELAY_UPLOAD_STRATEGIES:
+                        operation_key = f"relay-dl:{operation_key}"
+                    receipt_key = str(
+                        receipt.metadata.get("operation_key") or receipt.metadata.get("idempotency_key") or ""
+                    ).strip()
+                    if (
+                        fence.get("state") != "committed"
+                        or fence.get("phase") != retry_from
+                        or fence.get("operation_key") != operation_key
+                        or receipt_key != operation_key
+                    ):
+                        return self._to_manual_review(
+                            "失败回执与提交栅栏的阶段或操作身份不一致，已保留证据并停止重新提交",
+                            review_from=retry_from,
+                        )
+                    self.state.last_submission_attempt = {
+                        "version": 1,
+                        "job_id": self.plan.job_id,
+                        "phase": retry_from,
+                        "operation_key": operation_key,
+                        "plan_operation_key": self.plan.idempotency_key,
+                        "receipt": asdict(receipt),
+                        "submission_fence": fence,
+                        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    }
+                    self.state.submission_fence = {}
+                self.state.receipt = None
+            # Active, unknown or completed receipts remain authoritative. A
+            # transient poll error must not turn them into a fresh submission.
         self.state.preserve_receipt_on_retry = False
         return TransferStepResult(retry_from, "开始重试", finished=False)
 
@@ -1011,7 +1144,7 @@ class TransferOrchestrator:
         executor = self._executor()
         if receipt is not None and executor is not None and callable(getattr(executor, "poll", None)):
             try:
-                status = normalize_operation_status(executor.poll(receipt))
+                status = self._poll_for_cancel(executor, receipt)
                 normalized = status.status
                 if normalized == "cancelled":
                     self.state.phase = PHASE_CANCELLED
@@ -1091,12 +1224,12 @@ class TransferOrchestrator:
             PHASE_TRANSFERRING,
         }:
             try:
-                completed_status = normalize_operation_status(executor.poll(receipt))
+                completed_status = self._poll_for_cancel(executor, receipt)
                 if completed_status.status == "completed":
                     self.state.phase = PHASE_CANCELLED
                     return CancelResult(
                         "cancelled",
-                        "操作已完成但未通过目标校验，取消任务（目标可能残留文件，不做清理）",
+                        "外部操作已完成但未通过目标校验，取消任务（目标可能残留文件，不做清理）",
                         operation_id=receipt.operation_id,
                         phase=phase,
                     )
@@ -1154,6 +1287,24 @@ class TransferOrchestrator:
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
+    def _record_terminal_poll_result(self, receipt: OperationReceipt, status: OperationStatus) -> None:
+        if status.status in {"failed", "cancelled"}:
+            # Preserve the operation identity and metadata. Only a confirmed
+            # terminal status can provide evidence for a later scoped retry.
+            self.state.receipt = replace(
+                receipt,
+                status=status.status,
+                message=status.message or receipt.message,
+                error_code=status.error_code or receipt.error_code,
+            )
+
+    @staticmethod
+    def _poll_for_cancel(executor: Any, receipt: OperationReceipt) -> OperationStatus:
+        poll = getattr(executor, "poll_for_cancel", None)
+        if not callable(poll):
+            poll = executor.poll
+        return normalize_operation_status(poll(receipt))
+
     @staticmethod
     def _is_native_descriptor(descriptor: dict[str, Any] | None) -> bool:
         if not isinstance(descriptor, dict):
@@ -1305,6 +1456,7 @@ class TransferOrchestrator:
                 retryable=bool(value.get("retryable", True)),
                 task_id=int(value.get("task_id") or value.get("organizer_task_id") or 0),
                 final_path=str(value.get("final_path") or ""),
+                cleanup_only=value.get("cleanup_only") is True,
             )
         text = str(value or "").strip().lower()
         if text in {"done", "success", "completed"}:

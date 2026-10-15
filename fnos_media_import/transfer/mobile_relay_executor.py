@@ -29,7 +29,19 @@ from fnos_media_import.transfer import (
     TransferVerifyResult,
     UploadOutcome,
 )
+from fnos_media_import.transfer.relay_upload_manifest import (
+    merge_completed_upload_manifests,
+    selected_local_files,
+    validate_manifest_selection,
+    validate_relative_paths,
+    write_operation_manifest,
+)
 __all__ = ["CmccMobileUploader"]
+
+MOBILE_UPLOAD_UNCONFIRMED_MESSAGE = (
+    "检测到移动云上传记录，但成功结果尚未核实；"
+    "已暂停以避免重复上传，请保留原任务和现有文件。"
+)
 
 
 class CmccMobileUploader:
@@ -87,6 +99,7 @@ class CmccMobileUploader:
         target_locator: dict[str, str],
         idempotency_key: str = "",
         progress: Any = None,
+        relative_paths: list[str] | None = None,
     ) -> UploadOutcome:
         operation_key = str(idempotency_key or "").strip()
         if not operation_key:
@@ -102,12 +115,21 @@ class CmccMobileUploader:
         if not target_path and not target_parent_id:
             return UploadOutcome("failed", "移动云中继目标路径和父目录 ID 不能同时为空", error_code=ErrorCode.INVALID_PLAN)
 
-        files = self._list_local_files(local_dir)
-        if not files:
+        try:
+            selection = validate_relative_paths(local_dir, relative_paths) if relative_paths is not None else None
+        except TransferError as exc:
+            return UploadOutcome("failed", exc.message, error_code=exc.code)
+        files = self._list_local_files(local_dir) if selection is None else []
+        if selection is None and not files:
             return UploadOutcome("failed", f"中继目录为空或不存在：{local_dir}", error_code=ErrorCode.SOURCE_LANDING_UNAVAILABLE)
 
         manifest_path = self._operation_manifest_path(local_dir, operation_key)
-        manifest = self._read_operation_manifest(manifest_path)
+        invalid_manifest_file = os.path.lexists(manifest_path) and (
+            os.path.islink(manifest_path) or not os.path.isfile(manifest_path)
+        )
+        manifest = {} if invalid_manifest_file else self._read_operation_manifest(manifest_path)
+        if os.path.lexists(manifest_path) and (invalid_manifest_file or not manifest):
+            return UploadOutcome("unknown", "移动云上传回执无法读取，保留现场等待复核", error_code=ErrorCode.RESULT_UNKNOWN)
         target_fingerprint = json.dumps(
             {"path": target_path, "parent_file_id": target_parent_id},
             ensure_ascii=False,
@@ -117,6 +139,25 @@ class CmccMobileUploader:
             manifest.get("idempotency_key") != operation_key
             or manifest.get("target_fingerprint") != target_fingerprint
         )
+        interrupted = str(manifest.get("status") or "").lower() == "uploading"
+        if manifest and fresh_manifest:
+            return UploadOutcome(
+                "unknown" if interrupted else "failed", "中继上传幂等回执目标不一致",
+                error_code=ErrorCode.RESULT_UNKNOWN if interrupted else ErrorCode.INVALID_PLAN,
+            )
+        if manifest and (
+            type(manifest.get("version")) is not int or manifest["version"] != 1
+            or str(manifest.get("status") or "").lower() not in {"uploading", "completed"}
+        ):
+            return UploadOutcome("unknown", "移动云上传回执状态无法确认，保留现场等待复核", error_code=ErrorCode.RESULT_UNKNOWN)
+        if selection is not None and not fresh_manifest:
+            try:
+                validate_manifest_selection(manifest, selection)
+            except TransferError as exc:
+                return UploadOutcome(
+                    "unknown" if interrupted else "failed", exc.message,
+                    error_code=ErrorCode.RESULT_UNKNOWN if interrupted else exc.code,
+                )
         if fresh_manifest:
             manifest = {
                 "version": 1,
@@ -124,23 +165,34 @@ class CmccMobileUploader:
                 "target_fingerprint": target_fingerprint,
                 "status": "uploading",
                 "files": {},
+                "relative_paths": selection if selection is not None else [relative for _, relative, _ in files],
             }
         elif str(manifest.get("status") or "").lower() == "completed":
             records = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
             return UploadOutcome(
                 "done",
-                "移动云上传已按持久 fence 对账完成",
+                "移动云上传已根据现有回执确认完成",
                 file_count=sum(1 for item in records.values() if isinstance(item, dict) and item.get("success")),
                 total_size=sum(int(item.get("size") or 0) for item in records.values() if isinstance(item, dict) and item.get("success")),
             )
         elif str(manifest.get("status") or "").lower() == "uploading":
-            # The previous process may have crashed after the Provider call
-            # but before recording its response.  Do not submit the same
-            # operation again; an operator/provider reconcile is required.
-            return UploadOutcome("unknown", "移动云上传 fence 存在但结果未知")
+            # Only reconcile complete success receipts. Never call upload_file
+            # again: the original process may have lost its final checkpoint.
+            return self._reconcile_upload_fence(
+                manifest_path=manifest_path,
+                manifest=manifest,
+                target_path=target_path,
+                target_parent_id=target_parent_id,
+                relative_paths=selection,
+            )
+        if selection is not None:
+            try:
+                files = selected_local_files(local_dir, selection)
+            except TransferError as exc:
+                return UploadOutcome("failed", exc.message, error_code=exc.code)
         records = manifest.setdefault("files", {})
         if not self._write_operation_manifest(manifest_path, manifest):
-            return UploadOutcome("unknown", "无法持久化移动云上传 fence", error_code=ErrorCode.RESULT_UNKNOWN)
+            return UploadOutcome("unknown", "无法保存移动云上传记录，已暂停以避免重复上传", error_code=ErrorCode.RESULT_UNKNOWN)
         uploaded: list[CmccUploadResult] = []
         callback = progress or self.progress
         for full_path, relative_path, size in files:
@@ -193,6 +245,122 @@ class CmccMobileUploader:
         total_size = sum(int(item.size or 0) for item in uploaded)
         return UploadOutcome("done", "移动云上传完成", file_count=len(uploaded), total_size=total_size)
 
+    def _reconcile_upload_fence(
+        self,
+        *,
+        manifest_path: str,
+        manifest: dict[str, Any],
+        target_path: str,
+        target_parent_id: str,
+        relative_paths: list[str] | None,
+    ) -> UploadOutcome:
+        unknown = UploadOutcome("unknown", MOBILE_UPLOAD_UNCONFIRMED_MESSAGE, error_code=ErrorCode.RESULT_UNKNOWN)
+        records = manifest.get("files")
+        # Only the original persisted scope or the caller's frozen selection
+        # can prove completeness, never the set of files remaining on disk.
+        selected = manifest.get("relative_paths", relative_paths)
+        try:
+            selected = validate_relative_paths(os.path.dirname(manifest_path), selected)
+        except TransferError:
+            return unknown
+        if (
+            (relative_paths is not None and set(selected) != set(relative_paths))
+            or not isinstance(records, dict) or set(records) != set(selected)
+        ):
+            return unknown
+        file_ids: set[str] = set()
+        for relative, record in records.items():
+            result = record.get("result") if isinstance(record, dict) else None
+            if (
+                not isinstance(record, dict) or record.get("success") is not True
+                or type(record.get("size")) is not int or record["size"] < 0
+                or not isinstance(result, dict) or result.get("success") is not True
+                or result.get("status") not in ("done", "completed", "success")
+                or type(result.get("size")) is not int or result["size"] != record["size"]
+                or result.get("target_name") != posixpath.basename(relative)
+                or not isinstance(result.get("file_id"), str) or not result["file_id"].strip()
+                or not isinstance(result.get("parent_file_id"), str) or not result["parent_file_id"].strip()
+                or result["file_id"] in file_ids
+            ):
+                return unknown
+            file_ids.add(result["file_id"])
+
+        directories: dict[str, list[dict[str, Any]]] = {}
+
+        def lookup(parent_id: str, name: str) -> dict[str, Any]:
+            if parent_id not in directories:
+                entries = self.uploader.client.list_dir(parent_id)
+                if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+                    raise ValueError("invalid directory listing")
+                directories[parent_id] = entries
+            matches = [
+                item for item in directories[parent_id]
+                if str(item.get("name") or item.get("fileName") or "") == name
+            ]
+            return matches[0] if len(matches) == 1 else {}
+
+        def file_id(item: dict[str, Any]) -> str:
+            return str(item.get("file_id") or item.get("fileId") or item.get("id") or "")
+
+        def resolve(parent_id: str, path: str) -> str:
+            for segment in path.strip("/").split("/"):
+                if not segment:
+                    continue
+                if segment in {".", ".."} or "\\" in segment:
+                    return ""
+                item = lookup(parent_id, segment)
+                parent_id = file_id(item)
+                if not parent_id or not _item_is_dir(item):
+                    return ""
+            return parent_id
+
+        try:
+            root_id = target_parent_id or resolve("/", target_path)
+            if not root_id:
+                return unknown
+            for relative, record in records.items():
+                result = record["result"]
+                parent_id = resolve(root_id, posixpath.dirname(relative))
+                if not parent_id or result["parent_file_id"] != parent_id:
+                    return unknown
+                item = lookup(parent_id, posixpath.basename(relative))
+                size = item.get("size") if item.get("size") is not None else item.get("fileSize")
+                if (
+                    not item or _item_is_dir(item) or file_id(item) != result["file_id"]
+                    or isinstance(size, bool) or not isinstance(size, (int, str))
+                    or str(size) != str(record["size"])
+                ):
+                    return unknown
+        except Exception:  # noqa: BLE001 - failed observation never authorizes another upload
+            return UploadOutcome("unknown", "移动云上传回执只读核验失败，保留现场等待复核", error_code=ErrorCode.RESULT_UNKNOWN)
+
+        if self._read_operation_manifest(manifest_path) != manifest:
+            return unknown
+        completed = {**manifest, "status": "completed"}
+        if not self._write_operation_manifest(manifest_path, completed):
+            return UploadOutcome("unknown", "无法持久化移动云完成回执", error_code=ErrorCode.RESULT_UNKNOWN)
+        return UploadOutcome(
+            "done", "移动云上传已按逐文件回执只读对账完成，等待后续校验",
+            file_count=len(records), total_size=sum(record["size"] for record in records.values()),
+        )
+
+    def merge_upload_manifests(
+        self,
+        *,
+        local_dir: str,
+        idempotency_key: str,
+        file_operation_keys: list[str],
+    ) -> UploadOutcome:
+        return merge_completed_upload_manifests(
+            local_dir=local_dir,
+            idempotency_key=idempotency_key,
+            file_operation_keys=file_operation_keys,
+            provider_kind=self.provider_kind,
+            manifest_path=self._operation_manifest_path,
+            read_manifest=self._read_operation_manifest,
+            write_manifest=self._write_operation_manifest,
+        )
+
     def _call_upload_file(self, kwargs: dict[str, Any]) -> Any:
         method = getattr(self.uploader, "upload_file", None)
         if not callable(method):
@@ -215,22 +383,7 @@ class CmccMobileUploader:
 
     @staticmethod
     def _write_operation_manifest(path: str, value: dict[str, Any]) -> bool:
-        directory = os.path.dirname(path) or "."
-        try:
-            fd, temp_path = tempfile.mkstemp(prefix=".fnos-relay-upload-", suffix=".tmp", dir=directory)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(value, handle, ensure_ascii=False, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, path)
-            return True
-        except OSError:
-            try:
-                if "temp_path" in locals() and os.path.exists(temp_path):
-                    os.unlink(temp_path)
-            except OSError:
-                pass
-            return False
+        return write_operation_manifest(path, value)
 
     def _list_all_files(self, parent_id: str) -> list[dict[str, Any]]:
         """Recursively enumerate a Mobile Cloud directory when possible."""

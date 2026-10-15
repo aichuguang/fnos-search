@@ -531,10 +531,12 @@ class TianyiPublicFlowTests(unittest.TestCase):
         self.assertIn("tianyi_selection", workbench)
         self.assertEqual(template.count("20260809-v1-cutover-v001"), 1)
         self.assertEqual(request_template.count("20260809-v1-cutover-v001"), 2)
-        self.assertEqual(template.count("20260902-no-video-warn-v002"), 3)
-        self.assertEqual(request_template.count("20260902-no-video-warn-v002"), 3)
+        self.assertEqual(template.count("20260902-no-video-warn-v002"), 2)
+        self.assertEqual(request_template.count("20260902-no-video-warn-v002"), 2)
+        self.assertIn('/static/public-submit.js?v=20261012-quark-selection-v008', template)
+        self.assertIn('/static/public-submit.js?v=20261012-quark-selection-v008', request_template)
         self.assertIn(
-            "/static/resource-search-workbench.js?v=20260901-poster-v001",
+            "/static/resource-search-workbench.js?v=20261009-recovery-v001",
             admin_template,
         )
 

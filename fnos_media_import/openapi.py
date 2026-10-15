@@ -210,12 +210,17 @@ def get_openapi_spec() -> dict[str, Any]:
                 **_admin_delete("删除已完成或已取消的任务记录", parameters=[_path("job_id", "integer", "任务 ID")]),
             },
             "/api/admin/jobs/{job_id}/retry": _admin_post("管理员重试任务", parameters=[_path("job_id", "integer", "任务 ID")]),
+            "/api/admin/jobs/{job_id}/review": _admin_post(
+                "管理员核对未执行后恢复原任务；错误确认可能重复转存",
+                parameters=[_path("job_id", "integer", "任务 ID")],
+                request_body="TransferManualReviewRequest",
+            ),
             "/api/admin/jobs/{job_id}/cancel": _admin_post("管理员取消任务并清理源端/临时缓存", parameters=[_path("job_id", "integer", "任务 ID")], request_body="CancelRequest"),
             "/api/admin/jobs/batch-retry": _admin_post("管理员批量重试任务", request_body="BatchRetryRequest"),
             "/api/admin/media/refresh": _admin_post("管理员触发媒体库刷新", request_body="MediaRefreshRequest"),
             "/api/admin/rclone/status": _admin_get("管理员查询 rclone 状态"),
             "/api/admin/rclone/check": _admin_get("管理员检查 rclone 环境"),
-            "/api/admin/rclone/start": _admin_post("管理员启动 rclone 搬运", request_body="RcloneStartRequest"),
+            "/api/admin/rclone/start": _admin_post("旧版全局搬运入口已停用，返回 409；请在入库任务中继续或重试具体任务", request_body="RcloneStartRequest"),
             "/api/admin/rclone/stop": _admin_post("管理员停止 rclone 搬运"),
             "/api/admin/rclone/logs": _admin_get("管理员查询 rclone 日志", parameters=[_query("limit", "integer", "日志行数")]),
             "/api/admin/rclone/runs": _admin_get("管理员查询 rclone 运行记录", parameters=[_query("limit", "integer", "返回数量")]),
@@ -367,7 +372,7 @@ def get_openapi_spec() -> dict[str, Any]:
             },
             "schemas": {
                 "HealthResponse": _object({"ok": {"type": "boolean"}, "name": {"type": "string"}}),
-                "ErrorResponse": _object({"success": {"type": "boolean", "example": False}, "message": {"type": "string"}}),
+                "ErrorResponse": _object({"success": {"type": "boolean", "example": False}, "message": {"type": "string"}, "code": {"type": "string"}}),
                 "SearchRequest": _object(
                     {
                         "keyword": {"type": "string", "description": "搜索关键词"},
@@ -520,6 +525,15 @@ def get_openapi_spec() -> dict[str, Any]:
                         }
                     },
                     required=["job_ids"],
+                ),
+                "TransferManualReviewRequest": _object(
+                    {
+                        "action": {"type": "string", "enum": ["confirm_not_submitted"]},
+                        "confirmed": {"type": "boolean", "enum": [True], "description": "已核对来源暂存、目标目录及网盘任务列表，确认无本次文件及进行中操作"},
+                        "expected_row_version": {"type": "integer", "minimum": 1, "description": "任务详情返回的执行版本；过期返回 409"},
+                        "note": {"type": "string", "minLength": 1, "maxLength": 1000, "description": "实际核对的目录、任务列表及时间，保留审计"},
+                    },
+                    required=["action", "confirmed", "expected_row_version", "note"],
                 ),
                 "CancelRequest": _object(
                     {
@@ -685,8 +699,152 @@ def get_openapi_spec() -> dict[str, Any]:
     spec["paths"]["/api/admin/jobs/{job_id}"]["get"]["responses"]["200"][
         "content"
     ] = _json_ref("ImportJobDetailResponse")
+    _add_routing_snapshot_contract(spec)
+    _add_storage_account_selection_contract(spec)
+    spec["components"]["schemas"]["GuestRequestApprovalRequest"] = _object({
+        "title": {"type": "string", "description": "可选管理员修正标题"},
+        "category": {"type": "string", "description": "可选管理员修正分类"},
+        "retry": {
+            "type": "boolean", "default": False,
+            "description": "显式重试仅适用于 status=failed 且尚未关联 job_id 的提交。",
+        },
+    })
+    approval = spec["paths"]["/api/admin/requests/{request_id}/approve"]["post"]
+    approval["requestBody"] = {"required": False, "content": _json_ref("GuestRequestApprovalRequest")}
+    approval["description"] = "普通批准保持现有流程；retry=true 时重新校验原提交，沿用原 request_token，只允许重新激活 failed Worker。请求状态与入队在同一事务提交，不复活 completed/cancelled 或运行中的任务。"
+    approval["responses"].update({
+        "202": _response("已批准或明确重试，并加入持久化 Worker 队列。"),
+        "409": _response("提交已关联任务、状态已变化，或原 Worker 不再是 failed；未重新入队。", "ErrorResponse"),
+    })
     _complete_openapi_contract(spec)
     return spec
+
+
+def _add_routing_snapshot_contract(spec: dict[str, Any]) -> None:
+    schemas = spec["components"]["schemas"]
+    schemas["RoutingSnapshotToken"] = {
+        "type": "string", "pattern": "^routes-v1:[0-9a-f]{64}$",
+        "description": "从最近一次路由 GET 原样传回的不透明快照；保存后需重新读取，不要自行生成。",
+    }
+    token = {"$ref": "#/components/schemas/RoutingSnapshotToken"}
+    schemas["StorageSetupRoute"] = _object({
+        "search_source_id": {"type": "string"},
+        "default_destination_id": {"type": "string", "nullable": True},
+        "overrides": {"type": "object", "additionalProperties": {"type": "string", "nullable": True}},
+        "assignment_revisions": {
+            "type": "object", "additionalProperties": {"type": "integer", "minimum": 1, "nullable": True},
+            "description": "各分类的读取版本；null 表示读取时尚不存在该规则。",
+        },
+    }, required=["search_source_id"])
+    schemas["SourceDestinationAssignmentInput"] = _object({
+        "search_source_id": {"type": "string"},
+        "category_key": {"type": "string"},
+        "destination_id": {"type": "string"},
+        "enabled": {"type": "boolean"},
+        "expected_revision": {"type": "integer", "minimum": 1, "nullable": True},
+    }, required=["search_source_id", "category_key", "destination_id"])
+    schemas["StorageSetupRoutesUpdateRequest"] = _object({
+        "routing_token": token,
+        "routes": {"type": "array", "items": {"$ref": "#/components/schemas/StorageSetupRoute"}},
+    }, required=["routing_token", "routes"])
+    schemas["SourceAssignmentsUpdateRequest"] = _object({
+        "routing_token": token,
+        "assignments": {"type": "array", "items": {"$ref": "#/components/schemas/SourceDestinationAssignmentInput"}},
+    }, required=["routing_token", "assignments"])
+    paths = spec["paths"]
+    for path, summary in (
+        ("/api/admin/storage-setup", "查询多网盘配置及完整路由快照"),
+        ("/api/admin/source-assignments", "查询来源分类规则及完整路由快照"),
+        ("/api/admin/routing-matrix", "查询来源目标能力矩阵及完整路由快照"),
+    ):
+        operation = _contract_operation(summary, path, admin=True)
+        operation["responses"]["200"] = {
+            "description": "配置快照，包含保存时必须原样提交的 routing_token",
+            "content": _json_schema(_object({"success": {"type": "boolean"}, "routing_token": token}, required=["routing_token"])),
+        }
+        paths.setdefault(path, {})["get"] = operation
+    for path, request_schema in (
+        ("/api/admin/storage-setup/routes", "StorageSetupRoutesUpdateRequest"),
+        ("/api/admin/source-assignments", "SourceAssignmentsUpdateRequest"),
+    ):
+        operation = _contract_operation("按完整快照安全替换来源分类规则", path, admin=True)
+        operation["description"] = "全量替换。创建、更新、删除均校验 routing_token；冲突不会写入任何变更。"
+        operation["requestBody"] = _body_ref(request_schema)
+        operation["responses"].update({
+            "409": _response("ASSIGNMENT_CONFLICT：快照陈旧或无效，请重新读取并核对，禁止盲目重试。", "ErrorResponse"),
+            "428": _response("ASSIGNMENT_SNAPSHOT_REQUIRED：缺少 routing_token，请先 GET 配置。", "ErrorResponse"),
+        })
+        paths.setdefault(path, {})["put"] = operation
+
+
+def _add_storage_account_selection_contract(spec: dict[str, Any]) -> None:
+    schemas = spec["components"]["schemas"]
+    selection_revision = {
+        "type": "integer", "minimum": 1, "nullable": True,
+        "description": "从 storage-setup.active_selections 的 Provider:default 条目原样提交；条目不存在时显式传 null。",
+    }
+    schemas["ProviderAccountSelectionSnapshot"] = _object({
+        "provider_kind": {"type": "string"},
+        "scope": {"type": "string"},
+        "account_id": {"type": "string"},
+        "account_revision": {"type": "integer", "minimum": 1},
+        "selection_revision": {"type": "integer", "minimum": 1},
+    }, required=["account_id", "account_revision", "selection_revision"])
+    schemas["StorageSetupAccountActivationRequest"] = {
+        **_object({
+            "account_id": {"type": "string"},
+            "activate": {"type": "boolean", "enum": [True], "default": True},
+            "expected_selection_revision": selection_revision,
+        }, required=["account_id", "expected_selection_revision"]),
+        "additionalProperties": False,
+        "description": "只切换已有账号，不允许同时传 name、config 或 credentials；不会重命名账号。",
+    }
+    schemas["StorageSetupAccountRenameRequest"] = {
+        **_object({
+            "account_id": {"type": "string"},
+            "name": {"type": "string"},
+            "activate": {"type": "boolean", "enum": [False]},
+        }, required=["account_id", "name", "activate"]),
+        "additionalProperties": False,
+        "description": "独立修改名称，必须显式 activate=false，不改变当前账号选择。",
+    }
+    schemas["StorageSetupManualAccountCreateRequest"] = {
+        **_object({
+            "provider_kind": {"type": "string"},
+            "name": {"type": "string"},
+            "config": {"type": "object"},
+            "credentials": {"type": "object", "writeOnly": True},
+            "activate": {"type": "boolean", "default": True},
+            "expected_selection_revision": selection_revision,
+        }, required=["provider_kind", "name"]),
+        "additionalProperties": False,
+        "anyOf": [
+            {"required": ["expected_selection_revision"]},
+            {"required": ["activate"], "properties": {"activate": {"enum": [False]}}},
+        ],
+        "description": "仅供未声明登录授权方式的 Provider；默认激活同样要求快照。已接入网盘须通过登录授权添加。",
+    }
+    schemas["StorageSetupAccountMutationRequest"] = {
+        "oneOf": [{"$ref": f"#/components/schemas/{name}"} for name in (
+            "StorageSetupAccountActivationRequest", "StorageSetupAccountRenameRequest", "StorageSetupManualAccountCreateRequest",
+        )],
+    }
+    snapshot = spec["paths"]["/api/admin/storage-setup"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    snapshot["properties"]["active_selections"] = {
+        "type": "object", "additionalProperties": {"$ref": "#/components/schemas/ProviderAccountSelectionSnapshot"},
+        "description": "按 Provider:scope 索引的当前账号选择快照，例如 quark:default；没有选择时无对应条目。",
+    }
+    snapshot["required"].append("active_selections")
+    path = "/api/admin/storage-setup/accounts"
+    operation = _contract_operation("按读取快照切换当前账号或独立修改名称", path, admin=True)
+    operation["requestBody"] = _body_ref("StorageSetupAccountMutationRequest")
+    operation["description"] = "激活必须提交调用者读取的 expected_selection_revision；缺省 activate=true。旧快照被拒绝，不会自动改用最新选择版本重试。"
+    operation["responses"].update({
+        "409": _response("SELECTION_CHANGED：账号选择已变化；或账号已停用/尚未检测通过。请刷新并核对。", "ErrorResponse"),
+        "422": _response("字段无效，或激活同时携带 name；未修改已有账号。", "ErrorResponse"),
+        "428": _response("ACCOUNT_SELECTION_SNAPSHOT_REQUIRED：激活缺少 expected_selection_revision。", "ErrorResponse"),
+    })
+    spec["paths"].setdefault(path, {})["post"] = operation
 
 
 def _complete_openapi_contract(spec: dict[str, Any]) -> None:

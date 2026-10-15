@@ -152,7 +152,7 @@ class AdminSettingsUiTests(unittest.TestCase):
 
     def test_provider_auth_script_cache_version_is_current(self) -> None:
         self.assertIn(
-            '/static/admin-storage-v1.js?v=20260901-poster-v001',
+            '/static/admin-storage-v1.js?v=20261011-storage-cas-v004',
             self.template,
         )
 

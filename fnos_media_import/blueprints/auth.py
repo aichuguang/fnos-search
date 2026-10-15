@@ -17,6 +17,7 @@ class AuthRouteContext:
     is_logged_in: Callable[[], bool]
     security_status: Callable[[], dict[str, Any]]
     admin_required: Callable[[Callable[..., Any]], Callable[..., Any]]
+    session_fingerprint: Callable[[], str]
 
 
 def create_auth_blueprint(context: AuthRouteContext) -> Blueprint:
@@ -32,7 +33,11 @@ def create_auth_blueprint(context: AuthRouteContext) -> Blueprint:
             return None
         expected = str(session.get("csrf_token") or "")
         supplied = str(request.headers.get("X-CSRF-Token") or request.form.get("csrf_token") or "")
-        if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+        try:
+            matches = hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
+        except UnicodeError:
+            matches = False
+        if not expected or not supplied or not matches:
             return jsonify({"success": False, "message": "CSRF token 校验失败"}), 403
         return None
 
@@ -42,12 +47,16 @@ def create_auth_blueprint(context: AuthRouteContext) -> Blueprint:
         if limited:
             return limited
         payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "message": "登录参数必须是 JSON 对象"}), 400
+        fingerprint = context.session_fingerprint()
         ok, expected_username = context.verify_password(str(payload.get("username") or "").strip(), str(payload.get("password") or ""))
-        if not ok:
+        if not ok or not hmac.compare_digest(fingerprint, context.session_fingerprint()):
             return jsonify({"success": False, "message": "用户名或密码错误"}), 401
         session.clear()
         session["admin_logged_in"] = True
         session["admin_username"] = expected_username
+        session["admin_auth_fingerprint"] = fingerprint
         session["csrf_token"] = secrets.token_urlsafe(32)
         session.permanent = True
         return jsonify({"success": True, "message": "登录成功", "user": context.admin_profile()})

@@ -14,6 +14,7 @@ from ..config_persistence import (
     persisted_config_from_settings,
 )
 from ..time_utils import utc_now_iso
+from ..repositories.update_repository import HistoryCleanupBlockedError
 
 
 logger = logging.getLogger(__name__)
@@ -52,9 +53,20 @@ class SettingsService:
         return {"success": True, "summary": self.deps.db.update.history_cleanup_summary()}, 200
 
     def cleanup_history(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        if not isinstance(payload, dict):
+            return {"success": False, "message": "清理参数必须是 JSON 对象"}, 400
         if not self.deps.payload_bool(payload, "confirm", False):
             return {"success": False, "message": "请先确认清理历史记录"}, 400
-        result = self.deps.db.update.cleanup_history_records(backup=self.deps.payload_bool(payload, "backup", True), vacuum=self.deps.payload_bool(payload, "vacuum", True), backup_prefix="app_before_history_cleanup")
+        try:
+            result = self.deps.db.update.cleanup_history_records(
+                backup=self.deps.payload_bool(payload, "backup", False),
+                vacuum=self.deps.payload_bool(payload, "vacuum", True),
+                backup_prefix="app_before_history_cleanup",
+            )
+        except HistoryCleanupBlockedError as exc:
+            return {
+                "success": False, "code": "HISTORY_CLEANUP_BUSY", "message": str(exc), "blockers": exc.blockers,
+            }, 409
         cleared_total = int(result.get("cleared_total") or 0)
         message = f"历史记录清理完成，已删除 {cleared_total} 条历史记录；定时追更订阅与来源已保留。"
         if result.get("backup", {}).get("path"):

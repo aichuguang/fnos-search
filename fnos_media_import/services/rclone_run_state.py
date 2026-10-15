@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..constants import RCLONE_RUN_FAILED, RCLONE_RUN_RUNNING, RCLONE_RUN_SUCCESS
+from ..constants import RCLONE_EXIT_LOCK_BUSY, RCLONE_RUN_FAILED, RCLONE_RUN_RUNNING, RCLONE_RUN_SUCCESS
 
 
 @dataclass
@@ -33,6 +33,16 @@ class RcloneRunState:
         self.last_finished_at = finished_at
         self.last_error = error
         self.status = RCLONE_RUN_SUCCESS if exit_code == 0 else RCLONE_RUN_FAILED
+        self.current_run_id = None
+        return run_id
+
+    def mark_deferred(self, error: str, finished_at: str) -> int | None:
+        """脚本因互斥锁被占用而未启动：既不是成功也不是失败，回到空闲等待重排。"""
+        run_id = self.current_run_id
+        self.last_exit_code = RCLONE_EXIT_LOCK_BUSY
+        self.last_finished_at = finished_at
+        self.last_error = error
+        self.status = "idle"
         self.current_run_id = None
         return run_id
 

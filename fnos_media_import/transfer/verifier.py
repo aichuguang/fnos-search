@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import posixpath
 from typing import Any
 
 from fnos_media_import.domain.models import (
@@ -76,6 +77,71 @@ class TransferVerifier:
 
     def __init__(self, target_lister: Any = None) -> None:
         self.target_lister = target_lister
+
+    def verify_manifest(
+        self,
+        *,
+        descriptor: dict[str, Any],
+        files: list[dict[str, Any]],
+    ) -> TransferVerifyResult:
+        """Verify this task's retained files, not totals in a shared library.
+
+        Each parent is listed once. Unrelated episodes, artwork and files from
+        other jobs cannot satisfy a missing mapping or affect the result.
+        """
+        if self.target_lister is None or not files:
+            return TransferVerifyResult("unknown", "缺少任务级最终文件清单或读取器", code=ErrorCode.RESULT_UNKNOWN)
+        grouped: dict[str, list[tuple[str, int | None]]] = {}
+        seen: set[str] = set()
+        try:
+            for item in files:
+                path = str(item["path"] or "").replace("\\", "/")
+                if not path.startswith("/") or ".." in path.split("/") or any(ord(ch) < 32 for ch in path):
+                    raise ValueError("invalid target path")
+                path = posixpath.normpath(path)
+                if path == "/" or path in seen:
+                    raise ValueError("empty or duplicate target")
+                seen.add(path)
+                size = None if item.get("size") is None else int(item["size"])
+                if size is not None and size < 0:
+                    raise ValueError("invalid expected size")
+                grouped.setdefault(posixpath.dirname(path), []).append((posixpath.basename(path), size))
+        except (KeyError, TypeError, ValueError):
+            return TransferVerifyResult("unknown", "任务级最终文件清单无效", code=ErrorCode.RESULT_UNKNOWN)
+        verified_count = verified_size = 0
+        for parent, expected in grouped.items():
+            try:
+                listing = self.target_lister({**descriptor, "path": parent, "include_file_manifest": True})
+                if not isinstance(listing, dict) or listing.get("unknown"):
+                    raise ValueError("target listing unavailable")
+                if not listing.get("exists"):
+                    return TransferVerifyResult("missing", f"最终目标目录不存在：{parent}", code=ErrorCode.VERIFY_MISMATCH)
+                entries = listing.get("files")
+                if not isinstance(entries, list):
+                    raise ValueError("target listing has no file manifest")
+                for name, expected_size in expected:
+                    matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("name") == name]
+                    if not matches or (len(matches) == 1 and matches[0].get("is_dir")):
+                        return TransferVerifyResult("missing", f"最终目标文件不存在：{parent}/{name}", code=ErrorCode.VERIFY_MISMATCH)
+                    if len(matches) != 1:
+                        raise ValueError("ambiguous target file")
+                    size = matches[0].get("size")
+                    size = None if size is None else int(size)
+                    if (size is not None and size < 0) or (size is None and expected_size is not None):
+                        raise ValueError("target file size unavailable")
+                    if expected_size is not None and size != expected_size:
+                        return TransferVerifyResult(
+                            "missing", f"最终目标文件大小不符：{parent}/{name}（{size} != {expected_size}）",
+                            code=ErrorCode.VERIFY_MISMATCH,
+                        )
+                    verified_count += 1
+                    verified_size += size or 0
+            except Exception as exc:  # noqa: BLE001 - unknown listings must never authorize cleanup
+                return TransferVerifyResult("unknown", f"最终文件清单查询失败：{exc}", code=ErrorCode.RESULT_UNKNOWN)
+        return TransferVerifyResult(
+            "ok", "任务级最终文件清单校验通过", file_count=verified_count, total_size=verified_size,
+            expected_file_count=len(files), expected_total_size=sum(int(item.get("size") or 0) for item in files),
+        )
 
     def verify(
         self,

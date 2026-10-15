@@ -9,6 +9,7 @@ from ..cmcc.auth import CmccAuthConfigError, CmccAuthProvider
 from ..cmcc.client import CmccApiError, CmccClient
 from ..constants import JOB_FAILED, JOB_SUBMITTED
 from ..media_path_rules import append_resource_dir, sanitize_resource_dir_name
+from ..provider_errors import provider_error_details
 from .base import AdapterCheckResult, ImportResult
 
 
@@ -89,6 +90,12 @@ class Cloud139Importer:
             # minimal read-only request so an expired or malformed Basic token
             # cannot be accepted as a healthy Provider account.
             client.list_dir("/", page_size=1, max_pages=1)
+            # This API scopes its authenticated request to account=<phone>.
+            # A successful scoped read proves this account identifier, unlike
+            # the editable account name or the generic configuration summary.
+            phone = str(client.phone or "").strip()
+            if phone.isdigit() and len(phone) == 11:
+                details["identity_id"] = f"mobile:account:{phone}"
         except Exception as exc:  # noqa: BLE001
             return AdapterCheckResult(False, "probe_failed", f"139 官方直转认证检测失败：{exc}", details)
         return AdapterCheckResult(True, "ready", "139 官方直转认证检测通过", details)
@@ -104,7 +111,11 @@ class Cloud139Importer:
             passcode = password or parsed_password
             items = self._cmcc().list_share_dir(link_id, password=passcode, pdir_fid=pdir)
         except (CmccApiError, CmccAuthConfigError, RuntimeError) as exc:
-            return False, {"success": False, "message": f"139 官方分享检测失败：{exc}", "provider": "cmcc_native"}
+            details = _cloud139_error_details(exc)
+            return False, {
+                "success": False, "message": f"139 官方分享检测失败：{exc}", "provider": "cmcc_native",
+                "error_code": details["error_code"], "error_details": details,
+            }
         share_title = title or "139 分享"
         normalized = [_normalize_share_item(item) for item in items]
         return True, {
@@ -132,7 +143,11 @@ class Cloud139Importer:
             pdir = _normalize_share_fid(fid) or pdir_fid or "root"
             items = [_normalize_share_item(item) for item in self._cmcc().list_share_dir(link_id, password=password or parsed_password, pdir_fid=pdir)]
         except (CmccApiError, CmccAuthConfigError, RuntimeError) as exc:
-            return {"success": False, "message": f"139 官方目录读取失败：{exc}", "items": [], "provider": "cmcc_native"}
+            details = _cloud139_error_details(exc)
+            return {
+                "success": False, "message": f"139 官方目录读取失败：{exc}", "items": [], "provider": "cmcc_native",
+                "error_code": details["error_code"], "error_details": details,
+            }
         return {
             "success": True,
             "message": "139 官方目录读取成功",
@@ -236,7 +251,11 @@ class Cloud139Importer:
                 JOB_FAILED,
                 f"139 官方直转失败：{exc}",
                 target_path=save_path,
-                raw_data={"selection": {"files": files, "folders": folders}, "default_full_share": default_full_share, "error": str(exc)},
+                raw_data={
+                    "selection": {"files": files, "folders": folders},
+                    "default_full_share": default_full_share, "error": str(exc),
+                    **_cloud139_error_details(exc),
+                },
             )
 
         task_res = save_result.get("createOuterLinkBatchOprTaskRes") if isinstance(save_result.get("createOuterLinkBatchOprTaskRes"), dict) else {}
@@ -370,6 +389,19 @@ class Cloud139Importer:
         if path.casefold() == root.casefold() or path.casefold().startswith(f"{root.casefold()}/"):
             return path
         return _join_cloud_path(root, path)
+
+
+def _cloud139_error_details(exc: BaseException) -> dict[str, Any]:
+    details = provider_error_details(exc)
+    code = details["error_code"]
+    if code and code not in {"SHARE_INVALID", "NETWORK_TRANSIENT", "AUTH_EXPIRED", "AUTH_CONFIG"}:
+        if not (code.startswith("HTTP_") and code[5:].isdigit()):
+            # CMCC business codes were previously diagnostics only.  Preserve
+            # the legacy retry fallback unless this change classified a known
+            # resource, transport or HTTP rejection.
+            details.setdefault("provider_code", code)
+            details["error_code"] = ""
+    return details
 
 
 def _normalize_share_item(item: dict[str, Any]) -> dict[str, Any]:

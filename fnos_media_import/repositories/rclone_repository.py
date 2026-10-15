@@ -426,27 +426,49 @@ class RcloneRepository:
             ).fetchone()
         return self._decode_run(row) if row is not None else None
 
-    def list_recoverable_scoped_rclone_runs(self, limit: int = 100) -> list[dict[str, Any]]:
+    def scoped_rclone_recovery_high_watermark(self) -> int:
+        with self._connection_factory() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM rclone_runs "
+                "WHERE operation_key IS NOT NULL AND operation_key <> ''"
+            ).fetchone()
+        return int(row[0])
+
+    def list_recoverable_scoped_rclone_runs(
+        self,
+        limit: int = 100,
+        *,
+        after_id: int = 0,
+        through_id: int | None = None,
+    ) -> list[dict[str, Any]]:
         with self._connection_factory() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM rclone_runs
                 WHERE operation_key IS NOT NULL AND operation_key <> ''
                   AND status IN ('queued', 'starting', 'running', 'recovering', 'cancel_pending')
+                  AND id > ? AND (? IS NULL OR id <= ?)
                 ORDER BY id ASC
                 LIMIT ?
                 """,
-                (max(1, int(limit or 100)),),
+                (max(0, int(after_id)), through_id, through_id, max(1, int(limit or 100))),
             ).fetchall()
         return [self._decode_run(row) for row in rows]
 
-    def mark_scoped_rclone_run_started(self, run_id: int) -> bool:
+    def mark_scoped_rclone_run_started(
+        self,
+        run_id: int,
+        *,
+        started_at: str | None = None,
+        expected_operation_key: str | None = None,
+    ) -> bool:
         now = utc_now()
         with self._connection_factory() as conn:
             cursor = conn.execute(
                 "UPDATE rclone_runs SET status='running', started_at=?, updated_at=? "
-                "WHERE id=? AND status IN ('queued','starting','recovering','running')",
-                (now, now, int(run_id)),
+                "WHERE id=? AND status IN ('queued','starting','recovering','running') "
+                "AND (? IS NULL OR COALESCE(operation_key, '')=?)",
+                (started_at or now, now, int(run_id), expected_operation_key, expected_operation_key),
             )
             return cursor.rowcount == 1
 
@@ -457,6 +479,9 @@ class RcloneRepository:
         *,
         error_message: str = "",
         terminal: bool = False,
+        expected_status: str | None = None,
+        expected_operation_key: str | None = None,
+        expected_started_at: str | None = None,
     ) -> bool:
         normalized = str(status or "").strip().lower()
         if normalized not in {
@@ -475,7 +500,9 @@ class RcloneRepository:
             cursor = conn.execute(
                 "UPDATE rclone_runs SET status=?, error_message=?, updated_at=?, "
                 "finished_at=CASE WHEN ? THEN ? ELSE finished_at END "
-                "WHERE id=?",
+                "WHERE id=? AND (? IS NULL OR status=?) "
+                "AND (? IS NULL OR COALESCE(operation_key, '')=?) "
+                "AND (? IS NULL OR started_at=?)",
                 (
                     normalized,
                     str(error_message or ""),
@@ -483,21 +510,45 @@ class RcloneRepository:
                     int(bool(terminal)),
                     now,
                     int(run_id),
+                    expected_status,
+                    expected_status,
+                    expected_operation_key,
+                    expected_operation_key,
+                    expected_started_at,
+                    expected_started_at,
                 ),
             )
             return cursor.rowcount == 1
 
-    def update_rclone_run(self, run_id: int, status: str, exit_code: int | None = None, error_message: str = "") -> None:
+    def update_rclone_run(
+        self,
+        run_id: int,
+        status: str,
+        exit_code: int | None = None,
+        error_message: str = "",
+        *,
+        expected_status: str | None = None,
+        expected_operation_key: str | None = None,
+        expected_started_at: str | None = None,
+    ) -> bool:
         now = utc_now()
         with self._connection_factory() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE rclone_runs
                 SET status = ?, exit_code = ?, error_message = ?, finished_at = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND (? IS NULL OR status = ?)
+                  AND (? IS NULL OR COALESCE(operation_key, '') = ?)
+                  AND (? IS NULL OR started_at = ?)
                 """,
-                (status, exit_code, error_message, now, now, run_id),
+                (
+                    status, exit_code, error_message, now, now, run_id,
+                    expected_status, expected_status,
+                    expected_operation_key, expected_operation_key,
+                    expected_started_at, expected_started_at,
+                ),
             )
+            return cursor.rowcount == 1
 
     def add_rclone_event(self, run_id: int | None, level: str, message: str, raw_data: Any = None) -> int:
         raw_text = json.dumps(raw_data, ensure_ascii=False) if raw_data is not None else None
@@ -505,24 +556,30 @@ class RcloneRepository:
             cur = conn.execute(
                 """
                 INSERT INTO rclone_events (run_id, level, message, raw_data, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                SELECT ?, ?, ?, ?, ?
+                WHERE ? IS NULL OR EXISTS (SELECT 1 FROM rclone_runs WHERE id = ?)
                 """,
-                (run_id, level, message, raw_text, utc_now()),
+                (run_id, level, message, raw_text, utc_now(), run_id, run_id),
             )
-            return int(cur.lastrowid)
+            return int(cur.lastrowid) if cur.rowcount else 0
 
-    def add_rclone_events(self, events: list[tuple[int, str, str]]) -> None:
+    def add_rclone_events(self, events: list[tuple[int, str, str] | tuple[int, str, str, str]]) -> None:
         """单事务批量落库 rclone 事件，供日志 sink 的后台 flusher 使用。"""
         if not events:
             return
         now = utc_now()
+        rows = [
+            (int(event[0]), event[1], event[2], None, event[3] if len(event) > 3 and event[3] else now, int(event[0]))
+            for event in events
+        ]
         with self._connection_factory() as conn:
             conn.executemany(
                 """
                 INSERT INTO rclone_events (run_id, level, message, raw_data, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                SELECT ?, ?, ?, ?, ?
+                WHERE EXISTS (SELECT 1 FROM rclone_runs WHERE id = ?)
                 """,
-                [(int(run_id), level, message, None, now) for run_id, level, message in events],
+                rows,
             )
 
     def count_rclone_runs(self) -> int:

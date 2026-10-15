@@ -129,6 +129,15 @@ class PublicSubmissionPreparationService:
             "update_context",
             "organizer_context",
             "target_root_is_resource",
+            "native_selection",
+            "provider_selection",
+            "selection",
+            "selection_snapshot",
+            "selected_items",
+            "selected_files",
+            "selected_folders",
+            "selected_dirs",
+            "selection_hash",
         )
         forbidden = sorted(field for field in forbidden_fields if field in prepared)
         if forbidden:
@@ -164,9 +173,20 @@ class PublicSubmissionPreparationService:
         prepared["ignore_files"] = self.safe_string_list(
             ignore_source, max_items=2000, max_length=512
         )
-        prepared["quark_selection"] = self.safe_quark_selection(prepared.get("quark_selection"))
-        prepared["cloud139_selection"] = self.safe_cloud139_selection(prepared.get("cloud139_selection"))
-        prepared["tianyi_selection"] = self.safe_tianyi_selection(prepared.get("tianyi_selection"))
+        raw_quark_selection = prepared.get("quark_selection")
+        prepared["quark_selection"] = self.safe_quark_selection(raw_quark_selection)
+        if raw_quark_selection not in (None, {}) and not prepared["quark_selection"]:
+            raise PublicSubmissionPreparationError("夸克文件选择无效或为空，请重新勾选；不会改为转存整个分享", 400)
+        for field, sanitize, label in (
+            ("cloud139_selection", self.safe_cloud139_selection, "移动"),
+            ("tianyi_selection", self.safe_tianyi_selection, "天翼"),
+        ):
+            raw_selection = prepared.get(field)
+            prepared[field] = sanitize(raw_selection)
+            if raw_selection not in (None, {}) and not prepared[field]:
+                raise PublicSubmissionPreparationError(
+                    f"{label}文件选择无效或为空，请重新勾选；不会改为转存整个分享", 400
+                )
         if sixpan_selection is not None or prepared["ignore_files"]:
             prepared["sixpan_selection"] = {
                 **(sixpan_selection or {}),

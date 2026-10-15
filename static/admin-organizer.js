@@ -115,12 +115,20 @@
             return false;
         }
 
+        function organizerNeedsCompletion(task = {}) {
+            const mappings = Array.isArray(task.mappings) ? task.mappings : [];
+            if (mappings.some((item) => ["conflict", "need_edit"].includes(String(item.status || "")))) return false;
+            const evidence = task.evidence && typeof task.evidence === "object" ? task.evidence : {};
+            return Boolean(evidence.completion_confirmation || evidence.strm_completion);
+        }
+
         function organizerTaskButtons(item) {
             const status = String(item.status || "");
             const id = escapeHtml(item.id);
             const buttons = [`<button class="secondary mini" type="button" data-organizer-detail="${id}">详情</button>`];
             if (status === "waiting_review") {
-                buttons.push(`<button class="mini" type="button" data-organizer-task="${id}" data-organizer-action="apply">确认并整理</button>`);
+                const completing = organizerNeedsCompletion(item);
+                buttons.push(`<button class="mini" type="button" data-organizer-task="${id}" data-organizer-action="apply">${completing ? "继续完成确认" : "确认并整理"}</button>`);
                 buttons.push(`<button class="secondary mini danger" type="button" title="保留原目录和文件名，仅移入正式分类目录。" data-organizer-task="${id}" data-organizer-action="skip">跳过整理</button>`);
             } else if (["auto_approved", "manual_confirmed"].includes(status)) {
                 buttons.push(`<button class="mini" type="button" data-organizer-task="${id}" data-organizer-action="apply">开始整理</button>`);
@@ -138,7 +146,7 @@
             const status = String(task.status || "");
             const mappings = Array.isArray(task.mappings) ? task.mappings : [];
             const blockedCount = mappings.filter((item) => ["conflict", "need_edit"].includes(String(item.status || ""))).length;
-            const guide = organizerStatusGuide(status, { blockedCount, stale: organizerTaskIsStale(task) });
+            const guide = organizerStatusGuide(status, { blockedCount, stale: organizerTaskIsStale(task), completing: organizerNeedsCompletion(task) });
             return `
                 <section class="organizer-action-panel" aria-label="OpenList 标准化操作">
                     <div class="organizer-action-copy">
@@ -155,6 +163,12 @@
         function organizerStatusGuide(status, counts = {}) {
             const blockedCount = Number(counts.blockedCount || 0);
             const stale = Boolean(counts.stale);
+            if (status === "waiting_review" && counts.completing && !blockedCount) {
+                return {
+                    title: "整理操作已执行，等待收尾确认",
+                    body: "点击“继续完成确认”续跑当前计划；已完成的移动、删除不会重复执行，无需重新扫描暂存目录。",
+                };
+            }
             if (stale && ["stabilizing", "scanning"].includes(status)) {
                 return {
                     title: "扫描疑似卡住",
@@ -234,7 +248,7 @@
             } else if (status === "waiting_review") {
                 buttons.push(
                     { action: "rename", label: "修改计划", className: "secondary mini", title: "修改片名、季号或映射目标。" },
-                    { action: "apply", label: "确认并整理", className: "mini danger", title: "确认当前计划并执行真实移动/重命名。" },
+                    { action: "apply", label: organizerNeedsCompletion(task) ? "继续完成确认" : "确认并整理", className: "mini danger", title: "确认当前保存的计划并续跑，保留已经完成的操作。" },
                     { action: "skip", label: "跳过整理", className: "secondary mini danger", title: "保留原目录和文件名，仅移入正式分类目录。" },
                     { action: "rebuild", label: "重新识别", className: "secondary mini", title: "识别不准或文件有变化时重新扫描。" },
                 );
@@ -290,19 +304,23 @@
             }
             box.innerHTML = adminState.organizerRuns.map((run) => {
                 const undoCount = Array.isArray(run.undo_data) ? run.undo_data.length : 0;
+                const summary = run.summary && typeof run.summary === "object" ? run.summary : {};
+                const rolledBack = run.status === "rolled_back" || summary.rollback?.status === "completed";
+                const displayStatus = summary.kind === "rollback" && run.status === "done" ? "rolled_back" : run.status;
                 return `
                     <div class="list-item">
                         <div>
                             <strong>run #${escapeHtml(run.id)} / task #${escapeHtml(run.task_id)}</strong>
-                            <p>${statusPill(run.status)} · ${escapeHtml(formatDate(run.started_at))} → ${escapeHtml(formatDate(run.finished_at))}</p>
+                            <p>${statusPill(displayStatus)} · ${escapeHtml(formatDate(run.started_at))} → ${escapeHtml(formatDate(run.finished_at))}</p>
                             <p>${escapeHtml(organizerRunSummaryText(run))}</p>
                         </div>
-                        ${undoCount ? `<button class="secondary mini danger" type="button" data-organizer-rollback="${escapeHtml(run.id)}">回滚</button>` : ""}
+                        ${undoCount && !rolledBack ? `<button class="secondary mini danger" type="button" data-organizer-rollback="${escapeHtml(run.id)}">回滚</button>` : ""}
                     </div>
                 `;
             }).join("");
             box.querySelectorAll("[data-organizer-rollback]").forEach((button) => {
-                button.addEventListener("click", () => rollbackOrganizerRun(button.dataset.organizerRollback, button));
+                button.addEventListener("click", () => rollbackOrganizerRun(button.dataset.organizerRollback, button)
+                    .catch((error) => toast(error.message || "回滚失败", "error")));
             });
             renderPager("organizerRunsPager", adminState.pagination.organizerRuns, (page) => {
                 adminState.pagination.organizerRuns.page = page;
@@ -361,16 +379,23 @@
             });
         }
 
-        async function showOrganizerTask(id) {
+        async function showOrganizerTask(id, { preserveEditsExcept = null } = {}) {
             const data = await api(`/api/admin/organizer/tasks/${encodeURIComponent(id)}`);
+            const pendingEdits = preserveEditsExcept === null ? [] : organizerPendingMappingEdits(id)
+                .filter((item) => item.mappingId !== String(preserveEditsExcept));
             const task = data.task || {};
             const files = task.files || [];
             const mappings = task.mappings || [];
             const blockedMappings = mappings.filter((item) => ["conflict", "need_edit"].includes(String(item.status || "")));
             const readyMappings = mappings.filter((item) => String(item.status || "") === "ready");
+            const pendingMappingIds = new Set(pendingEdits.map((item) => item.mappingId));
+            const readyPreviewMappings = readyMappings.filter((item, index) => index < 20 || pendingMappingIds.has(String(item.id)));
+            const readyHasPendingEdits = readyPreviewMappings.some((item) => pendingMappingIds.has(String(item.id)));
             const evidence = task.evidence && typeof task.evidence === "object" ? task.evidence : {};
             const lowConfidenceOnly = organizerHasLowConfidence(evidence.problem_summary) && !blockedMappings.length;
-            const mappingsForEdit = blockedMappings.length ? blockedMappings : [];
+            // Keep deletion decisions visible after saving: previously the row
+            // disappeared from both the blocked and ready lists.
+            const mappingsForEdit = mappings.filter((item) => ["conflict", "need_edit", "delete_ad"].includes(String(item.status || "")));
             const operations = task.operations || [];
             const tmdbMatches = task.tmdb_matches || [];
             const aiSuggestions = task.ai_suggestions || [];
@@ -395,7 +420,11 @@
                 ${renderOrganizerEpisodeCompleteness(evidence.episode_completeness)}
                 ${renderOrganizerReviewFocus(task, mappings, evidence)}
                 ${mappingsForEdit.length ? `<div class="organizer-mapping-list organizer-focus-list">${mappingsForEdit.map((mapping) => renderOrganizerMappingRow(task.id, mapping)).join("")}</div>` : `<div class="empty organizer-no-row-edit">${lowConfidenceOnly ? "请核对标题、年份和目标目录；确认无误后点“确认并整理”。" : "当前没有需要逐条编辑的映射。"}</div>`}
-                ${readyMappings.length ? `<details class="advanced-details"><summary>${lowConfidenceOnly ? "查看可抽查的就绪映射" : "查看已隐藏的就绪映射"}（${escapeHtml(readyMappings.length)} 条）</summary><div class="organizer-mapping-list">${readyMappings.slice(0, 20).map((mapping) => renderOrganizerMappingRow(task.id, mapping)).join("")}${readyMappings.length > 20 ? `<div class="empty">仅预览前 20 条；其余就绪映射不会要求人工处理。</div>` : ""}</div></details>` : ""}
+                ${readyMappings.length ? `<details class="advanced-details"${readyHasPendingEdits ? " open" : ""}>
+                    <summary>${lowConfidenceOnly ? "查看可抽查的就绪映射" : "查看已隐藏的就绪映射"}（${escapeHtml(readyMappings.length)} 条）</summary>
+                    ${readyHasPendingEdits ? `<div class="notice-box warning">已保留尚未保存的映射修改，请先逐条保存再确认。</div>` : ""}
+                    <div class="organizer-mapping-list">${readyPreviewMappings.map((mapping) => renderOrganizerMappingRow(task.id, mapping)).join("")}${readyMappings.length > readyPreviewMappings.length ? `<div class="empty">仅预览前 20 条及尚未保存的映射；其余就绪映射不会要求人工处理。</div>` : ""}</div>
+                </details>` : ""}
                 <details class="advanced-details organizer-secondary-detail">
                     <summary>查看完整文件列表（${escapeHtml(files.length)} 条，分页）</summary>
                     ${renderOrganizerFileSummary(files, mappings)}
@@ -424,6 +453,7 @@
                 { mode: "modal", className: "organizer-detail-modal" }
             );
             const drawer = $("adminDrawerBody");
+            restoreOrganizerMappingEdits(task.id, pendingEdits);
             drawer?.querySelectorAll("[data-organizer-mapping-save]").forEach((button) => {
                 button.addEventListener("click", () => saveOrganizerMapping(task.id, button.dataset.organizerMappingSave, button));
             });
@@ -595,6 +625,7 @@
         }
 
         function renderOrganizerReviewFocus(task = {}, mappings = [], evidence = {}) {
+            if (organizerNeedsCompletion(task)) return "";
             const summary = evidence && typeof evidence === "object" ? evidence.problem_summary : null;
             const lowConfidence = organizerHasLowConfidence(summary);
             const blocked = (Array.isArray(mappings) ? mappings : []).filter((item) => ["conflict", "need_edit"].includes(String(item.status || "")));
@@ -639,7 +670,7 @@
             }
             if (summary && Array.isArray(summary.issues)) {
                 summary.issues.forEach((item) => {
-                    const text = item?.type === "low_confidence" ? "标题、年份或目标目录需要确认。" : (item && item.message ? String(item.message) : "");
+                    const text = item && item.message ? String(item.message) : (item?.type === "low_confidence" ? "标题、年份或目标目录需要确认。" : "");
                     if (text && !issues.includes(text)) issues.push(text);
                 });
             }
@@ -726,7 +757,7 @@
             const status = String(mapping.status || "ready");
             const sourceName = mapping.source_name || organizerPathBasename(mapping.source_path || "");
             return `
-                <section class="organizer-mapping-card" data-organizer-mapping-row="${escapeHtml(mapping.id)}">
+                <section class="organizer-mapping-card" data-organizer-mapping-row="${escapeHtml(mapping.id)}" data-organizer-mapping-task="${escapeHtml(taskId)}">
                     <div class="organizer-mapping-card-head">
                         <div>
                             <strong>${escapeHtml(sourceName || "-")}</strong>
@@ -764,6 +795,34 @@
             `;
         }
 
+        function organizerPendingMappingEdits(taskId) {
+            const rows = Array.from($("adminDrawerBody")?.querySelectorAll("[data-organizer-mapping-row]") || []);
+            return rows.filter((row) => row.dataset.organizerMappingTask === String(taskId)).map((row) => {
+                const fields = {};
+                row.querySelectorAll("[data-map-field]").forEach((field) => {
+                    const original = field.tagName === "SELECT"
+                        ? (Array.from(field.options).find((option) => option.defaultSelected)?.value ?? field.options[0]?.value ?? "")
+                        : field.defaultValue;
+                    if (String(field.value) !== String(original ?? "")) fields[field.dataset.mapField] = field.value;
+                });
+                return { mappingId: row.dataset.organizerMappingRow, fields };
+            }).filter((item) => Object.keys(item.fields).length);
+        }
+
+        function restoreOrganizerMappingEdits(taskId, pendingEdits) {
+            const byId = new Map(pendingEdits.map((item) => [item.mappingId, item.fields]));
+            $("adminDrawerBody")?.querySelectorAll("[data-organizer-mapping-row]").forEach((row) => {
+                if (row.dataset.organizerMappingTask !== String(taskId)) return;
+                const fields = byId.get(row.dataset.organizerMappingRow);
+                if (!fields) return;
+                row.querySelectorAll("[data-map-field]").forEach((field) => {
+                    if (!Object.prototype.hasOwnProperty.call(fields, field.dataset.mapField)) return;
+                    field.value = fields[field.dataset.mapField];
+                    if (field.tagName === "SELECT") field.dispatchEvent(new Event("change", { bubbles: true }));
+                });
+            });
+        }
+
         async function saveOrganizerMapping(taskId, mappingId, button = null) {
             const row = Array.from(document.querySelectorAll("[data-organizer-mapping-row]")).find((item) => String(item.dataset.organizerMappingRow) === String(mappingId));
             if (!row) return;
@@ -778,13 +837,21 @@
                     payload[key] = value;
                 });
                 toast("正在保存映射...", "info");
-                const data = await api(`/api/admin/organizer/tasks/${encodeURIComponent(taskId)}/mappings/${encodeURIComponent(mappingId)}`, {
-                    method: "PATCH",
-                    body: JSON.stringify(payload),
-                    allowFailure: true,
-                });
-                toast(data.success ? (data.target_path ? `映射已保存，目标已更新：${data.target_path}` : "映射已保存") : data.message || "映射保存失败", data.success ? "success" : "error");
-                await Promise.all([loadOrganizer(), showOrganizerTask(taskId)]);
+                try {
+                    const data = await api(`/api/admin/organizer/tasks/${encodeURIComponent(taskId)}/mappings/${encodeURIComponent(mappingId)}`, {
+                        method: "PATCH",
+                        body: JSON.stringify(payload),
+                        allowFailure: true,
+                    });
+                    if (!data.success) {
+                        toast(data.message || "映射保存失败，当前修改已保留", "error");
+                        return;
+                    }
+                    toast(data.target_path ? `映射已保存，目标已更新：${data.target_path}` : "映射已保存", "success");
+                    await Promise.all([loadOrganizer(), showOrganizerTask(taskId, { preserveEditsExcept: mappingId })]);
+                } catch (error) {
+                    toast(error.message || "映射保存失败，当前修改已保留", "error");
+                }
             });
         }
 
@@ -793,8 +860,12 @@
                 openBatchRenameDialog(taskId);
                 return;
             }
+            if (["apply", "retry"].includes(action) && organizerPendingMappingEdits(taskId).length) {
+                toast("还有未保存的映射修改，请先点击对应行的“保存本条”，再执行整理或重试；当前选择已保留。", "warning");
+                return;
+            }
             const messages = {
-                apply: "确认当前计划并执行真实 OpenList 移动/重命名？目标已存在时不会覆盖。",
+                apply: "确认当前保存的计划并执行 OpenList 整理？标记为“广告删除”的文件会被彻底删除；目标已存在时不会覆盖，已完成的操作不会重复执行。",
                 skip: "确认跳过整理？系统会保留原目录和文件名，仅将暂存内容移到正确的媒体分类目录，后续交给飞牛影视刮削；目标已存在时不会覆盖。",
                 delete: "确认删除这条记录？此操作不可撤销。",
                 rebuild: "",
@@ -831,6 +902,8 @@
                     const success = data.success !== false;
                     if (!success) {
                         toast(data.message || "操作失败", "error");
+                        await loadOrganizer();
+                        if (keepDrawer) await showOrganizerTask(taskId);
                         return;
                     }
                     if (deleting) {

@@ -78,6 +78,47 @@ class _AuthSessionClaimLost(RuntimeError):
     """Internal signal used to roll back a stale persistence transaction."""
 
 
+def _waiting_auth_session_expired(row: Any) -> bool:
+    if str(row["status"]) != "waiting":
+        return False
+    expires_at = str(row["expires_at"] or "").strip()
+    if not expires_at:
+        return False
+    try:
+        return datetime.fromisoformat(expires_at.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return True
+
+
+def expire_waiting_auth_sessions(connection: Any, *, session_id: str | None = None) -> int:
+    """Apply the normal waiting-session expiry without contacting a Provider.
+
+    Polling and frozen completion results are intentionally not expired here.
+    Callers replacing configuration use this inside their write transaction.
+    """
+    rows = connection.execute(
+        "SELECT session_id, status, expires_at, row_version FROM provider_auth_sessions WHERE status='waiting'"
+        + (" AND session_id=?" if session_id is not None else ""),
+        (str(session_id),) if session_id is not None else (),
+    ).fetchall()
+    expired = 0
+    for row in rows:
+        if not _waiting_auth_session_expired(row):
+            continue
+        updated = connection.execute(
+            "UPDATE provider_auth_sessions SET status='failed', message=?, updated_at=?, "
+            "row_version=row_version+1 WHERE session_id=? AND status='waiting' AND row_version=?",
+            (
+                "登录会话已过期，请重新发起登录",
+                utc_now_iso(),
+                str(row["session_id"]),
+                int(row["row_version"] or 1),
+            ),
+        )
+        expired += updated.rowcount
+    return expired
+
+
 @dataclass(frozen=True)
 class AuthStep:
     status: str
@@ -1183,73 +1224,25 @@ class ProviderAuthSessionService:
     ) -> str | None:
         if account_data is None:
             return None
-        existing_id = str(account_data.get("account_id") or "").strip()
-        if existing_id:
-            existing = self.accounts.get_account(existing_id)
-            if existing is None or existing.provider_kind != provider_kind:
-                raise AuthSessionError("重新登录的账号不存在或 Provider 不匹配", stage="account_persist")
-            try:
-                account, test = self.accounts.revise_credentials_if_healthy(
-                    existing_id,
-                    config=dict(account_data.get("config") or {}),
-                    credentials=dict(account_data.get("credentials") or {}),
-                    identity_hint=str(account_data.get("identity_hint") or ""),
-                    name=str(account_data.get("name") or ""),
-                )
-            except AuthSessionError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raise AuthSessionError(
-                    _safe_provider_message(exc),
-                    code="ACCOUNT_PERSIST_FAILED",
-                    stage="account_persist",
-                ) from exc
+        try:
+            # Immediate-completion handlers must use the same identity and
+            # final enabled/revision guards as asynchronous auth sessions.
+            prepared, test = self.accounts.prepare_authenticated_account(provider_kind, account_data)
             if not test.ok:
                 raise AuthSessionError(
                     test.message or "账号登录成功，但账号检测未通过",
                     code="ACCOUNT_PROBE_FAILED",
                     stage="account_probe",
                 )
-        else:
-            try:
-                account = self.accounts.create_account(
-                    provider_kind=provider_kind,
-                    name=str(account_data.get("name") or "主账号"),
-                    config=dict(account_data.get("config") or {}),
-                    credentials=dict(account_data.get("credentials") or {}),
-                    identity_hint=str(account_data.get("identity_hint") or ""),
-                )
-            except Exception as exc:  # noqa: BLE001
-                raise AuthSessionError(
-                    _safe_provider_message(exc),
-                    code="ACCOUNT_PERSIST_FAILED",
-                    stage="account_persist",
-                ) from exc
-        if account is None:
-            raise AuthSessionError("登录完成后无法读取账号", stage="account_persist")
-        if not existing_id:
-            try:
-                test = self.accounts.test_account(account.account_id)
-            except Exception as exc:  # noqa: BLE001
-                self.accounts.delete_account(account.account_id)
-                raise AuthSessionError(
-                    _safe_provider_message(exc),
-                    code="ACCOUNT_PROBE_FAILED",
-                    stage="account_probe",
-                ) from exc
-            if not test.ok:
-                self.accounts.delete_account(account.account_id)
-                raise AuthSessionError(
-                    test.message or "账号登录成功，但账号检测未通过",
-                    code="ACCOUNT_PROBE_FAILED",
-                    stage="account_probe",
-                )
-        current = self.accounts.get_selection(provider_kind)
-        self.accounts.activate_account(
-            "default",
-            account.account_id,
-            current.selection_revision if current else None,
-        )
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                account = self.accounts.commit_authenticated_account(prepared, conn=connection)
+        except AuthSessionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AuthSessionError(
+                _safe_provider_message(exc), code="ACCOUNT_PERSIST_FAILED", stage="account_persist",
+            ) from exc
         return account.account_id
 
     @staticmethod
@@ -1270,28 +1263,10 @@ class ProviderAuthSessionService:
         return row
 
     def _expire_waiting(self, row: Any) -> Any:
-        if str(row["status"]) != "waiting":
-            return row
-        expires_at = str(row["expires_at"] or "").strip()
-        if not expires_at:
-            return row
-        try:
-            expired = datetime.fromisoformat(expires_at.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
-        except (TypeError, ValueError):
-            expired = True
-        if not expired:
+        if not _waiting_auth_session_expired(row):
             return row
         with self.database.connect() as connection:
-            connection.execute(
-                "UPDATE provider_auth_sessions SET status='failed', message=?, updated_at=?, "
-                "row_version=row_version+1 WHERE session_id=? AND status='waiting' AND row_version=?",
-                (
-                    "登录会话已过期，请重新发起登录",
-                    utc_now_iso(),
-                    str(row["session_id"]),
-                    int(row["row_version"] or 1),
-                ),
-            )
+            expire_waiting_auth_sessions(connection, session_id=str(row["session_id"]))
         return self._row(str(row["session_id"]))
 
     def _claim_poll(self, row: Any) -> Any | None:

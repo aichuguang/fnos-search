@@ -659,7 +659,7 @@
     function renderAccountsV1() {
         if (state.editor?.type === "account") return renderAccountEditorV1();
         const providers = state.data.providers || [];
-        return `<div class="storage-section-heading"><div><h4>云盘账号</h4><p>每种云盘可以维护多个账号，入库只使用当前激活账号。</p></div></div><div class="storage-provider-grid">${providers.map((provider) => {
+        return `<div class="storage-section-heading"><div><h4>云盘账号</h4><p>每种云盘可维护多个账号；来源使用当前账号，保存位置独立绑定目标账号。</p></div></div><div class="storage-provider-grid">${providers.map((provider) => {
             const accounts = (state.data.accounts || []).filter((item) => item.provider_kind === provider.provider_kind);
             const active = accounts.find((item) => item.active);
             const authMethod = (provider.auth_methods || [])[0];
@@ -821,8 +821,7 @@
             await request(path, { method: values.destination_id ? "PATCH" : "POST", body: JSON.stringify(payload) });
         } catch (error) {
             if (error.code === "TARGET_CONFLICT" || error.code === "OPENLIST_CONNECTION_CONFLICT") {
-                await load();
-                const conflict = new Error("保存位置已被其他管理员修改，页面已刷新，请重新确认后保存。", { cause: error });
+                const conflict = new Error("保存位置已被其他管理员修改，本次未保存；当前输入已保留。请先记录修改，取消编辑后点击“刷新配置”，核对最新内容并重新打开编辑。", { cause: error });
                 conflict.code = error.code;
                 throw conflict;
             }
@@ -849,11 +848,15 @@
             };
         });
         try {
-            await request("/api/admin/storage-setup/routes", { method: "PUT", body: JSON.stringify({ routes }) });
+            await request("/api/admin/storage-setup/routes", {
+                method: "PUT",
+                body: JSON.stringify({ routes, routing_token: state.data.routing_token }),
+            });
         } catch (error) {
-            if (error.code === "ASSIGNMENT_CONFLICT") {
-                await load();
-                const conflict = new Error("入库规则已被其他管理员修改，页面已刷新，请重新确认后保存。", { cause: error });
+            if (["ASSIGNMENT_CONFLICT", "ASSIGNMENT_SNAPSHOT_REQUIRED"].includes(error.code)) {
+                // Keep the current form intact. A stale snapshot must not be
+                // silently replaced/retried with the user's unsaved choices.
+                const conflict = new Error("路由快照已变化或过期，未保存任何规则；当前选择已保留，请刷新配置并重新核对后保存。", { cause: error });
                 conflict.code = error.code;
                 throw conflict;
             }
@@ -1459,7 +1462,19 @@
             }
             if (accountAction === "activate") {
                 setBusy(true);
-                try { await request("/api/admin/storage-setup/accounts", { method: "POST", body: JSON.stringify({ account_id: account.account_id, name: account.name, activate: true }) }); await load(); setNotice("当前账号已切换。", "is-success"); }
+                try {
+                    const selection = state.data.active_selections?.[`${account.provider_kind}:default`];
+                    await request("/api/admin/storage-setup/accounts", {
+                        method: "POST",
+                        body: JSON.stringify({
+                            account_id: account.account_id,
+                            activate: true,
+                            expected_selection_revision: selection?.selection_revision ?? null,
+                        }),
+                    });
+                    await load();
+                    setNotice("当前账号已切换。", "is-success");
+                }
                 catch (error) { setNotice(error.message, "is-error"); }
                 finally { setBusy(false); }
                 return;

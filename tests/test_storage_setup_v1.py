@@ -246,6 +246,7 @@ class StorageSetupV1Tests(unittest.TestCase):
             "password_set": bool(payload.get("password")),
             "connection_status": "success",
             "message": "rclone WebDAV connection passed",
+            "_openlist_sync": dict(payload.get("_openlist_sync") or {}),
         }
         return dict(self.rclone_state)
 
@@ -261,7 +262,10 @@ class StorageSetupV1Tests(unittest.TestCase):
             self.db.close_all_connections()
         except AttributeError:
             pass
-        for suffix in ("", "-wal", "-shm"):
+        for suffix in (
+            "", "-wal", "-shm", ".openlist-change.lock", ".openlist-remote.lock",
+            ".openlist-owner.json", ".openlist-remote-state.json",
+        ):
             try:
                 Path(f"{self.db_path}{suffix}").unlink()
             except FileNotFoundError:
@@ -1249,6 +1253,7 @@ class StorageSetupV1Tests(unittest.TestCase):
                 "status": "worker_unavailable",
                 "error_code": "worker_unavailable",
                 "message": "无法连接 rclone Worker，请稍后重试",
+                "not_started": True,
             }
 
         self.rclone_sync_error = WorkerDown("无法连接 rclone Worker，请稍后重试")
@@ -1400,7 +1405,14 @@ class StorageSetupV1Tests(unittest.TestCase):
         target = self.targets.get_target(location["destination_id"])
         mount_id = self.service._target_mount_id(target)
         original_mount = self.mounts.get_mount(mount_id)
-        self.rclone_sync_error = RuntimeError("worker unavailable")
+        sync = self.service.rclone_webdav_sync
+
+        def reject_new_config(payload):
+            if "openlist-new" in str(payload.get("url") or ""):
+                raise RcloneWebdavConfigError("new connection rejected", 502, code="RCLONE_WEBDAV_SYNC_FAILED")
+            return sync(payload)
+
+        self.service.rclone_webdav_sync = reject_new_config
 
         with self.assertRaises(StorageSetupError) as raised:
             self.service.save_openlist(
@@ -1973,7 +1985,7 @@ class StorageSetupV1Tests(unittest.TestCase):
         self.assertIn("trace_id", missing_name.get_json())
 
         original_save_routes = self.service.save_routes
-        self.service.save_routes = lambda _payload: (_ for _ in ()).throw(
+        self.service.save_routes = lambda _payload, **_kwargs: (_ for _ in ()).throw(
             AssignmentConflictError("assignment revision conflict")
         )
         self.addCleanup(setattr, self.service, "save_routes", original_save_routes)

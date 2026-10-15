@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from contextlib import AbstractContextManager
 from typing import Any, Callable
@@ -33,7 +34,13 @@ class SearchCacheQueryRepository:
                 "SELECT * FROM search_cache WHERE public_id = ? AND expires_at > ?",
                 (public_id, _utc_now()),
             ).fetchone()
-        return self._row_decoder(row)
+        item = self._row_decoder(row)
+        if item and isinstance(item.get("raw_data"), str):
+            try:
+                item["raw_data"] = json.loads(item["raw_data"])
+            except (TypeError, ValueError):
+                item["raw_data"] = {}
+        return item
 
     def find_active_by_urls(self, keyword: str, urls: list[str]) -> dict[str, dict[str, Any]]:
         url_by_hash: dict[str, str] = {}

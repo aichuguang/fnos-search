@@ -32,7 +32,7 @@ class GuestRequestQueryRepository:
                 "SELECT * FROM guest_requests WHERE job_id = ? ORDER BY id ASC",
                 (job_id,),
             ).fetchall()
-        return [item for row in rows if (item := self._row_decoder(row)) is not None]
+        return [item for row in rows if (item := self._decode_request(row)) is not None]
 
     def list(self, limit: int = 100, status: str | None = None, offset: int = 0) -> list[dict[str, Any]]:
         safe_limit = max(1, int(limit or 100))
@@ -48,7 +48,7 @@ class GuestRequestQueryRepository:
                     "SELECT * FROM guest_requests ORDER BY id DESC LIMIT ? OFFSET ?",
                     (safe_limit, safe_offset),
                 ).fetchall()
-        return [item for row in rows if (item := self._row_decoder(row)) is not None]
+        return [item for row in rows if (item := self._decode_request(row)) is not None]
 
     def count(self, status: str | None = None) -> int:
         with self._connection_factory() as connection:
@@ -93,7 +93,7 @@ class GuestRequestQueryRepository:
             ).fetchall()
         wanted = str(destination_id or "").strip()
         for row in rows:
-            item = self._row_decoder(row)
+            item = self._decode_request(row)
             if not item:
                 continue
             raw = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
@@ -133,7 +133,16 @@ class GuestRequestQueryRepository:
                 f"SELECT * FROM guest_requests WHERE {column} = ?",
                 (value,),
             ).fetchone()
-        return self._row_decoder(row)
+        return self._decode_request(row)
+
+    def _decode_request(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        item = self._row_decoder(row)
+        if item and item.get("raw_data"):
+            try:
+                item["raw_data"] = json.loads(item["raw_data"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return item
 
     @staticmethod
     def _normalize_ids(request_ids: list[int]) -> list[int]:

@@ -19,6 +19,12 @@ NAMESPACE_PREFIX = "openlist"
 MountRootResolver = Callable[[str, str], str]
 RevisionResolver = Callable[[str, int], Mapping[str, Any] | None]
 RuntimeIdentityValidator = Callable[[str, int], bool]
+ManagedRemoteIdentityValidator = Callable[[str, int, str, str], bool]
+ManagedRemoteIdentityDiagnostics = Callable[[str, int, str, str], Mapping[str, Any]]
+_REMOTE_IDENTITY_RECHECK_MESSAGE = "托管 rclone Remote 身份暂时无法确认，请刷新后重试，并保留已转存文件。"
+_REMOTE_IDENTITY_LEGACY_MESSAGE = (
+    "冻结 OpenList connection 与当前托管 rclone Remote 身份不一致，请重新创建或重新规划该入库任务"
+)
 
 
 def normalize_openlist_path(value: Any, *, allow_empty: bool = False) -> str:
@@ -65,6 +71,8 @@ class RcloneLocatorResolver:
         self._mount_revision_resolver: RevisionResolver | None = None
         self._connection_revision_resolver: RevisionResolver | None = None
         self._connection_runtime_identity_validator: RuntimeIdentityValidator | None = None
+        self._managed_remote_identity_validator: ManagedRemoteIdentityValidator | None = None
+        self._managed_remote_identity_diagnostics: ManagedRemoteIdentityDiagnostics | None = None
         self.update_config(config)
 
     def update_config(self, config: Mapping[str, Any] | None = None) -> None:
@@ -103,6 +111,12 @@ class RcloneLocatorResolver:
         runtime_identity_validator = values.get("connection_runtime_identity_validator")
         if callable(runtime_identity_validator):
             self._connection_runtime_identity_validator = runtime_identity_validator
+        managed_validator = values.get("managed_remote_identity_validator")
+        if callable(managed_validator):
+            self._managed_remote_identity_validator = managed_validator
+        managed_diagnostics = values.get("managed_remote_identity_diagnostics")
+        if callable(managed_diagnostics):
+            self._managed_remote_identity_diagnostics = managed_diagnostics
         self._validate_managed_remote()
 
     def bind_revision_services(
@@ -112,7 +126,7 @@ class RcloneLocatorResolver:
     ) -> "RcloneLocatorResolver":
         """Bind the V1 revision readers used by task-scoped resolution.
 
-        Only the ``get_revision(id, revision)`` methods are retained.  The
+        Revision readers and read-only identity validators are retained. The
         resolver never reads a mutable current mount/connection while building
         a descriptor for an immutable plan.
         """
@@ -130,6 +144,12 @@ class RcloneLocatorResolver:
             self._connection_revision_resolver = connection_reader
         if callable(runtime_identity_validator):
             self._connection_runtime_identity_validator = runtime_identity_validator
+        managed_validator = getattr(connection_service, "managed_remote_identity_matches", None)
+        if callable(managed_validator):
+            self._managed_remote_identity_validator = managed_validator
+        managed_diagnostics = getattr(connection_service, "managed_remote_identity_diagnostics", None)
+        if callable(managed_diagnostics):
+            self._managed_remote_identity_diagnostics = managed_diagnostics
         return self
 
     def _validate_managed_remote(self) -> None:
@@ -303,14 +323,30 @@ class RcloneLocatorResolver:
             connection_revision=conn_revision,
         )
         runtime_identity_validator = self._connection_runtime_identity_validator
-        if callable(runtime_identity_validator) and not runtime_identity_validator(
-            parsed_connection,
-            conn_revision,
-        ):
-            raise OpenListValidationError(
-                "冻结 OpenList connection 与当前托管 rclone Remote 身份不一致，"
-                "请重新创建或重新规划该入库任务"
-            )
+        managed_validator = self._managed_remote_identity_validator
+        if callable(managed_validator):
+            identity_ok = managed_validator(parsed_connection, conn_revision, self.remote_name, self.config_path)
+        else:
+            identity_ok = not callable(runtime_identity_validator) or runtime_identity_validator(parsed_connection, conn_revision)
+        if not identity_ok:
+            message = _REMOTE_IDENTITY_LEGACY_MESSAGE
+            reason_code = "OPENLIST_REMOTE_IDENTITY_MISMATCH"
+            diagnose = self._managed_remote_identity_diagnostics
+            if callable(diagnose):
+                # This second read can race a finishing sync. It may improve
+                # the error, but must never reverse the failed bool check.
+                message = _REMOTE_IDENTITY_RECHECK_MESSAGE
+                reason_code = "OPENLIST_REMOTE_CONFIRMATION_UNKNOWN"
+                try:
+                    diagnostic = diagnose(parsed_connection, conn_revision, self.remote_name, self.config_path)
+                    if isinstance(diagnostic, Mapping) and diagnostic.get("matches") is False:
+                        message = str(diagnostic.get("message") or message)
+                        reason_code = str(diagnostic.get("reason_code") or reason_code)
+                except Exception:  # noqa: BLE001 - retain rejection without exposing diagnostic failures
+                    pass
+            error = OpenListValidationError(message)
+            error.reason_code = reason_code
+            raise error
         return self.remote_path(str(snapshot.get("webdav_root") or ""), path)
 
     @staticmethod

@@ -278,6 +278,7 @@ class OrganizeResult:
     retryable: bool = True
     task_id: int = 0
     final_path: str = ""
+    cleanup_only: bool = False
 
 
 class VisibilityStatus(str, Enum):
@@ -805,6 +806,7 @@ def receipt_from_import_result(result: Any, *, provider_kind: str) -> OperationR
             provider_kind=provider_kind,
             message=message,
             external_ref=operation_id,
+            error_code=str(_safe_raw(getattr(result, "raw_data", {})).get("error_code") or ""),
             metadata={"target_path": str(getattr(result, "target_path", "") or ""), "raw": _safe_raw(getattr(result, "raw_data", {}))},
         )
     if status_text in {"done", "success", "completed", "skipped_existing", "finished", "verified"}:

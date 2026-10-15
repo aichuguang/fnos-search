@@ -10,9 +10,8 @@ from flask import Flask, jsonify, request
 
 from fnos_media_import.public_web import (
     _public_request_payload,
-    _safe_public_sixpan_selection,
-    _safe_public_string_list,
 )
+from fnos_media_import.importers.tianyi import TianyiImporter
 from fnos_media_import.blueprints.requests import RequestsRouteContext, create_requests_blueprint
 from fnos_media_import.services.request_approval_service import (
     RequestApprovalDependencies,
@@ -76,12 +75,7 @@ def _service(item: dict, captured: dict) -> RequestApprovalService:
             public_status=lambda status: status,
             safe_result=lambda result: result,
             merge_raw_data=lambda current, patch: {**(current or {}), **patch},
-            sanitize_string_list=lambda value: _safe_public_string_list(
-                value, max_items=2000, max_length=512
-            ),
-            sanitize_quark_selection=lambda _value: {},
-            sanitize_cloud139_selection=lambda _value: {},
-            sanitize_sixpan_selection=_safe_public_sixpan_selection,
+            sanitize_request_payload=_public_request_payload,
             category_label=lambda key: key,
         )
     )
@@ -253,6 +247,53 @@ class RequestApprovalRouteTests(unittest.TestCase):
                 "ignored_count": 1,
             },
         )
+
+
+class RequestApprovalTianyiSelectionTests(unittest.TestCase):
+    def test_review_retains_only_chosen_files_and_media_identity(self) -> None:
+        captured: dict = {}
+        original = {
+            "tianyi_selection": {
+                "mode": "items", "selected_files": [{"fid": "ep1", "name": "第一集.mkv", "untrusted": True}],
+                "selected_folders": [], "target_path": "/not-allowed",
+            },
+            "media_identity": {
+                "tmdb_id": 101, "media_type": "tv", "title": "正式片名", "year": "2026",
+                "season_number": 1, "original_query": "搜索词", "untrusted": "drop",
+            },
+            "destination_id": "untrusted-destination",
+        }
+        item = _request_item(original)
+        item["source_url"] = "https://cloud.189.cn/t/example"
+        result, status = _service(item, captured).approve(41, {}, admin="admin")
+        self.assertEqual(status, 202, result)
+        payload = captured["submit_payload"]
+        selected = TianyiImporter._select_items([
+            {"file_id": "ep1", "name": "第一集.mkv"},
+            {"file_id": "ep2", "name": "第二集.mkv"},
+        ], payload["tianyi_selection"])
+        self.assertEqual([entry["file_id"] for entry in selected], ["ep1"])
+        self.assertNotIn("target_path", payload["tianyi_selection"])
+        self.assertNotIn("untrusted", payload["tianyi_selection"]["selected_files"][0])
+        self.assertEqual(payload["media_identity"], {key: value for key, value in original["media_identity"].items() if key != "untrusted"})
+        self.assertNotIn("destination_id", payload)
+        self.assertEqual(original["tianyi_selection"]["selected_files"][0]["untrusted"], True)
+
+    def test_saved_invalid_selection_does_not_fall_back_to_whole_share(self) -> None:
+        captured: dict = {}
+        service = _service(_request_item({"tianyi_selection": {"mode": "items", "selected_files": [{}]}}), captured)
+        result, status = service.approve(41, {}, admin="admin")
+        self.assertEqual(status, 400)
+        self.assertFalse(result["success"])
+        self.assertEqual(captured, {})
+
+    def test_administrator_rename_is_not_overridden_by_old_tmdb_title(self) -> None:
+        captured: dict = {}
+        service = _service(_request_item({"media_identity": {"tmdb_id": 101, "media_type": "tv", "title": "旧片名"}}), captured)
+        _, status = service.approve(41, {"title": "人工修正片名"}, admin="admin")
+        self.assertEqual(status, 202)
+        self.assertEqual(captured["submit_payload"]["title"], "人工修正片名")
+        self.assertNotIn("media_identity", captured["submit_payload"])
 
 
 if __name__ == "__main__":

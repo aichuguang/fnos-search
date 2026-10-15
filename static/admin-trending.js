@@ -541,10 +541,11 @@
             const source = workbenchItems.find((item) => String(item.public_id || "") === String(publicId)) || {};
             const kind = workbench.sourceKind(source.provider_kind ? source : detail);
             if (kind === "quark" && parent) {
+                const previousContext = detail._workbench_selection_context || {};
                 detail._workbench_selection_context = {
                     mode: "subdir_items",
                     base_dir: parent,
-                    root_items: currentItems,
+                    root_items: Array.isArray(previousContext.root_items) ? previousContext.root_items : currentItems,
                 };
                 inspection.items = Array.isArray(response.items) ? response.items : [];
                 workbenchSelections[publicId] = new Set();

@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import Any, Callable
 
 from ..constants import EVENT_ERROR, EVENT_INFO
+from ..time_utils import utc_now_iso
+from .rclone_live_progress import RcloneLiveProgress, log_scope
 
 
 class RcloneLogSink:
@@ -25,15 +27,18 @@ class RcloneLogSink:
         *,
         database: Any = None,
         current_run_id: Callable[[], int | None] | None = None,
+        current_job_id: Callable[[], int | None] | None = None,
         max_lines: int = 500,
         flush_interval: float = 1.0,
     ) -> None:
         self.database = database
         self.current_run_id = current_run_id or (lambda: None)
+        self.current_job_id = current_job_id or (lambda: None)
+        self._progress = RcloneLiveProgress()
         self._lines: deque[str] = deque(maxlen=self._normalize_max_lines(max_lines))
         self._lock = threading.Lock()
         self._flush_interval = max(0.05, float(flush_interval or 1.0))
-        self._pending: deque[tuple[int, str, str]] = deque()
+        self._pending: deque[tuple[int, str, str, str]] = deque()
         self._pending_lock = threading.Lock()
         self._flush_event = threading.Event()
         self._closed = False
@@ -50,26 +55,48 @@ class RcloneLogSink:
         with self._lock:
             self._lines = deque(self._lines, maxlen=self._normalize_max_lines(max_lines))
 
-    def append(self, message: str) -> None:
+    def append(self, message: str, *, job_id: int | None = None, trusted_milestone: bool = False) -> None:
         text = str(message or "")
+        occurred_at = utc_now_iso()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = text if text.startswith("[20") else f"[{timestamp}] {text}"
         with self._lock:
             self._lines.append(line)
         run_id = self.current_run_id()
-        if self.database and run_id:
+        try:
+            current_job_id = self.current_job_id()
+        except Exception:  # noqa: BLE001 - without a scope, do not infer an external log's run
+            current_job_id = None
+        event_run_id = run_id
+        try:
+            target_job, context_job, _ = log_scope(text, job_id=job_id, current_job_id=current_job_id)
+            if target_job is not None and target_job != context_job:
+                event_run_id = None
+        except Exception:  # noqa: BLE001 - keep the live line, not a guessed durable association
+            event_run_id = None
+        try:
+            self._progress.record(
+                text, job_id=job_id, current_job_id=current_job_id, current_run_id=run_id,
+                trusted_milestone=trusted_milestone,
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never stop pipe consumption
+            pass
+        if self.database and event_run_id:
             lowered = text.lower()
             level = EVENT_ERROR if any(token in lowered for token in ("失败", "异常", "error", "failed")) else EVENT_INFO
             with self._pending_lock:
                 if len(self._pending) >= self._MAX_PENDING_EVENTS:
                     self._pending.popleft()
-                self._pending.append((int(run_id), level, text))
+                self._pending.append((int(event_run_id), level, text, occurred_at))
             self._flush_event.set()
 
     def list(self, limit: int = 200) -> list[str]:
         with self._lock:
             items = list(self._lines)
         return items if limit <= 0 else items[-limit:]
+
+    def transfers(self) -> list[dict[str, Any]]:
+        return self._progress.snapshot()
 
     def flush_pending(self) -> None:
         """同步把待持久化事件写入数据库（测试与关停兜底用）。"""

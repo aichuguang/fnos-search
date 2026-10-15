@@ -6,8 +6,14 @@ from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from .worker_task_sequence import preserve_worker_task_sequence
+
 
 ConnectionFactory = Callable[[], AbstractContextManager[sqlite3.Connection]]
+
+
+class WorkerTaskConflictError(RuntimeError):
+    """An explicit failed-task retry no longer matches the durable task state."""
 
 
 class WorkerTaskRepository:
@@ -26,6 +32,7 @@ class WorkerTaskRepository:
         max_attempts: int = 3,
         config_revision: int = 1,
         reactivate_terminal: bool = False,
+        reactivate_failed: bool = False,
     ) -> tuple[int, bool]:
         with self._connection_factory() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -37,6 +44,7 @@ class WorkerTaskRepository:
                 max_attempts=max_attempts,
                 config_revision=config_revision,
                 reactivate_terminal=reactivate_terminal,
+                reactivate_failed=reactivate_failed,
             )
 
     def enqueue_with_connection(
@@ -49,6 +57,7 @@ class WorkerTaskRepository:
         max_attempts: int = 3,
         config_revision: int = 1,
         reactivate_terminal: bool = False,
+        reactivate_failed: bool = False,
     ) -> tuple[int, bool]:
         """Enqueue a durable task inside a caller-owned transaction.
 
@@ -65,6 +74,7 @@ class WorkerTaskRepository:
             max_attempts=max_attempts,
             config_revision=config_revision,
             reactivate_terminal=reactivate_terminal,
+            reactivate_failed=reactivate_failed,
         )
 
     def _enqueue_on_connection(
@@ -77,6 +87,7 @@ class WorkerTaskRepository:
         max_attempts: int = 3,
         config_revision: int = 1,
         reactivate_terminal: bool = False,
+        reactivate_failed: bool = False,
     ) -> tuple[int, bool]:
         now = _utc_now()
         normalized_max_attempts = max(1, int(max_attempts))
@@ -93,6 +104,8 @@ class WorkerTaskRepository:
         if existing:
             task_id = int(existing["id"])
             status = str(existing["status"] or "")
+            if reactivate_failed and (status != "failed" or str(existing["task_type"] or "") != task_type):
+                raise WorkerTaskConflictError("原后台任务不是可重试的失败任务，未重新提交；请刷新后核对任务状态")
             if status == "pending":
                 try:
                     existing_payload = json.loads(existing["payload"] or "{}")
@@ -126,16 +139,17 @@ class WorkerTaskRepository:
                     ),
                 )
                 return task_id, cursor.rowcount == 1
-            if reactivate_terminal and status in {"completed", "failed"}:
+            if reactivate_failed or (reactivate_terminal and status in {"completed", "failed"}):
+                state_guard = "status='failed'" if reactivate_failed else "status IN ('completed', 'failed')"
                 cursor = connection.execute(
-                    """
+                    f"""
                     UPDATE worker_tasks
                     SET task_type=?, payload=?, status='pending', attempts=0,
                         max_attempts=?, config_revision=?, owner_id=NULL,
                         lease_expires_at=NULL, available_at=?, result=NULL,
                         error_message='', updated_at=?, started_at=NULL,
                         completed_at=NULL
-                    WHERE id=? AND status IN ('completed', 'failed')
+                    WHERE id=? AND {state_guard}
                     """,
                     (
                         task_type,
@@ -149,6 +163,10 @@ class WorkerTaskRepository:
                 )
                 return task_id, cursor.rowcount == 1
             return task_id, False
+        # Upgrading after an old cleanup must be safe even if the user never
+        # cleans history again. Preserve existing task identities above; only
+        # allocating a new ID needs to repair the retained delivery fences.
+        preserve_worker_task_sequence(connection)
         cursor = connection.execute(
             """
             INSERT INTO worker_tasks

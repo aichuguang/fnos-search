@@ -42,7 +42,12 @@ def _database(testcase: unittest.TestCase) -> RepositorySet:
     path = Path(__file__).with_name(f"_planning_revision_{uuid.uuid4().hex}.db")
 
     def cleanup() -> None:
-        for candidate in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        for candidate in (
+            path, Path(str(path) + "-wal"), Path(str(path) + "-shm"),
+            *(Path(f"{path}.openlist-{suffix}") for suffix in (
+                "change.lock", "remote.lock", "owner.json", "remote-state.json",
+            )),
+        ):
             try:
                 candidate.unlink()
             except FileNotFoundError:

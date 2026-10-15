@@ -1453,18 +1453,41 @@ class UpdateService:
             return set()
 
     def _inflight_episodes(self, subscription_id: int) -> set[tuple[int | None, int]]:
+        rows: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        offset = 0
         try:
-            rows = self.db.update.list_update_candidates(subscription_id=subscription_id, limit=500)
+            while True:
+                page = list(self.db.update.list_update_candidates(
+                    subscription_id=subscription_id, limit=500, offset=offset,
+                ) or [])
+                new_rows = [row for row in page if not row.get("id") or int(row["id"]) not in seen_ids]
+                rows.extend(new_rows)
+                seen_ids.update(int(row["id"]) for row in new_rows if row.get("id"))
+                if len(page) < 500 or not new_rows or not any(row.get("id") for row in new_rows):
+                    break
+                offset += len(page)
         except Exception:  # noqa: BLE001
             logger.debug("list inflight update candidates failed", exc_info=True)
             return set()
         result: set[tuple[int | None, int]] = set()
         for row in rows:
-            if str(row.get("decision") or "") not in {"submitted", "imported"}:
+            if str(row.get("decision") or "") not in {"submitted", "imported", "failed", "review"}:
                 continue
-            status = str(row.get("job_status") or "").strip()
-            if status in {"failed", "cancelled", "unsupported", "review", "done", "success"}:
+            status = str(row.get("job_status") or "").strip().lower()
+            if not status or status in {"failed", "cancelled", "unsupported"}:
                 continue
+            # A just-completed job whose candidate has not caught up is also
+            # resolved work; do not redownload it in the synchronization window.
+            if status == "review":
+                job = self.db.job_queries.get(int(row["job_id"])) if row.get("job_id") else None
+                raw = job.get("raw_data") if isinstance((job or {}).get("raw_data"), dict) else {}
+                completion = raw.get("completion") if isinstance(raw.get("completion"), dict) else {}
+                rollback = completion.get("rollback") if isinstance(completion.get("rollback"), dict) else {}
+                if str(rollback.get("status") or "") not in {"running", "failed", "completed"}:
+                    continue
+                # Rollback needs an explicit resume of this existing task, not
+                # another provider download while files are being restored.
             episode = _to_int(row.get("episode"))
             if not episode:
                 continue

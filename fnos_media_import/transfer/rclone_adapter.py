@@ -38,6 +38,8 @@ class RcloneOperationAdapter:
     fallback.
     """
 
+    supports_sequential_relay = True
+
     def __init__(self, service: Any, locator_resolver: Any) -> None:
         self.service = service
         self.locator_resolver = locator_resolver
@@ -103,16 +105,10 @@ class RcloneOperationAdapter:
         )
         return receipt
 
-    def download(self, *, source: dict[str, str], local_dir: str, idempotency_key: str) -> OperationReceipt:
-        """Submit a source-landing -> task-local relay copy.
-
-        ``local_dir`` is intentionally explicit and must be a job-scoped
-        absolute path.  The adapter never substitutes ``/data/relay`` (or a
-        provider root) when it is absent.
-        """
-
+    def prepare_download(self, *, source: dict[str, str], local_dir: str, idempotency_key: str) -> dict[str, Any]:
+        """Validate and derive a relay descriptor without looking up or starting a run."""
         self._require_plan()
-        key = self._require_operation_key(idempotency_key)
+        self._require_operation_key(idempotency_key)
         local_path = self._validate_relay_path(local_dir)
         if self.plan.local_temp is not None:
             frozen_path = str(self.plan.local_temp.get("path") or "")
@@ -133,11 +129,27 @@ class RcloneOperationAdapter:
                 ErrorCode.INVALID_PLAN,
                 "relay 复制描述符与冻结 local_temp 路径不一致",
             )
+        return copy_run
+
+    def download(self, *, source: dict[str, str], local_dir: str, idempotency_key: str) -> OperationReceipt:
+        """Submit a job-scoped relay copy, revalidating before crossing the service boundary."""
+        copy_run = self.prepare_download(source=source, local_dir=local_dir, idempotency_key=idempotency_key)
         return self.start_copy(
             source,
             dict(self.plan.local_temp or {}),
-            key,
+            self._require_operation_key(idempotency_key),
             copy_run=copy_run,
+        )
+
+    def find_download(self, *, source: dict[str, str], local_dir: str, idempotency_key: str) -> OperationReceipt | None:
+        """Reconcile an in-flight file during cancellation without submitting work."""
+        copy_run = self.prepare_download(source=source, local_dir=local_dir, idempotency_key=idempotency_key)
+        existing = self._find_existing_run(idempotency_key)
+        if existing is None:
+            return None
+        return self._receipt_from_run(
+            existing, operation_key=idempotency_key, source=source,
+            destination=dict(self.plan.local_temp or {}), copy_run=copy_run,
         )
 
     # ------------------------------------------------------------------
@@ -183,6 +195,28 @@ class RcloneOperationAdapter:
             "error_code": status.error_code,
             "metadata": dict(status.metadata or {}),
         }
+
+    def invalidate(self, receipt: OperationReceipt, reason: str = "") -> bool:
+        """把回执限定的 rclone run 标为 failed，让下一次重试重新下载。
+
+        用于 run 记为 success 但本地产物缺失的情况（例如脚本被互斥锁跳过却
+        以 0 退出的旧版本、relay 缓存被清理）。不作废则重试时会按
+        operation_key 对账到那个假成功的 run，永远不会再真正搬运。
+        """
+        if not isinstance(receipt, OperationReceipt):
+            return False
+        run_id = self._run_id((receipt.metadata or {}).get("run_id"))
+        if not run_id:
+            return False
+        method = getattr(self.service, "invalidate_run", None)
+        if not callable(method):
+            return False
+        operation_key = str((receipt.metadata or {}).get("operation_key") or "")
+        try:
+            result = method(run_id, operation_key=operation_key, reason=reason)
+        except Exception:  # noqa: BLE001 - 作废失败不能吞掉原始上传错误
+            return False
+        return bool(isinstance(result, dict) and result.get("success"))
 
     def cancel(self, receipt: OperationReceipt) -> CancelResult:
         if self.plan is None:

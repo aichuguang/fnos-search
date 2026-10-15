@@ -7,6 +7,47 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_documented_transfer_timeouts_reach_both_application_containers() -> None:
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    timeouts = dict(re.findall(
+        r"^(TRANSFER_[A-Z_]+_SECONDS)=(\d+)$",
+        (ROOT / ".env.example").read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    ))
+    assert len(timeouts) == 4
+    for service_name in ("fnos-media-import", "fnos-rclone-worker"):
+        environment = compose["services"][service_name]["environment"]
+        for name, default in timeouts.items():
+            assert environment.get(name) == "${" + name + ":-" + default + "}", (service_name, name)
+
+
+def test_web_configuration_repair_does_not_wait_for_business_readiness() -> None:
+    from fnos_media_import.services.readiness_service import ReadinessService
+
+    worker_status = ReadinessService(
+        process_role="all",
+        database_probe=lambda: {},
+        docker_socket_mounted=lambda: False,
+        root_key_probe=lambda: True,
+        openlist_required=lambda: True,
+        valid_openlist_mounts_probe=lambda: 0,
+        local_worker_status=lambda: {"success": True, "healthy": True},
+    ).status()
+    assert worker_status["ok"] is False
+    assert worker_status["checks"]["openlist"]["status"] == "unconfigured"
+
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    dependency = compose["services"]["fnos-media-import"]["depends_on"]["fnos-rclone-worker"]
+    assert dependency["condition"] == "service_healthy"
+    worker_healthcheck = compose["services"]["fnos-rclone-worker"]["healthcheck"]
+    # The HTTP server only starts after shared DB initialization. Do not race it
+    # with service_started, or gate the repair UI on business configuration.
+    assert "127.0.0.1:5251/livez" in " ".join(worker_healthcheck["test"])
+    assert "/readyz" not in " ".join(worker_healthcheck["test"])
+    # Keep the readiness endpoint and web health check strict for monitoring.
+    assert "127.0.0.1:5251/readyz" in (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+
 def test_compose_supports_release_image_and_source_build() -> None:
     compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
     development = yaml.safe_load((ROOT / "compose.dev.yaml").read_text(encoding="utf-8"))
@@ -30,6 +71,10 @@ def test_compose_supports_release_image_and_source_build() -> None:
         "FNOS_ROOT_KEY": "${FNOS_ROOT_KEY:-}",
         "FNOS_RELAY_ROOT": "/data/relay",
         "FNOS_LOCAL_TARGET_ROOT": "/storage-targets",
+        "TRANSFER_SOURCE_VISIBLE_TIMEOUT_SECONDS": "${TRANSFER_SOURCE_VISIBLE_TIMEOUT_SECONDS:-1800}",
+        "TRANSFER_NATIVE_WAIT_TIMEOUT_SECONDS": "${TRANSFER_NATIVE_WAIT_TIMEOUT_SECONDS:-604800}",
+        "TRANSFER_WAIT_TIMEOUT_SECONDS": "${TRANSFER_WAIT_TIMEOUT_SECONDS:-10800}",
+        "TRANSFER_CANCEL_TIMEOUT_SECONDS": "${TRANSFER_CANCEL_TIMEOUT_SECONDS:-3600}",
         "FNOS_PROCESS_ROLE": "web",
         "RCLONE_WORKER_URL": "http://fnos-rclone-worker:5251",
         "LOG_FILE": "/app/logs/web.log",
@@ -152,6 +197,7 @@ def test_runtime_image_contains_rclone_without_docker_cli() -> None:
 
     assert "ARG RCLONE_IMAGE=rclone/rclone:1.70.3" in dockerfile
     assert "COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone" in dockerfile
+    assert "RUN command -v flock >/dev/null" in dockerfile
     assert "DOCKER_CLI_IMAGE" not in dockerfile
     assert "/var/run/docker.sock" not in compose
     assert "/var/run/docker.sock" not in entrypoint

@@ -16,6 +16,12 @@ from typing import Any
 import requests
 
 from ..constants import JOB_DONE, JOB_FAILED, JOB_SUBMITTED
+from ..provider_errors import (
+    SHARE_INVALID_MESSAGE,
+    is_share_resource_unavailable,
+    provider_error_details,
+    share_error_details,
+)
 from .base import AdapterCheckResult, ImportResult
 
 
@@ -28,10 +34,15 @@ SIGN_ALGORITHM = "HL6-HMAC-SHA256"
 
 
 class SixPanApiError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int = 0, data: Any = None):
+    def __init__(
+        self, message: str, *, status_code: int = 0, data: Any = None,
+        code: str = "", details: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.data = data
+        self.code = str(code or "")
+        self.details = dict(details or {})
 
 
 @dataclass
@@ -42,6 +53,7 @@ class SixPanTaskState:
     bytes_total: int = 0
     bytes_processed: int = 0
     task: dict[str, Any] | None = None
+    error_code: str = ""
 
     @property
     def completed(self) -> bool:
@@ -180,8 +192,23 @@ class SixPanClient:
             data: Any = response.json()
         except ValueError:
             data = {"text": response.text}
+        body_data = _dict_body(data)
+        provider_code = _first_value(data, "code", "errorCode", "error_code")
+        if provider_code in (None, "", 0, "0", 200, "200"):
+            provider_code = _first_value(body_data, "code", "errorCode", "error_code")
+        message = _response_message(data) or _response_message(body_data)
+        if is_share_resource_unavailable(
+            "sixpan", path=path, http_status=response.status_code, code=provider_code, message=message,
+        ):
+            raise SixPanApiError(
+                SHARE_INVALID_MESSAGE, code="SHARE_INVALID", status_code=response.status_code,
+                details=share_error_details(
+                    "sixpan", path=path, http_status=response.status_code,
+                    code=provider_code, message=message,
+                ),
+            )
         if response.status_code < 200 or response.status_code >= 300:
-            message = _response_message(data) or f"HTTP {response.status_code}"
+            message = message or f"HTTP {response.status_code}"
             raise SixPanApiError(f"六盘 API 请求失败：{message}", status_code=response.status_code, data=data)
         return data
 
@@ -435,7 +462,11 @@ class SixPanOfflineImporter:
             user = self.client.get_user()
         except Exception as exc:  # noqa: BLE001
             return AdapterCheckResult(False, "failed", f"六盘账号探测失败：{exc}", self.describe())
-        return AdapterCheckResult(True, "ready", "六盘账号探测通过", {"user": _redact(user), **self.describe()})
+        subject = str(user.get("identity") or user.get("id") or user.get("userId") or "").strip()
+        return AdapterCheckResult(True, "ready", "六盘账号探测通过", {
+            "user": _redact(user), **self.describe(),
+            "identity_id": f"sixpan:user:{subject}" if subject else "",
+        })
 
     def parse_resource(self, title: str, source_url: str, source_type: str = "") -> dict[str, Any]:
         source_type = source_type or ("torrent" if _looks_like_torrent(source_url) else "magnet")
@@ -488,13 +519,17 @@ class SixPanOfflineImporter:
                 expected_file_count = _task_file_count(parse_data)
             except Exception as exc:  # noqa: BLE001
                 parse_error = str(exc)
-                if self.parse_required:
+                if self.parse_required or str(getattr(exc, "code", "") or "") == "SHARE_INVALID":
                     return ImportResult(
                         False,
                         JOB_FAILED,
                         f"六盘离线解析失败：{parse_error}",
                         target_path=save_path,
-                        raw_data={"parse_error": parse_error, "request": {"title": title, "source_url": _redact_url(source_url), "save_path": save_path}},
+                        raw_data={
+                            "parse_error": parse_error,
+                            "request": {"title": title, "source_url": _redact_url(source_url), "save_path": save_path},
+                            **provider_error_details(exc),
+                        },
                     )
 
         addon = {
@@ -521,6 +556,7 @@ class SixPanOfflineImporter:
                     "parse": _redact(parse_data),
                     "parse_error": parse_error,
                     "request": {"title": title, "source_url": _redact_url(source_url), "save_path": save_path},
+                    **provider_error_details(exc),
                 },
             )
 
@@ -543,6 +579,7 @@ class SixPanOfflineImporter:
             "task_state": state.__dict__ | {"task": _redact(state.task or {})},
             "expected_file_count": expected_file_count,
             "file_count": expected_file_count,
+            "error_code": state.error_code,
         }
         return ImportResult(
             not state.failed,
@@ -646,6 +683,13 @@ class SixPanOfflineImporter:
         message = str(task.get("message") or "").strip()
 
         if status_text in self.failed_statuses or (code < 0):
+            if is_share_resource_unavailable(
+                "sixpan", code=task.get("code"), message=message, source_operation=True,
+            ):
+                return SixPanTaskState(
+                    "failed", SHARE_INVALID_MESSAGE, progress, bytes_total, bytes_processed,
+                    task, error_code="SHARE_INVALID",
+                )
             return SixPanTaskState("failed", message or f"status={status_text or code}", progress, bytes_total, bytes_processed, task)
         if status_text in self.success_statuses:
             return SixPanTaskState("completed", message or f"status={status_text}", progress, bytes_total, bytes_processed, task)

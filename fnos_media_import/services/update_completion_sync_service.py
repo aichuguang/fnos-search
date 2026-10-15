@@ -46,19 +46,58 @@ class UpdateCompletionSyncService:
         pending_keys: set[EpisodeKey] = set()
         terminal_candidate_updates: list[tuple[int, str, str, dict[str, Any]]] = []
         status_items: list[dict[str, Any]] = []
+        revoked_job_ids: set[int] = set()
         subscription_season = _to_season(subscription.get("season"))
 
         for candidate in candidates:
             decision = str(candidate.get("decision") or "")
-            if decision not in {"submitted", "imported", "review"} or not candidate.get("job_id"):
+            if decision not in {"submitted", "imported", "review", "failed", "completed"} or not candidate.get("job_id"):
                 continue
-            checked += 1
-            job = self.database.job_queries.get(int(candidate["job_id"]))
+            if decision == "completed" and str(candidate.get("job_status") or "") in {"done", "success"}:
+                continue
+            refresh_completed = False
+            for _attempt in range(2):
+                job = self.database.job_queries.get(int(candidate["job_id"]))
+                if not job:
+                    break
+                status = str(job.get("status") or "").strip().lower()
+                completion = (job.get("raw_data") or {}).get("completion") if isinstance(job.get("raw_data"), dict) else {}
+                completion = completion if isinstance(completion, dict) else {}
+                rollback = completion.get("rollback") if isinstance(completion.get("rollback"), dict) else {}
+                rollback_active = str(rollback.get("status") or "") in {"running", "failed", "completed"}
+                job_id = int(candidate["job_id"])
+                if not rollback_active or job_id in revoked_job_ids:
+                    break
+                revoked = self.database.update.revoke_update_seen_for_job(
+                    subscription_id, job_id, expected_rollback=rollback,
+                )
+                if revoked is not None:
+                    revoked_job_ids.add(job_id)
+                    break
+                # Re-apply may have finished after our read. Do not erase its
+                # new evidence or classify it using the stale rollback snapshot.
+                refresh_completed = True
+            else:
+                continue
             if not job:
                 continue
-            status = str(job.get("status") or "")
             raw = dict(candidate.get("raw_data")) if isinstance(candidate.get("raw_data"), dict) else {}
-            completion = (job.get("raw_data") or {}).get("completion") if isinstance(job.get("raw_data"), dict) else {}
+            if decision == "completed" and not rollback_active and not refresh_completed:
+                continue
+            previous_completion = raw.get("job_completion") if isinstance(raw.get("job_completion"), dict) else {}
+            if (
+                decision == "failed"
+                and status in {"failed", "cancelled", "unsupported"}
+                and previous_completion.get("status") == status
+                and previous_completion.get("job_id") == job.get("id")
+                and not rollback_active
+            ):
+                continue
+            checked += 1
+            if rollback_active:
+                raw["organizer_rollback"] = dict(rollback)
+            else:
+                raw.pop("organizer_rollback", None)
             raw["job_completion"] = {
                 "job_id": job.get("id"),
                 "status": status,
@@ -99,7 +138,7 @@ class UpdateCompletionSyncService:
                 if episode_key:
                     failed_keys.add(episode_key)
                 status_items.append(self.status_from_job(candidate_for_sync, job, status=status, decision="failed"))
-            elif status == JOB_REVIEW and self._provider_completed_review(completion):
+            elif status == JOB_REVIEW and not rollback_active and self._provider_completed_review(completion):
                 # 六盘旧流程可能已完成文件下载，仅媒体库刷新失败。此时 Job 仍需
                 # 保持 review 供管理员处理，但追更侧必须把该集视为已入库，否则
                 # missing 补查会创建新的 Provider 任务并重复下载。
@@ -130,7 +169,12 @@ class UpdateCompletionSyncService:
                     review_keys.add(episode_key)
                 status_items.append(self.status_from_job(candidate_for_sync, job, status=status, decision="review"))
             else:
-                self.database.update.update_update_candidate(candidate_id, decision="submitted", raw_data=raw)
+                self.database.update.update_update_candidate(
+                    candidate_id,
+                    decision="submitted",
+                    reason="关联入库任务正在执行，等待完整入库确认",
+                    raw_data=raw,
+                )
                 if episode:
                     pending.append(episode)
                 if episode_key:

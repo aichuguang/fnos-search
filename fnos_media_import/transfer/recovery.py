@@ -4,8 +4,8 @@ The queue is only a wake-up mechanism; the authoritative phase/receipt lives
 in ``transfer_executions``.  A process restart, a lost queue row, or an
 expired worker lease therefore must be repaired from that table rather than
 from legacy ``raw_data`` fields.  This scanner is intentionally small and
-side-effect free apart from idempotent queue insertion so it can run at
-startup and periodically in the worker process.
+side-effect free apart from idempotent queue insertion and narrowly scoped
+legacy timeout recovery, so it can run at startup and periodically in the worker.
 """
 
 from __future__ import annotations
@@ -84,9 +84,15 @@ class TransferRecoveryScanner:
         return {"woken": True, "enqueued": bool(created), "job_id": normalized}
 
     def scan_once(self, *, now: str | None = None, limit: int = 100) -> RecoveryScanResult:
-        due = self.executions.list_due(now=now or utc_now_iso(), limit=max(0, int(limit)))
         scanned = enqueued = already = skipped = 0
         errors: list[str] = []
+        recover_timeouts = getattr(self.executions, "resume_legacy_transfer_timeouts", None)
+        if callable(recover_timeouts):
+            try:
+                recover_timeouts(limit=max(0, int(limit)))
+            except Exception as exc:  # noqa: BLE001 - ordinary queue recovery must still run
+                errors.append(f"legacy transfer timeout recovery: {exc}")
+        due = self.executions.list_due(now=now or utc_now_iso(), limit=max(0, int(limit)))
         for execution in due:
             scanned += 1
             phase = str(getattr(execution, "phase", "") or "")

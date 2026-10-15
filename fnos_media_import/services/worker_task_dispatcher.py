@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from ..repositories.worker_task_repository import WorkerTaskConflictError
+
 
 class WorkerTaskDispatcher:
     """Creates durable business tasks while preserving legacy synchronous mode."""
@@ -156,15 +158,31 @@ class WorkerTaskDispatcher:
         request_token: str,
         submit_payload: dict[str, Any],
         request_updates: dict[str, Any] | None = None,
+        retry_failed: bool = False,
+        connection: Any = None,
     ) -> dict[str, Any] | None:
+        payload = {
+            "guest_request_id": int(guest_request_id),
+            "request_token": str(request_token),
+            "submit_payload": dict(submit_payload),
+            "request_updates": dict(request_updates or {}),
+        }
+        if retry_failed:
+            if connection is None or not self.enabled():
+                raise WorkerTaskConflictError("持久化 Worker 重试入口不可用，未改变原提交，请先恢复 Worker 配置")
+            task_id, created = self.repository.enqueue_with_connection(
+                connection,
+                "public_import_create", payload, f"public-import:{request_token}",
+                max_attempts=3, config_revision=self.config_revision(), reactivate_failed=True,
+            )
+            return {
+                "success": True, "queued": True, "created": created,
+                "worker_task_id": task_id, "task_type": "public_import_create",
+                "message": "原失败提交已重新加入持久化 Worker 队列",
+            }
         return self.dispatch(
             "public_import_create",
-            {
-                "guest_request_id": int(guest_request_id),
-                "request_token": str(request_token),
-                "submit_payload": dict(submit_payload),
-                "request_updates": dict(request_updates or {}),
-            },
+            payload,
             f"public-import:{request_token}",
             max_attempts=3,
         )

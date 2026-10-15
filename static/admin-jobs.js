@@ -21,6 +21,69 @@
         } = context;
         const adminState = state;
         const $ = getElement;
+        const pendingJobActions = new Set();
+        const REVIEW_COPY = Object.freeze({
+            action: "处理确认",
+            viewJob: "查看关联任务",
+            risk: "需人工复核",
+            suggestion: "请处理确认，核实原任务的执行结果",
+            noJobSuggestion: "需人工审核，请先查看详情和审核原因",
+            submittingRisk: "结果待确认",
+            submittingSuggestion: "网盘提交处理中，请勿重复提交",
+            checkPending: "执行结果待核实",
+            title: "人工复核：请先核对执行结果",
+            reason: "复核原因",
+            reasonFallback: "原任务已暂停，需要核实执行结果后继续。",
+            phase: "当前阶段",
+            resumePhase: "继续阶段",
+            savedPath: "网盘保存目录（原任务记录）",
+            targetPath: "目标目录",
+            checkPath: "核对目录",
+            missingPath: "未记录，请在对应网盘中核对",
+            guidance: "操作指引",
+            preserveEvidence: "若已有本次文件、存在进行中的网盘任务，或无法确认结果，请保留原任务和相关证据，不要重新提交；此处不能直接标记入库成功。",
+            checklist: "请核对源端暂存目录、目标目录，以及对应网盘的任务列表（含进行中和历史任务）。误判可能导致重复转存或产生重复文件。",
+            resume: "确认并继续",
+            resubmit: "确认未执行，重新提交",
+            reload: "刷新任务状态",
+            processing: "处理中...",
+            unavailable: "该操作当前不可用，请刷新任务详情后确认。",
+            versionMissing: "任务状态版本缺失，请刷新任务详情后重试。",
+            noteLabel: "核对说明（目录、任务列表和核对时间，最多 1000 字）",
+            noteRequired: "请填写实际核对说明，不能留空。",
+            noteTooLong: "核对说明不能超过 1000 个字符，请精简后重试。",
+            recorded: "确认已记录，请刷新状态",
+            unknownPhase: "未知阶段，请刷新任务状态",
+            next: "继续确认",
+            attest: "已核对不存在本次文件或进行中的任务，允许重新提交",
+            resubmitRisk: "仅在确认外部操作未执行时继续。判断错误会造成重复转存；系统不会替你确认网盘中的实际结果。",
+            resumeMessage: "请确认导致暂停的问题已处理。系统将保留已有回执继续原任务，不会另建入库任务。",
+            retryFailure: "任务重试失败，请保留当前任务并检查原因。",
+            reviewFailure: "复核操作未成功，请保留当前任务并检查原因。",
+            retrySuccess: "已提交原任务继续执行",
+            reviewSuccess: "已记录核对说明，原任务已重新排队",
+            refreshFailure: "操作已受理，但部分状态刷新失败，请使用“刷新任务状态”核对进度。",
+        });
+        const REVIEW_PHASES = Object.freeze({
+            planning: "检查入库计划",
+            source_materializing: "来源网盘转存",
+            source_waiting_visible: "等待来源文件可见",
+            native_submitting: "提交原生网盘任务",
+            native_waiting: "等待网盘任务完成",
+            transferring: "跨盘搬运",
+            target_verifying: "核对目标暂存文件",
+            organizing: "整理媒体文件",
+            finalizing: "归入最终目录",
+            final_verifying: "核对最终文件",
+            ack_pending: "确认入库结果",
+            cleanup_pending: "清理临时文件",
+            completed: "入库完成",
+            retry_wait: "等待继续执行",
+            manual_review: "等待人工复核",
+            cancel_pending: "等待取消结果",
+            failed: "执行失败",
+            cancelled: "已取消",
+        });
 
         async function loadOverview() {
             const data = await api("/api/admin/dashboard");
@@ -109,26 +172,33 @@
                         <td>${escapeHtml(formatDate(item.created_at))}</td>
                         <td>${statusPill(item.status)}</td>
                         <td>${riskPill(item)}</td>
-                        <td>${suggestionText(item)}</td>
+                        <td>${escapeHtml(suggestionText(item))}</td>
                         <td class="table-actions">${requestActionButtons(item)}</td>
                     </tr>
                 `
                 )
                 .join("");
             body.querySelectorAll("[data-request-detail]").forEach((button) => button.addEventListener("click", () => showRequestDetail(button.dataset.requestDetail)));
+            body.querySelectorAll("[data-request-job]").forEach((button) => button.addEventListener("click", () => showJobDetail(button.dataset.requestJob)));
             body.querySelectorAll("[data-request-approve]").forEach((button) => button.addEventListener("click", () => approveRequest(button.dataset.requestApprove)));
+            body.querySelectorAll("[data-request-retry]").forEach((button) => button.addEventListener("click", () => approveRequest(button.dataset.requestRetry, { retry: true })));
             body.querySelectorAll("[data-request-reject]").forEach((button) => button.addEventListener("click", () => rejectRequest(button.dataset.requestReject)));
             body.querySelectorAll("[data-request-cancel]").forEach((button) => button.addEventListener("click", () => cancelRequest(button.dataset.requestCancel)));
             renderListPagers(["requestsPagerTop", "requestsPager"], adminState.pagination.requests, goRequestsPage);
         }
 
         function requestActionButtons(item) {
-            const status = String(item.status || "");
+            const status = String(item.status || "").toLowerCase();
             const terminal = ["done", "success", "cancelled"].includes(status);
             const buttons = [`<button class="secondary mini" data-request-detail="${item.id}">详情</button>`];
-            if (status === "pending_review") {
+            if (item.job_id) {
+                buttons.push(`<button class="mini" data-request-job="${escapeHtml(item.job_id)}">${requestNeedsReview(item) ? REVIEW_COPY.action : REVIEW_COPY.viewJob}</button>`);
+            }
+            if (status === "pending_review" && !item.job_id) {
                 buttons.push(`<button class="mini" data-request-approve="${item.id}">批准</button>`);
                 buttons.push(`<button class="secondary mini danger" data-request-reject="${item.id}">拒绝</button>`);
+            } else if (status === "failed" && !item.job_id) {
+                buttons.push(`<button class="mini" data-request-retry="${item.id}">重试提交</button>`);
             } else if (!["rejected", "unsupported", "failed"].includes(status) && !terminal) {
                 buttons.push(`<button class="secondary mini danger" data-request-reject="${item.id}">拒绝</button>`);
             }
@@ -139,6 +209,10 @@
                 buttons.push(`<button class="secondary mini danger" data-request-cancel="${item.id}">取消任务</button>`);
             }
             return buttons.join("");
+        }
+
+        function requestNeedsReview(item) {
+            return ["review", "manual_review"].includes(String(item.status || "").toLowerCase());
         }
 
         function sourceText(value) {
@@ -189,6 +263,8 @@
 
         function riskPill(item) {
             const status = String(item.status || "");
+            if (requestNeedsReview(item)) return `<span class="pill warn">${REVIEW_COPY.risk}</span>`;
+            if (status === "provider_submitting") return `<span class="pill warn">${REVIEW_COPY.submittingRisk}</span>`;
             const guard = contentGuardInfo(item);
             if (guard) return `<span class="pill warn">${escapeHtml(guard.label || "内容风控")}</span>`;
             if (["failed", "rejected", "unsupported"].includes(status)) return `<span class="pill error">高风险</span>`;
@@ -199,6 +275,8 @@
 
         function suggestionText(item) {
             const status = String(item.status || "");
+            if (requestNeedsReview(item)) return item.job_id ? REVIEW_COPY.suggestion : REVIEW_COPY.noJobSuggestion;
+            if (status === "provider_submitting") return REVIEW_COPY.submittingSuggestion;
             const guard = contentGuardInfo(item);
             if (guard) return guard.reason || "疑似敏感内容，人工审核";
             if (status === "pending_review") return "人工审核";
@@ -256,10 +334,11 @@
 
         async function showRequestDetail(id) {
             const data = await api(`/api/admin/requests/${id}`);
-            const item = data.request || {};
             const job = data.job || null;
+            const item = { ...(data.request || {}), job_id: data.request?.job_id || job?.id };
             const events = data.events || [];
             const guard = contentGuardInfo(item);
+            const needsReview = requestNeedsReview(item);
             openDrawer(
                 `请求详情`,
                 `
@@ -289,15 +368,15 @@
                         <span>用户备注</span>
                         <p>${escapeHtml(item.note || "无")}</p>
                     </div>
-                    <div class="detail-block ok-block">
+                    <div class="detail-block ${needsReview ? "warn-block" : "ok-block"}">
                         <span>检测结果</span>
-                        <strong>检测完成</strong>
+                        <strong>${needsReview ? REVIEW_COPY.checkPending : "检测完成"}</strong>
                         <small>状态：${escapeHtml(statusText(item.status || ""))}</small>
                     </div>
                     <div class="detail-block warn-block">
                         <span>风险提示</span>
-                        <strong>${suggestionText(item)}</strong>
-                        <small>${guard ? `风险分：${escapeHtml(guard.score ?? "-")}；安全分：${escapeHtml(guard.safety_score ?? "-")}；请重点核对资源名和解析文件名。` : "请根据资源名称、分类和备注确认是否入库。"}</small>
+                        <strong>${escapeHtml(suggestionText(item))}</strong>
+                        <small>${guard ? `风险分：${escapeHtml(guard.score ?? "-")}；安全分：${escapeHtml(guard.safety_score ?? "-")}；请重点核对资源名和解析文件名。` : needsReview && item.job_id ? REVIEW_COPY.preserveEvidence : "请根据资源名称、分类和备注确认是否入库。"}</small>
                     </div>
                     ${guard ? `
                     <div class="detail-block warn-block">
@@ -316,18 +395,25 @@
                 <div class="drawer-action-stack">${requestDrawerActions(item)}</div>
                 `
             );
+            $("adminDrawerBody").querySelector("[data-drawer-job]")?.addEventListener("click", (event) => showJobDetail(event.currentTarget.dataset.drawerJob));
             $("adminDrawerBody").querySelector("[data-drawer-approve]")?.addEventListener("click", (event) => approveRequest(event.currentTarget.dataset.drawerApprove));
+            $("adminDrawerBody").querySelector("[data-drawer-retry]")?.addEventListener("click", (event) => approveRequest(event.currentTarget.dataset.drawerRetry, { retry: true }));
             $("adminDrawerBody").querySelector("[data-drawer-reject]")?.addEventListener("click", (event) => rejectRequest(event.currentTarget.dataset.drawerReject));
             $("adminDrawerBody").querySelector("[data-drawer-cancel]")?.addEventListener("click", (event) => cancelRequest(event.currentTarget.dataset.drawerCancel));
         }
 
         function requestDrawerActions(item) {
-            const status = String(item.status || "");
+            const status = String(item.status || "").toLowerCase();
             const terminal = ["done", "success", "cancelled"].includes(status);
             const buttons = [];
-            if (status === "pending_review") {
+            if (item.job_id) {
+                buttons.push(`<button data-drawer-job="${escapeHtml(item.job_id)}">${requestNeedsReview(item) ? REVIEW_COPY.action : REVIEW_COPY.viewJob}</button>`);
+            }
+            if (status === "pending_review" && !item.job_id) {
                 buttons.push(`<button data-drawer-approve="${item.id}">批准入库</button>`);
                 buttons.push(`<button class="secondary danger" data-drawer-reject="${item.id}">拒绝请求</button>`);
+            } else if (status === "failed" && !item.job_id) {
+                buttons.push(`<button data-drawer-retry="${item.id}">重试提交</button>`);
             } else if (!["rejected", "unsupported", "failed"].includes(status) && !terminal) {
                 buttons.push(`<button class="secondary danger" data-drawer-reject="${item.id}">拒绝请求</button>`);
             }
@@ -340,9 +426,19 @@
             return buttons.join("") || `<button class="secondary" type="button" disabled>无可用操作</button>`;
         }
 
-        async function approveRequest(id) {
-            await api(`/api/admin/requests/${id}/approve`, { method: "POST", body: JSON.stringify({}) });
-            toast("已批准提交", "success");
+        async function requestJobAction(path, options) {
+            try {
+                return await api(path, options);
+            } catch (error) {
+                toast(error?.message || "操作请求失败，请刷新状态后核对结果", "error");
+                return null;
+            }
+        }
+
+        async function approveRequest(id, { retry = false } = {}) {
+            const data = await requestJobAction(`/api/admin/requests/${id}/approve`, { method: "POST", body: JSON.stringify(retry ? { retry: true } : {}) });
+            if (!data) return;
+            toast(data.message || (retry ? "已重新提交后台处理" : "已批准提交"), "success");
             closeDrawer();
             await Promise.all([loadRequests(), loadJobs(), loadOverview()]);
         }
@@ -357,10 +453,11 @@
                 tone: "danger",
             });
             if (reason === null) return;
-            const data = await api(`/api/admin/requests/${id}/reject`, {
+            const data = await requestJobAction(`/api/admin/requests/${id}/reject`, {
                 method: "POST",
                 body: JSON.stringify({ reason, cleanup: true, delete_source: true, delete_temp: true, delete_target_partial: true, stop_running: true }),
             });
+            if (!data) return;
             const cleanupMessage = data.job_cancel?.cleanup?.message;
             toast(cleanupMessage || "已拒绝提交", "success");
             closeDrawer();
@@ -377,7 +474,7 @@
                 tone: "danger",
             });
             if (reason === null) return;
-            const data = await api(`/api/admin/requests/${id}/cancel`, {
+            const data = await requestJobAction(`/api/admin/requests/${id}/cancel`, {
                 method: "POST",
                 body: JSON.stringify({
                     reason,
@@ -388,6 +485,7 @@
                     stop_running: true,
                 }),
             });
+            if (!data) return;
             toast(data.job_cancel?.cleanup?.message || data.message || "已取消提交", "success");
             closeDrawer();
             await Promise.all([loadRequests(), loadJobs(), loadOverview(), loadRclone()]);
@@ -641,10 +739,223 @@
             `).join("");
         }
 
-        async function retryJob(id) {
-            await api(`/api/admin/jobs/${id}/retry`, { method: "POST", body: JSON.stringify({}) });
-            toast("已提交任务重试", "success");
-            await Promise.all([loadJobs(), loadOverview()]);
+        async function withJobActionLock(id, button, action) {
+            const key = String(id);
+            if (pendingJobActions.has(key)) return null;
+            pendingJobActions.add(key);
+            const previous = button ? {
+                disabled: button.disabled,
+                html: button.innerHTML,
+                busy: button.getAttribute("aria-busy"),
+            } : null;
+            if (button) {
+                button.disabled = true;
+                button.textContent = REVIEW_COPY.processing;
+                button.setAttribute("aria-busy", "true");
+            }
+            try {
+                return await action();
+            } finally {
+                pendingJobActions.delete(key);
+                if (button) {
+                    const consumed = button.dataset.reviewConsumed === "true";
+                    button.disabled = previous.disabled || consumed;
+                    button.innerHTML = consumed ? REVIEW_COPY.recorded : previous.html;
+                    if (previous.busy === null) button.removeAttribute("aria-busy");
+                    else button.setAttribute("aria-busy", previous.busy);
+                }
+            }
+        }
+
+        async function refreshAfterJobAction(id, reopenDetail) {
+            const reloads = [loadRequests(), loadJobs(), loadOverview()];
+            if (reopenDetail) reloads.push(showJobDetail(id));
+            const results = await Promise.allSettled(reloads);
+            if (results.some((result) => result.status === "rejected")) toast(REVIEW_COPY.refreshFailure, "warning");
+        }
+
+        async function submitJobRetry(id, reopenDetail) {
+            const data = await api(`/api/admin/jobs/${encodeURIComponent(id)}/retry`, {
+                method: "POST",
+                body: JSON.stringify({}),
+                allowFailure: true,
+                skipButtonLoading: true,
+            });
+            if (data.success !== true) {
+                toast(data.message || REVIEW_COPY.retryFailure, "error");
+                return data;
+            }
+            toast(data.message || REVIEW_COPY.retrySuccess, "success");
+            await refreshAfterJobAction(id, reopenDetail);
+            return data;
+        }
+
+        async function retryJob(id, button = null, reopenDetail = false) {
+            return withJobActionLock(id, button, async () => {
+                try {
+                    return await submitJobRetry(id, reopenDetail);
+                } catch (error) {
+                    toast(error?.message || REVIEW_COPY.retryFailure, "error");
+                    return null;
+                }
+            });
+        }
+
+        function transferReviewInfo(job) {
+            const execution = job?.transfer_execution;
+            if (!execution || typeof execution !== "object") return null;
+            const review = execution.review;
+            return review && review.required === true ? { execution, review } : null;
+        }
+
+        function reviewPaths(job) {
+            const paths = job.transfer_execution?.review?.paths;
+            const frozenPaths = Array.isArray(paths) ? paths.filter((row) => row && typeof row.path === "string" && row.path.trim()) : [];
+            if (frozenPaths.length) {
+                return frozenPaths.map((row) => ({
+                    label: String(row.label || REVIEW_COPY.checkPath),
+                    namespace: String(row.namespace || ""),
+                    path: row.path,
+                }));
+            }
+            return [
+                { label: REVIEW_COPY.savedPath, namespace: "", path: job.official_save_path || REVIEW_COPY.missingPath },
+                { label: REVIEW_COPY.targetPath, namespace: "", path: job.rclone_target_path || job.target_path || job.openlist_visible_path || REVIEW_COPY.missingPath },
+            ];
+        }
+
+        function reviewPathLabel(row) {
+            return `${row.label}${row.namespace ? `（${row.namespace}）` : ""}`;
+        }
+
+        function reviewPhaseText(phase) {
+            const key = String(phase || "").toLowerCase();
+            return key === "" || key === "-" ? "-" : REVIEW_PHASES[key] || REVIEW_COPY.unknownPhase;
+        }
+
+        function invalidateReviewSnapshot(job, button) {
+            const info = transferReviewInfo(job);
+            if (info) {
+                info.review.can_resume = false;
+                info.review.can_confirm_not_submitted = false;
+            }
+            if (button) {
+                button.dataset.reviewConsumed = "true";
+                button.disabled = true;
+            }
+        }
+
+        function renderTransferReview(job) {
+            const info = transferReviewInfo(job);
+            if (!info) return "";
+            const { execution, review } = info;
+            const paths = reviewPaths(job);
+            const guidance = Array.isArray(review.guidance) ? review.guidance.join("\n") : review.guidance;
+            return `<section class="notice-box warning job-manual-review">
+                <strong>${REVIEW_COPY.title}</strong>
+                <p><strong>${REVIEW_COPY.reason}：</strong>${escapeHtml(review.reason || REVIEW_COPY.reasonFallback)}</p>
+                <div class="detail-grid">
+                    <div><span>${REVIEW_COPY.phase}</span>${escapeHtml(reviewPhaseText(execution.phase || "manual_review"))}</div>
+                    <div><span>${REVIEW_COPY.resumePhase}</span>${escapeHtml(reviewPhaseText(review.resume_phase))}</div>
+                    ${paths.map((row) => `<div><span>${escapeHtml(reviewPathLabel(row))}</span>${escapeHtml(row.path)}</div>`).join("")}
+                </div>
+                <p><strong>${REVIEW_COPY.guidance}：</strong>${escapeHtml(guidance || REVIEW_COPY.reasonFallback)}</p>
+                ${review.can_confirm_not_submitted === true ? `<p>${REVIEW_COPY.checklist}</p>` : ""}
+                <p>${REVIEW_COPY.preserveEvidence}</p>
+                <div class="filter-row">
+                    ${review.can_resume === true ? `<button type="button" data-job-review-action="resume">${REVIEW_COPY.resume}</button>` : ""}
+                    ${review.can_confirm_not_submitted === true ? `<button type="button" class="secondary danger" data-job-review-action="confirm_not_submitted">${REVIEW_COPY.resubmit}</button>` : ""}
+                    <button type="button" class="secondary" data-job-review-reload="${escapeHtml(job.id)}">${REVIEW_COPY.reload}</button>
+                </div>
+            </section>`;
+        }
+
+        async function reviewJob(job, action, button = null) {
+            const info = transferReviewInfo(job);
+            if (!info || (action === "resume" ? info.review.can_resume !== true
+                : action !== "confirm_not_submitted" || info.review.can_confirm_not_submitted !== true)) {
+                toast(REVIEW_COPY.unavailable, "error");
+                return null;
+            }
+            return withJobActionLock(job.id, button, async () => {
+                try {
+                    if (action === "resume") {
+                        const confirmed = await confirmDialog({
+                            title: `${REVIEW_COPY.resume} #${job.id}`,
+                            message: `${REVIEW_COPY.resumeMessage}\n${REVIEW_COPY.reason}：${info.review.reason || REVIEW_COPY.reasonFallback}\n${REVIEW_COPY.resumePhase}：${reviewPhaseText(info.review.resume_phase)}`,
+                            confirmText: REVIEW_COPY.resume,
+                            tone: "warning",
+                        });
+                        if (!confirmed) return null;
+                        const data = await submitJobRetry(job.id, true);
+                        if (data.success === true || data.recovered === true) invalidateReviewSnapshot(job, button);
+                        if (data.success !== true && data.recovered === true) await refreshAfterJobAction(job.id, true);
+                        return data;
+                    }
+                    if (!Number.isInteger(info.execution.row_version) || info.execution.row_version <= 0) {
+                        toast(REVIEW_COPY.versionMissing, "error");
+                        return null;
+                    }
+                    const paths = reviewPaths(job);
+                    const note = await promptDialog({
+                        title: `${REVIEW_COPY.resubmit} #${job.id}`,
+                        message: `${REVIEW_COPY.checklist}\n${paths.map((row) => `${reviewPathLabel(row)}：${row.path}`).join("\n")}\n${REVIEW_COPY.preserveEvidence}`,
+                        promptLabel: REVIEW_COPY.noteLabel,
+                        defaultValue: "",
+                        required: true,
+                        requiredMessage: REVIEW_COPY.noteRequired,
+                        confirmText: REVIEW_COPY.next,
+                        tone: "danger",
+                    });
+                    if (note === null || note === undefined) return null;
+                    const normalizedNote = String(note).trim();
+                    if (!normalizedNote) {
+                        toast(REVIEW_COPY.noteRequired, "error");
+                        return null;
+                    }
+                    if (Array.from(normalizedNote).length > 1000) {
+                        toast(REVIEW_COPY.noteTooLong, "error");
+                        return null;
+                    }
+                    const confirmed = await confirmDialog({
+                        title: REVIEW_COPY.resubmit,
+                        message: `${REVIEW_COPY.attest}。\n${REVIEW_COPY.resubmitRisk}\n${REVIEW_COPY.noteLabel}：${normalizedNote}`,
+                        confirmText: REVIEW_COPY.resubmit,
+                        tone: "danger",
+                    });
+                    if (!confirmed) return null;
+                    const data = await api(`/api/admin/jobs/${encodeURIComponent(job.id)}/review`, {
+                        method: "POST",
+                        body: JSON.stringify({
+                            action: "confirm_not_submitted",
+                            confirmed: true,
+                            expected_row_version: info.execution.row_version,
+                            note: normalizedNote,
+                        }),
+                        allowFailure: true,
+                        skipButtonLoading: true,
+                    });
+                    if (data.success !== true) {
+                        toast(data.message || REVIEW_COPY.reviewFailure, "error");
+                        if (data.recovered === true) {
+                            invalidateReviewSnapshot(job, button);
+                            await refreshAfterJobAction(job.id, true);
+                        }
+                        return data;
+                    }
+                    invalidateReviewSnapshot(job, button);
+                    toast(data.message || REVIEW_COPY.reviewSuccess, "success");
+                    await refreshAfterJobAction(job.id, true);
+                    return data;
+                } catch (error) {
+                    toast(error?.message || REVIEW_COPY.reviewFailure, "error");
+                    if (error?.data?.recovered === true) {
+                        invalidateReviewSnapshot(job, button);
+                        await refreshAfterJobAction(job.id, true);
+                    }
+                    return null;
+                }
+            });
         }
 
         async function retryMediaRefreshOnly(id, button = null, reopenDetail = false) {
@@ -683,7 +994,7 @@
                 tone: "danger",
             });
             if (reason === null) return;
-            const data = await api(`/api/admin/jobs/${id}/cancel`, {
+            const data = await requestJobAction(`/api/admin/jobs/${id}/cancel`, {
                 method: "POST",
                 body: JSON.stringify({
                     reason,
@@ -694,6 +1005,7 @@
                     stop_running: true,
                 }),
             });
+            if (!data) return;
             toast(data.cleanup?.message || data.message || "已取消任务", "success");
             closeDrawer();
             await Promise.all([loadRequests(), loadJobs(), loadOverview(), loadRclone()]);
@@ -707,15 +1019,15 @@
                 tone: "danger",
             });
             if (!confirmed) return;
-            const data = await api(`/api/admin/jobs/${encodeURIComponent(id)}`, {
+            const data = await requestJobAction(`/api/admin/jobs/${encodeURIComponent(id)}`, {
                 method: "DELETE",
                 allowFailure: true,
                 button,
                 buttonLabel: "删除中...",
             });
+            if (!data) return;
             if (!data.success) {
                 toast(data.message || "任务记录删除失败", "error");
-                await loadJobs();
                 return;
             }
             toast("记录已删除", "success");
@@ -743,6 +1055,7 @@
             const failedChecks = checks.filter((item) => item && item.success === false);
             const mediaRefreshOnly = isMediaRefreshOnlyJob(job);
             const deletable = jobRecordDeletable(job);
+            const review = transferReviewInfo(job);
             openDrawer(
                 `任务 #${job.id}`,
                 `
@@ -755,6 +1068,7 @@
                     <div><span>保存位置</span>${escapeHtml(finalPath)}</div>
                     <div><span>更新时间</span>${escapeHtml(formatDate(job.updated_at || job.created_at))}</div>
                 </div>
+                ${renderTransferReview(job)}
                 ${mediaRefreshOnly ? `<div class="notice-box warning"><strong>六盘文件已经完成</strong><p>当前只剩飞牛媒体库刷新失败。请使用“仅重试媒体库刷新”，系统不会再次提交六盘离线任务。</p></div>` : ""}
                 ${failedChecks.length ? `<div class="notice-box warning"><strong>路径检查异常</strong>${renderCompletionChecks(failedChecks)}</div>` : ""}
                 <details class="advanced-details">
@@ -799,7 +1113,7 @@
                     <div id="jobTechnicalEventsPaged" class="organizer-paged-list"></div>
                 </details>
                 <div class="filter-row" style="margin-top:16px;">
-                    ${mediaRefreshOnly
+                    ${review ? "" : mediaRefreshOnly
                         ? `<button data-job-media-refresh-now="${escapeHtml(job.id)}" title="只刷新飞牛媒体库，不会再次提交六盘离线任务">仅重试媒体库刷新</button>`
                         : (deletable ? "" : `<button data-job-retry-now="${job.id}">重试整个任务</button><button class="secondary danger" data-job-cancel-now="${job.id}">取消并清理</button>`)}
                     ${deletable ? `<button class="secondary danger" data-job-delete-now="${escapeHtml(job.id)}">删除记录</button>` : ""}
@@ -815,7 +1129,9 @@
                 renderTechnicalEventItem,
                 { perPage: 30, empty: "暂无原始日志" },
             );
-            body.querySelector("[data-job-retry-now]")?.addEventListener("click", (event) => retryJob(event.currentTarget.dataset.jobRetryNow));
+            body.querySelector("[data-job-retry-now]")?.addEventListener("click", (event) => retryJob(event.currentTarget.dataset.jobRetryNow, event.currentTarget, true));
+            body.querySelectorAll("[data-job-review-action]").forEach((button) => button.addEventListener("click", () => reviewJob(job, button.dataset.jobReviewAction, button)));
+            body.querySelector("[data-job-review-reload]")?.addEventListener("click", () => showJobDetail(job.id).catch((error) => toast(error.message, "error")));
             body.querySelector("[data-job-media-refresh-now]")?.addEventListener("click", (event) => retryMediaRefreshOnly(event.currentTarget.dataset.jobMediaRefreshNow, event.currentTarget, true));
             body.querySelector("[data-job-cancel-now]")?.addEventListener("click", (event) => cancelJob(event.currentTarget.dataset.jobCancelNow));
             body.querySelector("[data-job-delete-now]")?.addEventListener("click", (event) => deleteJob(event.currentTarget.dataset.jobDeleteNow, event.currentTarget));
@@ -914,6 +1230,7 @@
             renderOverviewJobs,
             isMediaRefreshOnlyJob,
             retryJob,
+            reviewJob,
             retryMediaRefreshOnly,
             cancelJob,
             deleteJob,

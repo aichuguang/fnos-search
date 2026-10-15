@@ -14,6 +14,7 @@ def create_jobs_blueprint(context: JobsRouteContext) -> Blueprint:
         ("/api/admin/jobs", "admin_jobs", "GET"),
         ("/api/admin/jobs/<int:job_id>", "admin_job_detail", "GET"),
         ("/api/admin/jobs/<int:job_id>/retry", "admin_job_retry", "POST"),
+        ("/api/admin/jobs/<int:job_id>/review", "admin_job_review", "POST"),
         ("/api/admin/jobs/<int:job_id>/cancel", "admin_job_cancel", "POST"),
         ("/api/admin/jobs/<int:job_id>", "admin_job_delete", "DELETE"),
         ("/api/admin/jobs/batch-retry", "admin_jobs_batch_retry", "POST"),

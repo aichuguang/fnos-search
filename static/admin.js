@@ -108,7 +108,7 @@ const ADVANCED_SECRET_LABELS = {
 const ADVANCED_CONFIG_FORMAT = "fnos-media-import/advanced-config";
 const ADVANCED_CONFIG_VERSION = 1;
 const FULL_BACKUP_FORMAT = "fnos-media-import/full-backup";
-const FULL_BACKUP_VERSION = 1;
+const FULL_BACKUP_VERSION = 2;
 
 function advancedConfigEnvelope(stored = {}) {
     return {
@@ -459,6 +459,7 @@ function statusText(status) {
         upload_exception: "上传异常",
         rejected: "已拒绝",
         cancelled: "已取消",
+        rolled_back: "已回滚",
         ignored_cancelled: "已忽略",
         unsupported: "暂不支持",
         retry_requested: "等待重试",
@@ -614,7 +615,7 @@ function getAdminBootstrapModule() {
     adminBootstrapModule = window.FnosAdminBootstrap.create({
         state: adminState, getElement: $, api, toast, captureActionButton,
         loadOverview, loadRequests, loadJobs, loadUpdates, openUpdateEditor, runDueUpdates, loadTrending, runTrending, openTrendingScheduler,
-        startRclone, stopRclone, checkRclone, loadRclone, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer,
+        startRclone, stopRclone, checkRclone, loadRclone, loadTransfers, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer,
         loadAdapters, loadMediaLibraries, refreshAllMedia, saveSettings, saveAllSettingsTransaction, saveProfile, uploadSiteLogo, saveSearchProviders,
         loadAdvancedConfig, saveAdvancedConfig, loadRcloneWebdavConfig, saveRcloneWebdavConfig, testRcloneWebdavConfig,
         exportAdvancedConfig, importAdvancedConfig,
@@ -932,6 +933,10 @@ function getAdminRcloneModule() {
 
 function loadRclone() {
     return getAdminRcloneModule().loadRclone();
+}
+
+function loadTransfers() {
+    return getAdminRcloneModule().loadTransfers({ silentLoading: false });
 }
 
 function loadRcloneLive() {

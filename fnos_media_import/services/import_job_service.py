@@ -68,6 +68,7 @@ GUEST_FORBIDDEN_FIELDS = frozenset(
 
 PROVIDER_SUBMISSION_FENCE_KEY = "provider_submission_fence"
 PROVIDER_SUBMISSION_FENCE_VERSION = 1
+PUBLIC_REQUEST_OWNER_KEY = "public_request_owner"
 PROVIDER_RETRYABLE_JOB_STATUSES = frozenset({JOB_CREATED, JOB_FAILED, JOB_UNSUPPORTED})
 PROVIDER_POST_SUBMISSION_JOB_STATUSES = frozenset(
     {
@@ -124,6 +125,11 @@ def _load_planning_dependency(name: str) -> Any:
             code="PLANNING_UNAVAILABLE",
         ) from exc
     raise V1PlanningError(f"未知的 V1 规划依赖：{name}", code="PLANNING_UNAVAILABLE")
+
+
+def public_request_owner(request_token: str) -> str:
+    token = str(request_token or "").strip()
+    return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
 
 
 def _account_id(account: Any) -> str:
@@ -225,15 +231,19 @@ class ImportJobCreationService:
 
         return self._create(payload)
 
-    def create_internal(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def create_internal(
+        self, payload: dict[str, Any], *, public_request_token: str = ""
+    ) -> dict[str, Any]:
         """Create a job for a trusted workflow without trusting its routing fields."""
 
         sanitized = dict(payload or {})
         for field in GUEST_FORBIDDEN_FIELDS:
             sanitized.pop(field, None)
-        return self._create(sanitized)
+        return self._create(sanitized, public_request_token=public_request_token)
 
-    def _create(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _create(
+        self, payload: dict[str, Any], *, public_request_token: str = ""
+    ) -> dict[str, Any]:
 
         title = str(payload.get("title") or "未命名资源").strip()
         # 访客经 TMDB 选片提交时，任务标题使用 TMDB 正式标题；
@@ -311,6 +321,12 @@ class ImportJobCreationService:
                         "attempt": 0,
                     },
                 }
+                owner = public_request_owner(public_request_token)
+                if owner:
+                    # Resource deduplication is shared across requests. Only
+                    # this server-supplied, immutable creation owner permits
+                    # a request to compensate an unbound job on cancellation.
+                    raw_data[PUBLIC_REQUEST_OWNER_KEY] = owner
                 job_payload = {
                     "title": title,
                     "category": category_key,
@@ -414,6 +430,7 @@ class ImportJobCreationService:
                 "message": message,
                 "success": False,
                 "plan_error": True,
+                "retryable": not isinstance(exc, (V1PlanningError, ValueError)),
                 "idempotency_key": idempotency_key,
             }
 

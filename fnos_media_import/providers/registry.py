@@ -124,12 +124,14 @@ class ProviderRegistry:
                 identity_hint=str(value.get("identity_hint") or value.get("user") or ""),
                 message=str(value.get("message") or ""),
                 errors=list(value.get("errors") or []),
+                identity_id=str(value.get("identity_id") or ""),
             )
         return AccountTestResult(
             bool(getattr(value, "ok", False)),
             identity_hint=str(getattr(value, "identity_hint", "") or ""),
             message=str(getattr(value, "message", "") or ""),
             errors=list(getattr(value, "errors", []) or []),
+            identity_id=str(getattr(value, "identity_id", "") or ""),
         )
 
     def load_entry_points(self, context: dict[str, Any] | None = None) -> list[str]:

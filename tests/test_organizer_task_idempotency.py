@@ -363,7 +363,7 @@ class OrganizerRollbackPaginationTests(unittest.TestCase):
             "id": 7,
             "task_id": 99,
             "undo_data": [
-                {"type": "move_file", "source_path": "/b", "target_path": "/a"}
+                {"type": "move_file", "source_path": "/openlist/tv/Show/E01.mkv", "target_path": "/openlist/staging/tv/job-99/E01.mkv"}
             ],
         }
 
@@ -380,11 +380,31 @@ class OrganizerRollbackPaginationTests(unittest.TestCase):
             def get_job(_job_id: int) -> dict:
                 return organizer_v1_job(plan)
 
+            @staticmethod
+            def claim_organizer_rollback(source_run_id: int, **_kwargs):
+                assert source_run_id == 7
+                task["status"] = "executing"
+                return 8, {"success": True, "completed_count": 0}
+
+            @staticmethod
+            def renew_organizer_run(*_args, **_kwargs):
+                return True
+
+            owns_organizer_run = renew_organizer_run
+            acquire_organizer_lock = renew_organizer_run
+            update_organizer_rollback_progress = renew_organizer_run
+
+            @staticmethod
+            def release_organizer_locks(**_kwargs):
+                return None
+
         service = OrganizerService.__new__(OrganizerService)
         service.db = FakeDatabase()
+        service.organizer_config = {}
         bind_task_openlist_resolver(service, SimpleNamespace(configured=True), plan)
         inverses: list[dict] = []
-        service._execute_inverse = lambda item: inverses.append(item)
+        service._execute_rollback_inverse = lambda item, *_args: inverses.append(item)
+        service._sync_linked_guest_requests = lambda *_args, **_kwargs: 0
 
         result = service.rollback_run(7)
 

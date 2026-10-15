@@ -24,6 +24,12 @@ from Crypto.Util.Padding import pad
 from ..constants import JOB_DONE, JOB_FAILED, JOB_SUBMITTED
 from ..http_client import HttpClient
 from ..media_path_rules import should_force_resource_dir
+from ..provider_errors import (
+    SHARE_INVALID_MESSAGE,
+    is_share_resource_unavailable,
+    provider_error_details,
+    share_error_details,
+)
 from .base import AdapterCheckResult, ImportResult
 
 
@@ -66,11 +72,17 @@ class TianyiApiError(RuntimeError):
         code: str = "",
         stage: str = "",
         http_status: int | None = None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = str(code or "")
         self.stage = str(stage or "")
         self.http_status = int(http_status) if http_status is not None else None
+        self.details = dict(details or {})
+
+
+class TianyiUploadNotSubmitted(TianyiApiError):
+    """Local upload preparation failed before any upload API was invoked."""
 
 
 class TianyiImporter:
@@ -372,12 +384,15 @@ class TianyiImporter:
                 recursive=0,
             )
             identity = str(self._auth_data.get("loginName") or self.identity or self.username or "")
+            # Only an ID issued by the authenticated session proves identity;
+            # configured usernames and login/display aliases are not stable.
+            subject = str(self._auth_data.get("userId") or self._auth_data.get("user_id") or "").strip()
             suffix = f": {identity}" if identity else ""
             return AdapterCheckResult(
                 True,
                 "ready",
                 f"天翼云账号检测通过{suffix}",
-                {"identity_hint": identity} if identity else {},
+                {"identity_hint": identity, "identity_id": f"tianyi:user:{subject}" if subject else ""},
             )
         except Exception as exc:  # noqa: BLE001
             return AdapterCheckResult(
@@ -436,10 +451,12 @@ class TianyiImporter:
                 "raw": info,
             }
         except Exception as exc:  # noqa: BLE001
+            details = provider_error_details(exc)
             return False, {
                 "success": False,
                 "message": str(exc),
-                "error_code": str(getattr(exc, "code", "") or ""),
+                "error_code": details["error_code"],
+                "error_details": details,
             }
 
     def list_files(
@@ -462,7 +479,11 @@ class TianyiImporter:
                 ),
             }
         except Exception as exc:  # noqa: BLE001
-            return {"success": False, "message": str(exc)}
+            details = provider_error_details(exc)
+            return {
+                "success": False, "message": str(exc),
+                "error_code": details["error_code"], "error_details": details,
+            }
 
     def import_resource(
         self,
@@ -487,7 +508,8 @@ class TianyiImporter:
             if not ok:
                 raise TianyiApiError(
                     str(share.get("message") or "天翼云分享检测失败"),
-                    code=str(share.get("error_code") or "SHARE_INVALID"),
+                    code=str(share.get("error_code") or "RESULT_UNKNOWN"),
+                    details=share.get("error_details"),
                 )
             selected = self._select_items(share.get("items"), native_selection)
             file_count = len(selected)
@@ -549,7 +571,7 @@ class TianyiImporter:
                 JOB_FAILED,
                 f"天翼云转存失败：{exc}",
                 target_path=target_parent_id,
-                raw_data={"provider": "tianyi", "error_code": str(getattr(exc, "code", "") or "")},
+                raw_data={"provider": "tianyi", **provider_error_details(exc)},
             )
 
     def materialize_resource(
@@ -854,32 +876,42 @@ class TianyiImporter:
     ) -> dict[str, Any]:
         """Upload one local file with the 189CloudPC multipart protocol."""
 
-        path = os.path.realpath(str(local_file or ""))
-        if not path or not os.path.isfile(path):
-            raise TianyiApiError(
-                f"天翼云上传文件不存在：{local_file}",
-                code="LOCAL_FILE_MISSING",
-            )
-        folder_id = str(parent_folder_id or "").strip()
-        if not folder_id:
-            raise TianyiApiError(
-                "天翼云上传需要父级 folder_id",
-                code="TARGET_FOLDER_REQUIRED",
-            )
-        file_name = str(target_name or os.path.basename(path)).strip()
-        if not file_name or file_name in {".", ".."} or "/" in file_name or "\\" in file_name:
-            raise TianyiApiError(
-                "天翼云上传文件名无效",
-                code="FILE_NAME_INVALID",
-            )
-        file_size = int(os.path.getsize(path))
-        if file_size <= 0:
-            raise TianyiApiError(
-                "天翼云 PC 客户端上传不支持空文件",
-                code="EMPTY_FILE_UNSUPPORTED",
-            )
-        slice_size = self._upload_part_size(file_size)
-        file_md5, slice_md5, parts = self._upload_hashes(path, file_size, slice_size)
+        # This boundary contains local work only. Once initMultiUpload is
+        # invoked below, even a local read failure may follow a submitted
+        # operation and must retain the uploader's unknown-result fence.
+        try:
+            path = os.path.realpath(str(local_file or ""))
+            if not path or not os.path.isfile(path):
+                raise TianyiApiError(
+                    f"天翼云上传文件不存在：{local_file}",
+                    code="LOCAL_FILE_MISSING",
+                )
+            folder_id = str(parent_folder_id or "").strip()
+            if not folder_id:
+                raise TianyiApiError(
+                    "天翼云上传需要父级 folder_id",
+                    code="TARGET_FOLDER_REQUIRED",
+                )
+            file_name = str(target_name or os.path.basename(path)).strip()
+            if not file_name or file_name in {".", ".."} or "/" in file_name or "\\" in file_name:
+                raise TianyiApiError(
+                    "天翼云上传文件名无效",
+                    code="FILE_NAME_INVALID",
+                )
+            file_size = int(os.path.getsize(path))
+            if file_size <= 0:
+                raise TianyiApiError(
+                    "天翼云 PC 客户端上传不支持空文件",
+                    code="EMPTY_FILE_UNSUPPORTED",
+                )
+            slice_size = self._upload_part_size(file_size)
+            file_md5, slice_md5, parts = self._upload_hashes(path, file_size, slice_size)
+        except Exception as exc:  # noqa: BLE001 - provably before the first upload request
+            raise TianyiUploadNotSubmitted(
+                str(exc),
+                code=exc.code if isinstance(exc, TianyiApiError) else "LOCAL_FILE_READ_FAILED",
+                stage=exc.stage if isinstance(exc, TianyiApiError) and exc.stage else "upload_prepare",
+            ) from exc
         params = {
             "parentFolderId": folder_id,
             "fileName": quote_plus(file_name, safe=""),
@@ -1464,6 +1496,10 @@ class TianyiImporter:
         value = self._response_payload(response, "天翼云 PC 接口", stage="provider_request")
         code = self._response_code(value)
         provider_message = self._message(value, f"天翼云接口错误：{code}")
+        self._raise_if_share_unavailable(
+            path, response.status_code, value,
+            source_operation=str((form or {}).get("type") or "") == "SHARE_SAVE",
+        )
         invalid_session = code in {"InvalidSessionKey", "InvalidAccessToken", "UserInvalidOpenToken"} or (
             "usersessionboisnull" in provider_message.lower().replace(" ", "")
         )
@@ -1571,9 +1607,14 @@ class TianyiImporter:
             timeout=self.timeout,
             verify=self.http.verify_tls,
         )
-        value = self._response_payload(response, "天翼云网页接口", stage="provider_request")
+        try:
+            value = self._response_payload(response, "天翼云网页接口", stage="provider_request")
+        except TianyiApiError as exc:
+            self._raise_if_share_unavailable(path, response.status_code, {"message": str(exc)})
+            raise
         code = self._response_code(value)
         provider_message = self._message(value, f"天翼云网页接口错误：{code}")
+        self._raise_if_share_unavailable(path, response.status_code, value)
         if self._is_session_ip_mismatch(provider_message):
             logger.warning(
                 "event=tianyi_session_ip_mismatch stage=provider_request path=%s code=%s raw=%s "
@@ -1635,6 +1676,28 @@ class TianyiImporter:
                 http_status=response.status_code,
             )
         return value
+
+    def _raise_if_share_unavailable(
+        self,
+        path: str,
+        http_status: int,
+        value: dict[str, Any],
+        *,
+        source_operation: bool = False,
+    ) -> None:
+        code = self._response_code(value)
+        message = self._message(value, f"天翼云接口 HTTP {http_status} code={code}")
+        if is_share_resource_unavailable(
+            "tianyi", path=path, http_status=http_status, code=code, message=message,
+            source_operation=source_operation,
+        ):
+            raise TianyiApiError(
+                SHARE_INVALID_MESSAGE,
+                code="SHARE_INVALID", stage="provider_request", http_status=http_status,
+                details=share_error_details(
+                    "tianyi", path=path, http_status=http_status, code=code, message=message,
+                ),
+            )
 
     def _rebind_session_for_ip_mismatch(self) -> bool:
         """Exchange a stored token for one fresh PC session, at most once."""
@@ -2763,4 +2826,4 @@ class TianyiImporter:
             return default
 
 
-__all__ = ["TianyiApiError", "TianyiImporter"]
+__all__ = ["TianyiApiError", "TianyiImporter", "TianyiUploadNotSubmitted"]

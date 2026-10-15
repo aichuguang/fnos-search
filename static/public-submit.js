@@ -430,18 +430,10 @@
             return children.every((item) => Boolean(selected[item.fid]));
         }
 
-        function collapseQuarkSubdirSelectionIfComplete(publicId, selectedItems = null) {
-            const state = quarkSelectionState(publicId);
-            if (state.mode !== "subdir_items" || !quarkSubdirSelectionCoversParent(publicId, state, selectedItems)) return false;
-            const parentDir = quarkDirPayload(state.baseDir || {});
-            if (!parentDir.fid) return false;
-            publicState.quarkSelections[publicId] = {
-                mode: "root_dirs",
-                rootDirs: { [parentDir.fid]: parentDir },
-                baseDir: null,
-                items: {},
-            };
-            return true;
+        function collapseQuarkSubdirSelectionIfComplete() {
+            // Keep the public facade compatible without widening explicit file
+            // selections: a complete preview is not proof of a complete folder.
+            return false;
         }
 
         function quarkSelectionSummaryText(publicId) {
@@ -669,10 +661,6 @@
                 const items = { ...(current.items || {}) };
                 if (input.checked) items[item.fid] = item;
                 else delete items[item.fid];
-                if (input.checked && collapseQuarkSubdirSelectionIfComplete(publicId, items)) {
-                    refreshPublicResourceViews(publicId);
-                    return;
-                }
                 setQuarkSelectionState(publicId, { mode: "subdir_items", items });
                 refreshPublicResourceViews(publicId);
             }
@@ -703,14 +691,6 @@
                 if (!baseDir?.fid) return {};
                 // 文件夹展开只用于预览；未勾选任何条目时仍按完整分享提交。
                 if (!selectedItems.length) return {};
-                if (quarkSubdirSelectionCoversParent(publicId, state)) {
-                    return {
-                        quark_selection: {
-                            mode: "root_dirs",
-                            selected_dirs: [quarkDirPayload(baseDir)],
-                        },
-                    };
-                }
                 return {
                     quark_selection: {
                         mode: "subdir_items",

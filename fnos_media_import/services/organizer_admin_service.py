@@ -114,6 +114,20 @@ class OrganizerAdminCommandService:
         return self._with_status(self._organizer.approve_task(task_id))
 
     def apply(self, task_id: int):
+        task = self._organizer.get_task(task_id)
+        if not task:
+            return {"success": False, "message": "标准化任务不存在"}, 404
+        status = str(task.get("status") or "")
+        if status == "done":
+            return {"success": True, "task_id": task_id, "status": "done", "message": "标准化任务已完成，无需重复执行"}, 200
+        if status == "executing":
+            return {"success": True, "queued": True, "task_id": task_id, "status": status, "message": "标准化任务正在执行"}, 200
+        # The UI's confirmation is one action: validate/approve its exact saved
+        # plan, then enqueue it. In particular, mapping edits have not yet
+        # authorized deletion operations, and a resume must retain done work.
+        approved = self._organizer.approve_task(task_id)
+        if approved.get("success") is False:
+            return approved, (409 if approved.get("conflict") else 400)
         if self._worker_dispatcher:
             queued = self._worker_dispatcher.organizer_apply(task_id)
             if queued:
@@ -154,7 +168,15 @@ class OrganizerAdminCommandService:
     def retry(self, task_id: int):
         getter = getattr(self._organizer, "get_task", None)
         task = getter(task_id) if callable(getter) else None
+        evidence = task.get("evidence") if isinstance(task, dict) and isinstance(task.get("evidence"), dict) else {}
+        rollback = evidence.get("rollback") if isinstance(evidence.get("rollback"), dict) else {}
+        if rollback.get("status") in {"running", "failed"} and rollback.get("run_id"):
+            result = self._organizer.rollback_run(int(rollback["run_id"]))
+            return self._with_status({**result, "retry_mode": "resume_rollback"})
         resume_apply = _retry_should_resume_apply(task)
+        if resume_apply:
+            result, status_code = self.apply(task_id)
+            return {**result, "retry_mode": "resume_apply"}, status_code
         if self._worker_dispatcher:
             queued = (
                 self._worker_dispatcher.organizer_apply(task_id)
@@ -234,7 +256,7 @@ class OrganizerAdminCommandService:
 
     @staticmethod
     def _with_status(result: dict[str, Any]) -> tuple[dict[str, Any], int]:
-        return result, (200 if result.get("success", True) else 400)
+        return result, (200 if result.get("success", True) else (409 if result.get("conflict") else 400))
 
 
 def _retry_should_resume_apply(task: dict[str, Any] | None) -> bool:
@@ -253,13 +275,13 @@ def _retry_should_resume_apply(task: dict[str, Any] | None) -> bool:
         str(item.get("status") or "pending").strip().lower()
         for item in operations
     }
-    if operation_statuses - {"pending", "done", "skipped"}:
+    if operation_statuses - {"pending", "done", "skipped", "failed"}:
         return False
     evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
     confirmation = evidence.get("completion_confirmation")
     error_message = str(task.get("error_message") or "").strip().lower()
     apply_was_started = bool(
-        operation_statuses & {"done", "skipped"}
+        operation_statuses & {"done", "skipped", "failed"}
         or isinstance(confirmation, dict)
         or "租约" in error_message
         or "lease" in error_message

@@ -298,7 +298,7 @@ class QuarkImporterV1Tests(unittest.TestCase):
     def test_expired_share_code_is_not_reported_as_cookie_expired(self) -> None:
         # 10000 是路径双关码：/share/ 下是分享失效，其他路径才是 Cookie 失效。
         # 混为一谈会把管理员支去重新扫码，而账号本来就是好的。
-        with self.assertRaisesRegex(Exception, "分享不存在或已失效"):
+        with self.assertRaisesRegex(Exception, "分享资源已失效或被删除"):
             self.importer._validate_response(
                 200,
                 {"code": 10000},
@@ -316,7 +316,7 @@ class QuarkImporterV1Tests(unittest.TestCase):
     def test_share_specific_codes_are_reported_as_share_failures(self) -> None:
         for code in (41001, "41001", 41002, 41003):
             with self.subTest(code=code):
-                with self.assertRaisesRegex(Exception, "分享不存在或已失效"):
+                with self.assertRaisesRegex(Exception, "分享资源已失效或被删除"):
                     self.importer._validate_response(200, {"code": code})
 
 

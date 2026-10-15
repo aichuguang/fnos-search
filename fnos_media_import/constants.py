@@ -74,6 +74,13 @@ EVENT_ERROR = "error"
 RCLONE_RUN_RUNNING = "running"
 RCLONE_RUN_SUCCESS = "success"
 RCLONE_RUN_FAILED = "failed"
+# worker 脚本因互斥锁被占用而未启动时的退出码（scripts/fnos_rclone_worker.sh 的
+# EXIT_LOCK_BUSY）。主程序据此把持久 run 回滚到 queued 延后重排，不标成功也不唤醒传输。
+RCLONE_EXIT_LOCK_BUSY = 75
+RCLONE_JOB_REQUIRED_MESSAGE = (
+    "当前版本按具体入库任务调度搬运，不支持全局目录扫描。"
+    "请在“入库任务”选择对应任务继续或重试；Worker 会自动启动该任务的搬运。"
+)
 
 # rclone worker 回调状态（POST /api/callback/rclone 的 status 字段）。
 # 这些值是对外契约：worker 脚本发送的字符串必须与之一致，改动需同步脚本。

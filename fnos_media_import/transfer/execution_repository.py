@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from . import (
+    ErrorCode,
     IMMUTABLE_TERMINAL_PHASES,
     OPERATOR_RECOVERABLE_PHASES,
     PHASE_FAILED,
@@ -148,6 +151,12 @@ class TransferExecutionRepository:
         require_job_status_transition: bool = False,
         operator_recovery: bool = False,
     ) -> TransferExecution:
+        # The orchestrator emits a deliberately small runtime snapshot.  An
+        # recovery history is audit evidence, not runtime state, so later
+        # worker saves must not silently discard or rewrite it.
+        for audit_field in ("manual_review_history", "transfer_timeout_recovery"):
+            if audit_field in execution.snapshot:
+                snapshot = {**snapshot, audit_field: execution.snapshot[audit_field]}
         next_phase = str(phase or "").strip()
         _validate_phase_name(next_phase)
         _validate_transition(execution.phase, next_phase)
@@ -260,6 +269,66 @@ class TransferExecutionRepository:
                 (*terminal_args, due, int(limit)),
             ).fetchall()
         return [_decode(row) for row in rows]
+
+    def resume_legacy_transfer_timeouts(self, *, limit: int = 100) -> int:
+        """Undo only the old wall-clock cutoff, never a real unknown result.
+
+        Keep the submitted operation and its evidence. The normal worker will
+        validate the frozen plan and poll that receipt, not submit a new job.
+        Queue insertion remains the scanner's responsibility: a crash between
+        recovery and enqueue is repaired by the next ordinary list_due scan.
+        """
+        if limit <= 0:
+            return 0
+        recovered = 0
+        now = utc_now_iso()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT e.*, p.plan_json, p.plan_hash FROM transfer_executions e "
+                "JOIN import_execution_plans p ON p.job_id=e.job_id "
+                "JOIN import_jobs j ON j.id=e.job_id "
+                "WHERE e.phase='manual_review' AND j.status IN ('review', 'manual_review') "
+                "AND e.last_error_code=? AND e.last_error_message LIKE ? ORDER BY e.job_id",
+                (ErrorCode.RESULT_UNKNOWN, "传输任务超过最大等待时间（% 秒），已停止自动轮询，请人工核对"),
+            ).fetchall()
+            for row in rows:
+                execution = _decode(row)
+                snapshot = dict(execution.snapshot)
+                if not _is_legacy_transfer_timeout(execution, row["plan_json"], row["plan_hash"], now):
+                    continue
+                snapshot["transfer_timeout_recovery"] = {
+                    "recovered_at": now,
+                    "row_version": execution.row_version,
+                    "review_from": snapshot["review_from"],
+                    "message": execution.last_error_message,
+                    "error_code": execution.last_error_code,
+                    "phase_wait_started_at": snapshot.get("phase_wait_started_at", {}),
+                    "receipt": execution.receipt,
+                }
+                snapshot.update(
+                    phase=PHASE_RETRY_WAIT, retry_from="transferring", review_from="",
+                    retry_ready=False, preserve_receipt_on_retry=True,
+                    receipt=execution.receipt, error_code="",
+                    message="已恢复因旧版时长上限暂停的传输，保留原回执继续查询",
+                )
+                snapshot.pop("claim", None)
+                _validate_receipt_fence(execution, snapshot, execution.receipt, next_phase=PHASE_RETRY_WAIT)
+                connection.execute(
+                    "UPDATE transfer_executions SET phase=?, snapshot_json=?, resume_at=NULL, "
+                    "last_error_code='', last_error_message='', row_version=row_version+1, updated_at=? "
+                    "WHERE job_id=? AND row_version=?",
+                    (PHASE_RETRY_WAIT, _json(snapshot), now, execution.job_id, execution.row_version),
+                )
+                if not _sync_job_with_connection(
+                    self.database, connection, execution.job_id,
+                    status="retry_requested", error_message="", updated_at=now,
+                ):
+                    raise ExecutionConflictError("传输超时恢复时任务状态已变化")
+                recovered += 1
+                if recovered >= limit:
+                    break
+        return recovered
 
     def claim(self, job_id: int, owner_id: str, *, lease_seconds: int = 60) -> TransferExecution | None:
         """Atomically claim an execution using its JSON snapshot.
@@ -381,6 +450,218 @@ class TransferExecutionRepository:
         )
         return self._operator_recover(execution, snapshot, recovered_phase)
 
+    def resume_after_organizer_completion(self, job_id: int, task_id: int) -> bool:
+        """Resume only a plan-bound Organizer wait, never an unknown submission.
+
+        The completion evidence, execution recovery and queue wake-up share one
+        write transaction so rollback/cancellation cannot leave a false ACK.
+        Actual final file verification still belongs to the transfer worker.
+        """
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM transfer_executions WHERE job_id=?", (int(job_id),)).fetchone()
+            if row is None:
+                return False
+            execution = _decode(row)
+            snapshot = dict(execution.snapshot)
+            origin = snapshot.get("review_from") if execution.phase == PHASE_MANUAL_REVIEW else snapshot.get("failure_from")
+            if execution.phase not in {PHASE_MANUAL_REVIEW, PHASE_FAILED} or origin != "organizing":
+                return False
+            if (
+                int(snapshot.get("organizer_task_id") or execution.organizer_task_id or 0) != int(task_id)
+                or (execution.organizer_task_id is not None and execution.organizer_task_id != int(task_id))
+                or execution.final_verified or execution.app_acked
+                or snapshot.get("final_verified") or snapshot.get("app_acked")
+            ):
+                return False
+            task_row = connection.execute(
+                "SELECT * FROM organizer_tasks WHERE id=? AND job_id=?", (int(task_id), int(job_id)),
+            ).fetchone()
+            plan_row = connection.execute(
+                "SELECT plan_json, plan_hash FROM import_execution_plans WHERE job_id=?", (int(job_id),),
+            ).fetchone()
+            job = connection.execute("SELECT status FROM import_jobs WHERE id=?", (int(job_id),)).fetchone()
+            if task_row is None or plan_row is None or job is None:
+                return False
+            if str(job["status"] or "").lower() in {"cancelled", "canceled", "rejected", "unsupported"}:
+                return False
+            task = dict(task_row)
+            evidence = _object(task.get("evidence"))
+            confirmation = evidence.get("completion_confirmation") or {}
+            reference = _object(task.get("raw_data")).get("execution_plan_ref") or {}
+            encoded_plan = str(plan_row["plan_json"] or "")
+            plan = _object(encoded_plan)
+            if (
+                task.get("status") not in {"done", "skipped"}
+                or confirmation.get("success") is not True
+                or confirmation.get("cleanup_only") or evidence.get("cleanup_only")
+                or hashlib.sha256(encoded_plan.encode("utf-8")).hexdigest() != plan_row["plan_hash"]
+                or reference.get("plan_hash") != plan_row["plan_hash"]
+                or int(reference.get("job_id") or 0) != int(job_id)
+                or reference.get("strategy") != execution.strategy
+                or (plan.get("transfer") or {}).get("strategy") != execution.strategy
+                or task.get("category") != plan.get("category")
+                or connection.execute(
+                    "SELECT 1 FROM organizer_operations WHERE task_id=? AND status NOT IN ('done', 'skipped') LIMIT 1",
+                    (int(task_id),),
+                ).fetchone()
+            ):
+                return False
+            fence = snapshot.get("submission_fence") or {}
+            receipt = execution.receipt or snapshot.get("receipt")
+            if fence and not receipt:
+                return False
+            if receipt:
+                snapshot["receipt"] = receipt
+            attempts = dict(snapshot.get("phase_attempts") or {})
+            attempts.pop("organizing", None)
+            snapshot.update(
+                phase=PHASE_RETRY_WAIT, retry_from="organizing", retry_ready=False,
+                phase_attempts=attempts, preserve_receipt_on_retry=False,
+                error_code="", message="Organizer 已完成，继续最终文件校验与 ACK",
+                organizer_task_id=int(task_id),
+            )
+            snapshot.pop("claim", None)
+            now = utc_now_iso()
+            connection.execute(
+                "UPDATE transfer_executions SET phase=?, snapshot_json=?, resume_at=NULL, "
+                "organizer_task_id=?, last_error_code='', last_error_message='', row_version=row_version+1, updated_at=? "
+                "WHERE job_id=? AND row_version=?",
+                (PHASE_RETRY_WAIT, _json(snapshot), int(task_id), now, int(job_id), execution.row_version),
+            )
+            _sync_job_with_connection(self.database, connection, int(job_id), status="confirming", error_message="", updated_at=now)
+            self.database.worker_tasks.enqueue_with_connection(
+                connection, "import_transfer_execute", {"job_id": int(job_id)}, f"import-transfer:{int(job_id)}",
+                max_attempts=20, reactivate_terminal=True,
+            )
+            return True
+
+    def confirm_not_submitted(
+        self,
+        job_id: int,
+        *,
+        expected_row_version: int,
+        admin: str,
+        note: str,
+    ) -> TransferExecution:
+        """Release an ambiguous fence only after an explicit operator attestation.
+
+        This does not prove that a Provider operation never happened.  The
+        administrator must first check task-scoped source/destination files
+        and Provider task lists; the caller warns that a mistaken confirmation
+        can submit the operation twice.  Never call this from normal retries.
+        """
+
+        if type(expected_row_version) is not int or expected_row_version <= 0:
+            raise ValueError("执行版本必须是正整数")
+        if not isinstance(admin, str) or not admin.strip():
+            raise ValueError("缺少管理员身份")
+        if not isinstance(note, str) or not note.strip() or len(note.strip()) > 1000:
+            raise ValueError("请填写 1 至 1000 字的人工核对说明")
+        now = utc_now_iso()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM transfer_executions WHERE job_id=?", (int(job_id),)
+            ).fetchone()
+            if row is None:
+                raise ExecutionConflictError("任务缺少持久执行状态")
+            execution = _decode(row)
+            if execution.row_version != expected_row_version:
+                raise ExecutionConflictError("执行状态已变化，请刷新任务详情后重新核对")
+            if execution.phase != PHASE_MANUAL_REVIEW:
+                raise ExecutionConflictError("只有等待人工复核的任务可以确认未提交")
+            job = connection.execute(
+                "SELECT status FROM import_jobs WHERE id=?", (int(job_id),)
+            ).fetchone()
+            if job is None or str(job["status"] or "").strip().lower() not in {"review", "manual_review"}:
+                raise ExecutionConflictError("正式任务不在人工复核状态，不能重新提交")
+            snapshot = dict(execution.snapshot)
+            claim = snapshot.get("claim")
+            if claim:
+                if not isinstance(claim, dict) or not str(claim.get("owner_id") or "").strip():
+                    raise ExecutionConflictError("旧执行租约信息无效，请先核对 Worker 状态")
+                try:
+                    lease_until = datetime.fromisoformat(str(claim.get("lease_until") or "").replace("Z", "+00:00"))
+                    if lease_until.tzinfo is None:
+                        lease_until = lease_until.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError) as exc:
+                    raise ExecutionConflictError("旧执行租约时间无效，请先核对 Worker 状态") from exc
+                if lease_until > datetime.now(timezone.utc):
+                    raise ExecutionConflictError("旧 Worker 执行租约尚未结束，请等待租约结束后重新核对")
+            if row["receipt_json"] is not None or snapshot.get("receipt") is not None:
+                raise ExecutionConflictError("任务已有外部操作回执，不能确认为未提交；请保留回执核对结果")
+            if (
+                execution.staging_verified or execution.final_verified or execution.app_acked
+                or any(snapshot.get(key) for key in ("target_verified", "staging_verified", "final_verified", "app_acked"))
+            ):
+                raise ExecutionConflictError("任务已有目标校验或入库确认记录，不能确认为未提交")
+            resume_phase = str(snapshot.get("review_from") or "").strip()
+            if resume_phase not in {"source_materializing", "native_submitting", "transferring"}:
+                raise ExecutionConflictError("人工复核来源不是可确认未提交的阶段")
+            fence = snapshot.get("submission_fence")
+            if not isinstance(fence, dict) or str(fence.get("state") or "").strip().lower() not in {"prepared", "committed"}:
+                raise ExecutionConflictError("任务缺少待核对的外部提交栅栏")
+            fence_phase = str(fence.get("phase") or "").strip()
+            if fence_phase and fence_phase != resume_phase:
+                raise ExecutionConflictError("提交栅栏与人工复核阶段不一致，不能重新提交")
+            history = snapshot.get("manual_review_history", [])
+            if not isinstance(history, list):
+                raise ExecutionConflictError("人工复核历史格式无效，已停止恢复")
+            snapshot["manual_review_history"] = [
+                *history,
+                {
+                    "action": "confirm_not_submitted",
+                    "admin": admin.strip(),
+                    "note": note.strip(),
+                    "confirmed_at": now,
+                    "previous_row_version": execution.row_version,
+                    "review_from": resume_phase,
+                    "submission_fence": dict(fence),
+                    "previous_error": {
+                        "code": execution.last_error_code,
+                        "message": execution.last_error_message,
+                    },
+                },
+            ]
+            raw_attempts = snapshot.get("phase_attempts")
+            phase_attempts = dict(raw_attempts) if isinstance(raw_attempts, dict) else {}
+            phase_attempts.pop(resume_phase, None)
+            snapshot.update({
+                "phase": PHASE_RETRY_WAIT,
+                "attempt": execution.attempts,
+                "phase_attempts": phase_attempts,
+                "retry_from": resume_phase,
+                "retry_ready": False,
+                "preserve_receipt_on_retry": False,
+                "receipt": None,
+                "error_code": "",
+                "message": "管理员已确认本次操作未提交，等待重新提交",
+            })
+            snapshot.pop("submission_fence", None)
+            snapshot.pop("claim", None)
+            cursor = connection.execute(
+                "UPDATE transfer_executions SET phase=?, snapshot_json=?, receipt_json=NULL, "
+                "resume_at=NULL, last_error_code='', last_error_message='', "
+                "row_version=row_version+1, updated_at=? "
+                "WHERE job_id=? AND phase=? AND row_version=? AND receipt_json IS NULL",
+                (
+                    PHASE_RETRY_WAIT, _json(snapshot), now, execution.job_id,
+                    PHASE_MANUAL_REVIEW, expected_row_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ExecutionConflictError("执行状态已变化，人工确认未生效")
+            if not _sync_job_with_connection(
+                self.database, connection, execution.job_id,
+                status="retry_requested", error_message="", updated_at=now,
+            ):
+                raise ExecutionConflictError("正式任务状态已变化，人工确认未生效")
+            latest = connection.execute(
+                "SELECT * FROM transfer_executions WHERE job_id=?", (execution.job_id,)
+            ).fetchone()
+            return _decode(latest)
+
     def _operator_recover(
         self,
         execution: TransferExecution,
@@ -396,7 +677,6 @@ class TransferExecutionRepository:
         fence = snapshot.get("submission_fence")
         if (
             execution.receipt is None
-            and submission_phase
             and isinstance(fence, dict)
             and str(fence.get("state") or "").strip().lower() in {"prepared", "committed"}
         ):
@@ -485,6 +765,61 @@ def _decode(row: Any) -> TransferExecution:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _is_legacy_transfer_timeout(execution: TransferExecution, encoded_plan: str, plan_hash: str, now: str) -> bool:
+    snapshot = execution.snapshot
+    receipt = execution.receipt
+    message = execution.last_error_message
+    if (
+        execution.strategy not in {"rclone_copy", "relay_upload_provider"}
+        or snapshot.get("phase") != PHASE_MANUAL_REVIEW
+        or snapshot.get("review_from") != "transferring"
+        or snapshot.get("executor_strategy") != execution.strategy
+        or snapshot.get("error_code") != ErrorCode.RESULT_UNKNOWN
+        or snapshot.get("message") != message
+        or re.fullmatch(r"传输任务超过最大等待时间（[1-9][0-9]* 秒），已停止自动轮询，请人工核对", message) is None
+        or "transfer_timeout_recovery" in snapshot
+        or not isinstance(receipt, dict)
+        or not str(receipt.get("operation_id") or "").strip()
+        or receipt.get("status") not in {"submitted", "pending", "running", "completed"}
+        or not isinstance(receipt.get("metadata"), dict)
+        or (snapshot.get("receipt") is not None and snapshot["receipt"] != receipt)
+        or execution.staging_verified or execution.final_verified or execution.app_acked
+        or any(snapshot.get(key) for key in ("target_verified", "staging_verified", "final_verified", "app_acked"))
+    ):
+        return False
+    if hashlib.sha256(str(encoded_plan).encode("utf-8")).hexdigest() != plan_hash:
+        return False
+    plan = _object(encoded_plan)
+    transfer = plan.get("transfer")
+    if (
+        plan.get("version") != 1 or plan.get("job_id") != execution.job_id
+        or not isinstance(transfer, dict) or transfer.get("strategy") != execution.strategy
+    ):
+        return False
+    key = str(transfer.get("idempotency_key") or f"import:{execution.job_id}:{execution.strategy}")
+    operation_key = f"relay-dl:{key}" if execution.strategy == "relay_upload_provider" else key
+    if _explicit_operation_key(receipt) != operation_key:
+        return False
+    fence = snapshot.get("submission_fence")
+    if fence and (
+        not isinstance(fence, dict) or fence.get("state") != "committed"
+        or fence.get("phase") != "transferring"
+        or not (_operation_key_aliases(fence) & _operation_key_aliases(receipt))
+    ):
+        return False
+    claim = snapshot.get("claim")
+    if claim:
+        if not isinstance(claim, dict):
+            return False
+        try:
+            lease = datetime.fromisoformat(str(claim.get("lease_until") or "").replace("Z", "+00:00"))
+            if lease.tzinfo is None or lease > datetime.fromisoformat(now.replace("Z", "+00:00")):
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def _object(value: Any) -> dict[str, Any]:

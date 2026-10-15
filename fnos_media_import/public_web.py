@@ -65,12 +65,32 @@ def _safe_public_quark_selection(value: Any) -> dict[str, Any]:
     def _entry(raw: Any) -> dict[str, Any] | None:
         if not isinstance(raw, dict):
             return None
+        if not isinstance(raw.get("fid"), (str, int)) or isinstance(raw.get("fid"), bool):
+            return None
+        for key, limit in (("fid", 256), ("name", 240), ("path", 1024)):
+            value = raw.get(key)
+            if value is None:
+                continue
+            if key != "fid" and not isinstance(value, str):
+                return None
+            text = str(value).strip()
+            if len(text) > limit or any(ord(char) < 32 or ord(char) == 127 for char in text):
+                return None
         fid = _clip_text(raw.get("fid"), 256)
         name = _clip_text(raw.get("name"), 240)
         if not fid:
             return None
         type_text = str(raw.get("type") or raw.get("kind") or "").strip().lower()
-        is_dir = bool(raw.get("is_dir") or raw.get("dir") or type_text in {"dir", "folder", "directory"})
+        file_type = raw.get("file_type") if raw.get("file_type") is not None else raw.get("fileType")
+        directory_flag = any(
+            value is True or (type(value) is int and value == 1)
+            or (isinstance(value, str) and value.strip().lower() in {"1", "true"})
+            for value in (raw.get("is_dir"), raw.get("isDir"), raw.get("dir"), raw.get("directory"))
+        )
+        is_dir = bool(
+            directory_flag or type_text in {"dir", "folder", "directory"}
+            or str(file_type).strip().lower() in {"0", "dir", "folder", "directory"}
+        )
         path = _clip_text(raw.get("path"), 1024)
         entry: dict[str, Any] = {
             "fid": fid,
@@ -82,27 +102,32 @@ def _safe_public_quark_selection(value: Any) -> dict[str, Any]:
             entry["path"] = path
         return entry
 
-    def _entry_list(raw: Any, max_items: int = 100) -> list[dict[str, Any]]:
-        rows = raw if isinstance(raw, list) else []
+    def _entry_list(raw: Any, max_items: int = 100) -> list[dict[str, Any]] | None:
+        if not isinstance(raw, list) or len(raw) > max_items:
+            return None
         result: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in rows[:max_items]:
+        for item in raw:
             entry = _entry(item)
-            if not entry or entry["fid"] in seen:
+            if not entry:
+                return None
+            if entry["fid"] in seen:
                 continue
             seen.add(entry["fid"])
             result.append(entry)
         return result
 
     if mode == "root_dirs":
-        selected_dirs = [item for item in _entry_list(value.get("selected_dirs"), max_items=100) if item.get("is_dir")]
-        return {"mode": "root_dirs", "selected_dirs": selected_dirs} if selected_dirs else {}
+        selected_dirs = _entry_list(value.get("selected_dirs"), max_items=100)
+        if not selected_dirs or any(not item.get("is_dir") for item in selected_dirs):
+            return {}
+        return {"mode": "root_dirs", "selected_dirs": selected_dirs}
 
     base_dir = _entry(value.get("base_dir"))
     if not base_dir or not base_dir.get("is_dir"):
         return {}
     selected_items = _entry_list(value.get("selected_items"), max_items=200)
-    return {"mode": "subdir_items", "base_dir": base_dir, "selected_items": selected_items} if selected_items else {"mode": "subdir_items", "base_dir": base_dir, "selected_items": []}
+    return {"mode": "subdir_items", "base_dir": base_dir, "selected_items": selected_items} if selected_items else {}
 
 
 def _safe_public_cloud139_selection(value: Any) -> dict[str, Any]:

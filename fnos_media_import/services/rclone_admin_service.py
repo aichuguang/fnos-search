@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+import logging
+
+from ..constants import RCLONE_JOB_REQUIRED_MESSAGE
+
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+
+from .transfer_status_projection import project_transfer_status, transfer_job_id
+
+
+logger = logging.getLogger(__name__)
 
 
 class RcloneQueries(Protocol):
@@ -21,6 +30,7 @@ class RcloneCounts(Protocol):
 class RcloneAdminQueryDependencies:
     rclone: RcloneQueries
     counts: RcloneCounts
+    load_transfer_states: Callable[[list[int]], list[dict[str, Any]]] | None = None
 
 
 class RcloneAdminQueryService:
@@ -30,6 +40,23 @@ class RcloneAdminQueryService:
     def status(self) -> dict[str, Any]:
         status = dict(self._deps.rclone.status())
         http_status = int(status.pop("_http_status", 200) or 200)
+        if http_status < 400 and self._deps.load_transfer_states is not None:
+            observations = status.get("transfers")
+            observations = observations if isinstance(observations, list) else []
+            job_ids = [job_id for item in observations if isinstance(item, dict)
+                       if (job_id := transfer_job_id(item.get("job_id"))) is not None]
+            try:
+                records = self._deps.load_transfer_states(job_ids)
+                status["transfers"] = project_transfer_status(observations, records)
+                status["transfer_state_source"] = "import_jobs_and_transfer_executions"
+            except Exception:  # State-read failure must not revive stale success from worker memory.
+                logger.exception("Failed to read authoritative transfer task state")
+                status["transfers"] = []
+                return {
+                    "success": False, "status": status, "_http_status": 503,
+                    "error_code": "task_state_unavailable",
+                    "message": "入库任务状态暂不可用，请稍后刷新；未更新为旧的传输状态。",
+                }
         response = {"success": http_status < 400, "status": status, "_http_status": http_status}
         if http_status >= 400:
             error_code = str(status.get("error_code") or status.get("status") or "worker_unavailable")
@@ -77,7 +104,15 @@ class RcloneAdminCommandService:
         self._rclone = dependencies.rclone
 
     def start(self, payload: dict[str, Any], *, default_reason: str = "admin_manual") -> dict[str, Any]:
-        return self._rclone.start(reason=str(payload.get("reason") or default_reason))
+        # This legacy endpoint has no immutable job descriptor.  A client-
+        # supplied job id/path cannot substitute for the guarded job workflow.
+        return {
+            "success": False,
+            "code": "RCLONE_JOB_REQUIRED",
+            "message": RCLONE_JOB_REQUIRED_MESSAGE,
+            "next_action": "open_jobs",
+            "_http_status": 409,
+        }
 
     def stop(self) -> dict[str, Any]:
         return self._rclone.stop()

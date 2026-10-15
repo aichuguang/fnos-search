@@ -109,6 +109,7 @@ class _FrozenImporterAdapter:
             ok,
             identity_hint=str(details.get("identity_hint") or ""),
             message=message,
+            identity_id=str(details.get("identity_id") or ""),
         )
 
     def inspect_source(
@@ -127,8 +128,15 @@ class _FrozenImporterAdapter:
             raise TransferError(ErrorCode.SHARE_INVALID, "Provider 分享检查返回格式无效")
         ok, data = value
         if not ok:
-            message = str((data or {}).get("message") or "分享失效") if isinstance(data, dict) else "分享失效"
-            raise TransferError(ErrorCode.SHARE_INVALID, message)
+            failure = data if isinstance(data, dict) else {}
+            message = str(failure.get("message") or "资源检查失败，请稍后重试或检查账号配置")
+            # Inspecting a share can also fail because of authentication,
+            # networking or provider configuration.  Only a classified source
+            # rejection is SHARE_INVALID; keep its diagnostics for operators.
+            raise TransferError(
+                str(failure.get("error_code") or ErrorCode.RESULT_UNKNOWN), message,
+                details=failure.get("error_details") if isinstance(failure.get("error_details"), dict) else None,
+            )
         return dict(data or {}) if isinstance(data, dict) else {"ok": True}
 
     def can_native_transfer(self, source: Any, destination: Any, account: Any) -> Any:
@@ -627,7 +635,10 @@ class SixPanProviderAdapter(_FrozenImporterAdapter):
         if status == "completed" or bool(getattr(state, "completed", False)):
             return OperationStatus("completed", message or "六盘离线任务完成")
         if status == "failed" or bool(getattr(state, "failed", False)):
-            return OperationStatus("failed", message or "六盘离线任务失败")
+            return OperationStatus(
+                "failed", message or "六盘离线任务失败",
+                error_code=str(getattr(state, "error_code", "") or ""),
+            )
         if status == "running":
             return OperationStatus("running", message or "六盘离线任务进行中")
         unknown_count = int(metadata.get("unknown_polls") or 0) + 1

@@ -72,6 +72,12 @@ class SearchCacheCommandRepository:
                 (public_id, keyword, title, source_type, source_url, source_url_hash,
                  password, size, raw_data, expires_at, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(public_id) DO UPDATE SET
+                    keyword = excluded.keyword, title = excluded.title,
+                    source_type = excluded.source_type, source_url = excluded.source_url,
+                    source_url_hash = excluded.source_url_hash, password = excluded.password,
+                    size = excluded.size, raw_data = excluded.raw_data,
+                    expires_at = excluded.expires_at
                 """,
                 rows,
             )

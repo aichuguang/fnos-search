@@ -55,6 +55,7 @@ class _StartApplyDatabase(RepositoryFakeMixin):
         *,
         owner_id: str,
         lease_seconds: int,
+        expected_revision: int | None = None,
     ) -> tuple[int, None]:
         del lease_seconds
         run_id = self.create_organizer_run(task_id, owner_id=owner_id)

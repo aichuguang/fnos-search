@@ -99,7 +99,9 @@ class UpdateCandidateImportService:
         }
         self.database.update.update_update_candidate(
             candidate_id,
-            decision=decision,
+            # Persist the Job link before recording completion, so normal
+            # completion sync can retry if the seen write fails or we crash.
+            decision="submitted" if succeeded and completed else decision,
             job_id=job.get("id"),
             reason=result.get("message") or candidate_row.get("reason") or "",
             raw_data=candidate_raw,
@@ -114,6 +116,7 @@ class UpdateCandidateImportService:
                 auto=auto,
                 completion_state="done",
             )
+            self.database.update.update_update_candidate(candidate_id, decision="completed")
 
         if succeeded:
             event_message = "候选资源已完整整理入库" if completed else "候选资源已提交入库，等待 OpenList/Organizer 完整确认"

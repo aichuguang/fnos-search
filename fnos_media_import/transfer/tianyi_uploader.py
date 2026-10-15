@@ -11,11 +11,19 @@ import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from fnos_media_import.importers.tianyi import TianyiApiError, TianyiImporter
+from fnos_media_import.importers.tianyi import TianyiApiError, TianyiImporter, TianyiUploadNotSubmitted
 from fnos_media_import.transfer import (
     ErrorCode,
+    TransferError,
     TransferVerifyResult,
     UploadOutcome,
+)
+from fnos_media_import.transfer.relay_upload_manifest import (
+    merge_completed_upload_manifests,
+    selected_local_files,
+    validate_manifest_selection,
+    validate_relative_paths,
+    write_operation_manifest,
 )
 
 __all__ = ["TianyiCloudUploader"]
@@ -110,6 +118,7 @@ class TianyiCloudUploader:
         target_locator: dict[str, Any],
         idempotency_key: str = "",
         progress: Callable[[float], Any] | None = None,
+        relative_paths: list[str] | None = None,
     ) -> UploadOutcome:
         operation_key = str(idempotency_key or "").strip()
         if not operation_key:
@@ -127,8 +136,12 @@ class TianyiCloudUploader:
                 error_code=ErrorCode.INVALID_PLAN,
             )
 
-        files = self._list_local_files(local_dir)
-        if not files:
+        try:
+            selection = validate_relative_paths(local_dir, relative_paths) if relative_paths is not None else None
+        except TransferError as exc:
+            return UploadOutcome("failed", exc.message, error_code=exc.code)
+        files = self._list_local_files(local_dir) if selection is None else []
+        if selection is None and not files:
             return UploadOutcome(
                 "failed",
                 f"中继目录为空或不存在：{local_dir}",
@@ -152,15 +165,24 @@ class TianyiCloudUploader:
             manifest.get("idempotency_key") != operation_key
             or manifest.get("target_fingerprint") != target_fingerprint
         )
+        if selection is not None and manifest and fresh:
+            return UploadOutcome("failed", "中继上传幂等回执目标不一致", error_code=ErrorCode.INVALID_PLAN)
+        if selection is not None and not fresh:
+            try:
+                validate_manifest_selection(manifest, selection)
+            except TransferError as exc:
+                return UploadOutcome("failed", exc.message, error_code=exc.code)
         if fresh:
             manifest = {
                 "version": 1,
                 "provider_kind": self.provider_kind,
                 "idempotency_key": operation_key,
                 "target_fingerprint": target_fingerprint,
-                "status": "uploading",
+                "status": "prepared",
                 "files": {},
             }
+            if selection is not None:
+                manifest["relative_paths"] = selection
         elif str(manifest.get("status") or "").lower() == "completed":
             records = self._manifest_records(manifest)
             completed = [
@@ -180,6 +202,18 @@ class TianyiCloudUploader:
                 "天翼云上传 fence 存在但结果未知",
                 error_code=ErrorCode.RESULT_UNKNOWN,
             )
+
+        if selection is not None:
+            try:
+                files = selected_local_files(local_dir, selection)
+            except TransferError as exc:
+                return UploadOutcome("failed", exc.message, error_code=exc.code)
+            if any(size <= 0 for _path, _relative, size in files):
+                return UploadOutcome(
+                    "failed",
+                    "天翼云 PC 客户端上传不支持空文件",
+                    error_code=ErrorCode.INVALID_PLAN,
+                )
 
         records = manifest.setdefault("files", {})
         if not isinstance(records, dict):
@@ -221,6 +255,15 @@ class TianyiCloudUploader:
                     if relative_dir not in frozenset({"", "."})
                     else root_folder_id
                 )
+                # Directory lookup/creation has not submitted a file. Only
+                # an actual upload needs the unknown-result crash fence.
+                manifest["status"] = "uploading"
+                if not self._write_operation_manifest(manifest_path, manifest):
+                    return UploadOutcome(
+                        "unknown",
+                        "无法持久化天翼云上传 fence",
+                        error_code=ErrorCode.RESULT_UNKNOWN,
+                    )
                 result = self.importer.upload_file(
                     local_file=full_path,
                     parent_folder_id=parent_id,
@@ -236,6 +279,17 @@ class TianyiCloudUploader:
                         else None
                     ),
                 )
+            except TianyiUploadNotSubmitted as exc:
+                # The importer guarantees that no upload request was made.
+                # Do not apply this reset to generic API/network exceptions.
+                manifest["status"] = "prepared"
+                if not self._write_operation_manifest(manifest_path, manifest):
+                    return UploadOutcome(
+                        "unknown",
+                        "无法持久化天翼云上传前失败状态",
+                        error_code=ErrorCode.RESULT_UNKNOWN,
+                    )
+                return self._api_failure(exc, prefix="天翼云上传准备失败")
             except TianyiApiError as exc:
                 return self._api_failure(exc, prefix="天翼云上传失败")
             except Exception as exc:  # noqa: BLE001
@@ -260,7 +314,7 @@ class TianyiCloudUploader:
                 "rapid_upload": bool(result.get("rapid_upload")),
             }
             records[relative_path] = record
-            manifest["status"] = "uploading"
+            manifest["status"] = "prepared"
             if not self._write_operation_manifest(manifest_path, manifest):
                 return UploadOutcome(
                     "unknown",
@@ -294,6 +348,23 @@ class TianyiCloudUploader:
             "天翼云原生上传完成",
             file_count=uploaded_count,
             total_size=uploaded_size,
+        )
+
+    def merge_upload_manifests(
+        self,
+        *,
+        local_dir: str,
+        idempotency_key: str,
+        file_operation_keys: list[str],
+    ) -> UploadOutcome:
+        return merge_completed_upload_manifests(
+            local_dir=local_dir,
+            idempotency_key=idempotency_key,
+            file_operation_keys=file_operation_keys,
+            provider_kind=self.provider_kind,
+            manifest_path=self._operation_manifest_path,
+            read_manifest=self._read_operation_manifest,
+            write_manifest=self._write_operation_manifest,
         )
 
     def verify_target(
@@ -578,27 +649,7 @@ class TianyiCloudUploader:
 
     @staticmethod
     def _write_operation_manifest(path: str, value: dict[str, Any]) -> bool:
-        directory = os.path.dirname(path) or "."
-        temp_path = ""
-        try:
-            fd, temp_path = tempfile.mkstemp(
-                prefix=".fnos-relay-upload-",
-                suffix=".tmp",
-                dir=directory,
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(value, handle, ensure_ascii=False, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, path)
-            return True
-        except OSError:
-            try:
-                if temp_path and os.path.exists(temp_path):
-                    os.unlink(temp_path)
-            except OSError:
-                pass
-            return False
+        return write_operation_manifest(path, value)
 
     @staticmethod
     def _api_failure(exc: TianyiApiError, *, prefix: str) -> UploadOutcome:

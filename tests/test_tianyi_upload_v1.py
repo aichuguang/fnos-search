@@ -9,12 +9,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
 from fnos_media_import.importers.tianyi import TianyiApiError, TianyiImporter
+from fnos_media_import.transfer import ErrorCode
 from fnos_media_import.transfer.tianyi_uploader import TianyiCloudUploader
 
 
@@ -442,6 +443,115 @@ class TianyiCloudUploaderTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "UPLOAD_PROBE_CLEANUP_FAILED")
         self.assertEqual(len(importer.delete_calls), 1)
+
+
+class TianyiUploadPreSubmissionTests(unittest.TestCase):
+    def setUp(self):
+        temporary_root = Path(__file__).resolve().parents[1] / "codex_tmp"
+        temporary_root.mkdir(exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=temporary_root)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / "movie.mkv").write_bytes(b"isolated payload")
+        self.importer = TianyiImporter({"session_key": "isolated", "session_secret": "0123456789abcdef"})
+        self.importer.resolve_folder_locator = Mock(return_value="root")
+
+        def upload_request(_method, path, *, params, **_kwargs):
+            if path.endswith("initMultiUpload"):
+                return {"data": {"uploadFileId": "upload-1", "fileDataExists": 1}}
+            if path.endswith("commitMultiUploadFile"):
+                return {"file": {"userFileId": "file-1"}}
+            raise AssertionError(f"Unexpected upload API: {path}")
+
+        self.importer._upload_request = Mock(side_effect=upload_request)
+        self.uploader = TianyiCloudUploader(self.importer)
+        self.kwargs = {
+            "local_dir": str(self.root),
+            "target_locator": {"kind": "folder_id", "path": "root"},
+            "idempotency_key": "local-preflight-test",
+        }
+
+    def _manifest(self):
+        return self.uploader._read_operation_manifest(
+            self.uploader._operation_manifest_path(str(self.root), self.kwargs["idempotency_key"])
+        )
+
+    def test_local_read_failure_can_retry_without_unknown_result(self):
+        with patch.object(self.importer, "_upload_hashes", side_effect=PermissionError("temporary local read failure")):
+            first = self.uploader.upload_local_dir(**self.kwargs)
+        self.assertEqual(first.status, "failed")
+        self.assertEqual(self._manifest()["status"], "prepared")
+        self.importer._upload_request.assert_not_called()
+        second = self.uploader.upload_local_dir(**self.kwargs)
+        self.assertEqual(second.status, "done")
+        self.assertEqual(self.importer._upload_request.call_count, 2)
+
+    def test_changed_local_file_during_hash_is_known_not_submitted(self):
+        with patch.object(self.importer, "_upload_hashes", side_effect=TianyiApiError(
+            "source changed", code="LOCAL_FILE_CHANGED", stage="upload_hash",
+        )):
+            first = self.uploader.upload_local_dir(**self.kwargs)
+        self.assertEqual(first.status, "failed")
+        self.assertEqual(self._manifest()["status"], "prepared")
+        self.importer._upload_request.assert_not_called()
+        self.assertEqual(self.uploader.upload_local_dir(**self.kwargs).status, "done")
+
+    def test_local_failure_after_upload_init_still_keeps_unknown_fence(self):
+        self.importer._upload_request.side_effect = [
+            {"data": {"uploadFileId": "upload-1", "fileDataExists": 0}},
+            {"uploadUrls": {"partNumber_1": {"requestURL": "https://upload.invalid/unused", "requestHeader": ""}}},
+        ]
+        self.importer._put_upload_part = Mock(side_effect=PermissionError("read failed after init"))
+        first = self.uploader.upload_local_dir(**self.kwargs)
+        self.assertEqual(first.status, "failed")
+        self.assertEqual(self._manifest()["status"], "uploading")
+        second = self.uploader.upload_local_dir(**self.kwargs)
+        self.assertEqual((second.status, second.error_code), ("unknown", ErrorCode.RESULT_UNKNOWN))
+        self.assertEqual(self.importer._upload_request.call_count, 2)
+        self.importer._put_upload_part.assert_called_once()
+
+    def test_upload_init_unknown_response_is_never_treated_as_local_failure(self):
+        self.importer._upload_request.side_effect = TianyiApiError("response lost", code="NETWORK_ERROR")
+        first = self.uploader.upload_local_dir(**self.kwargs)
+        second = self.uploader.upload_local_dir(**self.kwargs)
+        self.assertEqual(first.status, "failed")
+        self.assertEqual((second.status, second.error_code), ("unknown", ErrorCode.RESULT_UNKNOWN))
+        self.importer._upload_request.assert_called_once()
+
+    def test_failed_prepared_fence_write_remains_fail_closed(self):
+        write = self.uploader._write_operation_manifest
+        writes = 0
+
+        def fail_reset(path, value):
+            nonlocal writes
+            writes += 1
+            return False if writes == 3 else write(path, value)
+
+        with patch.object(self.importer, "_upload_hashes", side_effect=PermissionError("local read failed")):
+            with patch.object(self.uploader, "_write_operation_manifest", side_effect=fail_reset):
+                first = self.uploader.upload_local_dir(**self.kwargs)
+        self.assertEqual((first.status, first.error_code), ("unknown", ErrorCode.RESULT_UNKNOWN))
+        self.assertEqual(self._manifest()["status"], "uploading")
+        self.assertEqual(self.uploader.upload_local_dir(**self.kwargs).status, "unknown")
+        self.importer._upload_request.assert_not_called()
+
+    def test_retry_after_second_file_hash_failure_does_not_reupload_first(self):
+        (self.root / "a.mkv").write_bytes(b"first file")
+        hashes = self.importer._upload_hashes
+
+        def fail_second(path, file_size, slice_size):
+            if Path(path).name == "movie.mkv":
+                raise PermissionError("second file unavailable")
+            return hashes(path, file_size, slice_size)
+
+        with patch.object(self.importer, "_upload_hashes", side_effect=fail_second):
+            first = self.uploader.upload_local_dir(**self.kwargs)
+        self.assertEqual(first.status, "failed")
+        self.assertEqual(self._manifest()["status"], "prepared")
+        self.assertTrue(self._manifest()["files"]["a.mkv"]["success"])
+        self.assertEqual(self.importer._upload_request.call_count, 2)
+        self.assertEqual(self.uploader.upload_local_dir(**self.kwargs).status, "done")
+        self.assertEqual(self.importer._upload_request.call_count, 4)
 
 
 if __name__ == "__main__":

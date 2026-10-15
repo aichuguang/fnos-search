@@ -4,8 +4,9 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>管理员后台 - {{ app_name }}</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260901-poster-v001">
-    <link rel="stylesheet" href="/static/product.css?v=20260901-poster-v001">
+    <link rel="stylesheet" href="/static/styles.css?v=20261009-recovery-v001">
+    <link rel="stylesheet" href="/static/product.css?v=20261009-recovery-v001">
+    <link rel="stylesheet" href="/static/admin-transfers.css?v=20261015-transfer-polish-v012">
     {% if site_logo_url %}<style>:root { --site-logo-bg: url("{{ site_logo_url }}"); }</style>{% endif %}
 </head>
 <body class="ui-dark" data-page="admin">
@@ -33,6 +34,10 @@
                     <button class="tab" id="adminTabJobs" type="button" role="tab" aria-selected="false" aria-controls="tab-jobs" tabindex="-1" data-tab="jobs">
                         <span class="icon-slot icon-shell" aria-hidden="true"></span>
                         <span>正式任务</span>
+                    </button>
+                    <button class="tab" id="adminTabTransfers" type="button" role="tab" aria-selected="false" aria-controls="tab-transfers" tabindex="-1" data-tab="transfers">
+                        <span class="icon-slot icon-transfer" aria-hidden="true"></span>
+                        <span>传输中心</span>
                     </button>
                     <button class="tab" id="adminTabUpdates" type="button" role="tab" aria-selected="false" aria-controls="tab-updates" tabindex="-1" data-tab="updates">
                         <span class="icon-slot icon-refresh" aria-hidden="true"></span>
@@ -258,6 +263,57 @@
                     <div id="jobDetailBox" class="detail-box hidden"></div>
                 </section>
 
+                <section class="admin-tab-panel transfer-center" id="tab-transfers" role="tabpanel" aria-labelledby="adminTabTransfers" hidden>
+                    <header class="transfer-header">
+                        <div>
+                            <h2>传输中心</h2>
+                            <p>查看当前文件、传输进度与最近完成记录。</p>
+                        </div>
+                        <div class="transfer-actions">
+                            <button class="secondary mini" type="button" id="adminTransfersJobsBtn">查看入库任务</button>
+                            <button class="secondary mini" type="button" id="adminTransfersLogsBtn">查看日志</button>
+                            <button class="mini" type="button" id="loadTransfersBtn">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"/></svg>
+                                <span>刷新状态</span>
+                            </button>
+                        </div>
+                    </header>
+                    <div id="adminRcloneStatusRefreshError" class="transfer-refresh-error" role="status" hidden></div>
+                    <div class="transfer-toolbar">
+                        <div class="transfer-filters" role="group" aria-label="筛选传输任务">
+                            <button class="active" type="button" data-transfer-filter="current" aria-pressed="true" aria-controls="adminRcloneStatus">当前任务<span id="transferCurrentTabCount">—</span></button>
+                            <button type="button" data-transfer-filter="attention" aria-pressed="false" aria-controls="adminRcloneStatus">需处理<span id="transferAttentionTabCount">—</span></button>
+                        </div>
+                        <span id="transferQueueSummary" class="transfer-queue-summary" hidden>排队 <span id="transferQueueCount">0</span></span>
+                        <label class="transfer-search">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4" stroke-linecap="round"/></svg>
+                            <input id="transferSearch" type="search" aria-label="搜索传输任务" placeholder="任务编号或文件名" autocomplete="off">
+                        </label>
+                    </div>
+                    <div id="adminRcloneStatus" class="transfer-list" aria-busy="true">
+                        <div class="transfer-empty" role="status">
+                            <h3>正在获取传输任务</h3>
+                            <p>影视文件的当前进度将在这里展示。</p>
+                        </div>
+                    </div>
+                    <footer class="transfer-footer">
+                        <details id="transferHistory" class="transfer-history" hidden>
+                            <summary><span class="transfer-history-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 5v5h5M4 10a8 8 0 1 1 1.6 7M12 7v5l3 2" stroke-linecap="round" stroke-linejoin="round"/></svg>已结束记录 <span id="transferHistoryCount">0</span></span><svg class="transfer-history-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m9 5 7 7-7 7" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>
+                            <div class="transfer-history-body">
+                                <div id="adminTransferHistory" class="transfer-history-list" role="list"></div>
+                                <div class="transfer-history-actions">
+                                    <p id="transferVisibilityHint" class="transfer-visibility-hint">这里只展示近期记录，完整记录请到入库任务查看。</p>
+                                    <button class="secondary mini transfer-history-all" type="button" id="adminTransferHistoryJobsBtn">查看全部任务</button>
+                                </div>
+                            </div>
+                        </details>
+                        <details id="transferServiceDetails" class="transfer-service-details">
+                            <summary>服务状态</summary>
+                            <div id="adminTransferService" class="transfer-service-strip" role="status" aria-live="polite">正在获取服务状态</div>
+                        </details>
+                    </footer>
+                </section>
+
                 <section class="glass-panel pad admin-tab-panel" id="tab-updates" role="tabpanel" aria-labelledby="adminTabUpdates" hidden>
                     <div class="section-title">
                         <div>
@@ -415,17 +471,20 @@
                 <section class="glass-panel pad admin-tab-panel" id="tab-rclone" role="tabpanel" aria-labelledby="adminTabRclone" hidden>
                     <div class="section-title">
                         <div>
-                            <h2>日志中心 / 服务状态</h2>
-                            <p>查看系统运行状态和关键记录。</p>
+                            <h2>日志中心</h2>
+                            <p>下载、上传进度已移至传输中心。搬运由具体任务调度，不支持无任务全局扫描。</p>
                         </div>
                         <div class="filter-row">
-                            <button type="button" id="adminRcloneStartBtn">启动搬运</button>
+                            <button type="button" id="adminRcloneStartBtn">查看入库任务</button>
+                            <button class="secondary" type="button" id="adminLogsTransfersBtn">进入传输中心</button>
                             <button class="danger" type="button" id="adminRcloneStopBtn">停止搬运</button>
                             <button class="secondary" type="button" id="adminRcloneCheckBtn">环境检查</button>
                             <button class="secondary" type="button" id="loadRcloneBtn">刷新记录</button>
                         </div>
                     </div>
-                    <div id="adminRcloneStatus" class="notice-box">等待刷新。</div>
+                    <div id="adminRcloneServiceStatus" class="transfer-service-strip" role="status" aria-live="polite">正在获取服务状态</div>
+                    <div id="adminRcloneServiceStatusRefreshError" class="transfer-refresh-error" role="status" hidden></div>
+                    <div id="adminRcloneCheckResult" class="transfer-check-result" role="status" hidden></div>
                     <div class="task-log-section">
                         <div class="task-log-head">
                             <div>
@@ -973,20 +1032,20 @@
     <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
     <script src="/static/ui-core.js?v=20260808-request-core-v015"></script>
     <script src="/static/ui-select.js?v=20260808-custom-select-v017"></script>
-    <script src="/static/resource-search-workbench.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin-system.js?v=20260805-rclone-webdav-v003"></script>
-    <script src="/static/admin-jobs.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin-media.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin-rclone.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin-organizer.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin-updates.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin-trending.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin-settings.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin-storage-v1.js?v=20260901-poster-v001"></script>
+    <script src="/static/resource-search-workbench.js?v=20261009-recovery-v001"></script>
+    <script src="/static/admin-system.js?v=20261011-history-cleanup-v001"></script>
+    <script src="/static/admin-jobs.js?v=20261011-request-retry-v006"></script>
+    <script src="/static/admin-media.js?v=20261009-recovery-v001"></script>
+    <script src="/static/admin-rclone.js?v=20261015-transfer-polish-v012"></script>
+    <script src="/static/admin-organizer.js?v=20261011-review-guard-v003"></script>
+    <script src="/static/admin-updates.js?v=20261009-recovery-v001"></script>
+    <script src="/static/admin-trending.js?v=20261012-quark-selection-v008"></script>
+    <script src="/static/admin-settings.js?v=20261009-recovery-v001"></script>
+    <script src="/static/admin-storage-v1.js?v=20261011-storage-cas-v004"></script>
     <script src="/static/admin-notifications.js?v=20260805-notifications-v006"></script>
-    <script src="/static/admin-adapters.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin-bootstrap.js?v=20260901-poster-v001"></script>
-    <script src="/static/ui-dialog.js?v=20260901-poster-v001"></script>
-    <script src="/static/admin.js?v=20260901-poster-v001"></script>
+    <script src="/static/admin-adapters.js?v=20261009-recovery-v001"></script>
+    <script src="/static/admin-bootstrap.js?v=20261014-transfer-center-v009"></script>
+    <script src="/static/ui-dialog.js?v=20261009-recovery-v001"></script>
+    <script src="/static/admin.js?v=20261014-transfer-center-v009"></script>
 </body>
 </html>

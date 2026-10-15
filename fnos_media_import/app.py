@@ -88,6 +88,7 @@ from .services.public_submission_service import PublicSubmissionDependencies, Pu
 from .services.guest_request_admin_service import GuestRequestAdminDependencies, GuestRequestAdminService
 from .services.job_admin_query_service import JobAdminQueryDependencies, JobAdminQueryService
 from .services.job_admin_command_service import JobAdminCommandDependencies, JobAdminCommandService
+from .services.transfer_manual_review_service import TransferManualReviewService
 from .services.job_cancellation_service import JobCancellationDependencies, JobCancellationService
 from .services.request_review_command_service import RequestReviewCommandDependencies, RequestReviewCommandService
 from .services.request_approval_service import RequestApprovalDependencies, RequestApprovalService
@@ -311,6 +312,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         app_config.base_dir / "static" / "uploads",
         _hash_password,
         _verify_password_hash,
+        session_key=app_session_key,
     )
     persisted_settings = db.app_settings.get_all()
     app_config = apply_persisted_config(app_config, persisted_settings)
@@ -588,8 +590,15 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         atexit.register(rclone_worker_client.close)
     rclone_controller = rclone_worker_client or rclone_service
     rclone_webdav_config_service = RcloneWebdavConfigService(lambda: rclone_service.config)
-    # run 启动前自动补写托管 Remote（MP），部署后不再需要手动点“检测 OpenList”。
+    rclone_webdav_config_service.set_connection_service(v1_openlist_connections)
+    # Worker 启动及传输前置检查自动确认 Remote；不能等到 run 启动后才补写。
     rclone_service.set_webdav_config_service(rclone_webdav_config_service)
+
+    def _ensure_worker_remote_confirmation() -> dict[str, Any]:
+        if not rclone_service.enabled:
+            raise RcloneWebdavConfigError("rclone 集成未启用，未自动修改 Remote", 409, code="RCLONE_DISABLED")
+        return rclone_webdav_config_service.ensure_confirmation()
+
     update_service = UpdateService(
         update_repositories,
         app_config.raw,
@@ -1270,7 +1279,15 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         return wrapper
 
     def _is_admin_logged_in() -> bool:
-        return bool(session.get("admin_logged_in"))
+        if not session.get("admin_logged_in"):
+            return False
+        if admin_profile_service.session_is_current(
+            str(session.get("admin_username") or ""),
+            str(session.get("admin_auth_fingerprint") or ""),
+        ):
+            return True
+        session.clear()
+        return False
 
     def _page_args(default_per_page: int = 50, max_per_page: int = 200) -> tuple[int, int, int]:
         page = _safe_int(request.args.get("page"), 1, 1, 999999)
@@ -1376,9 +1393,17 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def api_admin_profile_update():
         payload = request.get_json(silent=True) or {}
         current_username = str(session.get("admin_username") or admin_profile_service.profile().get("username") or "")
-        result, status_code = admin_profile_service.update_profile(payload, current_username)
+        result, status_code = admin_profile_service.update_profile(
+            payload, current_username,
+            current_fingerprint=str(session.get("admin_auth_fingerprint") or ""),
+        )
+        fingerprint = result.pop("_auth_fingerprint", "")
         if result.get("success"):
             session["admin_username"] = result["profile"]["username"]
+            # Bind this cookie to our write, never a concurrent later change.
+            session["admin_auth_fingerprint"] = fingerprint
+        elif status_code == 401:
+            session.clear()
         return jsonify(result), status_code
 
     def api_admin_profile_avatar():
@@ -1748,10 +1773,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 public_status=_public_status,
                 safe_result=_guest_safe_job_result,
                 merge_raw_data=_merge_raw_data,
-                sanitize_string_list=lambda value: _safe_public_string_list(value, max_items=2000, max_length=512),
-                sanitize_quark_selection=_safe_public_quark_selection,
-                sanitize_cloud139_selection=_safe_public_cloud139_selection,
-                sanitize_sixpan_selection=_safe_public_sixpan_selection,
+                sanitize_request_payload=_public_request_payload,
                 category_label=lambda key: app_config.category(key).get("label", key),
                 db=notification_repositories,
                 emit_notification=_emit_configured_notification,
@@ -1849,6 +1871,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 reconcile=_no_job_reconcile,
                 decorate=_decorate_job_completion,
                 load_transfer_execution=v1_execution_repository.get,
+                load_transfer_plan=v1_execution_repository.plan,
             )
         )
 
@@ -1858,6 +1881,26 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     def api_admin_job_retry(job_id: int):
         return jsonify(_job_admin_command_application().retry(job_id))
+
+    def api_admin_job_review(job_id: int):
+        from .planning.plan_validator import validate_plan
+
+        service = TransferManualReviewService(
+            database=db,
+            executions=v1_execution_repository,
+            validate_plan=lambda plan, job: validate_plan(plan, job, deps=v1_transfer_dispatch._validation_deps()),
+            enqueue_transfer=lambda target_job_id: worker_task_dispatcher.import_transfer_execute(
+                target_job_id, reactivate=True
+            ),
+        )
+        result, status_code = service.confirm_not_submitted(
+            job_id, request.get_json(silent=True), admin=str(session.get("admin_username") or "")
+        )
+        if result.get("recovered"):
+            current_job = db.job_queries.get(job_id)
+            if current_job:
+                _sync_guest_requests_for_job(job_id, str(current_job.get("status") or "retry_requested"))
+        return jsonify(result), status_code
 
     def api_admin_job_delete(job_id: int):
         result, status_code = _job_admin_command_application().delete(job_id)
@@ -2081,6 +2124,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             RcloneAdminQueryDependencies(
                 rclone=rclone_controller,
                 counts=db.rclone,
+                load_transfer_states=db.job_queries.list_transfer_statuses,
             )
         )
 
@@ -2097,7 +2141,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         try:
             result = action()
         except RcloneWebdavConfigError as exc:
-            return jsonify({"success": False, "message": str(exc)}), exc.status_code
+            return jsonify({"success": False, "message": str(exc), **({"code": exc.code} if exc.code else {})}), exc.status_code
         except RcloneWorkerRequestError as exc:
             payload = dict(exc.payload)
             payload.pop("_http_status", None)
@@ -2147,7 +2191,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         try:
             return jsonify(action())
         except RcloneWebdavConfigError as exc:
-            return jsonify({"success": False, "message": str(exc)}), exc.status_code
+            return jsonify({"success": False, "message": str(exc), **({"code": exc.code} if exc.code else {})}), exc.status_code
 
     def _rclone_worker_cancel_job():
         payload = _rclone_worker_payload()
@@ -2904,6 +2948,10 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         execution_repository=v1_execution_repository,
         organizer_service=organizer_service,
         upload_log_bridge=_upload_log_bridge,
+        ensure_remote_confirmation=(
+            _ensure_worker_remote_confirmation
+            if role_runs(active_process_role, "worker") else None
+        ),
     )
     app.extensions["v1_rclone_locator"] = v1_rclone_locator
     app.extensions["v1_transfer_dispatch"] = v1_transfer_dispatch
@@ -3702,6 +3750,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             cleanup_default=False,
             stop_running_default=True,
             admin_username=None,
+            require_unbound=True,
         )
 
     public_import_job_coordinator = PublicImportJobCoordinator(
@@ -4076,6 +4125,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 is_logged_in=_is_admin_logged_in,
                 security_status=_build_security_status,
                 admin_required=admin_required,
+                session_fingerprint=admin_profile_service.session_fingerprint,
             )
         )
     )
@@ -4249,6 +4299,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         "admin_jobs": api_admin_jobs,
         "admin_job_detail": api_admin_job_detail,
         "admin_job_retry": api_admin_job_retry,
+        "admin_job_review": api_admin_job_review,
         "admin_job_cancel": api_admin_job_cancel,
         "admin_job_delete": api_admin_job_delete,
         "admin_jobs_batch_retry": api_admin_jobs_batch_retry,
@@ -4298,6 +4349,19 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     app.register_blueprint(create_callbacks_blueprint(CallbackRouteContext(rclone_callback=api_rclone_callback)))
     if role_runs(active_process_role, "worker"):
         rclone_worker_runtime.start()
+        # Old deployments can have a valid persisted Remote but no confirmation
+        # sidecar. Reconcile it before any durable transfer is consumed, not
+        # after frozen-path validation has already rejected the task.
+        try:
+            if rclone_service.enabled and v1_openlist_connections.list_connections():
+                remote_bootstrap = _ensure_worker_remote_confirmation()
+                if remote_bootstrap.get("auto_confirmed"):
+                    app.logger.info("OpenList Remote confirmation restored automatically from saved configuration")
+        except Exception as exc:  # noqa: BLE001 - preflight retries if OpenList is not ready at boot
+            app.logger.warning(
+                "OpenList Remote startup verification deferred; transfer preflight will retry (code=%s)",
+                str(getattr(exc, "code", "") or type(exc).__name__),
+            )
         # The queue is only a wake-up channel.  Reconcile the durable
         # transfer table before consuming new tasks so a crash between plan
         # persistence and enqueue (or a lost queue row) cannot strand work.

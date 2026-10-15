@@ -315,23 +315,30 @@ class RcloneWorkerSourceStabilityTests(unittest.TestCase):
             stats_branch = self.content.index("n >= 3 && parts[n] ~ /^ETA[ \\t]/")
             self.assertLess(stats_branch, marker_created)
 
-    def test_copy_file_runs_slow_source_watchdog_until_first_progress(self) -> None:
+    def test_copy_file_reports_prolonged_silence_and_cleans_up_watchdog(self) -> None:
         copy_file = self.content[
             self.content.index("copy_file() {") : self.content.index("copy_file_once() {")
         ]
-        # 源网盘准备下载链接期间 rclone 完全静默（2026-09-05 线上等待近 3 分钟），
-        # 看门狗必须：10s 轮询哨兵、60s 无首字节提示一次、结束后回收进程与临时文件。
+        # 心跳覆盖整个调用而非只到第一条统计；实际流式时序由活进程测试验证。
         self.assertIn('copy_progress_marker="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-progress.XXXXXX")"', copy_file)
         self.assertIn('rm -f "$copy_progress_marker"', copy_file)
         self.assertIn("RCLONE_PROGRESS_MARKER", copy_file)
-        self.assertIn("sleep 10", copy_file)
+        self.assertIn('sleep "$copy_poll_seconds"', copy_file)
         self.assertIn("if [ -e \"$copy_progress_marker\" ]; then", copy_file)
-        self.assertIn("if [ \"$copy_waited\" -ge 60 ]", copy_file)
-        self.assertIn("源端响应缓慢", copy_file)
-        self.assertIn("通常是源网盘在准备下载链接", copy_file)
+        self.assertIn('while :; do', copy_file)
+        self.assertIn('if [ "$copy_idle_seconds" -ge "$copy_next_notice" ]', copy_file)
+        self.assertIn("等待进度", copy_file)
+        self.assertIn("进度暂未变化", copy_file)
+        self.assertNotIn('copy_waited" -lt 300', copy_file)
+        self.assertIn('2>&1 | stream_progress_filter >&2', copy_file)
         self.assertIn('kill "$copy_watchdog_pid" 2>/dev/null || true', copy_file)
         self.assertIn('wait "$copy_watchdog_pid" 2>/dev/null || true', copy_file)
         self.assertIn('rm -f "$copy_rc_file" "$copy_progress_marker"', copy_file)
+
+    def test_partial_relay_failure_is_not_announced_as_upload_handoff(self) -> None:
+        summary = self.content[self.content.index('if [ "$copied_count" -eq 0 ]; then'):]
+        self.assertLess(summary.index('if [ "$failed_count" -ne 0 ]; then'), summary.index('已移交网盘上传'))
+        self.assertIn("本轮未移交上传，保留已下载文件等待恢复", summary)
 
     def _progress_filter_source(self) -> str:
         return self.content[

@@ -7,7 +7,7 @@
 
 set -eu
 
-SCRIPT_VERSION="v1.0"
+SCRIPT_VERSION="v1.3-sequential-relay"
 STOP_REQUESTED=0
 
 RCLONE_CONFIG_PATH="${RCLONE_CONFIG_PATH:-/config/rclone/rclone.conf}"
@@ -27,6 +27,8 @@ RCLONE_SOURCE_APPEAR_POLL_SECONDS="${RCLONE_SOURCE_APPEAR_POLL_SECONDS:-15}"
 RCLONE_VERIFY_SIZE_RETRIES="${RCLONE_VERIFY_SIZE_RETRIES:-6}"
 RCLONE_VERIFY_SIZE_DELAY="${RCLONE_VERIFY_SIZE_DELAY:-5}"
 RCLONE_UPLOAD_MAX_DURATION="${RCLONE_UPLOAD_MAX_DURATION:-3h}"
+RCLONE_PROGRESS_POLL_SECONDS="${RCLONE_PROGRESS_POLL_SECONDS:-10}"
+RCLONE_PROGRESS_NOTICE_SECONDS="${RCLONE_PROGRESS_NOTICE_SECONDS:-60}"
 LOCAL_TEMP="${LOCAL_TEMP:-/temp/fnos-media-import}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -45,10 +47,15 @@ RCLONE_COPY_TARGET_ROOT="${RCLONE_COPY_TARGET_ROOT:-}"
 RCLONE_COPY_LOCAL_TARGET="${RCLONE_COPY_LOCAL_TARGET:-}"
 RCLONE_COPY_RELAY_MODE="${RCLONE_COPY_RELAY_MODE:-false}"
 RCLONE_COPY_RELAY_ROOT="${RCLONE_COPY_RELAY_ROOT:-}"
+RCLONE_COPY_RELAY_SEQUENTIAL="${RCLONE_COPY_RELAY_SEQUENTIAL:-false}"
+RCLONE_COPY_RELAY_PLAN_KEY="${RCLONE_COPY_RELAY_PLAN_KEY:-}"
+RCLONE_COPY_RELAY_FILE_INDEX="${RCLONE_COPY_RELAY_FILE_INDEX:-0}"
 RCLONE_COPY_DELETE_SOURCE_AFTER_ACK="${RCLONE_COPY_DELETE_SOURCE_AFTER_ACK:-true}"
 
 LOCK_FILE="${LOCK_FILE:-/tmp/fnos_media_import_rclone.lock}"
-LOCK_DIR="${LOCK_FILE}.d"
+# 互斥锁被占用时的退出码：主程序按 75 识别“未启动、需稍后重排队”，
+# 绝不能与 0（成功）或普通失败混用。
+EXIT_LOCK_BUSY=75
 
 INCOMPLETE_FILE_SUFFIXES='.!qB
 .partial
@@ -175,6 +182,10 @@ retry_count() {
     fi
     if is_interrupted_rc "$rc"; then
       log "${name} 已被停止请求中断，停止重试"
+      return "$rc"
+    fi
+    if [ "$rc" -eq 74 ]; then
+      log "${name} 因目标空间不足停止，不再重复下载；请释放中继盘空间后重试"
       return "$rc"
     fi
     if [ "$attempt" -ge "$max_attempts" ]; then
@@ -655,12 +666,11 @@ copy_wait_size_match() {
 # 这里把该行翻译成中文进度（方向词由调用处经 RCLONE_PROGRESS_DIRECTION 注入：
 # 下载/上传，缺省退回“传输”），其余输出（错误、NOTICE 摘要等）原样透传，
 # 保证排障信息不受翻译影响。
-# 注意：输出必须逐行 fflush。progress_filter 的 stdout 接到 Python 端的捕获
-# 管道（非终端），awk 默认按 4KB 块缓冲，不冲刷的话进度会长时间不可见。
+# fflush 只刷新输出，不能解除部分 awk 实现对管道输入的整块读取等待。
+# 长时间运行的 rclone 必须先经过 stream_progress_filter 的逐行输入边界。
 progress_filter() {
   # progress_direction 由调用处注入（下载/上传），缺省时退回“传输”。
-  # progress_marker：首条统计行落盘的哨兵文件（缺省为空 = 不写），
-  # 供 copy_file 的慢源看门狗判断“是否已收到第一个数据”。
+  # progress_marker 记录已观察到的进度统计值；0% 也只是统计，不代表已收到字节。
   awk -v progress_label="${RCLONE_PROGRESS_LABEL:-}" -v progress_direction="${RCLONE_PROGRESS_DIRECTION:-}" -v progress_marker="${RCLONE_PROGRESS_MARKER:-}" '
     /NOTICE/ && /ETA/ {
       line = $0
@@ -674,10 +684,6 @@ progress_filter() {
       # 二段=速度、其余并入进度”归一化，避免写死字段数漏匹配。
       n = split(line, parts, ",[ \t]*")
       if (n >= 3 && parts[n] ~ /^ETA[ \t]/) {
-        if (progress_marker != "" && marker_written != 1) {
-          print "" > progress_marker
-          marker_written = 1
-        }
         gsub(/^ETA[ \t]+/, "", parts[n])
         if (parts[n] == "-") {
           parts[n] = "计算中"
@@ -686,6 +692,11 @@ progress_filter() {
         progress = parts[1]
         for (i = 2; i < n - 1; i++) {
           progress = progress "，" parts[i]
+        }
+        if (progress_marker != "") {
+          print "" > progress_marker
+          print progress >> progress_marker
+          close(progress_marker)
         }
         direction = (progress_direction == "" ? "传输" : progress_direction)
         printf "%s中%s：%s，速度 %s，预计剩余 %s\n", \
@@ -697,31 +708,70 @@ progress_filter() {
     { print; fflush() }
   '
 }
+stream_progress_filter() {
+  # POSIX read 在换行时立即返回；每行给 awk 独立 EOF，避免 mawk 等实现把
+  # 稀疏统计积压在输入缓冲中。保留现有格式化器，不依赖 stdbuf 或特定 awk 参数。
+  # rclone 每 5 秒一条统计，这里的短进程开销远小于一次网络请求。
+  while IFS= read -r copy_progress_line || [ -n "$copy_progress_line" ]; do
+    case "$copy_progress_line" in
+      *"no space left on device"*|*"disk quota exceeded"*)
+        if [ -n "${RCLONE_STORAGE_FULL_MARKER:-}" ]; then
+          printf '1\n' >"$RCLONE_STORAGE_FULL_MARKER" || true
+        fi
+        ;;
+    esac
+    printf '%s\n' "$copy_progress_line" | progress_filter
+  done
+}
 copy_file() {
   copy_source_spec="$1"
   copy_dest_spec="$2"
   # POSIX sh 没有 PIPESTATUS / 进程替换：用 rc 文件从管道里带回 rclone 退出码。
   copy_rc_file="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-rc.XXXXXX")"
-  # 慢源看门狗哨兵：progress_filter 打出第一条统计行时才存在。源网盘取下载
-  # 链接可能耗时数分钟且期间 rclone 完全静默（2026-09-05 线上：下载文件后
-  # 等待近 3 分钟才出现首条进度），看门狗只在实际变慢时补一条中文提示。
+  RCLONE_STORAGE_FULL_MARKER="${copy_rc_file}.storage-full"
+  export RCLONE_STORAGE_FULL_MARKER
+  # 看门狗覆盖整个 copy 调用：无统计或统计值长期不变时定期反馈，不能把
+  # 0% 当成首字节到达，也不能在首条统计后永久停止观察。
   copy_progress_marker="$(mktemp "${TMPDIR:-/tmp}/fnos-rclone-progress.XXXXXX")"
   rm -f "$copy_progress_marker"
   RCLONE_PROGRESS_LABEL="$(basename "$copy_dest_spec")"
   RCLONE_PROGRESS_MARKER="$copy_progress_marker"
   export RCLONE_PROGRESS_LABEL RCLONE_PROGRESS_DIRECTION RCLONE_PROGRESS_MARKER
   (
-    copy_waited=0
-    copy_slow_hinted=0
-    while [ "$copy_waited" -lt 300 ]; do
-      sleep 10 || exit 0
-      copy_waited=$((copy_waited + 10))
+    copy_poll_seconds="$RCLONE_PROGRESS_POLL_SECONDS"
+    copy_notice_seconds="$RCLONE_PROGRESS_NOTICE_SECONDS"
+    case "$copy_poll_seconds" in ''|*[!0-9]*|0*) copy_poll_seconds=10 ;; esac
+    case "$copy_notice_seconds" in ''|*[!0-9]*|0*) copy_notice_seconds=60 ;; esac
+    copy_idle_seconds=0
+    copy_next_notice="$copy_notice_seconds"
+    copy_last_progress=""
+    copy_seen_progress=0
+    copy_sleep_pid=""
+    # 不留下仍持有日志管道或 flock fd 的 sleep 子进程。
+    trap 'if [ -n "$copy_sleep_pid" ]; then kill "$copy_sleep_pid" 2>/dev/null || true; wait "$copy_sleep_pid" 2>/dev/null || true; fi; exit 0' INT TERM
+    while :; do
+      sleep "$copy_poll_seconds" &
+      copy_sleep_pid=$!
+      wait "$copy_sleep_pid" || exit 0
+      copy_sleep_pid=""
       if [ -e "$copy_progress_marker" ]; then
-        exit 0
+        copy_seen_progress=1
+        copy_current_progress="$(cat "$copy_progress_marker" 2>/dev/null || true)"
+        if [ "$copy_current_progress" != "$copy_last_progress" ]; then
+          copy_last_progress="$copy_current_progress"
+          copy_idle_seconds=0
+          copy_next_notice="$copy_notice_seconds"
+          continue
+        fi
       fi
-      if [ "$copy_waited" -ge 60 ] && [ "$copy_slow_hinted" -eq 0 ]; then
-        copy_slow_hinted=1
-        log "源端响应缓慢：${RCLONE_PROGRESS_LABEL} 已请求 ${copy_waited} 秒仍未开始传输，通常是源网盘在准备下载链接，请耐心等待"
+      copy_idle_seconds=$((copy_idle_seconds + copy_poll_seconds))
+      if [ "$copy_idle_seconds" -ge "$copy_next_notice" ]; then
+        if [ "$copy_seen_progress" -eq 0 ]; then
+          log "等待进度：${RCLONE_PROGRESS_LABEL} 约 ${copy_idle_seconds} 秒未收到 rclone 进度统计，搬运调用尚未结束；请检查源端响应或网络状态"
+        else
+          log "进度暂未变化：${RCLONE_PROGRESS_LABEL} 约 ${copy_idle_seconds} 秒未观察到进度统计值更新，搬运调用尚未结束，不能据此判定成功或失败"
+        fi
+        copy_next_notice=$((copy_next_notice + copy_notice_seconds))
       fi
     done
   ) &
@@ -729,11 +779,14 @@ copy_file() {
   {
     copy_file_once "$copy_source_spec" "$copy_dest_spec"
     echo "$?" >"$copy_rc_file"
-  } 2>&1 | progress_filter >&2
+  } 2>&1 | stream_progress_filter >&2
   kill "$copy_watchdog_pid" 2>/dev/null || true
   wait "$copy_watchdog_pid" 2>/dev/null || true
   copy_rc="$(cat "$copy_rc_file" 2>/dev/null || echo 1)"
-  rm -f "$copy_rc_file" "$copy_progress_marker"
+  if [ "$copy_rc" -ne 0 ] && [ -f "$RCLONE_STORAGE_FULL_MARKER" ]; then
+    copy_rc=74
+  fi
+  rm -f "$copy_rc_file" "$copy_progress_marker" "$RCLONE_STORAGE_FULL_MARKER"
   return "$copy_rc"
 }
 copy_file_once() {
@@ -771,6 +824,38 @@ copy_file_once() {
       --stats-one-line \
       --stats-log-level NOTICE
   fi
+}
+relay_file_state() {
+  if [ "$#" -gt 1 ]; then
+    "$PYTHON_BIN" -m fnos_media_import.transfer.relay_file_state "$1" \
+      --local-dir "$copy_target_dir" --job-id "${copy_job_dir#job-}" \
+      --plan-key "$RCLONE_COPY_RELAY_PLAN_KEY" --index "$RCLONE_COPY_RELAY_FILE_INDEX" --size "$2"
+  else
+    "$PYTHON_BIN" -m fnos_media_import.transfer.relay_file_state "$1" \
+      --local-dir "$copy_target_dir" --job-id "${copy_job_dir#job-}" \
+      --plan-key "$RCLONE_COPY_RELAY_PLAN_KEY" --index "$RCLONE_COPY_RELAY_FILE_INDEX"
+  fi
+}
+prepare_relay_file() {
+  relay_waited=0
+  relay_wait_limit="${TRANSFER_WAIT_TIMEOUT_SECONDS:-10800}"
+  case "$relay_wait_limit" in ''|*[!0-9]*|0*) relay_wait_limit=10800 ;; esac
+  while :; do
+    stop_if_requested
+    if relay_file_state prepare "$1"; then
+      return 0
+    else
+      relay_prepare_rc=$?
+    fi
+    if [ "$relay_prepare_rc" -ne 75 ]; then return "$relay_prepare_rc"; fi
+    if [ "$relay_waited" -ge "$relay_wait_limit" ]; then
+      log "等待其它任务释放中继缓存超时，本轮未下载，保留来源供人工核对"
+      return 1
+    fi
+    log "等待其它中继文件上传、验证并释放缓存；不会把正常排队当作下载失败重试"
+    sleep_or_stop 10 || return 143
+    relay_waited=$((relay_waited + 10))
+  done
 }
 copy_scoped_job() {
   stop_if_requested
@@ -939,12 +1024,28 @@ copy_scoped_job() {
   fi
   if [ -z "$copy_file_list" ]; then
     log "rclone_copy 源任务目录没有待复制文件：${copy_job_dir}"
+    if [ "$RCLONE_COPY_RELAY_MODE" = "true" ]; then
+      log "中继下载没有可上传文件，本轮失败并保留来源等待重试"
+      return 1
+    fi
     return 0
   fi
   log "rclone_copy 源文件数：$(line_count "$copy_file_list")"
   if ! persist_staging_manifest "$copy_file_list" "$RCLONE_ONLY_CATEGORY" "$copy_target_root" "$copy_source_root"; then
     log "rclone_copy 文件清单未被应用确认，本轮不复制也不删除任何源文件"
     return 1
+  fi
+
+  if [ "$RCLONE_COPY_RELAY_MODE" = "true" ] && [ "$RCLONE_COPY_RELAY_SEQUENTIAL" = "true" ]; then
+    if ! copy_file_list="$(printf '%s\n' "$copy_file_list" | relay_file_state select)"; then
+      log "逐文件中继清单核验失败，本轮不下载也不删除文件"
+      return 1
+    fi
+    if [ -z "$copy_file_list" ]; then
+      log "当前文件已有持久回执，不重复下载，交由中继协调器核验上传和清理"
+      return 0
+    fi
+    log "逐文件中继：本轮仅下载 ${copy_file_list}，上传、远端验证和缓存释放后才处理下一文件"
   fi
 
   copied_count=0
@@ -988,12 +1089,28 @@ copy_scoped_job() {
     fi
 
     log "${copy_direction_label}文件：${file} size=${source_size}"
+    if [ "$RCLONE_COPY_RELAY_MODE" = "true" ] && [ "$RCLONE_COPY_RELAY_SEQUENTIAL" = "true" ]; then
+      if prepare_relay_file "$source_size"; then
+        :
+      else
+        relay_prepare_rc=$?
+        if is_interrupted_rc "$relay_prepare_rc"; then return "$relay_prepare_rc"; fi
+        log "当前文件空间或状态检查失败，停止本轮搬运；保留来源，不重试下载也不处理下一文件"
+        return 1
+      fi
+    fi
     if [ "$copy_is_local" -eq 1 ]; then
       copy_local_parent="$(dirname "$target_file")"
       container_exec mkdir -p "$copy_local_parent" >/dev/null 2>&1 || true
     fi
 
-    if retry_count "${copy_direction_label} ${copy_basename}" "$MAX_RETRIES" copy_file "$source_file_remote" "$target_file"; then
+    copy_reuse_local=0
+    if [ "$RCLONE_COPY_RELAY_MODE" = "true" ] && [ "$RCLONE_COPY_RELAY_SEQUENTIAL" = "true" ] \
+      && [ "$(copy_local_size "$target_file")" = "$source_size" ]; then
+      copy_reuse_local=1
+      log "复用大小已核验的任务级本地缓存，不重复下载：${file}"
+    fi
+    if [ "$copy_reuse_local" -eq 1 ] || retry_count "${copy_direction_label} ${copy_basename}" "$MAX_RETRIES" copy_file "$source_file_remote" "$target_file"; then
       :
     else
       copy_result=$?
@@ -1021,6 +1138,15 @@ copy_scoped_job() {
       log "完成回调未确认，保留源端等待下次重试：${file}"
       failed_count=$((failed_count + 1))
       continue
+    fi
+
+    if [ "$RCLONE_COPY_RELAY_MODE" = "true" ] && [ "$RCLONE_COPY_RELAY_SEQUENTIAL" = "true" ]; then
+      if ! relay_file_state downloaded "$source_size"; then
+        log "单文件下载回执未持久化，保留缓存和来源，拒绝移交上传"
+        return 1
+      fi
+      log "单文件下载已确认：${file}；等待原生上传、远端验证和本地缓存释放，来源保留至整任务完成"
+      return 0
     fi
 
     stop_if_requested
@@ -1051,6 +1177,14 @@ EOF
   rclone_cmd rmdirs "$source_remote_dir" --leave-root >/dev/null 2>&1 || true
 
   if [ "$copy_is_local" -eq 1 ] && [ "$RCLONE_COPY_RELAY_MODE" = "true" ]; then
+    if [ "$copied_count" -eq 0 ]; then
+      log "中继下载未确认任何文件，拒绝标记成功或移交上传"
+      return 1
+    fi
+    if [ "$failed_count" -ne 0 ]; then
+      log "中继下载尚有 ${failed_count} 个失败文件，本轮未移交上传，保留已下载文件等待恢复"
+      return 1
+    fi
     # 下载只是中继链路第一段：结束后还有网盘 API 上传与整理，
     # 结束语必须如实说明“移交”，不能让用户误以为整个任务已完成。
     log "rclone 下载完成：${copy_job_dir}，下载 ${copied_count} 个文件，失败 ${failed_count} 个，已移交网盘上传"
@@ -1060,13 +1194,21 @@ EOF
   [ "$failed_count" -eq 0 ]
 }
 acquire_lock() {
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
-    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+  # 用 flock 持有锁文件描述符：进程退出（含 SIGKILL、容器硬重启）时内核自动
+  # 释放，不再像 mkdir 锁那样残留目录、把后续所有任务都挡在门外。
+  # 拿不到锁时用独立退出码 75 退出，主程序据此把本次 run 回滚到队列，
+  # 而不是当成搬运成功去唤醒上传。
+  if ! command -v flock >/dev/null 2>&1; then
+    log "Worker 内缺少 flock 命令，无法建立 rclone 互斥锁"
+    exit 1
+  fi
+  exec 9>"$LOCK_FILE"
+  if flock -n 9; then
     return 0
   fi
 
-  log "已有 rclone 搬运任务运行中，本次跳过"
-  exit 0
+  log "已有 rclone 搬运任务运行中，本次未启动，稍后由队列重新调度"
+  exit "$EXIT_LOCK_BUSY"
 }
 main() {
   acquire_lock

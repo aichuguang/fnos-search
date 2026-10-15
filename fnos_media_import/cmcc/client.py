@@ -15,6 +15,8 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import requests
 
+from ..http_client import RETRYABLE_STATUS_CODES
+from ..provider_errors import SHARE_INVALID_MESSAGE, is_share_resource_unavailable, share_error_details
 from .auth import CmccAuthConfigError, CmccAuthExpired, CmccAuthProvider
 
 
@@ -27,12 +29,14 @@ class CmccApiError(RuntimeError):
         status_code: int | None = None,
         payload: Any = None,
         auth_expired: bool = False,
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
         self.payload = payload
         self.auth_expired = auth_expired
+        self.details = dict(details or {})
 
 
 def _md5(text: str) -> str:
@@ -232,10 +236,36 @@ class CmccClient:
                 headers=self._share_headers(True),
                 timeout=timeout or self.timeout,
             )
+        except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as exc:
+            raise CmccApiError(
+                f"CMCC share request failed: {path}: {exc}", code="NETWORK_TRANSIENT",
+                details={"provider_path": urlparse(path).path, "exception_type": type(exc).__name__},
+            ) from exc
         except requests.RequestException as exc:
             raise CmccApiError(f"CMCC share request failed: {path}: {exc}") from exc
         if response.status_code != 200:
-            raise CmccApiError(self._response_message(response), status_code=response.status_code)
+            message = self._response_message(response)
+            try:
+                error_payload = response.json()
+            except ValueError:
+                error_payload = {}
+            code = str(error_payload.get("code") or "") if isinstance(error_payload, dict) else ""
+            if is_share_resource_unavailable(
+                "mobile", path=path, http_status=response.status_code, code=code, message=message
+            ):
+                raise CmccApiError(
+                    SHARE_INVALID_MESSAGE, code="SHARE_INVALID", status_code=response.status_code,
+                    details=share_error_details(
+                        "mobile", path=path, http_status=response.status_code, code=code, message=message,
+                    ),
+                )
+            raise CmccApiError(
+                message,
+                code="NETWORK_TRANSIENT" if response.status_code in RETRYABLE_STATUS_CODES else code or f"HTTP_{response.status_code}",
+                status_code=response.status_code,
+                auth_expired=response.status_code in {401, 403},
+                details={"provider_code": code, "provider_path": urlparse(path).path},
+            )
         try:
             data = response.json()
         except ValueError as exc:
@@ -244,8 +274,18 @@ class CmccClient:
             raise CmccAuthExpired(self._payload_message(data))
         code = str(data.get("code") or "").strip()
         success = data.get("success")
-        if code not in {"", "0", "0000", "200"} and success is not True:
-            raise CmccApiError(self._payload_message(data), code=code, payload=data)
+        if success is False or (code not in {"", "0", "0000", "200"} and success is not True):
+            message = self._payload_message(data)
+            if is_share_resource_unavailable(
+                "mobile", path=path, http_status=response.status_code, code=code, message=message
+            ):
+                raise CmccApiError(
+                    SHARE_INVALID_MESSAGE, code="SHARE_INVALID", status_code=response.status_code,
+                    details=share_error_details(
+                        "mobile", path=path, http_status=response.status_code, code=code, message=message,
+                    ),
+                )
+            raise CmccApiError(message, code=code, payload=data)
         body = data.get("data") if isinstance(data, dict) and "data" in data else data
         return body if isinstance(body, dict) else {"value": body}
 

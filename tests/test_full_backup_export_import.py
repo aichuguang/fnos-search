@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
-import shutil
+import tempfile
 import unittest
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,11 @@ from fnos_media_import.accounts.crypto import (
     encrypt,
 )
 from fnos_media_import.database import Database
+from fnos_media_import.accounts.repository import ProviderAccountRepository
+from fnos_media_import.accounts.service import ProviderAccountService
+from fnos_media_import.openlist.connection_service import OpenListConnectionService
+from fnos_media_import.openlist.mount_service import OpenListMountService
+from fnos_media_import.planning.plan_validator import PlanValidationDeps, PlanValidator
 from fnos_media_import.repositories import RepositorySet
 from fnos_media_import.services.backup_service import (
     FULL_BACKUP_FORMAT,
@@ -30,8 +35,11 @@ CONFIG_TABLES = (
     "provider_accounts",
     "provider_account_revisions",
     "provider_account_selections",
+    "provider_account_selection_revisions",
     "openlist_connections",
+    "openlist_connection_revisions",
     "openlist_mounts",
+    "openlist_mount_revisions",
     "storage_targets",
     "storage_target_revisions",
     "storage_target_account_bindings",
@@ -43,7 +51,8 @@ CONFIG_TABLES = (
 class _DatabaseWorkspace:
     def __enter__(self) -> RepositorySet:
         WORK_TEST_ROOT.mkdir(parents=True, exist_ok=True)
-        self.path = WORK_TEST_ROOT / f"backup-{uuid.uuid4().hex}.db"
+        self.directory = tempfile.TemporaryDirectory(prefix="backup-", dir=WORK_TEST_ROOT)
+        self.path = Path(self.directory.name) / "app.db"
         self.database = Database(self.path)
         self.database.init_schema()
         return RepositorySet.from_database(self.database)
@@ -53,16 +62,9 @@ class _DatabaseWorkspace:
             self.database.close_all_connections()
         except AttributeError:
             pass
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                (self.path.parent / f"{self.path.name}{suffix}").unlink()
-            except FileNotFoundError:
-                pass
-        try:
-            if self.path.parent.exists() and not any(self.path.parent.iterdir()):
-                shutil.rmtree(self.path.parent)
-        except OSError:
-            pass
+        if self.path.parent.resolve().parent != WORK_TEST_ROOT.resolve():
+            raise RuntimeError("test database escaped its temporary workspace")
+        self.directory.cleanup()
 
 
 def _service(repos: RepositorySet, root_key: Any, reload_runtime: Any = lambda: {"reloaded": True}) -> FullBackupService:
@@ -90,11 +92,6 @@ def _seed(repos: RepositorySet) -> None:
         json.dumps({"token": "quark-token"}),
         purpose=PURPOSE_PROVIDER_ACCOUNT,
     )
-    password_cipher, password_key_id = encrypt(
-        ROOT_KEY_A,
-        "openlist-password",
-        purpose=PURPOSE_OPENLIST,
-    )
     with repos.connect() as conn:
         conn.execute(
             "INSERT INTO provider_accounts (account_id, provider_kind, name, enabled, current_revision,"
@@ -107,26 +104,12 @@ def _seed(repos: RepositorySet) -> None:
             (json.dumps({"cookie": "uin=1"}), credentials_cipher, credentials_key_id, "2026-01-01T00:00:00Z"),
         )
         conn.execute(
-            "INSERT INTO provider_account_selections (provider_kind, scope, account_id, account_revision,"
-            " selection_revision, selected_at) VALUES ('quark', 'default', 'acc-1', 1, 1, ?)",
-            ("2026-01-01T00:00:00Z",),
-        )
-        conn.execute(
-            "INSERT INTO openlist_connections (connection_id, name, base_url, username, password_ciphertext,"
-            " credential_key_id, enabled, revision, created_at, updated_at)"
-            " VALUES ('conn-1', 'OpenList', 'http://openlist.local/dav', 'admin', ?, ?, 1, 1, ?, ?)",
-            (password_cipher, password_key_id, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
-        )
-        conn.execute(
-            "INSERT INTO openlist_mounts (mount_id, connection_id, name, webdav_root, namespace_id,"
-            " native_locator_json) VALUES ('mount-1', 'conn-1', 'media', '/media', 'ns', '{}')"
-        )
-        conn.execute(
             "INSERT INTO storage_targets (destination_id, name, provider_kind, account_scope, target_kind,"
             " enabled, audience, current_revision, created_at, updated_at)"
             " VALUES ('dest-1', '主存储', 'quark', 'default', 'provider', 1, 'admin', 1, ?, ?)",
             ("2026-01-01T00:00:00Z",) * 2,
         )
+
         conn.execute(
             "INSERT INTO storage_target_revisions (destination_id, revision, categories_json, display_json, created_at)"
             " VALUES ('dest-1', 1, ?, ?, ?)",
@@ -139,8 +122,9 @@ def _seed(repos: RepositorySet) -> None:
             ("2026-01-01T00:00:00Z",) * 2,
         )
         conn.execute(
-            "INSERT INTO storage_target_binding_revisions (binding_id, revision, locator_json, created_at)"
-            " VALUES ('bind-1', 1, ?, ?)",
+            "INSERT INTO storage_target_binding_revisions "
+            "(binding_id, revision, locator_json, created_at, account_revision)"
+            " VALUES ('bind-1', 1, ?, ?, 1)",
             (json.dumps({"mode": "native"}), "2026-01-01T00:00:00Z"),
         )
         conn.execute(
@@ -149,13 +133,88 @@ def _seed(repos: RepositorySet) -> None:
             ("2026-01-01T00:00:00Z",) * 2,
         )
 
+    accounts = ProviderAccountRepository(repos)
+    accounts.upsert_selection("quark", "default", "acc-1", 1, None)
+    accounts.upsert_selection("quark", "default", "acc-1", 1, 1)
+    connections = OpenListConnectionService(repos, lambda: ROOT_KEY_A)
+    connections.create_connection(
+        {
+            "connection_id": "conn-1",
+            "name": "OpenList",
+            "base_url": "http://openlist.local/dav",
+            "username": "admin",
+            "password": "openlist-password",
+        }
+    )
+    OpenListMountService(repos, connections).create_mount(
+        {
+            "mount_id": "mount-1",
+            "connection_id": "conn-1",
+            "name": "media",
+            "provider_kind": "quark",
+            "account_id": "acc-1",
+            "webdav_root": "/media",
+        }
+    )
+    connections.update_connection(
+        "conn-1", {"expected_revision": 1, "password": "openlist-current-password"}
+    )
+
 
 def _read_table(repos: RepositorySet, table: str) -> list[dict[str, Any]]:
     with repos.connect() as conn:
         return [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
 
 
+def _empty_document() -> dict[str, Any]:
+    return {
+        "format": FULL_BACKUP_FORMAT,
+        "version": FULL_BACKUP_VERSION,
+        "app_settings": {},
+        **{table: [] for table in CONFIG_TABLES},
+    }
+
+
+def _seed_auth_session(repos: RepositorySet) -> None:
+    with repos.connect() as conn:
+        conn.execute(
+            "INSERT INTO provider_auth_sessions "
+            "(session_id, provider_kind, auth_method, status, state_ciphertext, credential_key_id, "
+            "account_id, created_at, updated_at) "
+            "VALUES ('session-1', 'quark', 'qr', 'completed', ?, 'test-only', 'acc-1', ?, ?)",
+            (b"test-only-state", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+
+
 class FullBackupExportImportTests(unittest.TestCase):
+    def assert_frozen_revisions_readable(self, repos: RepositorySet) -> None:
+        accounts = ProviderAccountService(repos, lambda: ROOT_KEY_A)
+        connections = OpenListConnectionService(repos, lambda: ROOT_KEY_A)
+        mounts = OpenListMountService(repos, connections)
+        validator = PlanValidator(PlanValidationDeps(accounts, None, mounts, None))
+        for revision in (1, 2):
+            with self.subTest(revision=revision):
+                errors: list[str] = []
+                validator._validate_account(
+                    provider_kind="quark",
+                    account_id="acc-1",
+                    account_revision=1,
+                    selection_revision=revision,
+                    selection_scope="default",
+                    role="source",
+                    errors=errors,
+                )
+                self.assertEqual(errors, [])
+                credentials = connections.resolve_credentials("conn-1", revision)
+                self.assertEqual(
+                    credentials["password"],
+                    "openlist-password" if revision == 1 else "openlist-current-password",
+                )
+                mount = mounts.get_revision("mount-1", revision)
+                self.assertIsNotNone(mount)
+                self.assertEqual(mount["connection_revision"], revision)
+                self.assertEqual(mount["namespace_id"], "openlist:conn-1:mount-1")
+
     def test_export_document_structure_and_settings_exclusion(self) -> None:
         with _DatabaseWorkspace() as repos:
             _seed(repos)
@@ -173,6 +232,12 @@ class FullBackupExportImportTests(unittest.TestCase):
         self.assertEqual(revision["credential_key_id"], "v2:provider-account")
         connection = document["openlist_connections"][0]
         self.assertTrue(connection["password_ciphertext"])
+        for table in ("provider_account_selection_revisions", "openlist_connection_revisions", "openlist_mount_revisions"):
+            self.assertEqual(body["meta"]["table_counts"][table], 2)
+        historical_connection = document["openlist_connection_revisions"][0]
+        self.assertIsInstance(historical_connection["config"], dict)
+        self.assertTrue(historical_connection["password_ciphertext"])
+        self.assertEqual(historical_connection["credential_key_id"], "v2:openlist")
         self.assertEqual(document["storage_target_revisions"][0]["categories"], {"movie": {"paths": ["/电影"]}})
 
     def test_round_trip_restores_every_table_with_identical_ciphertext(self) -> None:
@@ -212,6 +277,7 @@ class FullBackupExportImportTests(unittest.TestCase):
                 base64.b64decode(document["provider_account_revisions"][0]["credentials_ciphertext"]),
             )
             self.assertEqual(revision["credential_key_id"], "v2:provider-account")
+            self.assert_frozen_revisions_readable(target)
 
     def test_import_rejects_document_when_root_key_differs(self) -> None:
         with _DatabaseWorkspace() as source:
@@ -251,52 +317,217 @@ class FullBackupExportImportTests(unittest.TestCase):
             _seed(source)
             document = _service(source, ROOT_KEY_A).export_document()[0]["document"]
         with _DatabaseWorkspace() as target:
+            _seed(target)
+            _seed_auth_session(target)
             target.app_settings.set_many({"advanced_config": {"pansou": {"timeout": 1}}})
-            with target.connect() as conn:
-                conn.execute(
-                    "INSERT INTO provider_accounts (account_id, provider_kind, name, enabled, current_revision,"
-                    " identity_hint, created_at, updated_at) VALUES ('local', 'quark', '本机账号', 1, 0, '', ?, ?)",
-                    ("2025-01-01T00:00:00Z",) * 2,
-                )
             before = {table: _read_table(target, table) for table in CONFIG_TABLES}
             settings_before = target.app_settings.get_all()
+            sessions_before = _read_table(target, "provider_auth_sessions")
 
             result, status = _service(target, ROOT_KEY_A, reload_runtime).import_document(document, confirm=True)
             self.assertEqual(status, 500, result)
             self.assertTrue(result["rolled_back"])
-            self.assertEqual(calls, 1)
+            self.assertFalse(result["runtime_restored"])
+            self.assertEqual(calls, 2)
             for table in CONFIG_TABLES:
                 with self.subTest(table=table):
                     self.assertEqual(_read_table(target, table), before[table])
             self.assertEqual(target.app_settings.get_all(), settings_before)
+            self.assertEqual(_read_table(target, "provider_auth_sessions"), sessions_before)
+            self.assert_frozen_revisions_readable(target)
+
+    def test_reload_failure_restores_runtime_from_rolled_back_database(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            _seed(repos)
+            document = _service(repos, ROOT_KEY_A).export_document()[0]["document"]
+            document["app_settings"]["submission.mode"] = "auto"
+            seen_modes: list[str] = []
+
+            def reload_runtime() -> dict[str, Any]:
+                seen_modes.append(repos.app_settings.get_all()["submission.mode"])
+                if len(seen_modes) == 1:
+                    raise RuntimeError("remote worker reload failed after local publication")
+                return {"success": True}
+
+            result, status = _service(repos, ROOT_KEY_A, reload_runtime).import_document(document, confirm=True)
+            self.assertEqual(status, 500)
+            self.assertTrue(result["rolled_back"])
+            self.assertTrue(result["runtime_restored"])
+            self.assertEqual(seen_modes, ["auto", "review"])
+            self.assert_frozen_revisions_readable(repos)
+
+    def test_reload_failure_result_is_not_reported_as_success(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            document = {**_empty_document(), "app_settings": {"submission.mode": "auto"}}
+            service = _service(repos, ROOT_KEY_A, lambda: {"success": False, "message": "worker unavailable"})
+            result, status = service.import_document(document, confirm=True)
+            self.assertEqual(status, 500)
+            self.assertTrue(result["rolled_back"])
+            self.assertFalse(result["runtime_restored"])
+            self.assertNotIn("submission.mode", repos.app_settings.get_all())
+
+    def test_successful_import_detaches_retained_auth_session_before_account_deletion(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            _seed(repos)
+            _seed_auth_session(repos)
+            service = _service(repos, ROOT_KEY_A)
+            document = service.export_document()[0]["document"]
+            self.assertNotIn("provider_auth_sessions", document)
+            result, status = service.import_document(document, confirm=True)
+            self.assertEqual(status, 200, result)
+            sessions = _read_table(repos, "provider_auth_sessions")
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0]["status"], "completed")
+            self.assertIsNone(sessions[0]["account_id"])
+            self.assert_frozen_revisions_readable(repos)
+
+    def test_v1_backup_is_rejected_without_modifying_existing_configuration(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            _seed(repos)
+            service = _service(repos, ROOT_KEY_A)
+            document = service.export_document()[0]["document"]
+            document["version"] = 1
+            for table in ("provider_account_selection_revisions", "openlist_connection_revisions", "openlist_mount_revisions"):
+                del document[table]
+            before = {table: _read_table(repos, table) for table in CONFIG_TABLES}
+            result, status = service.import_document(document, confirm=True)
+            self.assertEqual(status, 400)
+            self.assertIn("v1", result["message"])
+            self.assertIn("重新导出 v2", result["message"])
+            self.assertEqual({table: _read_table(repos, table) for table in CONFIG_TABLES}, before)
+            self.assert_frozen_revisions_readable(repos)
+
+    def test_missing_or_null_sections_never_become_empty_tables(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            _seed(repos)
+            service = _service(repos, ROOT_KEY_A)
+            original = service.export_document()[0]["document"]
+            before = {table: _read_table(repos, table) for table in CONFIG_TABLES}
+            for section in (*CONFIG_TABLES, "app_settings"):
+                for omitted in (True, False):
+                    with self.subTest(section=section, omitted=omitted):
+                        document = copy.deepcopy(original)
+                        if omitted:
+                            del document[section]
+                        else:
+                            document[section] = None
+                        result, status = service.import_document(document, confirm=True)
+                        self.assertEqual(status, 400, result)
+            self.assertEqual({table: _read_table(repos, table) for table in CONFIG_TABLES}, before)
+
+    def test_empty_revision_sections_are_rejected_and_transaction_rolls_back(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            _seed(repos)
+            _seed_auth_session(repos)
+            service = _service(repos, ROOT_KEY_A)
+            original = service.export_document()[0]["document"]
+            before = {table: _read_table(repos, table) for table in (*CONFIG_TABLES, "provider_auth_sessions")}
+            for section in ("provider_account_selection_revisions", "openlist_connection_revisions", "openlist_mount_revisions"):
+                with self.subTest(section=section):
+                    document = copy.deepcopy(original)
+                    document[section] = []
+                    result, status = service.import_document(document, confirm=True)
+                    self.assertEqual(status, 400, result)
+                    self.assertIn("修订", result["message"])
+            self.assertEqual({table: _read_table(repos, table) for table in before}, before)
+            self.assert_frozen_revisions_readable(repos)
+
+    def test_mismatched_selection_and_missing_historical_connection_are_rejected(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            _seed(repos)
+            service = _service(repos, ROOT_KEY_A)
+            original = service.export_document()[0]["document"]
+            documents = [copy.deepcopy(original), copy.deepcopy(original)]
+            documents[0]["provider_account_selection_revisions"][-1]["scope"] = "wrong-scope"
+            documents[1]["openlist_connection_revisions"] = [
+                row for row in documents[1]["openlist_connection_revisions"] if row["revision"] == 2
+            ]
+            for document in documents:
+                result, status = service.import_document(document, confirm=True)
+                self.assertEqual(status, 400, result)
+                self.assertIn("修订", result["message"])
+            self.assert_frozen_revisions_readable(repos)
+
+    def test_historical_openlist_credentials_are_verified_with_local_root_key(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            _seed(repos)
+            service = _service(repos, ROOT_KEY_A)
+            document = service.export_document()[0]["document"]
+            ciphertext, key_id = encrypt(ROOT_KEY_B, "historical-password", purpose=PURPOSE_OPENLIST)
+            row = document["openlist_connection_revisions"][0]
+            row["password_ciphertext"] = base64.b64encode(ciphertext).decode("ascii")
+            row["credential_key_id"] = key_id
+            result, status = service.import_document(document, confirm=True)
+            self.assertEqual(status, 400, result)
+            self.assertIn("FNOS_ROOT_KEY", result["message"])
+            self.assert_frozen_revisions_readable(repos)
+
+    def test_dangling_binding_and_inconsistent_mount_revisions_do_not_modify_configuration(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            _seed(repos)
+            _seed_auth_session(repos)
+            reloaded: list[bool] = []
+            service = _service(repos, ROOT_KEY_A, lambda: reloaded.append(True) or {"success": True})
+            original = service.export_document()[0]["document"]
+            before = {table: _read_table(repos, table) for table in (*CONFIG_TABLES, "provider_auth_sessions")}
+            cases = (
+                ("storage_target_binding_revisions", "account_revision", None),
+                ("storage_target_binding_revisions", "account_revision", 999),
+                ("openlist_mount_revisions", "connection_revision", 1),
+                ("openlist_mount_revisions", "namespace_id", "openlist:conn-1:another-mount"),
+            )
+            for table, field, value in cases:
+                with self.subTest(table=table, field=field, value=value):
+                    document = copy.deepcopy(original)
+                    row = document[table][-1]
+                    if table == "openlist_mount_revisions":
+                        row = row["config"]
+                    row[field] = value
+                    result, status = service.import_document(document, confirm=True)
+                    self.assertEqual(status, 400, result)
+                    self.assertIn("修订", result["message"])
+            self.assertEqual({table: _read_table(repos, table) for table in before}, before)
+            self.assertEqual(reloaded, [])
+            self.assert_frozen_revisions_readable(repos)
+
+    def test_accountless_storage_binding_does_not_require_account_revision(self) -> None:
+        with _DatabaseWorkspace() as repos:
+            _seed(repos)
+            service = _service(repos, ROOT_KEY_A)
+            document = service.export_document()[0]["document"]
+            document["storage_targets"][0]["provider_kind"] = "local"
+            binding = document["storage_target_account_bindings"][0]
+            binding["provider_kind"] = "local"
+            binding["account_id"] = None
+            document["storage_target_binding_revisions"][0]["account_revision"] = None
+            result, status = service.import_document(document, confirm=True)
+            self.assertEqual(status, 200, result)
+            self.assertIsNone(_read_table(repos, "storage_target_account_bindings")[0]["account_id"])
+            self.assertIsNone(_read_table(repos, "storage_target_binding_revisions")[0]["account_revision"])
 
     def test_invalid_documents_are_rejected(self) -> None:
         with _DatabaseWorkspace() as repos:
             service = _service(repos, ROOT_KEY_A)
             cases: list[tuple[Any, str]] = [
-                ({"format": "wrong", "version": 1}, "格式标识"),
-                ({"format": FULL_BACKUP_FORMAT, "version": 2}, "版本"),
-                ({"format": FULL_BACKUP_FORMAT, "version": 1, "unknown_section": []}, "不支持的字段"),
-                (
-                    {"format": FULL_BACKUP_FORMAT, "version": 1, "app_settings": {"admin.profile": {}}},
-                    "管理员",
-                ),
-                (
-                    {"format": FULL_BACKUP_FORMAT, "version": 1, "provider_accounts": [{"bogus": 1}]},
-                    "不支持的字段",
-                ),
-                (
-                    {"format": FULL_BACKUP_FORMAT, "version": 1, "provider_accounts": [["not-an-object"]]},
-                    "对象数组",
-                ),
+                ({"format": "wrong"}, "格式标识"),
+                ({"version": FULL_BACKUP_VERSION + 1}, "版本"),
+                ({"version": float(FULL_BACKUP_VERSION)}, "整数"),
+                ({"version": True}, "整数"),
+                ({"unknown_section": []}, "不支持的字段"),
+                ({"app_settings": {"admin.profile": {}}}, "管理员"),
+                ({"provider_accounts": [{"bogus": 1}]}, "不支持的字段"),
+                ({"provider_accounts": [["not-an-object"]]}, "对象数组"),
+                ({"provider_accounts": [{}]}, "必填字段"),
+                ({"openlist_mount_revisions": [{"mount_id": "x", "revision": 1, "config": [], "created_at": "x"}]}, "JSON 对象"),
             ]
-            for document, needle in cases:
-                with self.subTest(document=document):
+            for patch, needle in cases:
+                document = {**_empty_document(), **patch}
+                with self.subTest(patch=patch):
                     result, status = service.import_document(document, confirm=True)
                     self.assertEqual(status, 400)
                     self.assertIn(needle, result["message"])
             result, status = service.import_document(
-                {"format": FULL_BACKUP_FORMAT, "version": 1}, confirm=False
+                _empty_document(), confirm=False
             )
             self.assertEqual(status, 400)
 
@@ -306,11 +537,7 @@ class FullBackupExportImportTests(unittest.TestCase):
         def missing_key() -> bytes:
             raise MasterKeyMissingError("FNOS_ROOT_KEY 未配置")
 
-        document = {
-            "format": FULL_BACKUP_FORMAT,
-            "version": FULL_BACKUP_VERSION,
-            "app_settings": {"submission.mode": "auto"},
-        }
+        document = {**_empty_document(), "app_settings": {"submission.mode": "auto"}}
         with _DatabaseWorkspace() as target:
             result, status = _service(target, missing_key).import_document(document, confirm=True)
             self.assertEqual(status, 200, result)

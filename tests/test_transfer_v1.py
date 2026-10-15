@@ -13,6 +13,7 @@ from tests._repository_v1_fakes import RepositoryFakeMixin
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -1439,6 +1440,13 @@ class ProviderRelayTests(unittest.TestCase):
         download = _FakeDownloadAdapter(events=events)
         uploader = _ProgressReportingUploader(progress_values, events=events)
         sink_lines: list[str] = []
+        log_finished = threading.Event()
+
+        def progress_sink(message):
+            sink_lines.append(message)
+            if message.startswith("上传完成："):
+                log_finished.set()
+
         plan = make_plan(
             source_kind="quark",
             dest_kind="mobile",
@@ -1453,7 +1461,7 @@ class ProviderRelayTests(unittest.TestCase):
             source_materializer=_FakeMaterializer(events=events),
             visibility_poller=_visibility_poller(VisibilityStatus.visible, events),
             relay_root="/data/relay",
-            progress_sink=sink_lines.append,
+            progress_sink=progress_sink,
             progress_interval=0.0,
             event_sink=lambda level, message: milestone_events.append((level, message)),
         )
@@ -1467,8 +1475,10 @@ class ProviderRelayTests(unittest.TestCase):
         )
         _drive(orch)
         self.assertEqual(orch.state.phase, PHASE_COMPLETED)
+        self.assertTrue(log_finished.wait(2), "上传日志没有及时送达")
+        self.assertTrue(sink_lines[0].startswith("开始上传："))
         self.assertEqual(
-            sink_lines,
+            sink_lines[1:],
             [
                 "秒传校验 电影.mkv：3.04 GiB / 6.74 GiB，45%",
                 "上传中 电影.mkv：3.04 GiB / 6.74 GiB，45%，速度 10.5 MiB/s，预计剩余 5m32s",
@@ -1489,6 +1499,13 @@ class ProviderRelayTests(unittest.TestCase):
         download = _FakeDownloadAdapter(events=events)
         uploader = _ProgressReportingUploader(progress_values, events=events)
         sink_lines: list[str] = []
+        log_finished = threading.Event()
+
+        def progress_sink(message):
+            sink_lines.append(message)
+            if message.startswith("上传完成："):
+                log_finished.set()
+
         plan = make_plan(
             source_kind="quark",
             dest_kind="mobile",
@@ -1503,7 +1520,7 @@ class ProviderRelayTests(unittest.TestCase):
             source_materializer=_FakeMaterializer(events=events),
             visibility_poller=_visibility_poller(VisibilityStatus.visible, events),
             relay_root="/data/relay",
-            progress_sink=sink_lines.append,
+            progress_sink=progress_sink,
             progress_interval=3600.0,
         )
         orch = TransferOrchestrator(
@@ -1516,11 +1533,12 @@ class ProviderRelayTests(unittest.TestCase):
         )
         _drive(orch)
         self.assertEqual(orch.state.phase, PHASE_COMPLETED)
-        # 节流只作用于高频进度行；上传完成终态行不节流。
-        self.assertEqual(sink_lines[0], "上传中 电影.mkv：3.04 GiB / 6.74 GiB，45%，速度 10.5 MiB/s，预计剩余 5m32s")
-        self.assertEqual(len(sink_lines), 2)
-        self.assertTrue(sink_lines[1].startswith("上传完成："))
-        self.assertTrue(sink_lines[0].startswith("上传中 电影.mkv："))
+        self.assertTrue(log_finished.wait(2), "上传日志没有及时送达")
+        # 节流仅作用于同阶段的重复进度；开始和完成必须保留。
+        self.assertTrue(sink_lines[0].startswith("开始上传："))
+        self.assertEqual(sink_lines[1], "上传中 电影.mkv：3.04 GiB / 6.74 GiB，45%，速度 10.5 MiB/s，预计剩余 5m32s")
+        self.assertEqual(len(sink_lines), 3)
+        self.assertTrue(sink_lines[2].startswith("上传完成："))
 
     def test_relay_staging_without_organizer_is_rejected_by_plan_contract(self) -> None:
         plan = make_plan(

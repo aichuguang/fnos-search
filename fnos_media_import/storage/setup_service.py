@@ -15,6 +15,7 @@ import secrets
 import logging
 import time
 from dataclasses import asdict
+from contextlib import nullcontext
 from typing import Any
 
 from ..config import CATEGORY_KEYS
@@ -130,7 +131,7 @@ class StorageSetupService:
         return message[:500]
 
     _RCLONE_ABSENT_CODES = frozenset(
-        {"RCLONE_UNAVAILABLE", "WORKER_UNAVAILABLE", "WORKER_TIMEOUT"}
+        {"RCLONE_UNAVAILABLE"}
     )
 
     @classmethod
@@ -140,7 +141,10 @@ class StorageSetupService:
             _text(payload.get("status")).upper(),
             _text(payload.get("code")).upper(),
         }
-        return bool(codes & cls._RCLONE_ABSENT_CODES)
+        return bool(codes & cls._RCLONE_ABSENT_CODES) or (
+            payload.get("not_started") is True
+            and bool(codes & {"WORKER_UNAVAILABLE", "WORKER_TIMEOUT"})
+        )
 
     @classmethod
     def _rclone_plane_absent(cls, exc: BaseException) -> bool:
@@ -167,7 +171,12 @@ class StorageSetupService:
             "message": message,
         }
 
-    def _sync_rclone_webdav(self, connection_id: str) -> dict[str, Any]:
+    def _sync_rclone_webdav(self, connection_id: str, *, expected_revision: int | None = None) -> dict[str, Any]:
+        guard = getattr(self.connections, "mutation_guard", None)
+        with guard() if callable(guard) else nullcontext():
+            return self._sync_rclone_webdav_locked(connection_id, expected_revision=expected_revision)
+
+    def _sync_rclone_webdav_locked(self, connection_id: str, *, expected_revision: int | None = None) -> dict[str, Any]:
         """Persist and probe the worker-local managed WebDAV remote.
 
         OpenList credentials stay server-side: the browser saves them once in
@@ -190,15 +199,26 @@ class StorageSetupService:
                 code="OPENLIST_NOT_FOUND",
                 status=404,
             )
+        revision = int(connection.get("revision") or 1)
+        if expected_revision is not None and revision != expected_revision:
+            raise StorageSetupError("OpenList 同步修订已变化", code="RCLONE_SYNC_RESULT_UNKNOWN", status=409)
+        coordinator = getattr(self.connections, "runtime_sync", None)
+        fence = {
+            "connection_id": connection_id,
+            "revision": revision,
+            "operation_token": coordinator.current_token() if coordinator else "",
+            "managed_remote": self.connections.managed_remote_identity() if coordinator else {},
+        }
         credentials = self.connections.resolve_credentials(
             connection_id,
-            int(connection.get("revision") or 1),
+            revision,
         )
         password = str(credentials.get("password") or "")
         payload = {
             "url": credentials.get("base_url"),
             "username": credentials.get("username"),
             "password": password,
+            "_openlist_sync": fence,
         }
         try:
             result = self.rclone_webdav_sync(payload)
@@ -226,9 +246,15 @@ class StorageSetupService:
                 return self._rclone_degraded_state(
                     f"OpenList 已保存，但 rclone 不可用，跨盘搬运暂不可用：{message or 'rclone 管理命令不可用'}"
                 )
+            failure = getattr(exc, "payload", None)
+            failure = failure if isinstance(failure, dict) else {}
+            code = _text(getattr(exc, "code", "") or failure.get("code") or failure.get("error_code")).upper()
+            unknown = code in {
+                "RCLONE_SYNC_RESULT_UNKNOWN", "RCLONE_SYNC_CONFLICT", "WORKER_TIMEOUT", "WORKER_UNAVAILABLE",
+            } or (status >= 500 and code != "RCLONE_WEBDAV_SYNC_FAILED")
             raise StorageSetupError(
                 f"rclone WebDAV 同步或连接检测失败：{message or 'Worker 不可用'}",
-                code="RCLONE_WEBDAV_SYNC_FAILED",
+                code="RCLONE_SYNC_RESULT_UNKNOWN" if unknown else "RCLONE_WEBDAV_SYNC_FAILED",
                 status=status,
                 retryable=status >= 500,
             ) from exc
@@ -245,7 +271,7 @@ class StorageSetupService:
                 )
             raise StorageSetupError(
                 f"rclone WebDAV 同步或连接检测失败：{message or '返回结果无效'}",
-                code="RCLONE_WEBDAV_SYNC_FAILED",
+                code="RCLONE_SYNC_RESULT_UNKNOWN",
                 status=503,
                 retryable=True,
             )
@@ -253,15 +279,30 @@ class StorageSetupService:
         actual_url = _text(result.get("url")).rstrip("/")
         expected_user = _text(credentials.get("username"))
         actual_user = _text(result.get("user"))
-        if (actual_url and actual_url != expected_url) or (
-            actual_user and actual_user != expected_user
+        latest = self.connections.get_connection(connection_id)
+        if actual_url != expected_url or actual_user != expected_user or (
+            result.get("_openlist_sync") != fence
+            or not latest or int(latest.get("revision") or 0) != revision
+            or (coordinator is not None and not coordinator.owns(fence["operation_token"]))
+            or (coordinator is not None and self.connections.managed_remote_identity() != fence["managed_remote"])
         ):
             raise StorageSetupError(
                 "rclone WebDAV 已连接，但 Remote 与当前 OpenList 配置不一致",
-                code="RCLONE_WEBDAV_SYNC_MISMATCH",
+                code="RCLONE_SYNC_RESULT_UNKNOWN",
                 status=409,
                 retryable=False,
             )
+        if coordinator is not None:
+            with coordinator.remote_lock.hold():
+                if not coordinator.set_state(
+                    fence["operation_token"], "confirmed",
+                    fingerprint=self.connections.runtime_fingerprint(
+                        connection_id, revision, managed_remote=fence["managed_remote"],
+                    ),
+                    managed_remote=fence["managed_remote"],
+                    remote_config_fingerprint=_text(result.get("remote_config_fingerprint")),
+                ):
+                    raise StorageSetupError("OpenList 同步执行权已丢失", code="RCLONE_SYNC_RESULT_UNKNOWN", status=409)
         return {
             key: result.get(key)
             for key in (
@@ -532,9 +573,11 @@ class StorageSetupService:
             "success": True,
             "providers": providers,
             "accounts": accounts,
+            "active_selections": selections,
             "connections": connections,
             "locations": locations,
             "routes": routes,
+            "routing_token": matrix.get("routing_token"),
             "categories": [
                 {"key": key, "label": CATEGORY_LABELS.get(key, key)} for key in CATEGORY_KEYS
             ],
@@ -1065,7 +1108,11 @@ class StorageSetupService:
             for value in values.values():
                 if value:
                     counts[value] = counts.get(value, 0) + 1
-            default_id = max(counts, key=counts.get) if counts else None
+            # The UI's empty override means "follow default", not "unassigned".
+            # Never promote a partial assignment into a default or a save would
+            # silently enable every previously unassigned category.
+            fully_assigned = all(values.get(key) for key in CATEGORY_KEYS)
+            default_id = max(counts, key=counts.get) if counts and fully_assigned else None
             overrides = {key: value for key, value in values.items() if value and value != default_id}
             target = location_by_id.get(default_id or "")
             result.append(
@@ -1101,11 +1148,31 @@ class StorageSetupService:
     def save_account(self, payload: dict[str, Any]) -> dict[str, Any]:
         account_id = _text(payload.get("account_id"))
         should_test = not account_id
+        if account_id and ("config" in payload or "credentials" in payload):
+            raise StorageSetupError("账号凭证只能由登录会话或 Provider 自动刷新")
+        if "activate" in payload and not isinstance(payload["activate"], bool):
+            raise StorageSetupError("activate 必须是布尔值", field_errors={"activate": "必须是 true 或 false"})
+        should_activate = payload.get("activate", True)
+        if account_id and should_activate and "name" in payload:
+            raise StorageSetupError("切换当前账号时不能同时修改名称，请通过账号编辑单独保存名称")
+        expected_selection_revision = payload.get("expected_selection_revision")
+        if should_activate:
+            if "expected_selection_revision" not in payload:
+                raise StorageSetupError(
+                    "缺少账号选择快照，请刷新配置并核对后再切换账号",
+                    code="ACCOUNT_SELECTION_SNAPSHOT_REQUIRED",
+                    status=428,
+                )
+            if expected_selection_revision is not None and (
+                type(expected_selection_revision) is not int or expected_selection_revision <= 0
+            ):
+                raise StorageSetupError(
+                    "expected_selection_revision 必须是正整数或 null（尚未选择账号）",
+                    field_errors={"expected_selection_revision": "必须是正整数或 null"},
+                )
         if account_id:
             if "name" in payload:
                 self.accounts.update_account_name(account_id, payload.get("name"))
-            if "config" in payload or "credentials" in payload:
-                raise StorageSetupError("账号凭证只能由登录会话或 Provider 自动刷新")
         else:
             provider_kind = _text(payload.get("provider_kind"))
             provider = next(
@@ -1118,6 +1185,14 @@ class StorageSetupService:
             )
             if provider and provider.get("auth_methods"):
                 raise StorageSetupError("请使用网盘登录授权添加账号，不再支持手工填写 API 或 Token")
+            if should_activate:
+                current = self.accounts.get_selection(provider_kind, "default")
+                if (current.selection_revision if current else None) != expected_selection_revision:
+                    raise StorageSetupError(
+                        "账号选择已变化，未创建账号，请刷新配置并核对后重试",
+                        code="SELECTION_CHANGED",
+                        status=409,
+                    )
             account = self.accounts.create_account(
                 provider_kind=provider_kind,
                 name=_text(payload.get("name")),
@@ -1133,19 +1208,22 @@ class StorageSetupService:
         account = self.accounts.get_account(account_id)
         if account is None:
             raise StorageSetupError("账号保存后无法读取")
-        current = self.accounts.get_selection(account.provider_kind, "default")
-        should_activate = bool(payload.get("activate", True)) or current is None
         if should_activate:
             self.accounts.activate_account(
                 "default",
                 account_id,
-                current.selection_revision if current else None,
+                expected_selection_revision,
             )
         return {"success": True, "account_id": account_id, "message": "账号设置已保存"}
 
     # --------------------------------------------------------------- openlist
 
     def save_openlist(self, payload: dict[str, Any]) -> dict[str, Any]:
+        guard = getattr(self.connections, "mutation_guard", None)
+        with guard() if callable(guard) else nullcontext():
+            return self._save_openlist(payload)
+
+    def _save_openlist(self, payload: dict[str, Any]) -> dict[str, Any]:
         connection_id = _text(payload.get("connection_id"))
         existing_connections = self.connections.list_connections()
         if not connection_id:
@@ -1211,11 +1289,20 @@ class StorageSetupService:
                     status=503,
                     retryable=True,
                 )
-            rclone_state = self._sync_rclone_webdav(connection_id)
-        except Exception:
+            rclone_state = self._sync_rclone_webdav(
+                connection_id, expected_revision=int((item or {}).get("revision") or 0),
+            )
+        except Exception as original_error:
+            if getattr(original_error, "code", "") == "RCLONE_SYNC_RESULT_UNKNOWN":
+                # The Worker may still own an executing command. Never roll
+                # the DB back under it or describe that uncertainty as success.
+                raise
             try:
                 if created:
-                    if self.connections.get_connection(connection_id) is not None:
+                    current = self.connections.get_connection(connection_id)
+                    if current is not None and item is not None and (
+                        int(current.get("revision") or 0) == int(item.get("revision") or 0)
+                    ):
                         self.connections.delete_connection(connection_id)
                 elif previous is not None and previous_credentials is not None and item is not None:
                     current = self.connections.get_connection(connection_id)
@@ -1256,6 +1343,7 @@ class StorageSetupService:
                             restored_snapshot,
                             expected_revision=expected_mount_revision,
                         )
+                    self._sync_rclone_webdav(connection_id, expected_revision=restored_revision)
             except Exception as compensation_error:
                 logger.exception(
                     "event=openlist_save_compensation_failed connection_id=%s created=%s",
@@ -1287,6 +1375,11 @@ class StorageSetupService:
         }
 
     def delete_openlist(self, connection_id: str) -> dict[str, Any]:
+        guard = getattr(self.connections, "mutation_guard", None)
+        with guard() if callable(guard) else nullcontext():
+            return self._delete_openlist(connection_id)
+
+    def _delete_openlist(self, connection_id: str) -> dict[str, Any]:
         connection_id = _text(connection_id)
         if not connection_id:
             raise StorageSetupError("connection_id 不能为空", field_errors={"connection_id": "必填"})
@@ -1296,6 +1389,8 @@ class StorageSetupService:
             # Keep the aggregate API independent from concrete OpenList error
             # classes while preserving a useful conflict/not-found status.
             message = str(exc)
+            if getattr(exc, "code", "") == "OPENLIST_SYNC_BUSY":
+                raise StorageSetupError(message, code="OPENLIST_SYNC_BUSY", status=409, retryable=True) from exc
             lowered = message.lower()
             if "不存在" in message or "not found" in lowered:
                 raise StorageSetupError(message, code="OPENLIST_NOT_FOUND", status=404) from exc
@@ -1328,6 +1423,12 @@ class StorageSetupService:
             raise StorageSetupError("请填写保存位置名称", field_errors={"name": "必填"})
 
         existing = self.targets.get_target(destination_id) if destination_id else None
+        if destination_id and existing is None:
+            raise StorageSetupError(
+                "保存位置不存在或已被删除，请刷新配置后重新选择",
+                code="TARGET_NOT_FOUND",
+                status=404,
+            )
         requested_target_revision = payload.get("expected_revision", payload.get("revision"))
         if existing and requested_target_revision not in (None, ""):
             try:
@@ -1948,7 +2049,10 @@ class StorageSetupService:
 
     # ---------------------------------------------------------------- routes
 
-    def save_routes(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def save_routes(self, payload: dict[str, Any], *, require_snapshot: bool = False) -> dict[str, Any]:
+        routing_token = self.assignments.validate_snapshot_token(
+            payload.get("routing_token"), required=require_snapshot,
+        )
         raw_routes = payload.get("routes")
         if not isinstance(raw_routes, list):
             raise StorageSetupError("routes 必须是数组")
@@ -2041,11 +2145,12 @@ class StorageSetupService:
                     "destination_id": destination_id,
                     "enabled": True,
                 }
-                expected_revision = expected_revisions.get(category_key)
-                if expected_revision not in (None, ""):
-                    assignment["expected_revision"] = int(expected_revision)
+                if category_key in expected_revisions:
+                    assignment["expected_revision"] = expected_revisions[category_key]
                 assignments.append(assignment)
-        saved = self.assignments.replace(assignments)
+        saved = self.assignments.replace(
+            assignments, expected_token=routing_token, require_snapshot=require_snapshot,
+        )
         return {"success": True, "assignments": [asdict(item) for item in saved], "message": "入库规则已保存"}
 
     # --------------------------------------------------------------- preflight

@@ -275,19 +275,45 @@ class OrganizerRepository:
             return False
         placeholders = ",".join(["?"] * len(statuses))
         with self._connection_factory() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             now = utc_now()
+            task = conn.execute(
+                "SELECT evidence FROM organizer_tasks WHERE id = ?", (int(task_id),)
+            ).fetchone()
+            if task is None:
+                return False
+            evidence = _decode_json_fields(dict(task), ("evidence",)).get("evidence")
+            evidence = dict(evidence) if isinstance(evidence, dict) else {}
+            rollback = evidence.get("rollback")
+            if isinstance(rollback, dict) and rollback.get("status") in {"running", "failed"}:
+                return False
+            if conn.execute(
+                "SELECT 1 FROM organizer_runs WHERE task_id = ? AND status = 'running' LIMIT 1",
+                (int(task_id),),
+            ).fetchone():
+                return False
+            if conn.execute(
+                """SELECT 1 FROM organizer_operations WHERE task_id = ?
+                   AND type = 'move_file' AND status IN ('done', 'skipped') LIMIT 1""",
+                (int(task_id),),
+            ).fetchone():
+                return False
+            # A new scan revokes the old plan's authorization in the same write
+            # transaction as its revision/lease claim, including failed scans.
+            evidence.pop("manual_approval", None)
+            evidence.pop("execution_approval", None)
             lease_until = utc_seconds_from_now(max(30, int(lease_seconds)))
             cur = conn.execute(
                 f"""
                 UPDATE organizer_tasks
                 SET status = 'scanning', error_message = '', revision = COALESCE(revision, 1) + 1,
-                    scan_owner = ?, scan_lease_expires_at = ?, updated_at = ?
+                    scan_owner = ?, scan_lease_expires_at = ?, updated_at = ?, evidence = ?
                 WHERE id = ? AND (
                     status IN ({placeholders})
                     OR (status = 'scanning' AND scan_lease_expires_at IS NOT NULL AND scan_lease_expires_at <= ?)
                 )
                 """,
-                [str(owner_id or "") or None, lease_until, now, int(task_id), *statuses, now],
+                [str(owner_id or "") or None, lease_until, now, json.dumps(evidence, ensure_ascii=False), int(task_id), *statuses, now],
             )
             return cur.rowcount == 1
 
@@ -693,12 +719,16 @@ class OrganizerRepository:
         with self._connection_factory() as conn:
             conn.execute("BEGIN IMMEDIATE")
             task = conn.execute(
-                "SELECT status, revision FROM organizer_tasks WHERE id = ?",
+                "SELECT status, revision, evidence FROM organizer_tasks WHERE id = ?",
                 (int(task_id),),
             ).fetchone()
             if task is None or str(task["status"] or "") != str(expected_status or ""):
                 return False
             if expected_revision is not None and int(task["revision"] or 1) != max(1, int(expected_revision)):
+                return False
+            current_evidence = _decode_json_fields(dict(task), ("evidence",)).get("evidence")
+            rollback = current_evidence.get("rollback") if isinstance(current_evidence, dict) else None
+            if isinstance(rollback, dict) and rollback.get("status") in {"running", "failed"}:
                 return False
 
             if mapping_ids:
@@ -729,8 +759,8 @@ class OrganizerRepository:
                 conn.execute(
                     """
                     INSERT INTO organizer_operations
-                    (task_id, mapping_id, type, source_path, target_path, description, status, reason, raw_data, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (task_id, mapping_id, type, source_path, target_path, description, status, reason, raw_data, run_id, undo_data, error_message, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         int(task_id),
@@ -742,6 +772,9 @@ class OrganizerRepository:
                         item.get("status") or "pending",
                         json.dumps(item.get("reason") or [], ensure_ascii=False),
                         json.dumps(item.get("raw_data"), ensure_ascii=False) if item.get("raw_data") is not None else None,
+                        item.get("run_id"),
+                        json.dumps(item.get("undo_data"), ensure_ascii=False) if item.get("undo_data") is not None else None,
+                        item.get("error_message") or "",
                         now,
                         now,
                     ),
@@ -807,6 +840,7 @@ class OrganizerRepository:
         *,
         owner_id: str = "",
         lease_seconds: int = 120,
+        expected_revision: int | None = None,
     ) -> tuple[int | None, dict[str, Any] | None]:
         """Atomically claim one Organizer execution for a task.
 
@@ -826,7 +860,7 @@ class OrganizerRepository:
                 task_id=task_id,
             )
             task = conn.execute(
-                "SELECT id, status, revision FROM organizer_tasks WHERE id = ?",
+                "SELECT id, status, revision, evidence, scan_owner, scan_lease_expires_at FROM organizer_tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if task is None:
@@ -855,6 +889,27 @@ class OrganizerRepository:
             if task_status in {"executing", "done", "cancelled", "skipped"}:
                 return None, {"task_id": task_id, "task_status": task_status}
 
+            revision = max(1, int(task["revision"] or 1))
+            evidence = _decode_json_fields(dict(task), ("evidence",)).get("evidence")
+            evidence = dict(evidence) if isinstance(evidence, dict) else {}
+            approval = evidence.get("manual_approval") or evidence.get("execution_approval")
+            approved_revision = approval.get("revision") if isinstance(approval, dict) else None
+            rollback = evidence.get("rollback")
+            if (
+                task_status not in {"auto_approved", "manual_confirmed", "failed", "waiting_review"}
+                or task["scan_owner"]
+                or task["scan_lease_expires_at"]
+                or (isinstance(rollback, dict) and rollback.get("status") in {"running", "failed"})
+                or (approval and str(approved_revision) != str(revision))
+                or (task_status in {"failed", "waiting_review"} and str(approved_revision) != str(revision))
+            ):
+                return None, {"task_id": task_id, "task_status": task_status, "conflict": True}
+
+            # Approval and enqueue happen before this transaction. An intervening
+            # mapping edit must never be executed under the previous approval.
+            if expected_revision is not None and int(task["revision"] or 1) != int(expected_revision):
+                return None, {"task_id": task_id, "task_status": task_status, "conflict": True}
+
             cur = conn.execute(
                 """
                 INSERT INTO organizer_runs
@@ -873,15 +928,179 @@ class OrganizerRepository:
             task_cur = conn.execute(
                 """
                 UPDATE organizer_tasks
-                SET status = 'executing', error_message = '', updated_at = ?
+                SET status = 'executing', error_message = '', updated_at = ?, evidence = ?
                 WHERE id = ? AND revision = ? AND status = ?
                 """,
-                (now, task_id, max(1, int(task["revision"] or 1)), task_status),
+                (
+                    now,
+                    json.dumps({**evidence, "execution_approval": {"revision": revision}}, ensure_ascii=False),
+                    task_id,
+                    revision,
+                    task_status,
+                ),
             )
             if task_cur.rowcount != 1:
                 conn.rollback()
                 return None, {"task_id": task_id, "task_status": "changed"}
             return int(cur.lastrowid), None
+
+    def claim_organizer_rollback(
+        self, source_run_id: int, *, owner_id: str, expected_revision: int,
+        lease_seconds: int, total_count: int, target_paths: list[str], undo_data: list[dict[str, Any]],
+    ) -> tuple[int | None, dict[str, Any]]:
+        """Claim rollback as a normal leased run, fencing scans and applies."""
+        now = utc_now()
+        with self._connection_factory() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            source = conn.execute("SELECT * FROM organizer_runs WHERE id = ?", (int(source_run_id),)).fetchone()
+            if source is None:
+                return None, {"success": False, "message": "运行记录不存在"}
+            source = _decode_json_fields(dict(source), ("summary", "undo_data"))
+            summary = source.get("summary") if isinstance(source.get("summary"), dict) else {}
+            previous = summary.get("rollback") if isinstance(summary.get("rollback"), dict) else {}
+            if previous.get("status") == "completed":
+                return None, {"success": True, "already_rolled_back": True, "done": 0, "errors": []}
+            task_id = int(source["task_id"])
+            self._recover_expired_organizer_runs_in_connection(conn, now=now, task_id=task_id)
+            row = conn.execute("SELECT * FROM organizer_tasks WHERE id = ?", (task_id,)).fetchone()
+            task = _decode_json_fields(dict(row), ("evidence", "raw_data")) if row else {}
+            evidence = dict(task.get("evidence")) if isinstance(task.get("evidence"), dict) else {}
+            pending = evidence.get("rollback") if isinstance(evidence.get("rollback"), dict) else {}
+            if (
+                not task or int(task.get("revision") or 1) != int(expected_revision)
+                or task.get("status") in {"executing", "scanning", "cancelled", "skipped"}
+                or task.get("scan_owner") or task.get("scan_lease_expires_at")
+                or source.get("status") == "running"
+                or (pending.get("status") in {"running", "failed"} and pending.get("run_id") != int(source_run_id))
+                or conn.execute("SELECT 1 FROM organizer_runs WHERE task_id = ? AND status = 'running'", (task_id,)).fetchone()
+            ):
+                return None, {"success": False, "conflict": True, "message": "任务正在执行、扫描或另一次回滚中，请刷新后重试"}
+            job = conn.execute("SELECT status FROM import_jobs WHERE id = ?", (task.get("job_id"),)).fetchone()
+            if job and str(job["status"]) not in {"done", "success", "review", "failed"}:
+                return None, {"success": False, "conflict": True, "message": "关联入库任务仍在处理或已取消，请先等待其停止再回滚"}
+            revision = int(task["revision"] or 1) + 1
+            cur = conn.execute(
+                """INSERT INTO organizer_runs
+                   (task_id, status, owner_id, heartbeat_at, lease_expires_at, task_revision, started_at)
+                   VALUES (?, 'running', ?, ?, ?, ?, ?)""",
+                (task_id, owner_id, now, utc_seconds_from_now(lease_seconds), revision, now),
+            )
+            rollback_run_id = int(cur.lastrowid)
+            marker = {
+                "status": "running", "run_id": int(source_run_id), "rollback_run_id": rollback_run_id,
+                "completed_count": min(int(previous.get("completed_count") or 0), total_count),
+                "total_count": total_count, "target_paths": list(target_paths),
+            }
+            evidence.pop("manual_approval", None)
+            evidence.pop("execution_approval", None)
+            for key in ("completion_confirmation", "cleanup_only", "strm_completion", "strm_refresh"):
+                evidence.pop(key, None)
+            evidence["rollback"] = marker
+            raw = dict(task.get("raw_data")) if isinstance(task.get("raw_data"), dict) else {}
+            raw.pop("strm_completion", None)
+            conn.execute(
+                """UPDATE organizer_tasks SET status = 'executing', revision = ?, evidence = ?, raw_data = ?,
+                   error_message = '', scan_owner = NULL, scan_lease_expires_at = NULL, updated_at = ? WHERE id = ?""",
+                (revision, json.dumps(evidence, ensure_ascii=False), json.dumps(raw, ensure_ascii=False), now, task_id),
+            )
+            conn.execute("UPDATE organizer_runs SET summary = ?, undo_data = ? WHERE id = ?", (
+                json.dumps({**summary, "rollback": marker}, ensure_ascii=False),
+                json.dumps(undo_data, ensure_ascii=False), int(source_run_id),
+            ))
+            conn.execute("UPDATE organizer_runs SET summary = ? WHERE id = ?", (
+                json.dumps({"kind": "rollback", "rollback": marker}, ensure_ascii=False), rollback_run_id,
+            ))
+            self._write_rollback_job_state(conn, task.get("job_id"), marker, "Organizer 正在回滚，原入库完成状态已撤销", now)
+            return rollback_run_id, {"success": True, "task_id": task_id, **marker}
+
+    def update_organizer_rollback_progress(
+        self, rollback_run_id: int, *, source_run_id: int, owner_id: str,
+        completed_count: int, status: str = "running", error_message: str = "",
+    ) -> bool:
+        """Checkpoint inverse operations and finish task/job state atomically."""
+        if status not in {"running", "failed", "completed"}:
+            raise ValueError("无效回滚状态")
+        now = utc_now()
+        with self._connection_factory() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT t.* FROM organizer_runs r JOIN organizer_tasks t ON t.id = r.task_id
+                   WHERE r.id = ? AND r.status = 'running' AND r.owner_id = ?
+                     AND r.lease_expires_at > ? AND t.status = 'executing'
+                     AND t.revision = r.task_revision""",
+                (int(rollback_run_id), owner_id, now),
+            ).fetchone()
+            if row is None:
+                return False
+            task = _decode_json_fields(dict(row), ("evidence",))
+            source_row = conn.execute(
+                "SELECT summary FROM organizer_runs WHERE id = ? AND task_id = ?", (int(source_run_id), task["id"]),
+            ).fetchone()
+            if source_row is None:
+                return False
+            source = _decode_json_fields(dict(source_row), ("summary",))
+            summary = source.get("summary") if isinstance(source.get("summary"), dict) else {}
+            marker = summary.get("rollback") if isinstance(summary.get("rollback"), dict) else {}
+            if marker.get("rollback_run_id") != int(rollback_run_id):
+                return False
+            marker = {**marker, "status": status, "completed_count": int(completed_count)}
+            evidence = dict(task.get("evidence")) if isinstance(task.get("evidence"), dict) else {}
+            evidence["rollback"] = marker
+            conn.execute("UPDATE organizer_runs SET summary = ?, status = CASE WHEN ? = 'completed' THEN 'rolled_back' ELSE status END WHERE id = ?", (
+                json.dumps({**summary, "rollback": marker}, ensure_ascii=False), status, int(source_run_id),
+            ))
+            terminal = status != "running"
+            run_status = "done" if status == "completed" else status
+            conn.execute(
+                """UPDATE organizer_runs SET status = ?, summary = ?, error_message = ?,
+                   finished_at = CASE WHEN ? THEN ? ELSE finished_at END,
+                   lease_expires_at = CASE WHEN ? THEN NULL ELSE lease_expires_at END WHERE id = ?""",
+                (run_status, json.dumps({"kind": "rollback", "rollback": marker, "done": completed_count}, ensure_ascii=False),
+                 error_message, terminal, now, terminal, int(rollback_run_id)),
+            )
+            task_status = "waiting_review" if status == "completed" else ("failed" if terminal else "executing")
+            conn.execute("UPDATE organizer_tasks SET status = ?, evidence = ?, error_message = ?, updated_at = ? WHERE id = ?", (
+                task_status, json.dumps(evidence, ensure_ascii=False), error_message, now, task["id"],
+            ))
+            if status == "completed":
+                # Irreversible deletes remain completed. Restored moves and
+                # directory work must run again after the next explicit approval.
+                conn.execute(
+                    """UPDATE organizer_operations SET status = 'pending', run_id = NULL,
+                       undo_data = NULL, error_message = '', updated_at = ?
+                       WHERE task_id = ? AND run_id = ? AND type NOT IN ('delete_file', 'delete_duplicate_file')""",
+                    (now, task["id"], int(source_run_id)),
+                )
+            if terminal:
+                conn.execute("DELETE FROM organizer_locks WHERE run_id = ?", (int(rollback_run_id),))
+            message = (
+                "Organizer 回滚完成，请修改或确认整理计划后重新执行；已删除的广告不可恢复"
+                if status == "completed" else error_message or "Organizer 正在回滚"
+            )
+            self._write_rollback_job_state(conn, task.get("job_id"), marker, message, now)
+            return True
+
+    @staticmethod
+    def _write_rollback_job_state(
+        conn: sqlite3.Connection, job_id: Any, marker: dict[str, Any], message: str, now: str,
+    ) -> None:
+        if not job_id:
+            return
+        row = conn.execute("SELECT status, raw_data FROM import_jobs WHERE id = ?", (int(job_id),)).fetchone()
+        if row is None:
+            return
+        if str(row["status"]) in {"cancelled", "unsupported", "rejected"}:
+            raise RuntimeError("关联入库任务已停止，拒绝继续回滚")
+        job = _decode_json_fields(dict(row), ("raw_data",))
+        raw = dict(job.get("raw_data")) if isinstance(job.get("raw_data"), dict) else {}
+        completion = dict(raw.get("completion")) if isinstance(raw.get("completion"), dict) else {}
+        for key in ("confirmation", "strm_completion", "organized_target_path", "target_dirs"):
+            completion.pop(key, None)
+        completion.update({"stage": "review", "rollback": marker, "message": message})
+        raw["completion"] = completion
+        conn.execute("UPDATE import_jobs SET status = 'review', raw_data = ?, error_message = ?, updated_at = ? WHERE id = ?", (
+            json.dumps(raw, ensure_ascii=False), message if marker["status"] == "failed" else "", now, int(job_id),
+        ))
 
     def renew_organizer_run(self, run_id: int, owner_id: str, *, lease_seconds: int = 120) -> bool:
         now = utc_now()

@@ -57,6 +57,7 @@ class JobCancellationService:
         cleanup_default: bool,
         stop_running_default: bool,
         admin_username: str | None,
+        require_unbound: bool = False,
     ) -> dict[str, Any]:
         job_id = int(job["id"])
         cleanup_requested = self._deps.payload_bool(payload, "cleanup", cleanup_default)
@@ -96,6 +97,7 @@ class JobCancellationService:
             include_title_matches=include_title_matches,
             stop_running=stop_running,
             admin_username=admin_username,
+            require_unbound=require_unbound,
         )
         if not claim["cancelled"]:
             return self._skipped_result(
@@ -103,6 +105,7 @@ class JobCancellationService:
                 message=str(claim.get("message") or "任务状态已变化，取消未执行"),
                 state_conflict=bool(claim.get("state_conflict")),
                 retryable=bool(claim.get("retryable")),
+                bound_elsewhere=bool(claim.get("bound_elsewhere")),
             )
 
         cancelled_job = claim["job"]
@@ -222,11 +225,16 @@ class JobCancellationService:
         include_title_matches: bool,
         stop_running: bool,
         admin_username: str | None,
+        require_unbound: bool = False,
     ) -> dict[str, Any]:
         supplied_status = _normalized_status(supplied_job.get("status"))
         current = self._deps.job_queries.get(job_id)
         state_conflict = current is None or _normalized_status((current or {}).get("status")) != supplied_status
-        updater = getattr(self._deps.job_commands, "update_if_status", None)
+        updater = getattr(
+            self._deps.job_commands,
+            "update_if_status_and_unbound" if require_unbound else "update_if_status",
+            None,
+        )
         if not callable(updater):
             return {
                 "cancelled": False,
@@ -306,7 +314,17 @@ class JobCancellationService:
             }
             if not already_cancelled:
                 updates.update(status=self._deps.cancelled_status, error_message=reason)
-            if updater(job_id, {current_status}, **updates):
+            updated = updater(job_id, {current_status}, **updates)
+            if require_unbound and updated == "bound":
+                return {
+                    "cancelled": False,
+                    "job": self._deps.job_queries.get(job_id),
+                    "state_conflict": False,
+                    "bound_elsewhere": True,
+                    "message": "正式任务已有绑定提交，已保留共享任务并跳过取消补偿",
+                }
+            changed = updated == "updated" if require_unbound else bool(updated)
+            if changed:
                 latest = self._deps.job_queries.get(job_id)
                 if not latest or _normalized_status(latest.get("status")) != _normalized_status(
                     self._deps.cancelled_status
@@ -347,6 +365,7 @@ class JobCancellationService:
         message: str,
         state_conflict: bool,
         retryable: bool = False,
+        bound_elsewhere: bool = False,
     ) -> dict[str, Any]:
         return {
             "job": job,
@@ -366,6 +385,7 @@ class JobCancellationService:
             "state_conflict": state_conflict,
             "retryable": retryable,
             "already_cancelled": False,
+            "bound_elsewhere": bound_elsewhere,
         }
 
     def _cancel_related_execution(
@@ -482,6 +502,13 @@ class JobCancellationService:
             if isinstance(getattr(execution, "snapshot", {}), dict)
             else {}
         )
+        fence = snapshot.get("submission_fence")
+        receipt = getattr(execution, "receipt", None) or snapshot.get("receipt")
+        if not receipt and isinstance(fence, dict) and fence.get("state") in {"prepared", "committed"}:
+            return {
+                "message": "外部提交已有 fence 但缺少回执，无法确认操作已停止；拒绝取消清理，请先人工核对网盘任务和文件",
+                "retryable": False,
+            }
         app_acked = bool(getattr(execution, "app_acked", False) or snapshot.get("app_acked"))
         final_verified = bool(
             getattr(execution, "final_verified", False)
@@ -530,6 +557,9 @@ class JobCancellationService:
         has_receipt = isinstance(receipt, dict) and any(
             str(value or "").strip() for value in receipt.values()
         )
+        fence = snapshot.get("submission_fence") if isinstance(snapshot, dict) else None
+        if isinstance(fence, dict) and fence.get("state") in {"prepared", "committed"} and not has_receipt:
+            return True
         if phase in {"completed", "failed", "manual_review", "cancelled"} and not has_receipt:
             return False
         return True

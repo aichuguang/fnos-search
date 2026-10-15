@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import posixpath
+import re
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -18,9 +21,11 @@ from ..constants import (
     JOB_TRANSFERRING,
 )
 from ..planning.plan_validator import validate_plan
+from ..planning.job_plan import compute_persisted_plan_hash
 from ..services.execution_plan_guard import reject_non_v1_job, v1_plan_or_review
 from . import (
     AckResult,
+    ErrorCode,
     PHASE_CANCELLED,
     PHASE_CANCEL_PENDING,
     OrganizeResult,
@@ -32,6 +37,8 @@ from . import (
     PHASE_SOURCE_MATERIALIZING,
     PHASE_NATIVE_SUBMITTING,
     PHASE_TRANSFERRING,
+    TransferError,
+    TransferVerifyResult,
 )
 from .cleanup import (
     CompositeFilesystemOps,
@@ -42,11 +49,14 @@ from .cleanup import (
 from .execution_repository import ExecutionConflictError, TransferExecutionRepository
 from .finalizer import TransferFinalizer
 from .native_executor import NativeSourceMaterializer, NativeTransferExecutor
-from .orchestrator import TransferOrchestrator
+from .orchestrator import TransferOrchestrator, TransferStepResult
 from .provider_relay_executor import ProviderRelayExecutor
 from .rclone_adapter import RcloneOperationAdapter
-from .rclone_executor import RcloneTransferExecutor
+from .rclone_executor import RcloneTransferExecutor, build_managed_copy_run
 from .verifier import TransferVerifier
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class TransferDispatchError(RuntimeError):
@@ -76,6 +86,7 @@ class TransferDispatchService:
         native_wait_timeout_seconds: int | None = None,
         transfer_wait_timeout_seconds: int | None = None,
         cancel_timeout_seconds: int | None = None,
+        ensure_remote_confirmation: Callable[[], Any] | None = None,
     ) -> None:
         self.database = database
         self.accounts_service = accounts_service
@@ -89,6 +100,7 @@ class TransferDispatchService:
         self.executions = execution_repository or TransferExecutionRepository(database)
         self.organizer_service = organizer_service
         self.upload_log_bridge = upload_log_bridge
+        self.ensure_remote_confirmation = ensure_remote_confirmation
         self.relay_root = os.path.realpath(relay_root)
         self.local_target_root = os.path.realpath(local_target_root)
         self.execution_lease_seconds = max(60, int(execution_lease_seconds))
@@ -122,7 +134,8 @@ class TransferDispatchService:
         )
         # Shared only by executors created by this dispatch composition root;
         # a fresh app/test composition must not inherit another process'
-        # circuit-breaker state.
+        # circuit-breaker state. Entries include Provider/account/revision;
+        # late failures from old plans cannot stop newly authenticated work.
         self._halted_relay_account_ids: set[str] = set()
         local_ops = LocalFilesystemOps((self.relay_root, self.local_target_root))
         self.cleanup = TransferCleanupService(
@@ -173,6 +186,7 @@ class TransferDispatchService:
                     source_materializer=materializer,
                     visibility_poller=lambda receipt: self._source_visible(plan, receipt),
                     verifier=self.verifier,
+                    copy_manifest_verifier=self._verify_rclone_copy_manifest,
                 )
             }
         if strategy == "relay_upload_provider":
@@ -253,6 +267,33 @@ class TransferDispatchService:
 
         return sink
 
+    def _publish_transfer_phase(self, job_id: int, phase: str, message: str = "") -> None:
+        """Publish committed job milestones, separate from rclone process success."""
+        bridge = getattr(self, "upload_log_bridge", None)
+        if not callable(bridge):
+            return
+        try:
+            if phase == PHASE_COMPLETED:
+                job = self.database.job_queries.get(job_id)
+                if not isinstance(job, dict) or str(job.get("status") or "") not in {JOB_DONE, "success", "completed"}:
+                    return
+            labels = {
+                "planning": "准备入库", "source_materializing": "来源转存",
+                "source_waiting_visible": "等待来源可见", "native_submitting": "提交网盘任务",
+                "native_waiting": "等待网盘任务完成", "transferring": "跨盘搬运",
+                "target_verifying": "校验上传结果", "organizing": "整理文件",
+                "finalizing": "归档文件", "final_verifying": "最终文件校验",
+                "ack_pending": "确认入库结果", "cleanup_pending": "清理中继文件",
+                "completed": "入库完成", "failed": "入库失败", "manual_review": "等待人工复核",
+                "cancelled": "任务已取消", "cancel_pending": "等待取消确认", "retry_wait": "原任务等待重试",
+            }
+            if phase not in labels:
+                return
+            detail = self._safe_error(labels[phase], RuntimeError(message)) if message else labels[phase]
+            bridge(job_id, f"入库阶段：{phase}；{detail}")
+        except Exception:  # noqa: BLE001 - live feedback cannot change a committed business result
+            pass
+
     def handle_worker(self, payload: dict[str, Any], _task: dict[str, Any]) -> dict[str, Any]:
         job_id = int(payload.get("job_id") or 0)
         if job_id <= 0:
@@ -304,8 +345,10 @@ class TransferDispatchService:
             # snapshot.
             job = self.database.job_queries.get(job_id) or job
 
+        loaded_phase = str(execution.phase)
         cancellation_result = self._stop_if_job_cancelled(job, execution, claim_owner)
         if cancellation_result is not None:
+            self._publish_transfer_phase(job_id, str(cancellation_result.get("phase") or ""), str(cancellation_result.get("message") or ""))
             return cancellation_result
         plan, rejection = v1_plan_or_review(
             self.database,
@@ -405,54 +448,74 @@ class TransferDispatchService:
         if durable_receipt is not None:
             restored_snapshot["receipt"] = durable_receipt
         orchestrator.restore(restored_snapshot or {"phase": execution.phase})
+        if loaded_phase == PHASE_RETRY_WAIT:
+            self._publish_transfer_phase(job_id, PHASE_RETRY_WAIT, "保留原任务记录，从暂停阶段继续")
         unsafe_phases = {
             PHASE_SOURCE_MATERIALIZING,
             PHASE_NATIVE_SUBMITTING,
             PHASE_TRANSFERRING,
         }
+        preflight_result: TransferStepResult | None = None
         if orchestrator.state.phase in unsafe_phases and orchestrator.state.receipt is None:
             fence = dict(orchestrator.state.submission_fence or {})
-            if fence.get("state") == "prepared":
+            if fence.get("state") == "prepared" or (
+                orchestrator.state.phase == PHASE_TRANSFERRING and bool(fence)
+            ):
+                # Old committed landing markers are not proof that a later
+                # copy never started. Only the new explicit hand-off separates
+                # source evidence from the current submission fence.
+                previous_message = str(
+                    orchestrator.state.message or getattr(execution, "last_error_message", "") or ""
+                ).strip()
                 orchestrator.state.review_from = orchestrator.state.phase
                 orchestrator.state.phase = PHASE_MANUAL_REVIEW
+                orchestrator.state.error_code = ErrorCode.RESULT_UNKNOWN
+                orchestrator.state.submission_preflight = {}
                 orchestrator.state.message = (
                     "外部提交 fence 已存在但 receipt 缺失，提交结果无法确认；"
                     "为避免重复转存，任务进入人工复核"
                 )
-            else:
-                orchestrator.state.submission_fence = {
-                    "state": "prepared",
-                    "phase": orchestrator.state.phase,
-                    # The fence key is the exact idempotency key used by the
-                    # executor for this external side effect.  Appending the
-                    # phase name made the first receipt fail the repository
-                    # fence check (landing:/relay-dl: use explicit prefixes).
-                    "operation_key": self._submission_operation_key(
-                        plan,
-                        orchestrator.state.phase,
-                    ),
-                    "prepared_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                }
-                prepared_snapshot = orchestrator.snapshot()
-                prepared_snapshot["claim"] = {
-                    "owner_id": claim_owner,
-                    "lease_until": _after(self.execution_lease_seconds),
-                }
-                execution = self.executions.save(
-                    execution,
-                    prepared_snapshot,
-                    phase=orchestrator.state.phase,
-                    last_error_message="外部提交 fence 已持久化",
-                    claim_owner_id=claim_owner or None,
-                    job_status="provider_submitting",
-                    require_job_status_transition=True,
+                if previous_message and previous_message not in {"外部提交 fence 已持久化", "计划校验通过", "开始重试"}:
+                    orchestrator.state.message += "；" + self._safe_error("此前记录", RuntimeError(previous_message))
+                self._record_submission_diagnostic(
+                    job_id, orchestrator.state.review_from, orchestrator.state.message,
                 )
-        if orchestrator.state.phase == PHASE_RETRY_WAIT:
+            else:
+                if orchestrator.state.phase == PHASE_TRANSFERRING:
+                    preflight_result = self._prepare_transfer_submission(orchestrator, plan, job_id)
+                if orchestrator.state.phase in unsafe_phases:
+                    # A not-started preflight record applies only before this
+                    # fence. It must not survive an actual submission attempt.
+                    orchestrator.state.submission_preflight = {}
+                    orchestrator.state.submission_fence = {
+                        "state": "prepared",
+                        "phase": orchestrator.state.phase,
+                        "operation_key": self._submission_operation_key(plan, orchestrator.state.phase),
+                        "prepared_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    }
+                    prepared_snapshot = orchestrator.snapshot()
+                    prepared_snapshot["claim"] = {
+                        "owner_id": claim_owner,
+                        "lease_until": _after(self.execution_lease_seconds),
+                    }
+                    execution = self.executions.save(
+                        execution,
+                        prepared_snapshot,
+                        phase=orchestrator.state.phase,
+                        last_error_message="外部提交 fence 已持久化",
+                        claim_owner_id=claim_owner or None,
+                        job_status="provider_submitting",
+                        require_job_status_transition=True,
+                    )
+        if preflight_result is None and orchestrator.state.phase == PHASE_RETRY_WAIT:
             orchestrator.mark_retry_ready()
+        step_phase = orchestrator.state.phase
         claim_holder = {"execution": execution, "lost": False}
         try:
             with self._claim_heartbeat(job_id, claim_owner, claim_holder):
-                result = orchestrator.step()
+                # A newly scheduled preflight backoff must be persisted, not
+                # immediately marked ready and consumed by this same wake-up.
+                result = preflight_result if preflight_result is not None else orchestrator.step()
         except ExecutionConflictError:
             execution = claim_holder.get("execution") or execution
             if claim_holder.get("lost"):
@@ -477,6 +540,18 @@ class TransferDispatchService:
         execution = claim_holder.get("execution") or execution
         if claim_holder.get("lost"):
             return self._lost_claim_result(execution.phase)
+        if (
+            step_phase in unsafe_phases
+            and orchestrator.state.phase == PHASE_RETRY_WAIT
+            and orchestrator.state.receipt is None
+            and orchestrator.state.submission_fence.get("state") == "prepared"
+        ):
+            # Record the first submission error while it is still available;
+            # retry_wait itself only moves state and must not emit it again.
+            self._record_submission_diagnostic(
+                job_id, step_phase,
+                self._safe_error("提交未获得回执，已保留防重复栅栏", RuntimeError(result.message)),
+            )
         if orchestrator.state.receipt is not None and orchestrator.state.submission_fence:
             # Keep the fence as a committed audit marker.  Clearing it before
             # the durable save would make a crash window indistinguishable
@@ -510,17 +585,35 @@ class TransferDispatchService:
                 job_status=job_status,
                 job_error_message=job_error,
             )
-        except ExecutionConflictError:
-            # Another worker won the CAS.  Do not run the external operation
-            # again; let the durable queue/scanner wake the winner's state.
+        except ExecutionConflictError as exc:
+            # This also covers receipt/fence validation errors, not just CAS
+            # contention. Preserve the real cause without resubmitting.
+            message = self._safe_error("执行状态保存失败，已停止本次推进", exc)
+            self._record_submission_diagnostic(job_id, snapshot.get("phase") or execution.phase, message)
             return {
                 "worker_outcome": "deferred",
                 "phase": snapshot.get("phase") or execution.phase,
                 "delay_seconds": 5,
-                "message": "执行状态已被其他 Worker 更新，放弃本次写入",
+                "message": message,
             }
+        if snapshot["phase"] != loaded_phase:
+            self._publish_transfer_phase(job_id, snapshot["phase"], result.message)
+        if snapshot["phase"] in {PHASE_MANUAL_REVIEW, PHASE_FAILED} and (
+            snapshot.get("review_from") if snapshot["phase"] == PHASE_MANUAL_REVIEW else snapshot.get("failure_from")
+        ) == PHASE_ORGANIZING:
+            # Organizer may finish after our waiting-review read but before
+            # this save. Reconcile that completion after persisting the park
+            # so neither ordering can lose the only recovery wake-up.
+            resume = getattr(self.executions, "resume_after_organizer_completion", None)
+            if callable(resume) and resume(job_id, int(snapshot.get("organizer_task_id") or 0)):
+                return {
+                    "worker_outcome": "deferred", "phase": PHASE_RETRY_WAIT,
+                    "delay_seconds": 0, "message": "Organizer 已完成，继续最终文件校验与 ACK",
+                }
         if snapshot["phase"] == PHASE_COMPLETED:
             return {"worker_outcome": "completed", "phase": PHASE_COMPLETED, "message": result.message}
+        if snapshot["phase"] == PHASE_CANCELLED:
+            return {"worker_outcome": "completed", "phase": PHASE_CANCELLED, "message": result.message, "cancelled": True}
         if snapshot["phase"] == PHASE_FAILED:
             return {"worker_outcome": "business_failed", "phase": PHASE_FAILED, "message": result.message}
         if snapshot["phase"] == PHASE_MANUAL_REVIEW:
@@ -531,6 +624,51 @@ class TransferDispatchService:
             "delay_seconds": delay,
             "message": result.message,
         }
+
+    def _prepare_transfer_submission(
+        self, orchestrator: TransferOrchestrator, plan: dict[str, Any], job_id: int,
+    ) -> TransferStepResult | None:
+        """Confirm Remote setup and preflight before any copy can be submitted."""
+        confirmation_retryable = False
+        try:
+            confirm = getattr(self, "ensure_remote_confirmation", None)
+            if callable(confirm):
+                try:
+                    confirm()
+                except Exception as exc:  # noqa: BLE001 - remote setup must complete before any copy submission
+                    try:
+                        status_code = int(getattr(exc, "status_code", 0) or 0)
+                    except (TypeError, ValueError):
+                        status_code = 0
+                    confirmation_retryable = getattr(exc, "retryable", False) is True or 500 <= status_code < 600
+                    raise TransferError(
+                        ErrorCode.OPENLIST_UNAVAILABLE,
+                        f"托管 OpenList Remote 自动确认失败：{exc}",
+                    ) from exc
+            orchestrator.prepare_submission()
+        except Exception as exc:  # noqa: BLE001 - this boundary cannot submit a transfer
+            code = exc.code if isinstance(exc, TransferError) else ErrorCode.INVALID_PLAN
+            message = self._safe_error("搬运前置校验未通过，尚未启动本次搬运", exc)
+            orchestrator.state.submission_preflight = {
+                "version": 1,
+                "job_id": job_id,
+                "phase": PHASE_TRANSFERRING,
+                "state": "not_started",
+                "operation_key": self._submission_operation_key(plan, PHASE_TRANSFERRING),
+                "error_code": code,
+                "message": message,
+                "retryable": confirmation_retryable,
+                "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            self._record_submission_diagnostic(job_id, PHASE_TRANSFERRING, message)
+            if confirmation_retryable:
+                return orchestrator._handle_failure(
+                    TransferError(code, message, retryable=True),
+                    PHASE_TRANSFERRING,
+                    exhausted_to_manual_review=True,
+                )
+            return orchestrator._to_manual_review(message, review_from=PHASE_TRANSFERRING, error_code=code)
+        return None
 
     @contextmanager
     def _claim_heartbeat(
@@ -648,6 +786,14 @@ class TransferDispatchService:
         receipt = self._durable_receipt(execution, snapshot)
         if receipt is not None:
             return self._cancel_external_operation(job, execution, claim_owner)
+        fence = snapshot.get("submission_fence")
+        if isinstance(fence, dict) and fence.get("state") in {"prepared", "committed"}:
+            message = "外部提交已有 fence 但回执缺失，无法确认取消；保留来源、缓存与目标文件并转人工复核"
+            self._persist_manual_review(execution, message, claim_owner_id=claim_owner or None)
+            return {
+                "worker_outcome": "completed", "phase": PHASE_MANUAL_REVIEW,
+                "message": message, "manual_review": True, "cancelled": False,
+            }
 
         cleanup_result = self._cleanup_cancelled_artifacts(
             job,
@@ -987,14 +1133,32 @@ class TransferDispatchService:
 
     @staticmethod
     def _safe_error(prefix: str, exc: Exception) -> str:
-        text = str(exc or "").replace("\r", " ").replace("\n", " ").strip()
-        # Avoid persisting full URLs, cookies, or arbitrary provider payloads
-        # in the job error column.  The trace remains in server logs.
-        for marker in ("password=", "cookie=", "token=", "Authorization:"):
-            if marker.lower() in text.lower():
-                text = text[: text.lower().index(marker.lower())] + "[redacted]"
-                break
+        text = re.sub(r"[\x00-\x1f\x7f]", " ", str(exc or "")).strip()
+        # Log only a short diagnostic, never provider payloads or a traceback
+        # that could carry URLs, share passwords, cookies or bearer tokens.
+        text = re.sub(r"(?i)\b(?:https?|ftp)://[^\s<>\"']+|magnet:\?[^\s<>\"']+", "[redacted-url]", text)
+        text = re.sub(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+", "[redacted-auth]", text)
+        secret = re.search(
+            r"(?i)\b(?:password|passwd|pwd(?:_id)?|cookie|set-cookie|authorization|"
+            r"(?:access|refresh|auth|session)[_-]?token|token|secret|credentials?|"
+            r"api[_-]?key|source_url|share_url|url|uri)[\"']?\s*[:=]",
+            text,
+        )
+        if secret is not None:
+            text = text[:secret.start()] + "[redacted]"
         return f"{prefix}：{text[:800] or exc.__class__.__name__}"
+
+    def _record_submission_diagnostic(self, job_id: int, phase: str, message: str) -> None:
+        phase = str(phase or "")
+        safe_phase = phase if re.fullmatch(r"[a-z_]{1,64}", phase) else "unknown"
+        safe_message = self._safe_error("V1 提交诊断", RuntimeError(message))
+        _LOGGER.warning("job_id=%s phase=%s %s", int(job_id), safe_phase, safe_message)
+        add_event = getattr(getattr(self.database, "job_commands", None), "add_event", None)
+        if callable(add_event):
+            try:
+                add_event(job_id, "warn", safe_message, {"phase": safe_phase, "diagnostic": "submission"})
+            except Exception:  # noqa: BLE001 - logging must not change side-effect decisions
+                pass
 
     def _persist_manual_review(
         self,
@@ -1028,6 +1192,7 @@ class TransferDispatchService:
             )
         except Exception:
             return
+        self._publish_transfer_phase(int(execution.job_id), PHASE_MANUAL_REVIEW, message)
 
     def dispatch(self, job: dict[str, Any]) -> dict[str, Any]:
         """Synchronous single-step entry used only by tests and diagnostics."""
@@ -1093,6 +1258,84 @@ class TransferDispatchService:
             return "unknown"
         return "visible" if result.get("exists") else "pending"
 
+    def _rclone_copy_manifest(self, plan: Any, receipt: Any, *, final: bool = False) -> dict[str, Any]:
+        """Resolve the callback inventory only for this successful frozen run."""
+        from ..services.rclone_service import RcloneService
+
+        metadata = getattr(receipt, "metadata", None)
+        if plan.strategy != "rclone_copy" or not isinstance(metadata, dict):
+            raise ValueError("缺少 rclone 回执")
+        run_id = int(metadata.get("run_id") or 0)
+        if (
+            run_id <= 0 or metadata.get("operation_key") != plan.idempotency_key
+            or (metadata.get("job_id") is not None and int(metadata["job_id"]) != plan.job_id)
+        ):
+            raise ValueError("rclone 回执与冻结操作不一致")
+        if self.executions.plan(plan.job_id) != plan.raw:
+            raise ValueError("暂存核验计划与持久快照不一致")
+        job = self.database.job_queries.get(plan.job_id) or {}
+        if not job or str(job.get("status") or "").lower() in {"cancelled", "canceled", "rejected"}:
+            raise ValueError("暂存核验关联任务不存在或已取消")
+        run = self.database.rclone.get_rclone_run(run_id) or {}
+        if (
+            int(run.get("job_id") or 0) != plan.job_id
+            or run.get("operation_key") != plan.idempotency_key
+            or run.get("status") != "success"
+            or run.get("exit_code") != 0
+        ):
+            raise ValueError("rclone 运行尚未成功、已取消或不属于本任务")
+        expected = RcloneService._validated_copy_run(build_managed_copy_run(plan, self.locator_resolver))
+        actual = RcloneService._validated_copy_run(run.get("copy_descriptor"))
+        if not expected or actual != expected:
+            raise ValueError("rclone 运行路径与冻结复制描述符不一致")
+        raw_data = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
+        manifest = raw_data.get("rclone_staging_manifest")
+        if not isinstance(manifest, dict) or manifest.get("version") != 1:
+            raise ValueError("缺少持久化 rclone 文件清单")
+        run_ids = manifest.get("run_ids")
+        if not isinstance(run_ids, list) or run_id not in run_ids or manifest.get("last_run_id") != run_id:
+            raise ValueError("rclone 文件清单不属于本次成功运行")
+        source_root = f"/{expected['source_root'].strip('/')}/{expected['job_dir_name']}"
+        if manifest.get("job_root") != source_root:
+            raise ValueError("rclone 文件清单来源根路径不一致")
+        paths = manifest.get("source_paths")
+        if not isinstance(paths, list) or not paths or manifest.get("expected_file_count") != len(paths):
+            raise ValueError("rclone 文件清单为空或数量不一致")
+        seen: set[str] = set()
+        files: list[dict[str, Any]] = []
+        staging = plan.destination_staging or {}
+        destination = plan.destination_final if final else staging
+        if not destination or destination.get("namespace_id") != staging.get("namespace_id"):
+            raise ValueError("rclone 核验目标不属于冻结复制存储")
+        target_root = str(destination.get("path") or "").rstrip("/")
+        if not target_root:
+            raise ValueError("rclone 核验目标路径缺失")
+        for path in paths:
+            if (
+                not isinstance(path, str) or not path.startswith(source_root + "/")
+                or any(part in {".", "..", ""} for part in path[1:].split("/"))
+                or any(ord(char) < 32 for char in path) or "\\" in path
+                or path in seen
+            ):
+                raise ValueError("rclone 文件清单含重复、越界或非法路径")
+            seen.add(path)
+            relative = path[len(source_root) + 1:]
+            files.append({"path": f"{target_root}/{relative}", "size": None})
+        return {
+            "run_id": run_id, "started_at": run.get("started_at"), "finished_at": run.get("finished_at"),
+            "manifest": manifest, "files": files, "destination": destination,
+        }
+
+    def _verify_rclone_copy_manifest(self, plan: Any, receipt: Any, *, final: bool = False) -> TransferVerifyResult:
+        try:
+            evidence = self._rclone_copy_manifest(plan, receipt, final=final)
+            result = self.verifier.verify_manifest(descriptor=evidence["destination"], files=evidence["files"])
+            if result.status == "ok" and self._rclone_copy_manifest(plan, receipt, final=final) != evidence:
+                raise ValueError("rclone 暂存核验期间运行或清单发生变化")
+            return result
+        except Exception as exc:  # noqa: BLE001 - unproven copies must not reach Organizer/ACK
+            return TransferVerifyResult("unknown", f"rclone 暂存清单核验失败：{exc}", code=ErrorCode.RESULT_UNKNOWN)
+
     def _list_target(self, descriptor: dict[str, str]) -> dict[str, Any]:
         namespace = str(descriptor.get("namespace_id") or "")
         path = str(descriptor.get("path") or "")
@@ -1112,6 +1355,20 @@ class TransferDispatchService:
                 expected_identity_root=str(descriptor.get("identity_root") or ""),
             ):
                 return {"unknown": True, "message": "OpenList 目标缺少或无法解析冻结挂载修订"}
+            if descriptor.get("include_file_manifest"):
+                client, mount = self.mount_service.client_for_mount(mount_id, revision=revision)
+                absolute = self.mount_service.resolve_mount_absolute_path(mount, path)
+                if not client.exists(absolute):
+                    return {"exists": False, "files": []}
+                return {
+                    "exists": True,
+                    "files": [
+                        item for item in client.list_dir(absolute)
+                        if isinstance(item, dict)
+                        and str(item.get("path") or "") != absolute
+                        and posixpath.dirname(str(item.get("path") or "")) == absolute
+                    ],
+                }
             return self.mount_service.list_path(mount_id, path, revision=revision)
         if namespace.startswith("local:"):
             real = os.path.realpath(path)
@@ -1119,6 +1376,16 @@ class TransferDispatchService:
                 return {"unknown": True, "message": "本地目标越界"}
             if not os.path.exists(real):
                 return {"exists": False}
+            if descriptor.get("include_file_manifest"):
+                with os.scandir(real) as entries:
+                    return {
+                        "exists": True,
+                        "files": [
+                            {"name": item.name, "is_dir": not item.is_file(follow_symlinks=False),
+                             "size": item.stat(follow_symlinks=False).st_size}
+                            for item in entries
+                        ],
+                    }
             count = 0
             size = 0
             for current, _dirs, files in os.walk(real):
@@ -1249,6 +1516,73 @@ class _OrganizerAdapter:
         self.database = database
         self.service = service
 
+    def _final_manifest(self, plan: Any, task_id: int) -> dict[str, Any]:
+        """Read completed, job/plan-bound evidence; never infer it from a directory."""
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT id, job_id, status, revision, category, raw_data, evidence FROM organizer_tasks WHERE id=? AND job_id=?",
+                (task_id, plan.job_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("缺少本任务关联的 Organizer 完成记录")
+            task = dict(row)
+            if str(task["status"] or "") not in {"done", "completed", "applied", "success", "skipped"}:
+                raise ValueError("Organizer 尚未完成或已被取消/回滚")
+            raw = json.loads(task["raw_data"] or "{}")
+            evidence = json.loads(task["evidence"] or "{}")
+            reference = raw.get("execution_plan_ref") or {}
+            if (
+                reference.get("plan_hash") != compute_persisted_plan_hash(plan.raw)
+                or int(reference.get("job_id") or 0) != plan.job_id
+                or str(reference.get("strategy") or "") != plan.strategy
+                or str(task["category"] or "") != plan.category_key
+            ):
+                raise ValueError("Organizer 完成记录与冻结任务计划不一致")
+            confirmation = evidence.get("completion_confirmation") or {}
+            if confirmation.get("success") is not True or confirmation.get("cleanup_only") or evidence.get("cleanup_only"):
+                raise ValueError("Organizer 缺少入库文件完成确认")
+            if connection.execute(
+                "SELECT 1 FROM organizer_operations WHERE task_id=? AND status NOT IN ('done', 'skipped') LIMIT 1",
+                (task_id,),
+            ).fetchone():
+                raise ValueError("Organizer 仍有未完成的文件操作")
+            mappings = [dict(item) for item in connection.execute(
+                "SELECT m.id, m.status, m.source_path, m.target_path, f.id AS source_file_id, f.size "
+                "FROM organizer_mappings m LEFT JOIN organizer_files f "
+                "ON f.id=m.file_id AND f.task_id=m.task_id AND f.path=m.source_path "
+                "WHERE m.task_id=? ORDER BY m.id",
+                (task_id,),
+            ).fetchall()]
+        if any(item["status"] not in {"ready", "skipped_existing", "delete_ad", "skipped"} for item in mappings):
+            raise ValueError("Organizer 映射尚未全部确认")
+        retained = [item for item in mappings if item["status"] in {"ready", "skipped_existing"}]
+        if not retained or any(not item["source_file_id"] or not item["target_path"] for item in retained):
+            raise ValueError("Organizer 缺少可关联源文件的最终映射")
+        confirmed = confirmation.get("confirmed_paths")
+        if not isinstance(confirmed, list) or not confirmed or not set(confirmed).issubset({item["target_path"] for item in retained}):
+            raise ValueError("Organizer 最终映射与完成确认不一致")
+        return {
+            "task_id": task_id, "revision": task["revision"], "status": task["status"],
+            "confirmation": confirmation, "mappings": mappings,
+            "files": [{"path": item["target_path"], "size": item["size"]} for item in retained],
+        }
+
+    def verify_final(self, plan: Any, *, organizer_task_id: int, verifier: Any) -> TransferVerifyResult:
+        verify = getattr(verifier, "verify_manifest", None)
+        if not callable(verify):
+            return TransferVerifyResult("unknown", "未配置任务级最终文件核验器", code=ErrorCode.RESULT_UNKNOWN)
+        try:
+            task_id = int(organizer_task_id or 0)
+            manifest = self._final_manifest(plan, task_id)
+            result = verify(descriptor=plan.organizer_path, files=manifest["files"])
+            # A rollback or revised mapping can win while remote reads are in
+            # flight. Re-read the evidence before allowing ACK/source cleanup.
+            if result.status == "ok" and self._final_manifest(plan, task_id) != manifest:
+                raise ValueError("Organizer 最终映射在核验期间发生变化")
+            return result
+        except Exception as exc:  # noqa: BLE001 - stale/missing evidence is not completion
+            return TransferVerifyResult("unknown", f"Organizer 最终文件核验失败：{exc}", code=ErrorCode.RESULT_UNKNOWN)
+
     def organize(self, plan: Any, *, organizer_task_id: int | None = None) -> OrganizeResult:
         if self.service is None:
             return OrganizeResult("failed", "Organizer 服务未装配", retryable=False)
@@ -1256,12 +1590,12 @@ class _OrganizerAdapter:
         with self.database.connect() as connection:
             if frozen_task_id > 0:
                 row = connection.execute(
-                    "SELECT id, status, error_message FROM organizer_tasks WHERE id=? AND job_id=?",
+                    "SELECT id, status, error_message, evidence FROM organizer_tasks WHERE id=? AND job_id=?",
                     (frozen_task_id, plan.job_id),
                 ).fetchone()
             else:
                 row = connection.execute(
-                    "SELECT id, status, error_message FROM organizer_tasks WHERE job_id=? ORDER BY id DESC LIMIT 1",
+                    "SELECT id, status, error_message, evidence FROM organizer_tasks WHERE job_id=? ORDER BY id DESC LIMIT 1",
                     (plan.job_id,),
                 ).fetchone()
         if row is None:
@@ -1288,9 +1622,27 @@ class _OrganizerAdapter:
             return OrganizeResult("pending", "Organizer 已创建", task_id=task_id)
         status = str(row["status"] or "").lower()
         if status in {"done", "completed", "applied", "success", "skipped"}:
+            evidence = dict(row).get("evidence")
+            if isinstance(evidence, str):
+                try:
+                    evidence = json.loads(evidence)
+                except (ValueError, TypeError):
+                    evidence = {}
+            evidence = evidence if isinstance(evidence, dict) else {}
+            confirmation = evidence.get("completion_confirmation")
+            confirmation = confirmation if isinstance(confirmation, dict) else {}
+            if evidence.get("cleanup_only") is True or (
+                confirmation.get("cleanup_only") is True and confirmation.get("success") is True
+            ):
+                return OrganizeResult(
+                    "done",
+                    "广告清理完成，没有保留的视频文件，本次未入库",
+                    task_id=int(row["id"]),
+                    cleanup_only=True,
+                )
             with self.database.connect() as connection:
                 mappings = connection.execute(
-                    "SELECT target_path FROM organizer_mappings WHERE task_id=? ORDER BY target_path",
+                    "SELECT target_path FROM organizer_mappings WHERE task_id=? AND status IN ('ready', 'skipped_existing') ORDER BY target_path",
                     (int(row["id"]),),
                 ).fetchall()
             final_path = _common_target_root(

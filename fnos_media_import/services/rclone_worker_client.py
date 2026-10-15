@@ -4,6 +4,7 @@ import time
 from typing import Any, Callable
 
 import requests
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 
 class RcloneWorkerRequestError(RuntimeError):
@@ -130,6 +131,7 @@ class RcloneWorkerClient:
             dict(payload),
             timeout_seconds=120,
             raise_for_error=True,
+            unsafe_mutation=True,
         )
 
     def webdav_test(self, remote_name: Any = None) -> dict[str, Any]:
@@ -203,12 +205,14 @@ class RcloneWorkerClient:
         timeout_seconds: int | None = None,
         retry_safe: bool = False,
         raise_for_error: bool = False,
+        unsafe_mutation: bool = False,
     ) -> dict[str, Any]:
         if not self.token:
             return self._failed_response(
                 "rclone Worker 控制令牌未初始化",
                 503,
                 raise_for_error=raise_for_error,
+                not_started=True if unsafe_mutation else None,
             )
         response: Any = None
         attempts = 3 if retry_safe else 1
@@ -223,7 +227,7 @@ class RcloneWorkerClient:
                     headers={"Authorization": f"Bearer {self.token}"},
                     timeout=timeout_seconds or self.timeout_seconds,
                 )
-            except requests.Timeout:
+            except requests.Timeout as exc:
                 if attempt + 1 < attempts:
                     self.sleep(delays[min(attempt, len(delays) - 1)])
                     continue
@@ -231,15 +235,21 @@ class RcloneWorkerClient:
                     "连接 rclone Worker 超时",
                     504,
                     raise_for_error=raise_for_error,
+                    not_started=isinstance(exc, requests.ConnectTimeout) if unsafe_mutation else None,
+                    result_unknown=unsafe_mutation and not isinstance(exc, requests.ConnectTimeout),
                 )
-            except requests.RequestException:
+            except requests.RequestException as exc:
                 if attempt + 1 < attempts:
                     self.sleep(delays[min(attempt, len(delays) - 1)])
                     continue
+                cause = exc.args[0] if exc.args else None
+                not_started = isinstance(cause, MaxRetryError) and isinstance(cause.reason, NewConnectionError)
                 return self._failed_response(
                     "无法连接 rclone Worker，请稍后重试",
                     503,
                     raise_for_error=raise_for_error,
+                    not_started=not_started if unsafe_mutation else None,
+                    result_unknown=unsafe_mutation and not not_started,
                 )
             if response.status_code in {502, 503, 504} and attempt + 1 < attempts:
                 self.sleep(delays[min(attempt, len(delays) - 1)])
@@ -253,6 +263,8 @@ class RcloneWorkerClient:
             data = {"success": False, "message": "rclone Worker 返回了无法解析的响应"}
         if not isinstance(data, dict):
             data = {"success": False, "message": "rclone Worker 返回格式不正确"}
+        if unsafe_mutation and not data.get("success") and not data.get("code"):
+            data["code"] = "RCLONE_SYNC_RESULT_UNKNOWN"
         if response.status_code >= 400:
             data["success"] = False
             data.setdefault("message", f"rclone Worker 请求失败：HTTP {response.status_code}")
@@ -261,6 +273,8 @@ class RcloneWorkerClient:
             data["_http_status"] = int(response.status_code)
             if raise_for_error:
                 raise RcloneWorkerRequestError(str(data["message"]), response.status_code, data)
+        if unsafe_mutation and not data.get("success") and raise_for_error:
+            raise RcloneWorkerRequestError(str(data.get("message") or "Worker 写入结果未知"), 502, data)
         return data
 
     @staticmethod
@@ -269,6 +283,8 @@ class RcloneWorkerClient:
         status_code: int,
         *,
         raise_for_error: bool,
+        not_started: bool | None = None,
+        result_unknown: bool = False,
     ) -> dict[str, Any]:
         status = "worker_timeout" if status_code == 504 else "worker_unavailable"
         payload = {
@@ -278,6 +294,10 @@ class RcloneWorkerClient:
             "message": message,
             "_http_status": int(status_code),
         }
+        if not_started is not None:
+            payload["not_started"] = not_started
+        if result_unknown:
+            payload.update(code="RCLONE_SYNC_RESULT_UNKNOWN", error_code="RCLONE_SYNC_RESULT_UNKNOWN")
         if raise_for_error:
             raise RcloneWorkerRequestError(message, status_code, payload)
         return payload

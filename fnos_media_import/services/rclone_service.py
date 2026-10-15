@@ -5,7 +5,7 @@ import posixpath
 import re
 import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,6 +18,8 @@ from ..constants import (
     JOB_REVIEW,
     JOB_WAITING_ORGANIZER,
     JOB_WAITING_TRANSFER,
+    RCLONE_EXIT_LOCK_BUSY,
+    RCLONE_JOB_REQUIRED_MESSAGE,
     RCLONE_RUN_FAILED,
     RCLONE_RUN_RUNNING,
     RCLONE_RUN_SUCCESS,
@@ -39,9 +41,14 @@ from .rclone_process_runner import RcloneProcessRunner
 from .rclone_process_controller import RcloneProcessController
 from .rclone_run_queue import RcloneRunQueue
 from .rclone_run_state import RcloneRunState
-from .rclone_run_completion_service import RcloneRunCompletionService
+from .rclone_run_completion_service import RcloneRunCompletionService, RcloneRunResult
 from .rclone_worker_command import RcloneWorkerCommandBuilder
 from .rclone_cancelled_task_cleanup_service import RcloneCancelledTaskCleanupService
+from .rclone_webdav_config_service import RcloneWebdavConfigError
+
+
+_REMOTE_ADMISSION_FAILED = "托管 Remote 运行前确认失败，搬运进程未启动"
+_REMOTE_CONFIRMATION_UNVERIFIED = "托管 Remote 自动确认未返回成功结果"
 
 
 class RcloneService:
@@ -92,12 +99,19 @@ class RcloneService:
         self.log_sink = RcloneLogSink(
             database=self.db,
             current_run_id=lambda: self.run_state.current_run_id,
+            current_job_id=lambda: getattr(self, "_active_staging_job_id", 0),
             max_lines=config.get("log_lines", 500),
         )
         self.run_queue = RcloneRunQueue()
         self._startup_recovery_activated = False
         self._staging_retry_timers: dict[int, threading.Timer] = {}
         self._staging_retry_attempts: dict[int, int] = {}
+        # 互斥锁被占用而未启动的任务级 run：按 run_id 记录延后重排定时器与次数。
+        self._deferred_run_timers: dict[int, threading.Timer] = {}
+        self._deferred_run_attempts: dict[int, int] = {}
+        self._completion_retry_timers: dict[RcloneRunResult, threading.Timer] = {}
+        self._completion_retry_attempts: dict[RcloneRunResult, int] = {}
+        self._active_completion_identity: tuple[int | None, str | None, str | None] | None = None
         self._active_staging_job_id = 0
         self._active_full_staging_job_id = 0
         # A queued full-staging run is briefly removed from ``run_queue``
@@ -431,14 +445,36 @@ class RcloneService:
                 "run_id": normalized,
             }
         job_id = self._int_value(run.get("job_id"))
+        # Persist intent before SIGTERM: the process can finish immediately.
+        claimed = self.db.rclone.mark_scoped_rclone_run_status(
+            normalized,
+            "cancel_pending",
+            error_message="用户请求取消 rclone 运行",
+            expected_status=status,
+        )
+        if claimed is False:
+            latest = self.db.rclone.get_rclone_run(normalized) or {}
+            latest_status = str(latest.get("status") or "").strip().lower()
+            return {
+                "success": True,
+                "status": (
+                    "cancelled" if latest_status in {"cancelled", "canceled"}
+                    else "already_final" if latest_status in {RCLONE_RUN_SUCCESS, RCLONE_RUN_FAILED}
+                    else "cancel_pending"
+                ),
+                "message": "rclone 运行状态已更新，按最新状态确认取消",
+                "run_id": normalized,
+            }
         outcome = self.cancel_job(job_id, stop_running=True)
         active = bool(outcome.get("active_match"))
-        self.db.rclone.mark_scoped_rclone_run_status(
-            normalized,
-            "cancel_pending" if active else "cancelled",
-            error_message="用户请求取消 rclone 运行",
-            terminal=not active,
-        )
+        if not active:
+            self.db.rclone.mark_scoped_rclone_run_status(
+                normalized,
+                "cancelled",
+                error_message="用户请求取消 rclone 运行",
+                terminal=True,
+                expected_status="cancel_pending",
+            )
         return {
             "success": True,
             "status": "cancel_pending" if active else "cancelled",
@@ -457,53 +493,74 @@ class RcloneService:
                 "message": "rclone 数据库不可用，已跳过持久运行恢复",
                 "recovered": 0,
             }
-        rows = database.rclone.list_recoverable_scoped_rclone_runs(limit)
+        # Freeze the startup population and advance by id, not by status or
+        # OFFSET: previously queued rows remain recoverable while they execute.
+        through_id = database.rclone.scoped_rclone_recovery_high_watermark()
+        after_id = 0
+        batch_size = max(1, int(limit or 100))
         recovered = 0
         cancelled = 0
         errors: list[str] = []
-        for run in rows:
-            run_id = self._int_value(run.get("id"))
-            status = str(run.get("status") or "").strip().lower()
-            if status == "cancel_pending":
-                database.rclone.mark_scoped_rclone_run_status(
-                    run_id,
-                    "cancelled",
-                    error_message="进程重启时完成取消收敛",
-                    terminal=True,
-                )
-                cancelled += 1
-                continue
-            descriptor = run.get("copy_descriptor") if isinstance(run.get("copy_descriptor"), dict) else {}
-            key = str(run.get("operation_key") or "").strip()
-            if not descriptor or not key:
-                database.rclone.mark_scoped_rclone_run_status(
-                    run_id,
-                    RCLONE_RUN_FAILED,
-                    error_message="持久 rclone descriptor 缺失",
-                    terminal=True,
-                )
-                errors.append(f"run #{run_id} descriptor 缺失")
-                continue
-            database.rclone.mark_scoped_rclone_run_status(run_id, "recovering")
-            result = self.start(
-                reason=f"recovery:{run_id}",
-                staging_run={
-                    **descriptor,
-                    "_scoped_run_id": run_id,
-                    "_operation_key": key,
-                },
+        while after_id < through_id:
+            rows = database.rclone.list_recoverable_scoped_rclone_runs(
+                batch_size, after_id=after_id, through_id=through_id,
             )
-            if result.get("success"):
-                recovered += 1
-            else:
-                message = str(result.get("message") or "恢复提交失败")
-                database.rclone.mark_scoped_rclone_run_status(
-                    run_id,
-                    RCLONE_RUN_FAILED,
-                    error_message=message,
-                    terminal=True,
+            if not rows:
+                break
+            for run in rows:
+                run_id = self._int_value(run.get("id"))
+                after_id = run_id
+                status = str(run.get("status") or "").strip().lower()
+                key = str(run.get("operation_key") or "").strip()
+                if status == "cancel_pending":
+                    updated = database.rclone.mark_scoped_rclone_run_status(
+                        run_id,
+                        "cancelled",
+                        error_message="进程重启时完成取消收敛",
+                        terminal=True,
+                        expected_status=status,
+                        expected_operation_key=key,
+                    )
+                    cancelled += int(updated is not False)
+                    continue
+                descriptor = run.get("copy_descriptor") if isinstance(run.get("copy_descriptor"), dict) else {}
+                if not descriptor or not key:
+                    database.rclone.mark_scoped_rclone_run_status(
+                        run_id,
+                        RCLONE_RUN_FAILED,
+                        error_message="持久 rclone descriptor 缺失",
+                        terminal=True,
+                        expected_status=status,
+                        expected_operation_key=key,
+                    )
+                    errors.append(f"run #{run_id} descriptor 缺失")
+                    continue
+                claimed = database.rclone.mark_scoped_rclone_run_status(
+                    run_id, "recovering", expected_status=status, expected_operation_key=key,
                 )
-                errors.append(f"run #{run_id}: {message}")
+                if claimed is False:
+                    continue
+                result = self.start(
+                    reason=f"recovery:{run_id}",
+                    staging_run={
+                        **descriptor,
+                        "_scoped_run_id": run_id,
+                        "_operation_key": key,
+                    },
+                )
+                if result.get("success"):
+                    recovered += 1
+                else:
+                    message = str(result.get("message") or "恢复提交失败")
+                    database.rclone.mark_scoped_rclone_run_status(
+                        run_id,
+                        RCLONE_RUN_FAILED,
+                        error_message=message,
+                        terminal=True,
+                        expected_status="recovering",
+                        expected_operation_key=key,
+                    )
+                    errors.append(f"run #{run_id}: {message}")
         return {
             "success": not errors,
             "message": "V1 rclone 持久运行恢复完成" if not errors else "部分 V1 rclone 运行恢复失败",
@@ -523,9 +580,9 @@ class RcloneService:
         if not self.enabled:
             return {"success": False, "message": "rclone 集成未启用", "status": self.status()}
         if staging_run is None:
-            message = "global rclone directory scans are disabled; a V1 job descriptor is required"
+            message = RCLONE_JOB_REQUIRED_MESSAGE
             self._append_log(message)
-            return {"success": False, "message": message, "status": self.status()}
+            return {"success": False, "code": "RCLONE_JOB_REQUIRED", "message": message, "status": self.status()}
         if staging_run is not None:
             persisted_staging_run, staging_error = self._database_bound_staging_run(staging_run)
             if not persisted_staging_run:
@@ -851,6 +908,7 @@ class RcloneService:
             **queue_status,
             "script_path": str(self._script_path()),
             "directory_mapping": self._category_dir_env(os.environ.copy()),
+            "transfers": self.log_sink.transfers(),
         }
 
     def get_logs(self, limit: int = 200) -> list[str]:
@@ -869,7 +927,9 @@ class RcloneService:
             text = text[:2000]
         if job_id > 0:
             text = f"任务#{int(job_id)} {text}"
-        self._append_log(text)
+        # Only the authenticated application bridge may publish durable phase
+        # milestones. Raw process stdout keeps _append_log's untrusted default.
+        self.log_sink.append(text, job_id=job_id if job_id > 0 else None, trusted_milestone=True)
         return {"success": True, "message": "已记录"}
 
     def list_runs(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
@@ -980,6 +1040,11 @@ class RcloneService:
             self.environment_checker.command_runner(
                 "rclone",
                 ["rclone", "version"],
+                False,
+            ),
+            self.environment_checker.command_runner(
+                "rclone worker flock",
+                ["flock", "--version"],
                 False,
             ),
         ]
@@ -1250,17 +1315,20 @@ class RcloneService:
         return path
 
     def _ensure_managed_remote_config(self) -> None:
-        """rclone run 启动前确保托管 Remote 已写入本机 rclone 配置。
-
-        持久卷丢失或全新部署时，托管 Remote（MP）以前只有管理员在管理后台
-        点一次“检测 OpenList”才会写入，否则首个搬运任务直接失败（didn't
-        find section in config file）。现在 run 启动前自检，缺失即用数据库
-        里的 OpenList 连接凭证自动重建。任何失败都只记录日志不阻断 run：
-        Worker 会输出 rclone 的真实错误供排查。
-        """
+        """兼容 run 启动自检；正式传输会在冻结路径解析前完成严格自动确认。"""
 
         service = getattr(self, "_v1_webdav_config_service", None)
         if service is None:
+            return
+        ensure_confirmation = getattr(service, "ensure_confirmation", None)
+        if callable(ensure_confirmation):
+            result = ensure_confirmation()
+            if not isinstance(result, dict) or result.get("success") is not True:
+                raise RcloneWebdavConfigError(
+                    _REMOTE_CONFIRMATION_UNVERIFIED, 503, code="RCLONE_SYNC_RESULT_UNKNOWN",
+                )
+            if result.get("auto_confirmed"):
+                self._append_log("已使用保存的 OpenList 配置自动核验并恢复托管 Remote 确认")
             return
         try:
             remote_name = self._managed_remote_name()
@@ -1433,6 +1501,8 @@ class RcloneService:
             self._shutdown_requested = True
         self.run_queue.request_stop()
         self._cancel_all_staging_retries()
+        self._cancel_all_deferred_runs()
+        self._cancel_all_completion_retries()
         self.log_sink.close()
 
     def is_running_locked(self) -> bool:
@@ -1746,6 +1816,262 @@ class RcloneService:
             "message": message,
         }
 
+    # ------------------------------------------------------------------
+    # 互斥锁被占用：延后重排未启动的任务级 run
+    # ------------------------------------------------------------------
+    def _schedule_deferred_run(
+        self,
+        run_id: int,
+        staging_run: dict[str, Any] | None,
+        reason: str,
+        *,
+        pending_finish_error: str | None = None,
+    ) -> dict[str, Any]:
+        """脚本拿不到互斥锁（exit 75）时把持久 run 延后重新提交。
+
+        完成服务已把 run 回滚到 queued。这里只负责隔一段退避后再走一遍
+        ``start``；超过上限仍拿不到锁，说明有别的 rclone 进程长期占着锁，
+        此时把 run 标 failed 并唤醒传输，交给编排器按普通失败处理。
+        """
+        descriptor = dict(staging_run) if isinstance(staging_run, dict) else {}
+        if run_id <= 0 or not descriptor:
+            return {"success": False, "message": "延后重排缺少持久 run 描述符"}
+        max_attempts = self._staging_retry_max_attempts()
+        with self.lock:
+            if getattr(self, "_shutdown_requested", False):
+                return {"success": False, "message": "rclone 服务正在关闭，放弃延后重排"}
+            attempts = getattr(self, "_deferred_run_attempts", {})
+            attempt = int(attempts.get(run_id, 0) or 0) + 1
+            attempts[run_id] = attempt
+            self._deferred_run_attempts = attempts
+            exhausted = attempt > max_attempts
+        if exhausted:
+            message = (
+                f"rclone 延后重排已达 {max_attempts} 次上限，run #{run_id} 未能启动，"
+                "请检查 Worker 内的残留进程及数据库状态"
+            )
+            try:
+                if pending_finish_error is not None:
+                    self.run_completion.persist_result(run_id, RCLONE_EXIT_LOCK_BUSY, pending_finish_error)
+                    pending_finish_error = None
+                self._fail_deferred_run(run_id, message)
+            except Exception as exc:  # noqa: BLE001 - retain the timer until terminal persistence succeeds
+                self._append_log(f"run #{run_id} 终态暂未落库，将延后重试收敛：{exc}")
+            else:
+                self._clear_deferred_run_attempts(run_id)
+                return {"success": False, "exhausted": True, "run_id": run_id, "attempts": attempt}
+        delay = self._staging_retry_delay_seconds(attempt)
+        if not exhausted:
+            self._append_log(
+                f"rclone 运行暂未启动，run #{run_id} 将在 {delay} 秒后重新排队"
+                f"（第 {attempt}/{max_attempts} 次）"
+            )
+        timer = threading.Timer(
+            delay,
+            self._resume_deferred_run,
+            args=(run_id, descriptor, reason, pending_finish_error),
+        )
+        timer.daemon = True
+        with self.lock:
+            if getattr(self, "_shutdown_requested", False):
+                return {"success": False, "message": "rclone 服务正在关闭，放弃延后重排"}
+            timers = getattr(self, "_deferred_run_timers", {})
+            previous = timers.pop(run_id, None)
+            timers[run_id] = timer
+            self._deferred_run_timers = timers
+        if previous is not None:
+            previous.cancel()
+        timer.start()
+        return {
+            "success": True,
+            "deferred": True,
+            "run_id": run_id,
+            "delay_seconds": delay,
+            "attempts": attempt,
+        }
+
+    def _resume_deferred_run(
+        self,
+        run_id: int,
+        descriptor: dict[str, Any],
+        reason: str,
+        pending_finish_error: str | None = None,
+    ) -> None:
+        with self.lock:
+            getattr(self, "_deferred_run_timers", {}).pop(run_id, None)
+            if getattr(self, "_shutdown_requested", False):
+                return
+            exhausted = int(getattr(self, "_deferred_run_attempts", {}).get(run_id, 0)) > self._staging_retry_max_attempts()
+        try:
+            if pending_finish_error is not None:
+                self.run_completion.persist_result(run_id, RCLONE_EXIT_LOCK_BUSY, pending_finish_error)
+                pending_finish_error = None
+            if exhausted:
+                # The retry budget was exhausted while the database was down.
+                # Retry only terminal persistence, never start another download.
+                self._schedule_deferred_run(run_id, descriptor, reason)
+                return
+            if self.db:
+                run = self.db.rclone.get_rclone_run(run_id) or {}
+                status = str(run.get("status") or "").strip().lower()
+                if status != "queued":
+                    # 期间被取消、被启动恢复或已由别的路径接管，不再重复提交。
+                    self._append_log(f"run #{run_id} 当前状态为 {status or '未知'}，跳过延后重排")
+                    self._clear_deferred_run_attempts(run_id)
+                    return
+            result = self.start(reason=f"lock_deferred:{run_id}:{reason}", staging_run=descriptor)
+            if not result.get("success"):
+                message = str(result.get("message") or "延后重排提交失败")
+                self._append_log(f"run #{run_id} 延后重排失败：{message}")
+                self._fail_deferred_run(run_id, message)
+                self._clear_deferred_run_attempts(run_id)
+        except Exception as exc:  # noqa: BLE001 - a Timer has no caller to retry it
+            self._append_log(f"run #{run_id} 延后重排暂时失败，将继续退避：{exc}")
+            self._schedule_deferred_run(
+                run_id, descriptor, reason, pending_finish_error=pending_finish_error,
+            )
+
+    def _fail_deferred_run(self, run_id: int, message: str) -> None:
+        """延后重排放弃：run 落 failed 并唤醒传输，让编排器按普通失败处理。"""
+        self._append_log(message)
+        if not self.db:
+            return
+        run = self.db.rclone.get_rclone_run(run_id) or {}
+        if str(run.get("status") or "").strip().lower() != "queued":
+            return
+        updated = self.db.rclone.mark_scoped_rclone_run_status(
+            run_id,
+            RCLONE_RUN_FAILED,
+            error_message=message,
+            terminal=True,
+            expected_status="queued",
+        )
+        if updated is not False:
+            self.run_completion._wake_transfer_execution(run_id, run)
+
+    def _clear_deferred_run_attempts(self, run_id: int) -> None:
+        with self.lock:
+            getattr(self, "_deferred_run_attempts", {}).pop(run_id, None)
+            timer = getattr(self, "_deferred_run_timers", {}).pop(run_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_all_deferred_runs(self) -> None:
+        with self.lock:
+            timers = list(getattr(self, "_deferred_run_timers", {}).values())
+            self._deferred_run_timers = {}
+            self._deferred_run_attempts = {}
+        for timer in timers:
+            timer.cancel()
+
+    def _schedule_completion_retry(
+        self,
+        result: RcloneRunResult,
+        *,
+        expected_attempt: int | None = None,
+    ) -> None:
+        """Retry only the captured result, never resubmit a completed copy."""
+        with self.lock:
+            if getattr(self, "_shutdown_requested", False):
+                return
+            attempts = getattr(self, "_completion_retry_attempts", {})
+            current_attempt = int(attempts.get(result, 0))
+            if expected_attempt is not None and current_attempt != expected_attempt:
+                return
+            attempt = current_attempt + 1
+            attempts[result] = attempt
+            self._completion_retry_attempts = attempts
+            delay = self._staging_retry_delay_seconds(attempt)
+            timer = threading.Timer(delay, self._retry_completion, args=(result, attempt))
+            timer.daemon = True
+            timers = getattr(self, "_completion_retry_timers", {})
+            previous = timers.get(result)
+            timers[result] = timer
+            self._completion_retry_timers = timers
+        if previous is not None:
+            previous.cancel()
+        timer.start()
+
+    def _retry_completion(self, result: RcloneRunResult, attempt: int) -> None:
+        with self.lock:
+            attempts = getattr(self, "_completion_retry_attempts", {})
+            if getattr(self, "_shutdown_requested", False) or attempts.get(result) != attempt:
+                return
+            getattr(self, "_completion_retry_timers", {}).pop(result, None)
+        try:
+            self.run_completion.persist_result(
+                result.run_id, result.exit_code, result.error,
+                expected_operation_key=result.operation_key,
+                expected_started_at=result.started_at,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the outcome until persistence recovers
+            self._schedule_completion_retry(result, expected_attempt=attempt)
+            self._append_log(f"rclone run #{result.run_id} 完成结果仍未落库，将继续补写：{exc}")
+            return
+        with self.lock:
+            attempts = getattr(self, "_completion_retry_attempts", {})
+            if attempts.get(result) == attempt:
+                attempts.pop(result, None)
+
+    def _cancel_all_completion_retries(self) -> None:
+        with self.lock:
+            timers = list(getattr(self, "_completion_retry_timers", {}).values())
+            self._completion_retry_timers = {}
+            self._completion_retry_attempts = {}
+        for timer in timers:
+            timer.cancel()
+
+    def invalidate_run(
+        self,
+        run_id: int | str,
+        *,
+        operation_key: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """把一个已结束的任务级 run 标为 failed，让下次重试真正重新搬运。
+
+        典型场景：run 记为 success 但中继目录为空（脚本被跳过、缓存被清）。
+        不作废仍在执行或排队的 run，避免打断正在进行的下载。
+        """
+        if not self.db:
+            return {"success": False, "message": "rclone 数据库不可用"}
+        normalized = self._int_value(run_id)
+        run = self.db.rclone.get_rclone_run(normalized) if normalized > 0 else None
+        if not run:
+            return {"success": False, "message": "rclone run 不存在"}
+        expected = str(operation_key or "").strip()
+        actual = str(run.get("operation_key") or "").strip()
+        if expected and actual != expected:
+            return {"success": False, "message": "operation_key 不匹配"}
+        status = str(run.get("status") or "").strip().lower()
+        if status == RCLONE_RUN_FAILED:
+            return {"success": True, "status": RCLONE_RUN_FAILED, "run_id": normalized, "already": True}
+        if status != RCLONE_RUN_SUCCESS:
+            return {
+                "success": False,
+                "status": status,
+                "run_id": normalized,
+                "message": f"rclone run 处于 {status}，不能作废",
+            }
+        message = str(reason or "").strip() or "rclone run 结果与实际产物不符，已作废"
+        updated = self.db.rclone.mark_scoped_rclone_run_status(
+            normalized,
+            RCLONE_RUN_FAILED,
+            error_message=message,
+            terminal=True,
+            expected_status=RCLONE_RUN_SUCCESS,
+        )
+        if updated is False:
+            return {"success": False, "run_id": normalized, "message": "rclone run 状态已变化，未作废"}
+        self.db.rclone.add_rclone_event(
+            normalized,
+            EVENT_WARN,
+            f"run 已作废：{message}",
+            {"invalidated": True, "previous_status": status},
+        )
+        self._append_log(f"rclone run #{normalized} 已作废：{message}")
+        return {"success": True, "status": RCLONE_RUN_FAILED, "run_id": normalized}
+
     def _cancel_staging_retry_locked(self, job_id: int) -> None:
         if job_id <= 0:
             return
@@ -1777,9 +2103,30 @@ class RcloneService:
     ) -> None:
         started_at = self._now()
         scoped_run_id = self._int_value((staging_run or {}).get("_scoped_run_id"))
+        operation_key = str((staging_run or {}).get("_operation_key") or "") if scoped_run_id else None
+        # Seconds are insufficient: a retry can begin in the same second as
+        # an earlier completion. Keep its precise timestamp as an attempt fence.
+        attempt_started_at = datetime.now(timezone.utc).isoformat(timespec="microseconds") if scoped_run_id else None
         run_id = scoped_run_id or (self.db.rclone.create_rclone_run(reason) if self.db else None)
         if scoped_run_id > 0 and self.db:
-            if not self.db.rclone.mark_scoped_rclone_run_started(scoped_run_id):
+            try:
+                started = self.db.rclone.mark_scoped_rclone_run_started(
+                    scoped_run_id,
+                    started_at=attempt_started_at,
+                    expected_operation_key=operation_key,
+                )
+            except Exception as exc:  # noqa: BLE001 - no process was submitted; retain durable scheduling
+                message = f"rclone run #{scoped_run_id} 认领失败，脚本未启动：{exc}"
+                self._append_log(message)
+                try:
+                    self._schedule_deferred_run(
+                        scoped_run_id, staging_run, reason, pending_finish_error=message,
+                    )
+                finally:
+                    self.process = None
+                    self._start_next_queued_run()
+                return
+            if not started:
                 self._append_log(
                     f"rclone run #{scoped_run_id} 已取消或处于不可执行状态，跳过启动"
                 )
@@ -1787,6 +2134,7 @@ class RcloneService:
                 self._start_next_queued_run()
                 return
         with self.lock:
+            self._active_completion_identity = (run_id, operation_key, attempt_started_at)
             self.run_state.mark_running(run_id, started_at)
             self._append_log(f"开始执行 rclone 搬运任务，触发来源：{reason}")
 
@@ -1849,9 +2197,16 @@ class RcloneService:
             return
 
         try:
-            # 部署重建后 rclone.conf 可能缺少托管 Remote 段（此前要管理员手动
-            # 点一次“检测 OpenList”）：启动前自检并自动补写，失败不阻断 run。
-            self._ensure_managed_remote_config()
+            # The Remote may drift after transfer preflight. Do not spawn when
+            # this last admission check fails; finalize the claimed run instead.
+            try:
+                self._ensure_managed_remote_config()
+            except Exception as exc:  # noqa: BLE001 - confirmation failure must never start the process
+                code = str(getattr(exc, "code", "") or "RCLONE_SYNC_FAILED")
+                if not re.fullmatch(r"[A-Z0-9_]{1,80}", code):
+                    code = "RCLONE_SYNC_FAILED"
+                self._finish(2, f"{_REMOTE_ADMISSION_FAILED}（{code}）")
+                return
             result = self.process_runner.run(
                 command,
                 cwd=self.base_dir,
@@ -1859,13 +2214,24 @@ class RcloneService:
                 on_line=self._append_log,
                 on_started=self._set_process,
             )
-            self._finish(result.exit_code, result.error)
-            if scoped_run_id <= 0:
-                self._schedule_incomplete_staging_retry(
-                    staging_run,
-                    run_id=run_id,
-                    exit_code=result.exit_code,
+            if result.not_started and scoped_run_id > 0:
+                pending_finish_error = None
+                try:
+                    self._finish(result.exit_code, result.error)
+                except Exception as exc:  # noqa: BLE001 - do not lose scheduling during completion persistence
+                    pending_finish_error = result.error
+                    self._append_log(f"run #{scoped_run_id} 未启动状态暂未落库，将延后重试：{exc}")
+                self._schedule_deferred_run(
+                    scoped_run_id, staging_run, reason, pending_finish_error=pending_finish_error,
                 )
+            else:
+                self._finish(result.exit_code, result.error)
+                if scoped_run_id <= 0:
+                    self._schedule_incomplete_staging_retry(
+                        staging_run,
+                        run_id=run_id,
+                        exit_code=result.exit_code,
+                    )
         finally:
             self.process = None
             self._start_next_queued_run()
@@ -1884,7 +2250,23 @@ class RcloneService:
             self.process_controller.terminate(process)
 
     def _finish(self, exit_code: int, error: str) -> None:
-        self.run_completion.finish(exit_code, error)
+        run_id = self.run_state.current_run_id
+        identity = getattr(self, "_active_completion_identity", None)
+        operation_key, started_at = identity[1:] if identity and identity[0] == run_id else (None, None)
+        try:
+            self.run_completion.finish(
+                exit_code, error,
+                expected_operation_key=operation_key,
+                expected_started_at=started_at,
+            )
+        except Exception as exc:  # noqa: BLE001 - an exited process cannot be polled again
+            if exit_code == RCLONE_EXIT_LOCK_BUSY or not run_id:
+                raise
+            self._schedule_completion_retry(RcloneRunResult(run_id, exit_code, error, operation_key, started_at))
+            self._append_log(f"rclone run #{run_id} 已结束但完成结果暂未落库，将单独补写：{exc}")
+        finally:
+            if exit_code != RCLONE_EXIT_LOCK_BUSY and run_id:
+                self._clear_deferred_run_attempts(run_id)
 
 
 
@@ -2206,6 +2588,12 @@ class RcloneService:
             raise ValueError("V1 rclone 描述符使用了非托管远端")
         relay_mode = bool(copy_run.get("relay_mode"))
         managed_relay_root = self._managed_relay_root() if relay_mode else ""
+        relay_operation_key = str((staging_run or {}).get("_operation_key") or "")
+        if relay_mode and not relay_operation_key and run_id and self.db:
+            relay_operation_key = str((self.db.rclone.get_rclone_run(run_id) or {}).get("operation_key") or "")
+        relay_file_match = re.fullmatch(r"relay-file:([1-9][0-9]*):(.+)", relay_operation_key)
+        relay_file_index = int(relay_file_match.group(1)) if relay_file_match else 0
+        relay_plan_key = self._plan_scoped_operation_key(relay_operation_key)
 
         env = os.environ.copy()
         retired_prefixes = (
@@ -2283,7 +2671,7 @@ class RcloneService:
             "RCLONE_ONLY_JOB_DIR": copy_run["job_dir_name"],
             "RCLONE_STAGING_ENABLED": "true",
             "RCLONE_DELETE_SOURCE_AFTER_ACK": (
-                "true" if copy_run.get("delete_source_after_ack", True) else "false"
+                "true" if not relay_mode and copy_run.get("delete_source_after_ack", True) else "false"
             ),
             "LOCK_FILE": self.config.get("lock_file", "/tmp/fnos_media_import_rclone.lock"),
             "RCLONE_COPY_MODE": "true",
@@ -2294,9 +2682,12 @@ class RcloneService:
             "RCLONE_COPY_LOCAL_TARGET": copy_run["local_target"],
             "RCLONE_COPY_RELAY_MODE": "true" if relay_mode else "false",
             "RCLONE_COPY_RELAY_ROOT": managed_relay_root,
+            "RCLONE_COPY_RELAY_SEQUENTIAL": "true" if relay_mode else "false",
+            "RCLONE_COPY_RELAY_PLAN_KEY": relay_plan_key if relay_mode else "",
+            "RCLONE_COPY_RELAY_FILE_INDEX": relay_file_index,
             "RCLONE_COPY_DESTINATION_ID": copy_run.get("destination_id", ""),
             "RCLONE_COPY_DELETE_SOURCE_AFTER_ACK": (
-                "true" if copy_run.get("delete_source_after_ack", True) else "false"
+                "true" if not relay_mode and copy_run.get("delete_source_after_ack", True) else "false"
             ),
             **category_dirs,
         }
@@ -2442,6 +2833,9 @@ class RcloneService:
         # 与冻结计划的基础幂等键同源；比对前必须剥离前缀（见
         # execution_repository._operation_key_aliases 的同一约定）。
         key = str(value or "").strip()
+        file_key = re.fullmatch(r"relay-file:([1-9][0-9]*):(.+)", key)
+        if file_key:
+            return file_key.group(2)
         for prefix in ("landing:", "relay-dl:", "relay-up:"):
             if key.startswith(prefix):
                 return key[len(prefix) :]
@@ -2491,6 +2885,8 @@ class RcloneService:
             return {}, str(rejection.get("message") or "V1 执行计划无效")
         if not is_data_plane_strategy(plan_strategy(plan)):
             return {}, f"任务 #{job_id} 未使用 rclone V1 策略"
+        if effective_operation_key.startswith("relay-file:") and plan_strategy(plan) != "relay_upload_provider":
+            return {}, "逐文件中继 operation_key 不能用于非中继计划"
         declared_operation_key = str(
             (
                 plan.get("transfer")

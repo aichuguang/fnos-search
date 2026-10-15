@@ -156,8 +156,11 @@ def create_storage_blueprint(context: StorageBlueprintContext) -> Blueprint:
 
     @protected
     def _list_assignments() -> Any:
-        items = assignment_service.list_assignments()
-        return jsonify({"success": True, "assignments": [assignment_to_dict(item) for item in items]})
+        snapshot = assignment_service.snapshot()
+        return jsonify({
+            "success": True, "assignments": [assignment_to_dict(item) for item in snapshot["assignments"]],
+            "routing_token": snapshot["routing_token"],
+        })
 
     @protected
     def _put_assignments() -> Any:
@@ -166,10 +169,14 @@ def create_storage_blueprint(context: StorageBlueprintContext) -> Blueprint:
         if not isinstance(assignments, list):
             return jsonify({"success": False, "code": "ASSIGNMENTS_INVALID", "message": "assignments 必须是数组"}), 400
         try:
-            saved = assignment_service.replace(assignments)
+            saved = assignment_service.replace(
+                assignments, expected_token=payload.get("routing_token"), require_snapshot=True,
+            )
         except TargetNotFoundError as exc:
             return jsonify({"success": False, "code": "TARGET_NOT_FOUND", "message": str(exc)}), 404
-        except (AssignmentError, TargetValidationError) as exc:
+        except AssignmentError as exc:
+            return jsonify({"success": False, "code": exc.code, "message": str(exc)}), getattr(exc, "status", 400)
+        except TargetValidationError as exc:
             return jsonify({"success": False, "code": "ASSIGNMENTS_INVALID", "message": str(exc)}), 400
         return jsonify({"success": True, "assignments": [assignment_to_dict(item) for item in saved]})
 

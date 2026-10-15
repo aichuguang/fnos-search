@@ -227,6 +227,7 @@ class AccountsV1Tests(unittest.TestCase):
         updated = self.service.refresh_runtime_credentials(
             account.account_id,
             {"cookie": "refreshed-cookie"},
+            expected_revision=selected.account_revision,
         )
         current = self.service.get_active_account("quark")
         self.assertGreater(updated.current_revision, selected.account_revision)

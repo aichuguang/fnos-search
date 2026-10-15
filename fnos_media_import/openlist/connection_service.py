@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import urllib.parse
+from contextlib import contextmanager
 from typing import Any, Callable
 
 from ..accounts.crypto import PURPOSE_OPENLIST, ROOT_KEY_ENV, decrypt, encrypt
@@ -25,9 +26,41 @@ from . import (
     OpenListValidationError,
 )
 from .webdav_client import OpenListWebDAVClient
+from .runtime_sync import OpenListRuntimeSync, managed_remote_identity
 
 CONNECTION_KEY_ID = f"v2:{PURPOSE_OPENLIST}"
 _CONNECTION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_REMOTE_CONFIRMATION_GUIDANCE = (
+    "Worker 会使用已保存的连接自动核验并恢复确认；若仍失败，请检查具体的网络、权限或配置错误。"
+    "无需因升级重复保存连接，也不需要重建来源任务，请保留已转存文件。"
+)
+_REMOTE_IDENTITY_MESSAGES = {
+    "OPENLIST_REMOTE_CONFIRMED": "托管 rclone Remote 与冻结 OpenList 连接身份一致。",
+    "OPENLIST_REMOTE_CONFIRMATION_REQUIRED": "托管 rclone Remote 尚未完成确认。" + _REMOTE_CONFIRMATION_GUIDANCE,
+    "OPENLIST_REMOTE_CONFIRMATION_UNKNOWN": "托管 rclone Remote 的同步结果或确认记录尚不可信。" + _REMOTE_CONFIRMATION_GUIDANCE,
+    "OPENLIST_REMOTE_SYNC_BUSY": (
+        "OpenList 配置正在同步、Remote 正被占用或同步尚未完成。请等待结束后刷新重试；"
+        "Worker 会在搬运前重新核验，不要重新转存或删除已转存文件。"
+    ),
+    "OPENLIST_REMOTE_SCOPE_CHANGED": (
+        "当前 rclone Remote 名称或配置文件路径与已确认范围不一致。请先核对 Web 与 Worker 的 Remote 配置，"
+        "恢复原范围，或保持原 OpenList 连接及凭据不变并重新保存确认；请保留已转存文件。"
+    ),
+    "OPENLIST_CONNECTION_IDENTITY_CHANGED": (
+        "冻结 OpenList 连接与当前连接的地址、账号、启用状态或凭据身份已变化，禁止使用当前 Remote 继续搬运。"
+        "请核对原连接身份；无法恢复时再重新规划，并保留已转存文件。"
+    ),
+    "OPENLIST_CONNECTION_REVISION_INVALID": "冻结 OpenList 连接修订无效，无法确认安全搬运；请保留已转存文件并核对任务计划。",
+    "OPENLIST_CONNECTION_REVISION_MISSING": "当前或冻结的 OpenList 连接修订缺失，无法确认安全搬运；请保留已转存文件并核对任务计划。",
+}
+
+
+def _remote_identity_diagnostic(reason_code: str) -> dict[str, Any]:
+    return {
+        "matches": reason_code == "OPENLIST_REMOTE_CONFIRMED",
+        "reason_code": reason_code,
+        "message": _REMOTE_IDENTITY_MESSAGES[reason_code],
+    }
 
 # The managed rclone worker reads one mutable WebDAV remote.  Operational
 # connection edits must therefore wait until every automatically executable
@@ -186,6 +219,47 @@ class OpenListConnectionService:
         self.database = database
         self.master_key_provider = master_key_provider
         self.probe_runner = probe_runner or self._default_probe_runner
+        self.runtime_sync = OpenListRuntimeSync(database)
+        self._managed_remote_identity_provider: Callable[[], dict[str, str]] | None = None
+
+    @contextmanager
+    def mutation_guard(self):
+        with self.runtime_sync.mutation() as token:
+            yield token
+
+    def set_managed_remote_identity_provider(self, provider: Callable[[], dict[str, str]]) -> None:
+        self._managed_remote_identity_provider = provider
+
+    def managed_remote_identity(self) -> dict[str, str]:
+        provider = self._managed_remote_identity_provider
+        return dict(provider() or {}) if callable(provider) else {}
+
+    def runtime_fingerprint(
+        self, connection_id: str, revision: int, *, managed_remote: dict[str, str] | None = None,
+    ) -> str:
+        credentials = self.resolve_credentials(connection_id, revision)
+        identity = self.managed_remote_identity() if managed_remote is None else managed_remote
+        encoded = json.dumps(
+            {
+                **{key: credentials.get(key) for key in ("connection_id", "base_url", "username", "password", "enabled")},
+                "managed_remote": identity,
+            },
+            ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        return hmac.new(
+            _master_key_bytes(self.master_key_provider),
+            b"fnos-openlist-managed-remote-v2\0" + encoded,
+            "sha256",
+        ).hexdigest()
+
+    def _mark_remote_pending(self) -> None:
+        sync = self.runtime_sync
+        if sync.tracks_remote or sync.state():
+            if not sync.set_state(sync.current_token(), "pending"):
+                conflict = OpenListValidationError("OpenList 配置写入执行权已丢失")
+                conflict.code = "OPENLIST_SYNC_BUSY"
+                conflict.status = 409
+                raise conflict
 
     # ---- 查询 / 序列化 ----
 
@@ -227,6 +301,10 @@ class OpenListConnectionService:
     # ---- 写操作 ----
 
     def create_connection(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.mutation_guard(), self.runtime_sync.remote_lock.hold():
+            return self._create_connection(payload)
+
+    def _create_connection(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload or {})
         connection_id = str(payload.get("connection_id") or "").strip()
         if not connection_id:
@@ -273,9 +351,14 @@ class OpenListConnectionService:
                 )
             except sqlite3.IntegrityError as exc:
                 raise OpenListValidationError(f"OpenList 连接已存在：{connection_id}") from exc
+            self._mark_remote_pending()
         return self.get_connection(connection_id)
 
     def update_connection(self, connection_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.mutation_guard(), self.runtime_sync.remote_lock.hold():
+            return self._update_connection(connection_id, payload)
+
+    def _update_connection(self, connection_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload or {})
         with self.database.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -412,6 +495,8 @@ class OpenListConnectionService:
                     now,
                 ),
             )
+            if connection_identity_changed:
+                self._mark_remote_pending()
         return self.get_connection(connection_id)
 
     def get_revision(self, connection_id: str, revision: int) -> dict[str, Any] | None:
@@ -431,7 +516,78 @@ class OpenListConnectionService:
             and str(row["credential_key_id"] or "") == CONNECTION_KEY_ID,
         }
 
-    def runtime_identity_matches(self, connection_id: str, revision: int) -> bool:
+    def managed_remote_identity_matches(
+        self, connection_id: str, revision: int, remote_name: str, config_path: str,
+    ) -> bool:
+        identity = managed_remote_identity(remote_name, config_path)
+        return bool(identity) and self.runtime_identity_matches(connection_id, revision, managed_remote=identity)
+
+    def managed_remote_identity_diagnostics(
+        self, connection_id: str, revision: int, remote_name: str, config_path: str,
+    ) -> dict[str, Any]:
+        """Explain a rejected identity check without changing its authority.
+
+        The bool validator remains the only admission decision. Diagnostic
+        reads may race a completed sync, so callers must never turn an earlier
+        rejection into permission based on this descriptive result.
+        """
+
+        try:
+            identity = managed_remote_identity(remote_name, config_path)
+            if not identity:
+                return _remote_identity_diagnostic("OPENLIST_REMOTE_SCOPE_CHANGED")
+            try:
+                selected_revision = int(revision)
+            except (TypeError, ValueError):
+                selected_revision = 0
+            if selected_revision <= 0:
+                return _remote_identity_diagnostic("OPENLIST_CONNECTION_REVISION_INVALID")
+            if self.runtime_identity_matches(connection_id, selected_revision, managed_remote=identity):
+                return _remote_identity_diagnostic("OPENLIST_REMOTE_CONFIRMED")
+
+            sync = self.runtime_sync
+            if sync.change_lock.busy() or sync.remote_lock.busy():
+                return _remote_identity_diagnostic("OPENLIST_REMOTE_SYNC_BUSY")
+            with self.database.connect() as conn:
+                current = self._get_row(conn, connection_id)
+                frozen = conn.execute(
+                    "SELECT * FROM openlist_connection_revisions WHERE connection_id=? AND revision=?",
+                    (connection_id, selected_revision),
+                ).fetchone()
+            if current is None or frozen is None:
+                return _remote_identity_diagnostic("OPENLIST_CONNECTION_REVISION_MISSING")
+            config = json.loads(frozen["config_json"] or "{}")
+            if not isinstance(config, dict):
+                return _remote_identity_diagnostic("OPENLIST_REMOTE_CONFIRMATION_UNKNOWN")
+            if not (
+                str(current["base_url"] or "") == str(config.get("base_url") or "")
+                and str(current["username"] or "") == str(config.get("username") or "")
+                and bool(current["enabled"]) == bool(config.get("enabled", True))
+                and bytes(current["password_ciphertext"] or b"") == bytes(frozen["password_ciphertext"] or b"")
+                and str(current["credential_key_id"] or "") == str(frozen["credential_key_id"] or "")
+            ):
+                return _remote_identity_diagnostic("OPENLIST_CONNECTION_IDENTITY_CHANGED")
+            current_remote = self.managed_remote_identity()
+            if current_remote and current_remote != identity:
+                return _remote_identity_diagnostic("OPENLIST_REMOTE_SCOPE_CHANGED")
+            state = sync.state()
+            if not state:
+                return _remote_identity_diagnostic("OPENLIST_REMOTE_CONFIRMATION_REQUIRED")
+            if state.get("phase") == "pending":
+                return _remote_identity_diagnostic("OPENLIST_REMOTE_SYNC_BUSY")
+            confirmed_remote = state.get("managed_remote")
+            if state.get("phase") == "confirmed":
+                if not confirmed_remote:
+                    return _remote_identity_diagnostic("OPENLIST_REMOTE_CONFIRMATION_REQUIRED")
+                if confirmed_remote != identity:
+                    return _remote_identity_diagnostic("OPENLIST_REMOTE_SCOPE_CHANGED")
+            return _remote_identity_diagnostic("OPENLIST_REMOTE_CONFIRMATION_UNKNOWN")
+        except Exception:  # noqa: BLE001 - diagnostics must not leak credentials or mask a refusal
+            return _remote_identity_diagnostic("OPENLIST_REMOTE_CONFIRMATION_UNKNOWN")
+
+    def runtime_identity_matches(
+        self, connection_id: str, revision: int, *, managed_remote: dict[str, str] | None = None,
+    ) -> bool:
         """Return whether a frozen revision still matches the managed remote.
 
         Display-only revisions intentionally compare equal.  URL, username,
@@ -459,7 +615,7 @@ class OpenListConnectionService:
             config = json.loads(frozen["config_json"] or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             return False
-        return bool(
+        identity_matches = bool(
             str(current["base_url"] or "") == str(config.get("base_url") or "")
             and str(current["username"] or "") == str(config.get("username") or "")
             and bool(current["enabled"]) == bool(config.get("enabled", True))
@@ -468,6 +624,19 @@ class OpenListConnectionService:
             and str(current["credential_key_id"] or "")
             == str(frozen["credential_key_id"] or "")
         )
+        if not identity_matches:
+            return False
+        try:
+            current_remote = self.managed_remote_identity()
+            expected_remote = current_remote if managed_remote is None else managed_remote
+            if current_remote and current_remote != expected_remote:
+                return False
+            fingerprint = self.runtime_fingerprint(
+                connection_id, selected_revision, managed_remote=expected_remote,
+            ) if self.runtime_sync.state() else ""
+            return self.runtime_sync.permits(fingerprint, managed_remote=expected_remote)
+        except Exception:
+            return False
 
     def _assert_runtime_mutation_safe(self, conn: Any, connection_id: str) -> None:
         """Reject an operational edit while the shared Remote is in use."""
@@ -575,6 +744,10 @@ class OpenListConnectionService:
         raise conflict
 
     def delete_connection(self, connection_id: str) -> dict[str, Any]:
+        with self.mutation_guard(), self.runtime_sync.remote_lock.hold():
+            return self._delete_connection(connection_id)
+
+    def _delete_connection(self, connection_id: str) -> dict[str, Any]:
         with self.database.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._get_row(conn, connection_id)
@@ -621,6 +794,7 @@ class OpenListConnectionService:
                 raise OpenListValidationError("连接下仍存在挂载，请先删除挂载") from exc
             if cursor.rowcount == 0:
                 raise OpenListNotFoundError(f"OpenList 连接不存在：{connection_id}")
+            self._mark_remote_pending()
         return {"connection_id": connection_id, "deleted": True}
 
     # ---- 凭证解析（供 mount 服务使用）----

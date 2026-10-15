@@ -34,6 +34,7 @@ TEST_STATUS_FAILED = "failed"
 
 DEFAULT_SCOPE = "default"
 ACCOUNT_ID_PREFIX = "acc_"
+IDENTITY_CONFIG_KEY = "_provider_identity"
 
 MasterKeyProvider = Callable[[], bytes]
 AccountTester = Callable[[str, dict[str, Any], dict[str, Any]], AccountTestResult]
@@ -65,6 +66,14 @@ class CredentialResolutionError(ProviderAccountError):
 
 class ProviderMismatchError(ProviderAccountError):
     code = "PROVIDER_MISMATCH"
+
+
+class AccountIdentityChangedError(ProviderAccountError):
+    code = "ACCOUNT_IDENTITY_CHANGED"
+
+
+class AccountIdentityUnverifiedError(ProviderAccountError):
+    code = "ACCOUNT_IDENTITY_UNVERIFIED"
 
 
 def _manifest_catalog_item(item: Any) -> dict[str, Any]:
@@ -140,6 +149,97 @@ class ProviderAccountService:
     @staticmethod
     def _new_account_id() -> str:
         return f"{ACCOUNT_ID_PREFIX}{secrets.token_hex(8)}"
+
+    @staticmethod
+    def _public_config(config: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in config.items() if key != IDENTITY_CONFIG_KEY}
+
+    @staticmethod
+    def _reject_identity_override(config: dict[str, Any]) -> None:
+        if IDENTITY_CONFIG_KEY in config:
+            raise InvalidConfigError("账号身份由 Provider 检测确认，不能通过配置覆盖")
+
+    def _identity_transition(
+        self,
+        provider_kind: str,
+        previous: dict[str, Any] | None,
+        config: dict[str, Any],
+        credentials: dict[str, Any],
+        *,
+        identity_id: str = "",
+        trusted_refresh: bool = False,
+    ) -> tuple[dict[str, Any], bool]:
+        """Return protected revision config and whether mappings need revalidation."""
+        previous_config = dict((previous or {}).get("config") or {})
+        proof = previous_config.get(IDENTITY_CONFIG_KEY)
+        proof = proof if isinstance(proof, dict) and proof.get("provider_kind") == provider_kind else {}
+        old_subject = str(proof.get("identity_id") or "").strip()
+        subject = str(identity_id or "").strip()
+        if old_subject and subject and old_subject != subject:
+            raise AccountIdentityChangedError("本次登录属于另一个真实网盘账号，请新增独立账号；原账号和保存位置未修改")
+        candidate = self._public_config(dict(config or {}))
+        unchanged = bool(previous) and (
+            candidate == self._public_config(previous_config)
+            and credentials == self._decrypt_credentials(previous, str(previous.get("account_id") or ""))
+        )
+        same_identity = bool(old_subject and subject and old_subject == subject)
+        continuity = previous is None or unchanged or same_identity or trusted_refresh
+        if subject or old_subject:
+            candidate[IDENTITY_CONFIG_KEY] = {
+                "provider_kind": provider_kind,
+                "identity_id": subject or old_subject,
+                "verified": bool(subject or (continuity and proof.get("verified"))),
+            }
+        return candidate, not continuity
+
+    def _invalidate_unproven_mappings(self, conn: Any, account_id: str, required: bool, message: str) -> str:
+        if required and self._repository.invalidate_storage_mappings(account_id, conn=conn):
+            return f"{message}；无法证明仍为原账号，旧保存位置已停用，请重新确认映射并检测"
+        return message
+
+    @staticmethod
+    def _with_identity_baseline(previous: dict[str, Any], provider_kind: str, identity_id: str) -> dict[str, Any]:
+        config = dict(previous.get("config") or {})
+        existing = config.get(IDENTITY_CONFIG_KEY)
+        if identity_id and not (isinstance(existing, dict) and existing.get("identity_id")):
+            config[IDENTITY_CONFIG_KEY] = {"provider_kind": provider_kind, "identity_id": identity_id, "verified": True}
+        return {**previous, "config": config}
+
+    def _interactive_identity(
+        self, provider_kind: str, previous: dict[str, Any] | None, config: dict[str, Any],
+        credentials: dict[str, Any], result: AccountTestResult, *, tester: AccountTester | None,
+    ) -> tuple[dict[str, Any], str]:
+        subject = str(getattr(result, "identity_id", "") or "").strip()
+        candidate, unproven = self._identity_transition(
+            provider_kind, previous, config, credentials, identity_id=subject,
+        )
+        if not unproven:
+            return candidate, ""
+        # Legacy revisions have no stable identity stamp. Read-only probing
+        # the original credentials can establish it, but a display alias or
+        # an expired/unverifiable old login must never authorize replacement.
+        old_proof = (previous or {}).get("config", {}).get(IDENTITY_CONFIG_KEY)
+        old_subject = str(old_proof.get("identity_id") or "") if isinstance(old_proof, dict) else ""
+        if previous is not None and not old_subject and subject:
+            try:
+                old_result = self._run_account_test(
+                    provider_kind, self._decrypt_credentials(previous, str(previous.get("account_id") or "")),
+                    self._public_config(dict(previous.get("config") or {})), tester=tester,
+                    cache_namespace=f"identity-baseline:{previous.get('account_id')}:{previous.get('revision')}",
+                )
+            except Exception:  # noqa: BLE001 - no identity proof means no replacement
+                old_result = AccountTestResult(False)
+            baseline = str(getattr(old_result, "identity_id", "") or "").strip() if old_result.ok else ""
+            if baseline:
+                candidate, _ = self._identity_transition(
+                    provider_kind, self._with_identity_baseline(previous, provider_kind, baseline),
+                    config, credentials, identity_id=subject,
+                )
+                return candidate, baseline
+        raise AccountIdentityUnverifiedError(
+            "无法确认本次登录仍属于原网盘账号，已拒绝覆盖；请新增独立账号，或先用有效旧凭据完成身份检测。"
+            "原账号、默认选择和保存位置均未修改"
+        )
 
     # ---- catalog ----
 
@@ -217,6 +317,7 @@ class ProviderAccountService:
         kind = str(provider_kind or "").strip()
         if kind not in self._catalog_by_kind():
             raise InvalidConfigError(f"不支持的 Provider：{kind}")
+        self._reject_identity_override(config or {})
         errors = self._validate_credentials(kind, config or {}, credentials or {})
         if errors:
             raise InvalidConfigError("；".join(errors))
@@ -284,9 +385,11 @@ class ProviderAccountService:
         existing_id = str(data.get("account_id") or "").strip()
         name = str(data.get("name") or "").strip() or "主账号"
         supplied_config = dict(data.get("config") or {})
+        self._reject_identity_override(supplied_config)
         supplied_credentials = dict(data.get("credentials") or {})
         expected_revision: int | None = None
         previous_identity = ""
+        revision = None
 
         if existing_id:
             with self._database.connect() as conn:
@@ -303,7 +406,7 @@ class ProviderAccountService:
                     raise CredentialResolutionError(
                         f"账号 {existing_id} 缺少最新修订 {expected_revision}"
                     )
-                merged_config = dict(revision.get("config") or {})
+                merged_config = self._public_config(dict(revision.get("config") or {}))
                 merged_config.update(supplied_config)
                 merged_credentials = self._decrypt_credentials(revision, existing_id)
                 for key, value in supplied_credentials.items():
@@ -332,6 +435,11 @@ class ProviderAccountService:
             or self._derive_identity_hint(kind, merged_config, merged_credentials)
             or previous_identity
         )
+        baseline_identity = ""
+        if result.ok:
+            merged_config, baseline_identity = self._interactive_identity(
+                kind, revision, merged_config, merged_credentials, result, tester=tester,
+            )
         prepared: dict[str, Any] = {
             "provider_kind": kind,
             "account_id": existing_id or None,
@@ -340,6 +448,8 @@ class ProviderAccountService:
             "config": merged_config,
             "identity_hint": hint,
             "test_message": str(result.message or ""),
+            "identity_id": getattr(result, "identity_id", "") if result.ok else "",
+            "previous_identity_id": baseline_identity,
         }
         if result.ok:
             ciphertext, key_id = encrypt(
@@ -374,6 +484,8 @@ class ProviderAccountService:
         key_id = str(prepared.get("credential_key_id") or "").strip()
         if not isinstance(ciphertext, (bytes, bytearray)) or not key_id:
             raise InvalidConfigError("账号登录结果尚未通过检测，禁止落库")
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
 
         now = utc_now()
         hint = str(prepared.get("identity_hint") or "").strip()
@@ -384,8 +496,22 @@ class ProviderAccountService:
             expected_revision = int(prepared.get("expected_revision") or 0)
             if account is None or account.provider_kind != kind:
                 raise ProviderMismatchError("重新登录的账号不存在或 Provider 不匹配")
+            if not account.enabled:
+                raise AccountDisabledError("账号已被禁用，本次重新登录未保存，当前账号选择未修改")
             if account.current_revision != expected_revision:
                 raise AccountConflictError("账号凭证已被其他操作更新，请刷新后重试")
+            previous = self._repository.get_revision(existing_id, expected_revision, conn=conn)
+            if previous is None:
+                raise CredentialResolutionError("账号缺少当前凭据修订")
+            previous = self._with_identity_baseline(previous, kind, str(prepared.get("previous_identity_id") or ""))
+            credentials = self._decrypt_credentials({
+                "credentials_ciphertext": bytes(ciphertext), "credential_key_id": key_id,
+            }, existing_id)
+            config, invalidate = self._identity_transition(
+                kind, previous, config, credentials, identity_id=str(prepared.get("identity_id") or ""),
+            )
+            if invalidate:
+                raise AccountIdentityUnverifiedError("无法确认仍为原账号，已拒绝覆盖，请新增独立账号；默认选择和保存位置未修改")
             next_revision = expected_revision + 1
             self._repository.insert_revision(
                 existing_id,
@@ -433,7 +559,7 @@ class ProviderAccountService:
             )
 
         selection = self._repository.get_selection(kind, DEFAULT_SCOPE, conn=conn)
-        if (
+        if (not existing_id or selection is None) and (
             selection is None
             or selection.account_id != account_id
             or selection.account_revision != account_revision
@@ -480,10 +606,14 @@ class ProviderAccountService:
         identity_hint: str = "",
     ) -> ProviderAccount:
         """凭证更新：创建新修订并提升 current_revision，旧修订保持可读。"""
+        self._reject_identity_override(config or {})
         with self._database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             account = self._repository.get_account(account_id, conn=conn)
             if account is None:
                 raise AccountNotFoundError(account_id)
+            if not account.enabled:
+                raise AccountDisabledError("被禁用的账号不能更新凭据")
             current = self._repository.get_revision(
                 account_id, account.current_revision, conn=conn
             )
@@ -491,7 +621,7 @@ class ProviderAccountService:
                 raise CredentialResolutionError(
                     f"账号 {account_id} 缺少最新修订 {account.current_revision}"
                 )
-            merged_config = dict(current.get("config") or {})
+            merged_config = self._public_config(dict(current.get("config") or {}))
             merged_config.update(dict(config or {}))
             merged_credentials = self._decrypt_credentials(current, account_id)
             for key, value in dict(credentials or {}).items():
@@ -505,6 +635,10 @@ class ProviderAccountService:
             )
             if errors:
                 raise InvalidConfigError("；".join(errors))
+            merged_config, invalidate = self._identity_transition(
+                account.provider_kind, current, merged_config, merged_credentials,
+            )
+            message = self._invalidate_unproven_mappings(conn, account_id, invalidate, "凭据已更新，等待检测")
             ciphertext, key_id = encrypt(
                 self._master_key(),
                 json.dumps(merged_credentials, ensure_ascii=False, sort_keys=True),
@@ -521,7 +655,7 @@ class ProviderAccountService:
             )
             self._repository.set_account_revision(account_id, new_revision, conn=conn)
             self._repository.update_account_test(
-                account_id, TEST_STATUS_UNTESTED, "", None, conn=conn
+                account_id, TEST_STATUS_UNTESTED, message, None, conn=conn
             )
             hint = str(identity_hint or "").strip() or self._derive_identity_hint(
                 account.provider_kind, merged_config, merged_credentials
@@ -547,17 +681,20 @@ class ProviderAccountService:
         and active selection untouched. Network validation therefore happens
         before the short database transaction that publishes the new revision.
         """
+        self._reject_identity_override(config or {})
         with self._database.connect() as conn:
             account = self._repository.get_account(account_id, conn=conn)
             if account is None:
                 raise AccountNotFoundError(account_id)
+            if not account.enabled:
+                raise AccountDisabledError("被禁用的账号不能重新登录")
             expected_revision = account.current_revision
             current = self._repository.get_revision(account_id, expected_revision, conn=conn)
             if current is None:
                 raise CredentialResolutionError(
                     f"账号 {account_id} 缺少最新修订 {expected_revision}"
                 )
-            merged_config = dict(current.get("config") or {})
+            merged_config = self._public_config(dict(current.get("config") or {}))
             merged_config.update(dict(config or {}))
             merged_credentials = self._decrypt_credentials(current, account_id)
             for key, value in dict(credentials or {}).items():
@@ -576,6 +713,10 @@ class ProviderAccountService:
         if not result.ok:
             return account, result
 
+        merged_config, baseline_identity = self._interactive_identity(
+            account.provider_kind, current, merged_config, merged_credentials, result, tester=tester,
+        )
+
         ciphertext, key_id = encrypt(
             self._master_key(),
             json.dumps(merged_credentials, ensure_ascii=False, sort_keys=True),
@@ -591,11 +732,24 @@ class ProviderAccountService:
             or account.identity_hint
         )
         with self._database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             latest = self._repository.get_account(account_id, conn=conn)
             if latest is None:
                 raise AccountNotFoundError(account_id)
+            if not latest.enabled:
+                raise AccountDisabledError("账号已被禁用，本次重新登录未保存，当前账号选择未修改")
             if latest.current_revision != expected_revision:
                 raise AccountConflictError("账号凭证已被其他操作更新，请刷新后重试")
+            previous = self._repository.get_revision(account_id, expected_revision, conn=conn)
+            if previous is None:
+                raise CredentialResolutionError("账号缺少当前凭据修订")
+            previous = self._with_identity_baseline(previous, account.provider_kind, baseline_identity)
+            merged_config, invalidate = self._identity_transition(
+                account.provider_kind, previous, merged_config, merged_credentials, identity_id=getattr(result, "identity_id", ""),
+            )
+            if invalidate:
+                raise AccountIdentityUnverifiedError("无法确认仍为原账号，已拒绝覆盖，请新增独立账号")
+            test_message = result.message
             self._repository.insert_revision(
                 account_id,
                 next_revision,
@@ -608,7 +762,7 @@ class ProviderAccountService:
             self._repository.update_account_test(
                 account_id,
                 TEST_STATUS_OK,
-                result.message,
+                test_message,
                 utc_now(),
                 conn=conn,
             )
@@ -641,9 +795,12 @@ class ProviderAccountService:
             if expected <= 0:
                 raise AccountConflictError("运行时凭证修订无效")
         with self._database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             account = self._repository.get_account(account_id, conn=conn)
             if account is None:
                 raise AccountNotFoundError(account_id)
+            if not account.enabled:
+                raise AccountDisabledError("账号已被禁用，拒绝旧运行时回写凭据")
             if expected is not None and account.current_revision != expected:
                 raise AccountConflictError("账号凭证修订已变化，拒绝旧任务覆盖当前凭证")
             if not patch:
@@ -664,6 +821,13 @@ class ProviderAccountService:
                 raise InvalidConfigError("；".join(errors))
             if merged == existing_credentials:
                 return account
+            if expected is None:
+                raise AccountConflictError("运行时凭据写入必须绑定 expected_revision，缺少修订时拒绝覆盖当前账号")
+            # This is a trusted refresh grant from an importer already bound
+            # to this exact revision, not an administrator's replacement login.
+            config, _ = self._identity_transition(
+                account.provider_kind, current, config, merged, trusted_refresh=True,
+            )
             ciphertext, key_id = encrypt(
                 self._master_key(),
                 json.dumps(merged, ensure_ascii=False, sort_keys=True),
@@ -761,12 +925,14 @@ class ProviderAccountService:
             account = self._repository.get_account(account_id, conn=conn)
             if account is None:
                 raise AccountNotFoundError(account_id)
+            if not account.enabled:
+                raise AccountDisabledError("被禁用的账号不能重新检测并激活凭据")
             revision = self._repository.get_revision(account_id, account.current_revision, conn=conn)
             if revision is None:
                 raise CredentialResolutionError(
                     f"账号 {account_id} 缺少最新修订 {account.current_revision}"
                 )
-            config = revision["config"] or {}
+            config = self._public_config(dict(revision["config"] or {}))
             credentials = self._decrypt_credentials(revision, account_id)
             tested_revision = account.current_revision
             provider_kind = account.provider_kind
@@ -779,18 +945,36 @@ class ProviderAccountService:
             cache_namespace=f"account:{account_id}",
         )
         with self._database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             current = self._repository.get_account(account_id, conn=conn)
             if current is None:
                 raise AccountNotFoundError(account_id)
+            if not current.enabled:
+                raise AccountDisabledError("账号在检测期间已被禁用，本次检测结果未保存")
             if current.current_revision != tested_revision:
                 raise AccountConflictError(
                     "账号凭证在检测期间已更新，本次检测结果已丢弃，请重新检测"
+                )
+            identity_config = revision["config"]
+            if result.ok:
+                identity_config, _ = self._identity_transition(
+                    provider_kind, revision, config, credentials, identity_id=getattr(result, "identity_id", ""),
                 )
             if not persist_result:
                 return result
             status = TEST_STATUS_OK if result.ok else TEST_STATUS_FAILED
             now = utc_now()
             hint = str(result.identity_hint or "").strip() or current.identity_hint
+            if result.ok:
+                if identity_config != revision["config"]:
+                    # Bootstrap stable identity without rewriting an immutable
+                    # credential revision already used by a frozen task.
+                    tested_revision += 1
+                    self._repository.insert_revision(
+                        account_id, tested_revision, json.dumps(identity_config, ensure_ascii=False),
+                        revision["credentials_ciphertext"], revision["credential_key_id"], conn=conn,
+                    )
+                    self._repository.set_account_revision(account_id, tested_revision, conn=conn)
             self._repository.update_account_test(account_id, status, result.message, now, conn=conn)
             self._repository.update_identity_hint(account_id, hint, conn=conn)
             if result.ok:
@@ -814,7 +998,7 @@ class ProviderAccountService:
             raise InvalidConfigError(
                 f"{provider_kind} 未注入真实账号检测器，禁止产生假健康状态"
             )
-        probe_config = dict(config or {})
+        probe_config = self._public_config(dict(config or {}))
         if provider_kind == "tianyi" and cache_namespace:
             probe_config["_cache_namespace"] = cache_namespace
         return test_fn(provider_kind, credentials, probe_config)
@@ -829,6 +1013,7 @@ class ProviderAccountService:
     ) -> AccountSelection:
         scope = str(scope or "").strip() or DEFAULT_SCOPE
         with self._database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             account = self._repository.get_account(account_id, conn=conn)
             if account is None:
                 raise AccountNotFoundError(account_id)
@@ -847,6 +1032,7 @@ class ProviderAccountService:
 
     def disable_account(self, account_id: str) -> None:
         with self._database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             account = self._repository.get_account(account_id, conn=conn)
             if account is None:
                 raise AccountNotFoundError(account_id)
@@ -856,6 +1042,7 @@ class ProviderAccountService:
 
     def delete_account(self, account_id: str) -> None:
         with self._database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             account = self._repository.get_account(account_id, conn=conn)
             if account is None:
                 raise AccountNotFoundError(account_id)
@@ -917,7 +1104,7 @@ class ProviderAccountService:
             "account_id": account_id,
             "provider_kind": account.provider_kind,
             "revision": int(revision),
-            "config": dict(rev.get("config") or {}),
+            "config": self._public_config(dict(rev.get("config") or {})),
             "credentials": self._decrypt_credentials(rev, account_id),
         }
 
@@ -929,7 +1116,7 @@ class ProviderAccountService:
         raw = self._repository.get_revision(account_id, selected_revision)
         if raw is None:
             raise CredentialResolutionError(f"账号修订不存在：{account_id}@{selected_revision}")
-        return dict(raw.get("config") or {})
+        return self._public_config(dict(raw.get("config") or {}))
 
     def _decrypt_credentials(self, revision: dict[str, Any], account_id: str) -> dict[str, Any]:
         try:
@@ -974,6 +1161,8 @@ class ProviderAccountService:
 __all__ = [
     "ACCOUNT_ID_PREFIX",
     "AccountDisabledError",
+    "AccountIdentityChangedError",
+    "AccountIdentityUnverifiedError",
     "AccountNotTestedError",
     "AccountTester",
     "ActiveAccountDisableError",

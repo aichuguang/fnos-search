@@ -31,7 +31,35 @@ class JobQueryRepository:
                 "SELECT * FROM import_jobs WHERE idempotency_key = ? LIMIT 1",
                 (key,),
             ).fetchone()
-            return self._decode_job(row)
+        return self._decode_job(row)
+
+    def list_transfer_statuses(self, observed_job_ids: list[int], *, limit: int = 50) -> list[dict[str, Any]]:
+        """Bounded, single-snapshot join shared with the formal-task read model."""
+        ids = self._normalize_ids(observed_job_ids)[:50]
+        placeholders = ",".join("?" for _ in ids) or "NULL"
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                f"""
+                WITH recent AS (
+                    SELECT te.job_id
+                    FROM transfer_executions te JOIN import_jobs j ON j.id = te.job_id
+                    ORDER BY CASE
+                        WHEN j.status IN ('done','success','completed','cancelled','canceled','rejected') THEN 2
+                        WHEN j.status IN ('failed','review','manual_review') THEN 1
+                        ELSE 0 END, te.updated_at DESC, te.job_id DESC
+                    LIMIT ?
+                )
+                SELECT j.id AS job_id, j.title, j.status AS job_status,
+                    j.error_message AS job_error, j.updated_at AS job_updated_at,
+                    te.phase AS execution_phase, te.updated_at AS state_updated_at,
+                    te.final_verified, te.app_acked, te.last_error_message AS execution_message
+                FROM import_jobs j LEFT JOIN transfer_executions te ON te.job_id = j.id
+                WHERE j.id IN (SELECT job_id FROM recent) OR j.id IN ({placeholders})
+                ORDER BY j.id DESC
+                """,
+                [max(1, min(int(limit), 50)), *ids],
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_many(self, job_ids: list[int]) -> dict[int, dict[str, Any]]:
         normalized = self._normalize_ids(job_ids)

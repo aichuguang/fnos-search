@@ -196,6 +196,46 @@ class ProviderAccountRepository:
                 (revision, utc_now(), account_id),
             )
 
+    def invalidate_storage_mappings(self, account_id: str, *, conn: Any) -> int:
+        """Invalidate current mappings when credential continuity is unproven.
+
+        Append mount revisions rather than rewriting old proofs. Existing
+        frozen plans retain their original credential/mount snapshots; current
+        bindings are disabled until the administrator revalidates the location.
+        """
+        from ..openlist.mount_service import _mount_revision_json
+
+        now = utc_now()
+        mounts = conn.execute("SELECT * FROM openlist_mounts WHERE account_id=?", (account_id,)).fetchall()
+        for mount in mounts:
+            history = conn.execute(
+                "SELECT config_json FROM openlist_mount_revisions WHERE mount_id=? AND revision=?",
+                (mount["mount_id"], mount["revision"]),
+            ).fetchone()
+            if history is None:
+                raise AccountConflictError("账号挂载缺少不可变修订，请先修复保存位置")
+            snapshot = json.loads(history["config_json"])
+            locator = json.loads(mount["native_locator_json"] or "{}")
+            locator = dict(locator) if isinstance(locator, dict) else {}
+            for key in ("probe_fingerprint", "upload_tested_at", "organizer_tested_at", "probe_message"):
+                locator.pop(key, None)
+            locator.update(upload_verified=False, organizer_mutation_verified=False)
+            conn.execute(
+                "UPDATE openlist_mounts SET revision=revision+1, identity_status='unverified', "
+                "readable=0, writable=0, last_tested_at=NULL, native_locator_json=? WHERE mount_id=?",
+                (json.dumps(locator, ensure_ascii=False, sort_keys=True), mount["mount_id"]),
+            )
+            updated = conn.execute("SELECT * FROM openlist_mounts WHERE mount_id=?", (mount["mount_id"],)).fetchone()
+            conn.execute(
+                "INSERT INTO openlist_mount_revisions(mount_id, revision, config_json, created_at) VALUES (?,?,?,?)",
+                (mount["mount_id"], updated["revision"], _mount_revision_json(updated, int(snapshot["connection_revision"])), now),
+            )
+        bindings = conn.execute(
+            "UPDATE storage_target_account_bindings SET enabled=0, updated_at=? WHERE account_id=? AND enabled=1",
+            (now, account_id),
+        )
+        return len(mounts) + int(bindings.rowcount)
+
     def delete_account(self, account_id: str, *, conn: Any = None) -> None:
         with self._session(conn) as c:
             # Historical selection revisions are immutable references to

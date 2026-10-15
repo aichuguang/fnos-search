@@ -9,6 +9,7 @@ from typing import Any, Callable
 from ..time_utils import utc_now_iso, utc_now_iso_offset
 from .update_run_repository import UpdateRunRepository
 from .update_subscription_query_repository import UpdateSubscriptionQueryRepository
+from .worker_task_sequence import preserve_worker_task_sequence
 
 ConnectionFactory = Callable[[], AbstractContextManager[sqlite3.Connection]]
 RowDecoder = Callable[[sqlite3.Row | None], dict[str, Any] | None]
@@ -24,6 +25,38 @@ HISTORY_CLEANUP_TABLES = (
     "trending_snapshots", "trending_candidates", "trending_discovery_runs",
 )
 HISTORY_PRESERVED_TABLES = ("app_settings", "update_subscriptions", "update_sources")
+
+# Review requires an explicit operator action, unlike queued/retry-wait work.
+# Unknown states fail closed so a new execution phase cannot silently become
+# eligible for destructive history cleanup.
+_INACTIVE_IMPORT_STATES = (
+    "done", "success", "completed", "failed", "unsupported", "cancelled", "canceled",
+    "rejected", "skipped", "skipped_existing", "review", "manual_review",
+)
+_HISTORY_QUIESCENT_STATES = (
+    ("worker_tasks", "id", "status", "后台任务", ("completed", "failed", "cancelled", "canceled")),
+    ("import_jobs", "id", "status", "入库任务", _INACTIVE_IMPORT_STATES),
+    ("guest_requests", "id", "status", "访客提交", (*_INACTIVE_IMPORT_STATES, "pending_review", "waiting_review")),
+    ("transfer_executions", "job_id", "phase", "传输执行", ("completed", "failed", "manual_review", "cancelled", "canceled")),
+    ("rclone_runs", "id", "status", "rclone 运行", ("success", "completed", "failed", "cancelled", "canceled")),
+    ("organizer_tasks", "id", "status", "整理任务", ("done", "failed", "cancelled", "canceled", "skipped", "waiting_review", "manual_review", "review")),
+    ("organizer_runs", "id", "status", "整理运行", ("success", "done", "completed", "failed", "cancelled", "canceled", "interrupted", "rolled_back")),
+    ("update_runs", "id", "status", "追更运行", ("success", "done", "completed", "partial", "failed", "cancelled", "canceled", "interrupted", "skipped")),
+    ("trending_discovery_runs", "id", "status", "热榜发现", ("success", "completed", "partial", "failed", "cancelled", "canceled", "interrupted", "skipped")),
+)
+
+
+class HistoryCleanupBlockedError(RuntimeError):
+    def __init__(self, blockers: list[dict[str, Any]]) -> None:
+        self.blockers = blockers
+        details = "；".join(
+            f"{item['label']} #{item['first_id']}（{item['status']}，{item['count']} 条）"
+            for item in blockers[:5]
+        )
+        super().__init__(
+            f"存在待执行、运行中或尚未安全结束的任务，未清理任何历史记录：{details}。"
+            "请等待任务结束，或先完成取消/恢复操作后再清理。"
+        )
 
 
 def utc_now() -> str:
@@ -612,6 +645,45 @@ class UpdateRepository:
             )
             return True
 
+    def revoke_update_seen_for_job(
+        self, subscription_id: int, job_id: int, *, expected_rollback: dict[str, Any],
+    ) -> int | None:
+        """Invalidate only evidence undone by this Organizer rollback."""
+        with self._connection_factory() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job_row = conn.execute("SELECT status, raw_data FROM import_jobs WHERE id = ?", (int(job_id),)).fetchone()
+            if job_row is None or job_row["status"] in {"done", "success", "cancelled", "unsupported"}:
+                return None
+            job = _decode_json_fields(dict(job_row), ("raw_data",))
+            raw = job.get("raw_data") if isinstance(job.get("raw_data"), dict) else {}
+            completion = raw.get("completion") if isinstance(raw.get("completion"), dict) else {}
+            rollback = completion.get("rollback") if isinstance(completion.get("rollback"), dict) else {}
+            if rollback.get("status") not in {"running", "failed", "completed"} or any(
+                not expected_rollback.get(key) or rollback.get(key) != expected_rollback.get(key)
+                for key in ("run_id", "rollback_run_id")
+            ):
+                return None
+            target_paths = rollback.get("target_paths")
+            paths = {
+                path for path in (target_paths if isinstance(target_paths, (list, tuple)) else ())
+                if isinstance(path, str) and path
+            }
+            rows = conn.execute(
+                "SELECT id, source_type, file_id, raw_data FROM update_seen_items WHERE subscription_id = ?",
+                (int(subscription_id),),
+            ).fetchall()
+            revoked: list[int] = []
+            for row in rows:
+                item = _decode_json_fields(dict(row), ("raw_data",))
+                raw = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
+                if str(raw.get("job_id") or "") == str(int(job_id)) or (
+                    item.get("source_type") == "openlist" and item.get("file_id") in paths
+                ):
+                    revoked.append(int(item["id"]))
+            conn.executemany("DELETE FROM update_seen_items WHERE id = ?", [(item,) for item in revoked])
+            conn.execute("DELETE FROM update_path_snapshots WHERE subscription_id = ?", (int(subscription_id),))
+        return len(revoked)
+
     def get_update_preview_cache(self, source_type: str, source_url: str, *, now: str | None = None) -> dict[str, Any] | None:
         now_text = now or utc_now()
         with self._connection_factory() as conn:
@@ -816,29 +888,33 @@ class UpdateRepository:
 
     def history_cleanup_summary(self) -> dict[str, Any]:
         with self._connection_factory() as conn:
-            cleanup_counts = {table: _table_count(conn, table) for table in HISTORY_CLEANUP_TABLES}
-            preserved_counts = {table: _table_count(conn, table) for table in HISTORY_PRESERVED_TABLES}
-            subscriptions = [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT id, title, status, category, category_label, season,
-                           next_episode, last_success_episode, next_run_at, updated_at
-                    FROM update_subscriptions
-                    ORDER BY id ASC
-                    """
-                ).fetchall()
-            ]
-            sources = [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT id, subscription_id, type, name, enabled, priority, updated_at
-                    FROM update_sources
-                    ORDER BY subscription_id ASC, priority ASC, id ASC
-                    """
-                ).fetchall()
-            ]
+            return self._history_cleanup_summary(conn)
+
+    @staticmethod
+    def _history_cleanup_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+        cleanup_counts = {table: _table_count(conn, table) for table in HISTORY_CLEANUP_TABLES}
+        preserved_counts = {table: _table_count(conn, table) for table in HISTORY_PRESERVED_TABLES}
+        subscriptions = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, title, status, category, category_label, season,
+                       next_episode, last_success_episode, next_run_at, updated_at
+                FROM update_subscriptions
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        ]
+        sources = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, subscription_id, type, name, enabled, priority, updated_at
+                FROM update_sources
+                ORDER BY subscription_id ASC, priority ASC, id ASC
+                """
+            ).fetchall()
+        ]
         total_cleanup_rows = sum(int(value or 0) for value in cleanup_counts.values())
         return {
             "cleanup_tables": cleanup_counts,
@@ -850,14 +926,69 @@ class UpdateRepository:
             "will_preserve": list(HISTORY_PRESERVED_TABLES),
         }
 
-    def cleanup_history_records(self, *, backup: bool = True, vacuum: bool = True, backup_prefix: str = "app_before_history_cleanup") -> dict[str, Any]:
-        backup_result = self._backup(prefix=backup_prefix) if backup else {}
-        before = self.history_cleanup_summary()
+    @staticmethod
+    def _history_cleanup_blockers(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        blockers: list[dict[str, Any]] = []
+        for table, id_column, state_column, label, inactive in _HISTORY_QUIESCENT_STATES:
+            placeholders = ",".join("?" for _ in inactive)
+            # Bound requests mirror their job; the authoritative job/execution
+            # checks must not be overridden by a stale public display status.
+            extra = " AND job_id IS NULL" if table == "guest_requests" else ""
+            rows = conn.execute(
+                f"SELECT {state_column} AS status, COUNT(*) AS count, MIN({id_column}) AS first_id "
+                f"FROM {table} WHERE lower(trim(COALESCE({state_column}, ''))) NOT IN ({placeholders})"
+                f"{extra} GROUP BY {state_column}",
+                inactive,
+            )
+            blockers.extend({"table": table, "label": label, **dict(row)} for row in rows)
+        lock = conn.execute(
+            "SELECT COUNT(*) AS count, MIN(id) AS first_id FROM organizer_locks "
+            "WHERE expires_at IS NULL OR expires_at > ?",
+            (utc_now(),),
+        ).fetchone()
+        if lock["count"]:
+            blockers.append({"table": "organizer_locks", "label": "整理锁", "status": "locked", **dict(lock)})
+
+        # A failed scan may still have a scheduled retry; an incomplete undo
+        # must retain the original run/operation receipts even in review state.
+        for row in conn.execute("SELECT id, status, raw_data, evidence FROM organizer_tasks"):
+            values: dict[str, dict[str, Any]] = {}
+            for key in ("raw_data", "evidence"):
+                try:
+                    value = json.loads(row[key] or "{}")
+                except (TypeError, ValueError):
+                    value = {}
+                values[key] = value if isinstance(value, dict) else {}
+            retry = values["raw_data"].get("openlist_visibility_retry")
+            rollback = values["evidence"].get("rollback")
+            retry_pending = (
+                row["status"] == "failed" and isinstance(retry, dict)
+                and bool(retry.get("next_retry_at")) and not retry.get("exhausted")
+            )
+            rollback_pending = isinstance(rollback, dict) and rollback.get("status") in {"running", "failed"}
+            if retry_pending or rollback_pending:
+                blockers.append({
+                    "table": "organizer_tasks", "label": "整理恢复", "count": 1, "first_id": row["id"],
+                    "status": "rollback_pending" if rollback_pending else "retry_pending",
+                })
+        return blockers
+
+    def cleanup_history_records(self, *, backup: bool = False, vacuum: bool = True, backup_prefix: str = "app_before_history_cleanup") -> dict[str, Any]:
         with self._connection_factory() as conn:
+            # The write reservation serializes cleanup with claims/enqueues in
+            # every Web/Worker process, not just with this service instance.
+            conn.execute("BEGIN IMMEDIATE")
+            blockers = self._history_cleanup_blockers(conn)
+            if blockers:
+                raise HistoryCleanupBlockedError(blockers)
+            backup_result = self._backup(prefix=backup_prefix) if backup else {}
+            before = self._history_cleanup_summary(conn)
+            preserve_worker_task_sequence(conn)
             for table in HISTORY_CLEANUP_TABLES:
                 conn.execute(f"DELETE FROM {table}")
-            placeholders = ",".join(["?"] * len(HISTORY_CLEANUP_TABLES))
-            conn.execute(f"DELETE FROM sqlite_sequence WHERE name IN ({placeholders})", list(HISTORY_CLEANUP_TABLES))
+            # Never reuse job/run/task IDs: callbacks, in-memory queues and
+            # local/remote job directories may outlive the database rows.
+            after = self._history_cleanup_summary(conn)
         vacuum_error = ""
         if vacuum:
             try:
@@ -865,7 +996,6 @@ class UpdateRepository:
                     conn.execute("VACUUM")
             except sqlite3.Error as exc:
                 vacuum_error = str(exc)
-        after = self.history_cleanup_summary()
         return {
             "backup": backup_result,
             "before": before,
