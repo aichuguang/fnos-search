@@ -1168,3 +1168,12 @@ Node 语法、Shell 语法、定向 Ruff、应用导入通过。未用真实网�
 - 源码部署命令：`docker compose -f docker-compose.yml -f compose.dev.yaml up -d --build fnos-media-import fnos-rclone-worker`。先停止新调度、等待当前上传结束再更新，避免中途终止未知上传和新旧数据面混跑。此命令本轮未执行。
 - v2 缓存清单不应交给只支持 v1 的旧代码。保留数据库、媒体缓存和全部隐藏回执；降级优先在当前版本将新任务的预下载设为0，不通过删除回执或重建任务回滚。
 - 未访问真实网盘、未运行线上任务或生产数据库、未部署、未推送、未测速；实际提速取决于上下行带宽、NAS I/O 和网盘限制。空间保护不能替代操作系统配额或防止外部程序瞬间占满磁盘。
+
+## 33. v1.0.3 发布 CI 失败修复（2026-11-03）
+
+- 已读取 GitHub run `41613885432` 的实际日志：`Run Python tests and lint` 步骤中 10 项测试失败、2028 项通过。真实错误是 `RelayFileState.load()` 对不存在的回执仍创建共享锁和 `/data/relay`；Linux Runner 无权创建 `/data`，使只读提交/恢复路径提前失败。不是 Node 弃用或 Ubuntu 迁移通知导致失败。
+- 修正为：先校验回执路径；回执不存在时只返回 `None`，不创建目录或锁文件；已存在回执继续使用短锁读取，保留 Windows 并发替换保护。未增加 sudo/chmod、未跳过原失败测试。
+- 新增“父目录不可写仍可只读检查不存在回执”和“不存在回执不创建锁”回归，用 PermissionError 注入复现 Linux 条件，不依赖本机已有 `/data`。
+- 两个 job 固定为 `ubuntu-24.04`；checkout/setup-python、Docker QEMU/Buildx/login/metadata/build-push 全部改为已发布的 Node.js 24 版本，逐个核实官方 `action.yml` 的运行时及本仓库使用的输入参数。
+- 定向验证：101 项通过、33 个子用例通过、1 项 Linux 原生 flock 测试在 Windows 跳过，耗时18.70秒；全仓 Ruff、差异检查通过。当前本机没有可用 WSL Linux，因此由发布 Action 验证真实 Linux 全量套件。
+- 用户已确认修复后推送 master 并新建 `v1.0.4` 重新发布；保留原 `v1.0.3`，不移动或覆盖旧 tag。此次不修改 NAS、网盘、业务数据库或运行任务。

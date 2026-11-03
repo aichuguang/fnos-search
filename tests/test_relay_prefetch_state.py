@@ -23,6 +23,19 @@ def _increment_checkpoint(root: str, count: int) -> None:
 
 
 class RelayPrefetchStateTests(unittest.TestCase):
+    def test_missing_checkpoint_read_never_creates_unwritable_relay_root(self):
+        missing = self.parent / "not-created" / "relay" / "job-7"
+        store = RelayFileState(str(missing), job_id=7, plan_key="unwritable-root")
+        with patch.object(Path, "mkdir", side_effect=PermissionError("CI runner cannot create /data")) as mkdir:
+            self.assertIsNone(store.load())
+        mkdir.assert_not_called()
+        self.assertFalse(missing.parent.exists())
+
+    def test_missing_checkpoint_read_does_not_create_shared_lock_file(self):
+        store = self._store(7)
+        with patch.object(store, "_lock", side_effect=AssertionError("missing reads must not acquire a write lock")):
+            self.assertIsNone(store.load())
+
     def test_readers_share_write_lock_and_nested_reads_are_reentrant(self):
         started, finished = threading.Event(), threading.Event()
 

@@ -129,10 +129,26 @@ def test_release_workflow_validates_before_multi_arch_publish() -> None:
     publish_step = next(
         step
         for step in jobs["publish"]["steps"]
-        if step.get("uses") == "docker/build-push-action@v6"
+        if step.get("uses") == "docker/build-push-action@v7"
     )
     assert publish_step["with"]["push"] is True
     assert publish_step["with"]["platforms"] == "linux/amd64,linux/arm64"
+
+
+def test_release_workflow_uses_node24_actions_and_pinned_ubuntu() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/docker-publish.yml").read_text(encoding="utf-8"))
+    supported = {
+        "actions/checkout": "v6", "actions/setup-python": "v6",
+        "docker/setup-qemu-action": "v4", "docker/setup-buildx-action": "v4",
+        "docker/login-action": "v4", "docker/metadata-action": "v6",
+        "docker/build-push-action": "v7",
+    }
+    for job in workflow["jobs"].values():
+        assert job["runs-on"] == "ubuntu-24.04"
+        for step in job["steps"]:
+            if "uses" in step:
+                action, version = step["uses"].split("@")
+                assert version == supported[action]
 
 
 def test_optional_env_example_only_exposes_common_user_settings() -> None:

@@ -177,6 +177,13 @@ class RelayFileState:
         return state
 
     def load(self) -> dict[str, Any] | None:
+        # A missing checkpoint is a read-only observation, not permission to
+        # create the relay root. Preflight/submission can legitimately inspect
+        # a container-only path on a host where /data is absent or unwritable.
+        # Concurrent initialization after this check belongs to a later read.
+        self._check_path(self.path)
+        if not self.path.exists():
+            return None
         # A Windows reader can temporarily deny the atomic rename even though
         # every writer is serialized. Share the short lock with readers too.
         with self._lock():
