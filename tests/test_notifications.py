@@ -276,6 +276,10 @@ class NotificationTests(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_emit_enabled_creates_task_and_dedups(self) -> None:
+        self.enterContext(mock.patch(
+            "fnos_media_import.notifications.emitter.utc_now_iso",
+            side_effect=["2026-11-03T10:00:00Z", "2026-11-03T10:00:01Z"],
+        ))
         db = self.database
         config = _enabled_config()
         config["rules"][notify_events.EVENT_GUEST_NEW] = ["webhook"]
@@ -302,6 +306,40 @@ class NotificationTests(unittest.TestCase):
         )
         self.assertFalse(repeated["created"])
         self.assertEqual(len(db.worker_tasks.list(task_type="notification_deliver")), 1)
+        self.assertEqual(db.worker_tasks.get(result["task_id"])["payload"], tasks[0]["payload"])
+
+    def test_repeat_notification_preserves_first_event_and_retry_backoff(self) -> None:
+        db = self.database
+        config = _enabled_config()
+        config["rules"][notify_events.EVENT_GUEST_NEW] = ["webhook"]
+        notify_config.write_config(db, config)
+        first = emit_notification(db, notify_events.EVENT_GUEST_NEW, {"title": "first"},
+            idempotency_key="notify:immutable", occurred_at="2026-11-03T10:00:00Z")
+        with db.connect() as conn:
+            conn.execute("UPDATE worker_tasks SET attempts=2, available_at='2099-01-01T00:00:00Z' WHERE id=?", (first["task_id"],))
+        before = db.worker_tasks.get(first["task_id"])
+        repeated = emit_notification(db, notify_events.EVENT_GUEST_NEW, {"title": "changed"},
+            idempotency_key="notify:immutable", occurred_at="2026-11-03T10:01:00Z")
+        self.assertEqual(repeated["task_id"], first["task_id"])
+        self.assertFalse(repeated["created"])
+        self.assertEqual(db.worker_tasks.get(first["task_id"]), before)
+
+    def test_transactional_repeat_notification_also_preserves_first_event(self) -> None:
+        db = self.database
+        config = _enabled_config()
+        config["rules"][notify_events.EVENT_GUEST_NEW] = ["webhook"]
+        notify_config.write_config(db, config)
+        with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            first = emit_notification(db, notify_events.EVENT_GUEST_NEW, {"title": "first"},
+                idempotency_key="notify:transactional", occurred_at="2026-11-03T10:00:00Z", connection=conn)
+            repeated = emit_notification(db, notify_events.EVENT_GUEST_NEW, {"title": "changed"},
+                idempotency_key="notify:transactional", occurred_at="2026-11-03T10:01:00Z", connection=conn)
+            self.assertFalse(repeated["created"])
+            self.assertEqual(repeated["task_id"], first["task_id"])
+        stored = db.worker_tasks.get(first["task_id"])
+        self.assertEqual(stored["payload"]["occurred_at"], "2026-11-03T10:00:00Z")
+        self.assertEqual(stored["payload"]["context"]["title"], "first")
 
     # --- Webhook：签名 / SSRF / 分类 ---
 

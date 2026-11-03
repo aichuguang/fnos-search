@@ -14,6 +14,7 @@ from fnos_media_import.web_input import (
 )
 from fnos_media_import.database import Database
 from fnos_media_import.repositories import RepositorySet
+from fnos_media_import.repositories.worker_task_repository import WorkerTaskConflictError
 from fnos_media_import.services.durable_worker_runtime import DurableWorkerRuntime
 from fnos_media_import.services.worker_task_dispatcher import WorkerTaskDispatcher
 from fnos_media_import.services.worker_queue_diagnostics_service import (
@@ -22,6 +23,13 @@ from fnos_media_import.services.worker_queue_diagnostics_service import (
 
 
 class WorkerRepositoryReliabilityTests(unittest.TestCase):
+    def test_immutable_pending_events_reject_cross_task_type_key_collision(self) -> None:
+        task_id, _created = self.database.worker_tasks.enqueue("example", {"value": 1}, "shared-key")
+        before = self.database.worker_tasks.get(task_id)
+        with self.assertRaises(WorkerTaskConflictError):
+            self.database.worker_tasks.enqueue("notification_deliver", {"value": 2}, "shared-key", replace_pending=False)
+        self.assertEqual(self.database.worker_tasks.get(task_id), before)
+
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.db_path = root / f"worker-reliability-{uuid.uuid4().hex}.db"

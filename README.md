@@ -290,6 +290,10 @@ docker exec fnos-rclone-worker ps aux | grep -E "rclone|fnos_rclone_worker"
 
 ### 入库完成、人工确认与取消边界
 
+发布流程先将代码推送到 `master`：GitHub Actions 仅执行全量测试、Lint、JS 语法和 Compose 校验，不发布镜像。
+确认该提交校验通过后，再创建新的 `v*.*.*` tag 触发镜像发布；保留失败 tag，不移动历史版本。
+`workflow_dispatch` 仍支持按指定镜像标签手动构建。两个 job 使用 Ubuntu 24.04 和 Node.js 24 Action 运行时。
+
 - Organizer 人工确认只是完成整理，不等于入库成功；关联的传输任务还需完成最终文件校验、ACK 及任务级清理。
 - 网盘提交已有持久栅栏、但操作回执缺失时，取消不会自动删除来源、缓存或部分目标；应先核对外部任务，不能用取消绕过未知提交的保护。
 - 同资源的多个公开请求可复用一个正式任务，但创建补偿只能撤销持久所有权匹配且全局尚未被任何请求绑定的任务。

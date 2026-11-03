@@ -33,6 +33,7 @@ class WorkerTaskRepository:
         config_revision: int = 1,
         reactivate_terminal: bool = False,
         reactivate_failed: bool = False,
+        replace_pending: bool = True,
     ) -> tuple[int, bool]:
         with self._connection_factory() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -45,6 +46,7 @@ class WorkerTaskRepository:
                 config_revision=config_revision,
                 reactivate_terminal=reactivate_terminal,
                 reactivate_failed=reactivate_failed,
+                replace_pending=replace_pending,
             )
 
     def enqueue_with_connection(
@@ -58,6 +60,7 @@ class WorkerTaskRepository:
         config_revision: int = 1,
         reactivate_terminal: bool = False,
         reactivate_failed: bool = False,
+        replace_pending: bool = True,
     ) -> tuple[int, bool]:
         """Enqueue a durable task inside a caller-owned transaction.
 
@@ -75,6 +78,7 @@ class WorkerTaskRepository:
             config_revision=config_revision,
             reactivate_terminal=reactivate_terminal,
             reactivate_failed=reactivate_failed,
+            replace_pending=replace_pending,
         )
 
     def _enqueue_on_connection(
@@ -88,6 +92,7 @@ class WorkerTaskRepository:
         config_revision: int = 1,
         reactivate_terminal: bool = False,
         reactivate_failed: bool = False,
+        replace_pending: bool = True,
     ) -> tuple[int, bool]:
         now = _utc_now()
         normalized_max_attempts = max(1, int(max_attempts))
@@ -104,9 +109,15 @@ class WorkerTaskRepository:
         if existing:
             task_id = int(existing["id"])
             status = str(existing["status"] or "")
+            if not replace_pending and str(existing["task_type"] or "") != task_type:
+                raise WorkerTaskConflictError("幂等键已被其他类型的后台任务占用，未覆盖原任务")
             if reactivate_failed and (status != "failed" or str(existing["task_type"] or "") != task_type):
                 raise WorkerTaskConflictError("原后台任务不是可重试的失败任务，未重新提交；请刷新后核对任务状态")
             if status == "pending":
+                # Commands may refresh pending payloads, but immutable events
+                # must keep their first timestamp, delivery data and backoff.
+                if not replace_pending:
+                    return task_id, False
                 try:
                     existing_payload = json.loads(existing["payload"] or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):

@@ -151,6 +151,18 @@ def test_release_workflow_uses_node24_actions_and_pinned_ubuntu() -> None:
                 assert version == supported[action]
 
 
+def test_master_push_validates_without_publishing_images() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/docker-publish.yml").read_text(encoding="utf-8"))
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers["push"]["branches"] == ["master"]
+    assert triggers["push"]["tags"] == ["v*.*.*"]
+    assert "workflow_dispatch" in triggers
+    assert "if" not in workflow["jobs"]["validate"]
+    assert workflow["jobs"]["publish"]["if"] == (
+        "startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'"
+    )
+
+
 def test_optional_env_example_only_exposes_common_user_settings() -> None:
     assignments = {
         line.split("=", 1)[0]

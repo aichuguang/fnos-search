@@ -104,6 +104,7 @@ def emit_notification(
             idempotency_key,
             max_attempts=MAX_ATTEMPTS,
             config_revision=1,
+            replace_pending=False,
         )
     else:
         task_id, created = db.worker_tasks.enqueue(
@@ -112,5 +113,6 @@ def emit_notification(
             idempotency_key,
             max_attempts=MAX_ATTEMPTS,
             config_revision=1,
+            replace_pending=False,
         )
     return {"task_id": task_id, "created": created, "channels": channels, "event_id": idempotency_key}
