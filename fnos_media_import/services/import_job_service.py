@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -31,6 +32,8 @@ from ..constants import (
 )
 from ..domain.models import EXECUTION_PLAN_VERSION, DestinationDescriptor, SourceDescriptor
 from ..media_identity_contract import ORGANIZER_INTENTS, normalize_media_identity
+
+logger = logging.getLogger(__name__)
 
 
 class V1PlanningError(ValueError):
@@ -770,6 +773,7 @@ class ImportJobRetryService:
         plan_validation_deps: Any | None = None,
         execution_repository: Any | None = None,
         enqueue_transfer: Callable[[int], Any] | None = None,
+        enqueue_organizer: Callable[[int], Any] | None = None,
     ) -> None:
         self.database = database
         self.config = config
@@ -777,6 +781,7 @@ class ImportJobRetryService:
         self.plan_validation_deps = plan_validation_deps
         self.execution_repository = execution_repository
         self.enqueue_transfer = enqueue_transfer
+        self.enqueue_organizer = enqueue_organizer
 
     def retry(self, job_id: int) -> dict[str, Any]:
         job = self.database.job_queries.get(job_id)
@@ -872,6 +877,7 @@ class ImportJobRetryService:
                 message = str(exc)
                 self.database.job_commands.add_event(job_id, EVENT_WARN, message)
                 return {"job": job, "created": False, "message": message, "success": False}
+            organizer_retry = self._retry_linked_organizer(job_id)
             self.database.job_commands.add_event(
                 job_id, EVENT_INFO, "人工复核任务已恢复执行并重新入队"
             )
@@ -883,6 +889,7 @@ class ImportJobRetryService:
                 "queued": queued,
                 "recovered_from_manual_review": True,
                 "idempotency_key": str(job.get("idempotency_key") or ""),
+                **({"organizer_retry": organizer_retry} if organizer_retry else {}),
             }
         try:
             self.execution_repository.reactivate(job_id)
@@ -891,6 +898,7 @@ class ImportJobRetryService:
             message = str(exc)
             self.database.job_commands.add_event(job_id, EVENT_WARN, message)
             return {"job": job, "created": False, "message": message, "success": False}
+        organizer_retry = self._retry_linked_organizer(job_id)
         self.database.job_commands.add_event(job_id, EVENT_INFO, "V1 持久执行任务已重新入队")
         return {
             "job": self.database.job_queries.get(job_id),
@@ -899,7 +907,101 @@ class ImportJobRetryService:
             "success": True,
             "queued": queued,
             "idempotency_key": str(job.get("idempotency_key") or ""),
+            **({"organizer_retry": organizer_retry} if organizer_retry else {}),
         }
+
+    def _retry_linked_organizer(self, job_id: int) -> dict[str, Any]:
+        """Reset and requeue the organizer task owned by a retried job.
+
+        A transfer retry alone leaves a linked organizer task stuck in
+        ``waiting_review`` with its old scan error and plan. Reset that task to
+        ``pending`` first, then enqueue a fresh scan/apply pass.
+        """
+        task_id = self._reset_linked_organizer_task(job_id)
+        if not task_id:
+            return {}
+        queued: Any = None
+        if callable(self.enqueue_organizer):
+            try:
+                queued = self.enqueue_organizer(task_id)
+            except Exception as exc:  # noqa: BLE001 - transfer retry must survive queue errors
+                logger.warning(
+                    "import_retry_organizer_enqueue_failed job_id=%s task_id=%s: %s",
+                    job_id,
+                    task_id,
+                    exc,
+                )
+        return {"task_id": task_id, "queued": queued}
+
+    def _reset_linked_organizer_task(self, job_id: int) -> int:
+        repository = getattr(self.database, "organizer", None)
+        if repository is None:
+            return 0
+        try:
+            rows = repository.list_organizer_tasks_by_job(job_id, limit=1)
+        except Exception as exc:  # noqa: BLE001 - never block a job retry
+            logger.warning("import_retry_organizer_lookup_failed job_id=%s: %s", job_id, exc)
+            return 0
+        if not rows:
+            return 0
+        task_id = int(rows[0].get("id") or 0)
+        if task_id <= 0:
+            return 0
+        try:
+            task = repository.get_organizer_task(task_id, include_children=False) or rows[0]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("import_retry_organizer_read_failed job_id=%s task_id=%s: %s", job_id, task_id, exc)
+            return 0
+        status = str(task.get("status") or "").strip().lower()
+        if status not in {"failed", "waiting_review", "review", "manual_review"}:
+            return 0
+        operations = task.get("operations") if isinstance(task.get("operations"), list) else []
+        progressed = any(
+            str(operation.get("status") or "pending") != "pending"
+            or operation.get("run_id")
+            or operation.get("undo_data")
+            for operation in operations
+            if isinstance(operation, dict)
+        )
+        evidence = dict(task.get("evidence") or {}) if isinstance(task.get("evidence"), dict) else {}
+        rollback = evidence.get("rollback") if isinstance(evidence.get("rollback"), dict) else {}
+        if progressed or rollback.get("status") in {"running", "failed"}:
+            logger.warning(
+                "import_retry_organizer_has_execution job_id=%s task_id=%s status=%s",
+                job_id,
+                task_id,
+                status,
+            )
+            return 0
+        evidence.pop("manual_approval", None)
+        evidence.pop("execution_approval", None)
+        evidence.pop("agent_confirmation", None)
+        evidence.pop("agent_review_required", None)
+        raw_data = dict(task.get("raw_data") or {}) if isinstance(task.get("raw_data"), dict) else {}
+        raw_data["agent_review_required"] = False
+        try:
+            revision = int(task.get("revision") or 0) or None
+        except (TypeError, ValueError):
+            revision = None
+        try:
+            updated = repository.update_organizer_task(
+                task_id,
+                status="pending",
+                error_message="",
+                evidence=evidence,
+                raw_data=raw_data,
+                expected_revision=revision,
+                expected_statuses={status},
+                bump_revision=True,
+                clear_scan_lease=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("import_retry_organizer_reset_failed job_id=%s task_id=%s: %s", job_id, task_id, exc)
+            return 0
+        if updated is False:
+            logger.warning("import_retry_organizer_reset_conflict job_id=%s task_id=%s", job_id, task_id)
+            return 0
+        return task_id
 
     def _validate_plan(
         self, plan: dict[str, Any], job_record: dict[str, Any]

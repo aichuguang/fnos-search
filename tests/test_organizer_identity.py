@@ -40,6 +40,19 @@ def test_identity_rejects_unsafe_title(title: str) -> None:
         Identity("tv", "tmdb", "123", title, 2026)
 
 
+def test_colon_title_keeps_semantic_title_and_builds_portable_directory() -> None:
+    identity = Identity("tv", "tmdb", "296206", "金特务：本色回归", 2026)
+    assert identity.title == "金特务:本色回归"
+    directory = format_dir_name(identity)
+    assert directory == "金特务 - 本色回归 (2026) [tmdb-296206]"
+    parsed = parse_dir_name(directory, media_type="tv")
+    assert parsed is not None
+    assert parsed.key == identity.key
+    # An already-created full-width-colon directory is still recognized.
+    legacy = parse_dir_name("金特务：本色回归 (2026) [tmdb-296206]", media_type="tv")
+    assert legacy is not None and legacy.key == identity.key
+
+
 def test_standard_directory_round_trip_and_unknown_year() -> None:
     identity = Identity("tv", "tmdb", "297253", "伟大的长征", 2026)
     assert format_dir_name(identity) == "伟大的长征 (2026) [tmdb-297253]"

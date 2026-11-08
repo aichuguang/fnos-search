@@ -6,6 +6,7 @@ executing a decision. A scan is evidence, never a reservation or write lock.
 
 from __future__ import annotations
 
+import logging
 import posixpath
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -20,10 +21,12 @@ from .identity import (
     IdentityManifest,
     build_identity_manifest,
     format_dir_name,
-    normalize_identity_title,
     parse_dir_name,
     parse_identity_manifest,
+    safe_directory_title,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class LibraryScanError(RuntimeError):
@@ -87,6 +90,10 @@ def scan_library(
 ) -> LibraryIndex:
     """Scan one category root with refresh, rejecting corrupt/duplicate IDs.
 
+    One malformed tagged directory name is logged and skipped so it cannot
+    block every other title in the library. Manifest corruption, duplicate
+    identities, unsafe listing entries and transport errors still fail closed.
+
     ``read_manifest`` receives the exact manifest file path. It may return None
     only for a confirmed missing file; permission, transport and parsing errors
     must raise. No caller may turn an unsuccessful scan into an empty index.
@@ -119,7 +126,11 @@ def scan_library(
         identity = parse_dir_name(name, media_type=media_type)
         if identity is None:
             if re.search(r"\[(?:tmdb|imdb|tvdb|douban|local)-", name, re.I):
-                raise LibraryScanError(f"Invalid canonical identity directory: {path}")
+                # A single malformed tagged folder must not abort the whole
+                # library scan. Keep it occupied so it can never be silently
+                # overwritten, but let every valid sibling resolve normally.
+                logger.warning("library_scan_skipping_invalid_canonical path=%s", path)
+                continue
             continue
         payload = None
         if read_manifest is not None:
@@ -174,7 +185,10 @@ def resolve_target_dir(
         if entry is None or posixpath.dirname(path) != index.root:
             return TargetDecision(errors=("Identity index contains an invalid or out-of-scope directory",))
         if all(key[1] == "local" for key in matched_keys):
-            titles_agree = normalize_identity_title(identity.title).casefold() == entry.identity.title.casefold()
+            titles_agree = (
+                safe_directory_title(identity.title).casefold()
+                == safe_directory_title(entry.identity.title).casefold()
+            )
             years_agree = identity.year is None or entry.identity.year is None or identity.year == entry.identity.year
             if not titles_agree or not years_agree:
                 return TargetDecision(errors=("Weak local identity evidence conflicts with the existing title or year",))

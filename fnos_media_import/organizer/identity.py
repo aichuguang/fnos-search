@@ -25,7 +25,12 @@ _DIRECTORY_PATTERN = re.compile(
     r"^(?P<title>.+?)(?: \((?P<year>(?:18|19|20|21)\d{2})\))? "
     r"\[(?P<ns>tmdb|imdb|tvdb|douban|local)-(?P<value>[A-Za-z0-9]+)\]$"
 )
-_UNSAFE_TITLE = re.compile(r'[\x00-\x1f\x7f/\\<>:"|?*]')
+# A title may legitimately contain characters that Windows/SMB clients cannot
+# use in a directory name (a very common example is the colon in a Chinese
+# title). Keep path separators and control characters out of identity data,
+# but sanitize punctuation only when a physical directory name is built.
+_UNSAFE_IDENTITY_TITLE = re.compile(r"[\x00-\x1f\x7f/\\]")
+_UNSAFE_DIRECTORY_CHARS = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|]')
 
 
 class IdentityError(ValueError):
@@ -36,10 +41,25 @@ def normalize_identity_title(value: Any) -> str:
     if not isinstance(value, str):
         raise IdentityError("Identity title must be a string")
     title = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip()
-    if not title or title in {".", ".."} or _UNSAFE_TITLE.search(title) or title.endswith("."):
+    if not title or title in {".", ".."} or _UNSAFE_IDENTITY_TITLE.search(title) or title.endswith("."):
         raise IdentityError("Identity title is empty or unsafe for a directory name")
     if re.search(r"\[(?:tmdb|imdb|tvdb|douban|local)-", title, re.I):
         raise IdentityError("Identity title must not contain an identity tag")
+    return title
+
+
+def safe_directory_title(value: Any) -> str:
+    """Return a portable directory title without changing the identity title.
+
+    ``Identity.title`` keeps the semantic title (including a colon or
+    full-width punctuation). The canonical directory name is a separate
+    representation and must be safe for Windows, SMB and NAS clients.
+    """
+    title = normalize_identity_title(value)
+    title = _UNSAFE_DIRECTORY_CHARS.sub(" - ", title)
+    title = re.sub(r"\s+", " ", title).strip(" .-")
+    if not title or title in {".", ".."}:
+        raise IdentityError("Identity title is empty or unsafe for a directory name")
     return title
 
 
@@ -125,7 +145,10 @@ def make_local_identity(title: str, year: Any = None, media_type: str = "tv") ->
     media_type = str(media_type).strip().lower()
     if media_type not in {"tv", "movie"}:
         raise IdentityError("Identity media_type must be tv or movie")
-    key = f"{media_type}|{title.casefold()}|{year or ''}"
+    # A local identity is a weak alias keyed by the directory-safe title. This
+    # keeps the hash stable whether the alias was derived from a TMDB title
+    # containing a colon or from the sanitized directory name created for it.
+    key = f"{media_type}|{safe_directory_title(title).casefold()}|{year or ''}"
     value = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
     return Identity(media_type, "local", value, title, year)
 
@@ -153,13 +176,24 @@ def identity_from_tmdb(
     return identity
 
 
-def format_dir_name(identity: Identity) -> str:
+def _format_raw_dir_name(identity: Identity) -> str:
     year = f" ({identity.year})" if identity.year is not None else ""
     return f"{identity.title}{year} [{identity.ns}-{identity.value}]"
 
 
+def format_dir_name(identity: Identity) -> str:
+    """Build the portable canonical directory name for new libraries."""
+    year = f" ({identity.year})" if identity.year is not None else ""
+    return f"{safe_directory_title(identity.title)}{year} [{identity.ns}-{identity.value}]"
+
+
 def parse_dir_name(name: str, *, media_type: str) -> Identity | None:
-    """Recognize only the exact new canonical format, never legacy folders."""
+    """Recognize the exact canonical format, including legacy colon names.
+
+    Older libraries may already contain a canonical directory whose title has
+    a colon (valid on Linux/OpenList). It is still the same identity and must
+    not make the whole library scan fail or be recreated under a second name.
+    """
     if not isinstance(name, str):
         return None
     match = _DIRECTORY_PATTERN.fullmatch(name)
@@ -171,7 +205,12 @@ def parse_dir_name(name: str, *, media_type: str) -> Identity | None:
         identity = Identity(media_type, match["ns"], match["value"], match["title"], match["year"])
     except IdentityError:
         return None
-    return identity if format_dir_name(identity) == name else None
+    raw_name = _format_raw_dir_name(identity)
+    safe_name = format_dir_name(identity)
+    # NFKC comparison accepts an existing full-width colon directory while
+    # safe_name accepts directories created by the current sanitizer.
+    normalized_name = unicodedata.normalize("NFKC", name)
+    return identity if name in {raw_name, safe_name} or normalized_name in {raw_name, safe_name} else None
 
 
 @dataclass(frozen=True)

@@ -116,6 +116,7 @@ class RuntimeBuilder:
         execution_repository: Any = None,
         enqueue_transfer: Callable[[int], Any] | None = None,
         enqueue_transfer_with_connection: Callable[[Any, int], Any] | None = None,
+        enqueue_organizer: Callable[[int], Any] | None = None,
         config_revision_provider: Callable[[], int] | None = None,
     ) -> None:
         self._database = database
@@ -140,6 +141,7 @@ class RuntimeBuilder:
         self._execution_repository = execution_repository
         self._enqueue_transfer = enqueue_transfer
         self._enqueue_transfer_with_connection = enqueue_transfer_with_connection
+        self._enqueue_organizer = enqueue_organizer
         self._config_revision_provider = config_revision_provider
 
     @staticmethod
@@ -279,6 +281,7 @@ class RuntimeBuilder:
             enqueue_transfer=self._enqueue_transfer,
             enqueue_transfer_with_connection=self._enqueue_transfer_with_connection,
             source_record_service=self._source_record_service,
+            enqueue_organizer=self._enqueue_organizer,
             config_revision_provider=self._config_revision_provider,
             executor_id=self._owner_id,
         )

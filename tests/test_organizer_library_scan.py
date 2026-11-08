@@ -158,12 +158,27 @@ def test_manifest_primary_must_match_directory_and_media_scope() -> None:
         scan_library(client(item(identity)), ROOT, media_type="tv", read_manifest=lambda _: payload)
 
 
-def test_legacy_is_not_resolved_but_malformed_tagged_directory_fails_closed() -> None:
+def test_malformed_tagged_directory_is_skipped_without_hiding_valid_entries() -> None:
     old = OpenListItem("旧目录", ROOT + "/旧目录", True)
     assert not scan_library(client(old), ROOT, media_type="tv").entries
     malformed = OpenListItem("测试剧 [tmdb-0]", ROOT + "/测试剧 [tmdb-0]", True)
-    with pytest.raises(LibraryScanError, match="Invalid canonical"):
-        scan_library(client(malformed), ROOT, media_type="tv")
+    valid = item(Identity("tv", "tmdb", "123", "测试剧", 2026))
+    index = scan_library(client(malformed, valid), ROOT, media_type="tv")
+    assert [entry.canonical_dir for entry in index.entries] == [valid.path]
+    assert malformed.path in index.occupied_paths
+
+
+def test_existing_colon_directory_remains_a_valid_canonical_identity() -> None:
+    raw_name = "金特务：本色回归 (2026) [tmdb-296206]"
+    raw = OpenListItem(raw_name, ROOT + "/" + raw_name, True)
+    identity = Identity("tv", "tmdb", "296206", "金特务：本色回归", 2026)
+    index = scan_library(client(raw), ROOT, media_type="tv")
+    decision = resolve_target_dir(identity, index, is_first_import=False)
+    assert decision.success and not decision.is_new
+    assert decision.canonical_dir == raw.path
+    # New directories use the portable title, while the old colon directory
+    # stays addressable and is not recreated under a second name.
+    assert format_dir_name(identity) == "金特务 - 本色回归 (2026) [tmdb-296206]"
 
 
 def test_scan_rejects_out_of_scope_entry_and_global_or_traversing_roots() -> None:

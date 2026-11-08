@@ -42,6 +42,7 @@ class ImportService:
         enqueue_transfer: Callable[[int], Any],
         enqueue_transfer_with_connection: Callable[[Any, int], Any],
         source_record_service: Any,
+        enqueue_organizer: Callable[[int], Any] | None = None,
         config_revision_provider: Callable[[], int] | None = None,
         executor_id: str = "web",
     ) -> None:
@@ -70,6 +71,7 @@ class ImportService:
             plan_validation_deps=plan_validation_deps,
             execution_repository=execution_repository,
             enqueue_transfer=enqueue_transfer,
+            enqueue_organizer=enqueue_organizer,
         )
 
     def detect(self, url: str, password: str = "") -> dict[str, Any]:

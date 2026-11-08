@@ -580,6 +580,11 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         enqueue_transfer_with_connection=(
             worker_task_dispatcher.import_transfer_execute_with_connection
         ),
+        enqueue_organizer=lambda task_id: worker_task_dispatcher.organizer_process(
+            task_id,
+            auto_apply=True,
+            respect_schedule=False,
+        ),
         config_revision_provider=lambda: runtime_services.revision,
     )
     runtime_build = runtime_builder.build(
