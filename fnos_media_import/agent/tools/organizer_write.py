@@ -1,8 +1,9 @@
 """Organizer write tools.
 
 Physical apply and rollback require ``organize.apply`` (absent from a default
-token). Apply also requires the fingerprint of the reviewed plan. Mapping edits
-and retry only prepare a new plan; neither may implicitly execute file changes.
+token). An agent may act autonomously under the user's rules with execute=true;
+the current plan fingerprint is still checked atomically by the backend. Retry
+defaults to planning only and requires the same extra scope to resume execution.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ def register(registry: ToolRegistry, services: AgentServices | None = None) -> N
                 "此时只支持 title、season 与 tmdb_id。单条 tmdb_id=null 表示显式解除绑定；批量禁止 null。"
                 "tmdb_id 不传或留空会保留已有身份。必须修正身份、季集与冲突原因；只改 ready 不代表问题已解决。"
                 "只给 target_name 时会同步算出 target_path，避免“改名字但按旧路径移动”。"
-                "返回新的计划摘要与 plan_hash，执行移动前需要用它。"
+                "返回新的计划摘要与 plan_hash，供调用方按用户已授权规则审核和并发校验。"
             ),
             input_schema=obj(
                 {
@@ -64,14 +65,16 @@ def register(registry: ToolRegistry, services: AgentServices | None = None) -> N
             name="apply_organizer_task",
             title="执行整理（移动/改名）",
             description=(
-                "按已确认身份计划执行真实改名、移动和身份附件写入，再请求 OpenList 异步刷新。第一次调用请不传 plan_hash，"
-                "工具会返回计划摘要与 plan_hash；把摘要交给用户确认后，再带同一个 plan_hash 调用一次。"
-                "需要 organize.apply 作用域（full 档位）。计划在此期间被修改会返回 PLAN_CHANGED。"
+                "按当前身份计划执行真实改名、移动和身份附件写入，再请求 OpenList 异步刷新。"
+                "AI 可按用户已授权规则自主审核，传 execute=true 即可一次调用执行，不要求用户逐次确认或预先获取 plan_hash。"
+                "执行时仍用当前计划指纹和版本做原子校验；若提供 plan_hash 则必须严格匹配。"
+                "显式 execute=false 始终只预览；不传 execute 时兼容携带 plan_hash 执行，两者都不传也只预览。需要 organize.apply 作用域（full 档位），未解决的审核问题仍会阻止执行。"
             ),
             input_schema=obj(
                 {
                     "task_id": integer("整理任务编号", minimum=1),
-                    "plan_hash": string("用户确认过的计划指纹；首次调用留空", max_length=64),
+                    "execute": boolean("调用方决定执行当前计划；AI 可依用户已授权规则设为 true", default=False),
+                    "plan_hash": string("可选的已审核计划指纹；提供时严格匹配，不提供可用 execute=true 执行当前计划", max_length=64),
                 },
                 required=["task_id"],
             ),
@@ -84,11 +87,19 @@ def register(registry: ToolRegistry, services: AgentServices | None = None) -> N
     registry.register(
         ToolSpec(
             name="retry_organizer_task",
-            title="重新识别整理任务",
-            description="仅重新扫描识别并生成待确认计划（auto_apply=false），不会续跑 apply 或 rollback，也不会移动文件；执行仍需单独确认 plan_hash。",
-            input_schema=obj({"task_id": integer("整理任务编号", minimum=1)}, required=["task_id"]),
+            title="重新识别或恢复整理任务",
+            description=(
+                "默认仅重新扫描识别并生成计划（auto_apply=false），不移动文件。"
+                "AI 可按用户已授权规则自主传 execute=true 请求后台安全恢复整理，不要求用户逐次确认；"
+                "此模式额外要求 organize.apply 权限，未解决的身份、季集或冲突问题不会自动变为 ready。"
+            ),
+            input_schema=obj({
+                "task_id": integer("整理任务编号", minimum=1),
+                "execute": boolean("调用方请求安全恢复执行；true 额外要求 organize.apply，false 仅重新识别", default=False),
+            }, required=["task_id"]),
             scope=SCOPE_ORGANIZE_WRITE,
-            risk=RISK_WRITE,
+            risk=RISK_DESTRUCTIVE,
+            idempotent=False,
             handler=_retry_task,
         )
     )
@@ -97,13 +108,13 @@ def register(registry: ToolRegistry, services: AgentServices | None = None) -> N
             name="rollback_organizer_run",
             title="回滚整理批次",
             description=(
-                "按批次撤销已执行的改名与移动。必须显式确认；不可逆的覆盖冲突会直接失败。"
-                "需要 organize.apply 权限。"
+                "按批次撤销已执行的改名与移动。confirm=true 表示调用方的执行意图，"
+                "AI 可按用户已授权规则自主提供，不要求用户逐次点击确认；不可逆的覆盖冲突会直接失败。需要 organize.apply 权限。"
             ),
             input_schema=obj(
                 {
                     "run_id": integer("整理批次编号", minimum=1),
-                    "confirm": boolean("确认执行回滚", default=False),
+                    "confirm": boolean("调用方的回滚执行意图；可由 AI 按用户已授权规则设为 true", default=False),
                 },
                 required=["run_id"],
             ),
@@ -224,6 +235,13 @@ def _bounded_integer(arguments: dict[str, Any], name: str, *, minimum: int, maxi
     return value
 
 
+def _execute_requested(arguments: dict[str, Any]) -> bool:
+    value = arguments.get("execute", False)
+    if not isinstance(value, bool):
+        raise invalid_params("execute 必须是布尔值")
+    return value
+
+
 def _plan_blockers(task: dict[str, Any], plan: dict[str, Any]) -> list[str]:
     reasons = []
     if plan.get("blocked_count"):
@@ -243,13 +261,15 @@ def _apply_task(context: AgentCallContext, arguments: dict[str, Any]) -> dict[st
     writes = writes_of(context)
     task_id = _bounded_integer(arguments, "task_id", minimum=1, maximum=2_147_483_647)
     supplied_hash = optional_text(arguments, "plan_hash", max_length=64)
+    execute = _execute_requested(arguments)
     task = _task_of(context, task_id)
     plan = organizer_plan_summary(task)
     blockers = _plan_blockers(task, plan)
 
-    if not supplied_hash:
+    if not execute and ("execute" in arguments or not supplied_hash):
         result: dict[str, Any] = {
             "confirmation_required": True,
+            "human_confirmation_required": False,
             "executed": False,
             "plan": plan,
             "can_apply": not blockers,
@@ -257,16 +277,16 @@ def _apply_task(context: AgentCallContext, arguments: dict[str, Any]) -> dict[st
         if blockers:
             result["blocked_warning"] = "；".join(blockers)
         result["instruction"] = (
-            "把 plan 摘要交给用户确认；确认后带 plan_hash 再调用一次才会真正移动文件。"
+            "可按用户已授权规则自主审核此计划；符合规则时传 execute=true 执行，无需逐次询问用户。也可携带 plan_hash 锁定已审核版本。"
         )
         return result
 
-    if supplied_hash != plan["plan_hash"]:
+    if supplied_hash and supplied_hash != plan["plan_hash"]:
         raise AgentError(
             "PLAN_CHANGED",
             "计划已变化，不能按旧确认执行",
             retryable=False,
-            hint="重新预览计划，让用户确认新的 plan_hash",
+            hint="重新读取当前计划并按用户已授权规则评估，不要沿用过期指纹执行",
             details={"current_plan_hash": plan["plan_hash"], "plan": plan},
         )
 
@@ -278,7 +298,7 @@ def _apply_task(context: AgentCallContext, arguments: dict[str, Any]) -> dict[st
             details={"plan": plan},
         )
 
-    body, status_code = writes.apply_organizer_task(task_id, plan.get("revision"), supplied_hash)
+    body, status_code = writes.apply_organizer_task(task_id, plan.get("revision"), plan["plan_hash"])
     if status_code >= 400 or not body.get("success", True):
         raise organizer_error(body, status_code, "整理未执行")
     result = compact_write_result(body)
@@ -289,10 +309,19 @@ def _apply_task(context: AgentCallContext, arguments: dict[str, Any]) -> dict[st
 
 def _retry_task(context: AgentCallContext, arguments: dict[str, Any]) -> dict[str, Any]:
     writes = writes_of(context)
-    body, status_code = writes.retry_organizer_task(_bounded_integer(arguments, "task_id", minimum=1, maximum=2_147_483_647))
-    result = _organizer_result(body, status_code, "重新识别整理计划失败")
-    result["mode"] = "rescan_only"
-    result["next"] = "读取新的整理计划；修正待审核项并确认 plan_hash 后，另用 apply_organizer_task 执行"
+    task_id = _bounded_integer(arguments, "task_id", minimum=1, maximum=2_147_483_647)
+    execute = _execute_requested(arguments)
+    if execute:
+        context.require(SCOPE_ORGANIZE_APPLY)
+        body, status_code = writes.retry_organizer_task(task_id, True)
+    else:
+        body, status_code = writes.retry_organizer_task(task_id)
+    result = _organizer_result(body, status_code, "恢复整理失败" if execute else "重新识别整理计划失败")
+    result["mode"] = "autonomous_retry" if execute else "rescan_only"
+    result["next"] = (
+        "读取任务状态跟踪安全恢复结果；若仍待审核，按用户已授权规则修正原因，不能仅改为 ready"
+        if execute else "读取新的整理计划；按用户已授权规则修正待审核项后，可用 apply_organizer_task execute=true 自主执行"
+    )
     if isinstance(body.get("task"), dict):
         result["plan"] = organizer_plan_summary(body["task"])
     return result

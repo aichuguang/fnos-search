@@ -4778,8 +4778,9 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 task_id, expected_revision=expected_revision, expected_plan_hash=expected_plan_hash
             )
 
-        def _agent_retry_organizer(task_id: int) -> tuple[dict[str, Any], int]:
-            return _organizer_admin_command_application().rescan_only(task_id)
+        def _agent_retry_organizer(task_id: int, execute: bool = False) -> tuple[dict[str, Any], int]:
+            application = _organizer_admin_command_application()
+            return application.retry_authorized(task_id) if execute else application.rescan_only(task_id)
 
         def _agent_rollback_organizer(run_id: int) -> tuple[dict[str, Any], int]:
             return _organizer_admin_command_application().rollback(run_id)

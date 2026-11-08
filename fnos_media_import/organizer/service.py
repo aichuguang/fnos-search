@@ -2855,8 +2855,8 @@ class OrganizerService:
         # 自动执行，避免任务停在 auto_approved 后还要求管理员再次点“执行”。
         return self.process_task(task_id, auto_apply=True)
 
-    def request_agent_rescan(self, task_id: int) -> dict[str, Any]:
-        """Persist a review hold before scheduling an unprivileged Agent scan."""
+    def request_agent_rescan(self, task_id: int, *, require_review: bool = True) -> dict[str, Any]:
+        """Fence a scan; authorized execution may release a previous review hold."""
         task = self.db.organizer.get_organizer_task(task_id)
         if not task:
             return {"success": False, "code": "NOT_FOUND", "message": "整理任务不存在"}
@@ -2880,8 +2880,9 @@ class OrganizerService:
         evidence.pop("manual_approval", None)
         evidence.pop("execution_approval", None)
         evidence.pop("agent_confirmation", None)
+        evidence.pop("agent_review_required", None)
         raw = dict(task.get("raw_data") or {})
-        raw["agent_review_required"] = True
+        raw["agent_review_required"] = bool(require_review)
         updated = self.db.organizer.update_organizer_task(
             task_id, status="waiting_review", raw_data=raw, evidence=evidence,
             expected_revision=_safe_positive_int(task.get("revision")), expected_statuses={status},
@@ -2889,7 +2890,7 @@ class OrganizerService:
         )
         if updated is False:
             return {"success": False, "conflict": True, "code": "STATE_CONFLICT", "message": "任务已变化，未提交重新识别"}
-        return {"success": True, "task_id": task_id, "retry_mode": "rescan_only", "executed": False}
+        return {"success": True, "task_id": task_id, "retry_mode": "rescan_only" if require_review else "autonomous_rescan", "executed": False}
 
     def approve_task(self, task_id: int, *, expected_revision: int | None = None, expected_plan_hash: str | None = None) -> dict[str, Any]:
         task = self.db.organizer.get_organizer_task(task_id)

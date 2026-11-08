@@ -23,7 +23,7 @@
         }
 
         function profileLabel(name) {
-            return { read: "只读", operator: "可写（不放行整理）", full: "完全（含整理执行）" }[name] || name;
+            return { read: "只读", operator: "可写（修改/仅重扫）", full: "完整（自主整理/恢复）" }[name] || name;
         }
 
         // -- expiry picker (day granularity, project select component) --------
@@ -111,7 +111,12 @@
             const hint = $("agentProfileHint");
             if (hint) {
                 const chosen = profiles[select.value] || scopes;
-                hint.textContent = `包含：${chosen.join(" / ") || "-"}`;
+                const explanations = {
+                    read: "只读查询，不授予业务写入权限。",
+                    operator: "整理权限仅修改映射和重扫；入库与订阅仍按系统策略运行。",
+                    full: "Agent 可按用户规则自主审核、执行整理和恢复；是否询问人由 Agent 规则决定，身份与路径校验仍生效。",
+                };
+                hint.textContent = `${explanations[select.value] || ""} 包含：${chosen.join(" / ") || "-"}`;
             }
         }
 

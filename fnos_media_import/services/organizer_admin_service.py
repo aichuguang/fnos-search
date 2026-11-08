@@ -53,7 +53,7 @@ class OrganizerCommands(Protocol):
     def update_mapping(self, mapping_id: int, payload: dict[str, Any], *, task_id: int) -> dict[str, Any]: ...
     def batch_update_mappings(self, task_id: int, payload: dict[str, Any]) -> dict[str, Any]: ...
     def approve_task(self, task_id: int, *, expected_revision: int | None = None, expected_plan_hash: str | None = None) -> dict[str, Any]: ...
-    def request_agent_rescan(self, task_id: int) -> dict[str, Any]: ...
+    def request_agent_rescan(self, task_id: int, *, require_review: bool = True) -> dict[str, Any]: ...
     def start_apply_task(self, task_id: int, *, expected_revision: int | None = None) -> dict[str, Any]: ...
     def skip_task(self, task_id: int) -> dict[str, Any]: ...
     def delete_task(self, task_id: int) -> dict[str, Any]: ...
@@ -224,6 +224,43 @@ class OrganizerAdminCommandService:
                         "requires_confirmation": True, "message": "已排队重新识别，仅生成计划，不移动文件"}, 200
         scanned = self._organizer.process_task(task_id, auto_apply=False)
         return self._with_status({**scanned, "retry_mode": "rescan_only", "executed": False, "requires_confirmation": True})
+
+    def retry_authorized(self, task_id: int):
+        """Execute an Agent-authorized retry without a human-confirmation roundtrip.
+
+        Only the organize.apply-protected bridge calls this entry point. Existing
+        journaled work is resumed, never replaced by a fresh scan.
+        """
+        task = self._organizer.get_task(task_id)
+        if not task:
+            return {"success": False, "code": "NOT_FOUND", "message": "整理任务不存在"}, 404
+        status = str(task.get("status") or "")
+        evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
+        rollback = evidence.get("rollback") if isinstance(evidence.get("rollback"), dict) else {}
+        if rollback.get("status") in {"running", "failed"} and rollback.get("run_id"):
+            result = self._organizer.rollback_run(int(rollback["run_id"]))
+            return self._with_status({**result, "retry_mode": "resume_rollback", "autonomous": True})
+        if status in {"done", "executing"}:
+            return {"success": True, "task_id": task_id, "status": status, "queued": status == "executing",
+                    "autonomous": True, "message": "任务已完成" if status == "done" else "任务正在执行，不重复派发"}, 200
+        if _retry_should_resume_apply(task):
+            from ..organizer.plan_contract import organizer_plan_hash
+
+            result, status_code = self.apply(task_id, expected_revision=task.get("revision"), expected_plan_hash=organizer_plan_hash(task))
+            return {**result, "retry_mode": "resume_apply", "autonomous": True}, status_code
+        prepare = getattr(self._organizer, "request_agent_rescan", None)
+        if not callable(prepare):
+            return {"success": False, "code": "RESCAN_UNAVAILABLE", "message": "整理器不支持授权重扫"}, 409
+        result = prepare(task_id, require_review=False)
+        if not result.get("success"):
+            return self._with_status(result)
+        if self._worker_dispatcher:
+            queued = self._worker_dispatcher.organizer_process(task_id, auto_apply=True, respect_schedule=False)
+            if queued:
+                return {**queued, "retry_mode": "autonomous_rescan", "autonomous": True,
+                        "message": "已排队重新识别，符合整理条件后自动执行；可由 AI 继续处理待审核项"}, 200
+        scanned = self._organizer.process_task(task_id, auto_apply=True)
+        return self._with_status({**scanned, "retry_mode": "autonomous_rescan", "autonomous": True})
 
     def rollback(self, run_id: int):
         return self._with_status(self._organizer.rollback_run(run_id))

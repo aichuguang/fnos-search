@@ -47,7 +47,7 @@ def compact_write_result(body: dict[str, Any], *, success_default: bool = True) 
         "success": bool(body.get("success", success_default)),
         "message": str(body.get("message") or "")[:300],
     }
-    for name in ("job_id", "request_id", "task_id", "run_id", "subscription_id", "status", "cancelled", "cleanup", "queued", "worker_task_id", "retry_mode", "executed", "requires_confirmation"):
+    for name in ("job_id", "request_id", "task_id", "run_id", "subscription_id", "status", "cancelled", "cleanup", "queued", "worker_task_id", "retry_mode", "executed", "requires_confirmation", "autonomous"):
         if body.get(name) is not None:
             payload[name] = body[name]
     job = body.get("job")

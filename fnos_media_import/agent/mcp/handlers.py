@@ -23,7 +23,7 @@ from . import protocol
 logger = logging.getLogger(__name__)
 
 SERVER_NAME = "fnos-search-agent"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 INSTRUCTIONS = (
     "这是飞牛影视统一入库维护系统的能力接口。典型流程：search_resources 搜索 → "
@@ -31,9 +31,12 @@ INSTRUCTIONS = (
     "get_job 轮询任务 → list_organizer_tasks 查看整理状态 → "
     "list_subscriptions 管理定时追更。"
     "写工具会真实产生业务变更：只有带 dry_run 参数的写工具在 dry_run=true 时才只预览；"
-    "apply_organizer_task 首次调用（不传 plan_hash）只返回计划，带 plan_hash 才执行。"
-    "retry_organizer_task 只重新识别并生成待确认计划，不能继续移动或回滚；没有跳过身份整理的入口。"
-    "详情支持文件、映射和阻塞项分页，应读完相关分页；审核和身份错误不要自动循环重试。"
+    "具备 organize.apply 的 Agent 可按用户规则自主审核，用 apply_organizer_task(execute=true) 单次执行；"
+    "服务端仍绑定当次计划指纹并校验身份、路径和冲突。显式 execute=false 始终只预览；未给 execute 时兼容旧 plan_hash 执行流程，两者都未给时也只预览。"
+    "retry_organizer_task(execute=true) 需要 organize.apply，可重新识别或续跑；默认 execute=false 仅重新识别，不移动文件。"
+    "rollback_organizer_run 的 confirm=true 表示调用方明确的回滚意图，Agent 可按用户规则提供。是否询问人由用户的 Agent 规则决定，不强制逐次人工确认。"
+    "后台 waiting_review 或“人工确认”是业务待审核状态，不代表只能由人类操作；有权限的 AI 可修正映射并执行，仅在用户规则要求或确实无法判断时询问。"
+    "详情支持文件、映射和阻塞项分页，应读完相关分页；审核和身份错误先读证据再修正，不要无条件循环重试。没有跳过身份整理的入口。"
 )
 
 
@@ -79,7 +82,7 @@ PROMPT_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "name": "organize_pending",
         "title": "处理待整理任务",
-        "description": "检查等待整理的入库任务，核对改名与分类后再允许执行移动",
+        "description": "按用户规则自主审核等待整理的任务，核对身份、改名与分类后执行",
         "arguments": [
             {"name": "category", "description": "只看某个分类（可选）", "required": False},
         ],
@@ -294,7 +297,7 @@ class McpHandler:
                 "2. 对选定候选调用 get_resource，必要时用 list_resource_files 展开子目录。\n"
                 "3. 调用 submit_import 提交，记录返回的 request_token 与 job_id。\n"
                 "4. 用 get_job 查看状态；review/failed 时先读原因，不自动循环重试或把 queued 当作已完成。\n"
-                "5. 完成后用 list_organizer_tasks 查看整理任务，核对改名与分类后再执行移动。"
+                "5. 用 list_organizer_tasks 查看整理任务；具备 full 权限时按我的 Agent 规则自主审核并执行，不把排队视为完成。"
             )
         elif name == "organize_pending":
             text = (
@@ -303,17 +306,19 @@ class McpHandler:
                 + "：\n"
                 "1. list_organizer_tasks 拉取待处理任务。\n"
                 "2. 对每个任务调用 get_organizer_task，按 files_page/mappings_page/blocked_page 读完相关分页，核对身份、目录、季集和审核原因。\n"
-                "3. 用 update_organizer_mappings 修正 TMDB ID、标题或季集；只改 ready 不能替代身份校验。retry_organizer_task 只重新识别，不移动文件。\n"
-                "4. 预览 apply_organizer_task，说明作品根、身份清单和文件操作；经我确认后带同一 plan_hash 执行。\n"
-                "5. 继续回滚必须另用 rollback_organizer_run 明确确认；执行或回滚未完成时不要重建计划。"
+                "waiting_review 或界面上的“人工确认”只是业务待审核状态，不限制为人类操作；有权限的 AI 可以自主处理。\n"
+                "3. 用 update_organizer_mappings 修正 TMDB ID、标题或季集；只改 ready 不能替代身份校验。证据不足或我的 Agent 规则要求时才询问我。\n"
+                "4. 具备 full 权限时，可按我的规则用 apply_organizer_task(execute=true) 单次执行；也可自行预览并用 plan_hash 执行，无需固定增加人工确认步骤。\n"
+                "5. retry_organizer_task(execute=true) 可重新识别或续跑；默认 execute=false 只生成计划。不要用重建覆盖未完成的执行或回滚记录。\n"
+                "6. 回滚用 rollback_organizer_run(confirm=true) 表达调用方意图，可按我的规则自主调用；核对实际完成状态后再汇报。"
             )
         elif name == "follow_series":
             text = (
                 f"请为《{title}》建立定时追更订阅。\n"
                 "1. 先用 resolve_tmdb 确认 TMDB 身份，避免同名误追。\n"
                 "2. 用 list_subscriptions 检查是否已有同一作品的订阅。\n"
-                "3. 调用 create_subscription 时先传 dry_run=true，把 next_run_at 和来源策略给我确认。\n"
-                "4. 确认后再正式创建，并记住 subscription_id 便于后续 run_subscription_now 或暂停。"
+                "3. 可用 create_subscription(dry_run=true) 检查 next_run_at 和来源策略，按我的 Agent 规则判断是否需要询问。\n"
+                "4. 在授权范围内正式创建，并记住 subscription_id 便于后续 run_subscription_now 或暂停。"
             )
         else:
             raise AgentError("NOT_FOUND", f"未知提示词：{name}")

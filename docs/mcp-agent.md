@@ -4,7 +4,7 @@
 
 ## 1. 定位
 
-当前协议能力版本为 **0.2.0**。本轮只对齐新身份整理和权限边界，不增加全库清洗或自动修复业务。升级后客户端应重新获取 `tools/list`；旧的跳过工具及旧计划指纹不可继续使用。
+当前协议能力版本为 **0.3.0**。具备执行权限的 Agent 可以按用户规则自主审核、整理与恢复，不强制每次请人确认；身份、路径、冲突与计划指纹校验仍保留。升级后客户端应重新获取 `tools/list`；工具总数仍为 35，不增加跳过身份校验或全库清洗入口。
 
 `/mcp` 把系统已有的能力（搜索、入库、整理、追更订阅、运行状态）以 JSON-RPC 2.0 暴露给外部 Agent。
 它**不是**管理后台 API 的镜像：只暴露经过挑选、面向任务的能力；设置、账号凭证、备份、高级配置一律不对外。
@@ -62,7 +62,7 @@ docker exec -it fnos-media-import python -m fnos_media_import.agent.cli audit --
 |---|---|---|
 | `read`（默认） | `search` `import.read` `organize.read` `schedule.read` `ops.read` | 只能查询 |
 | `operator` | read + `import.write` `organize.write` `schedule.write` | 可提交入库、改映射、重新识别、管订阅；**不能直接放行整理或回滚** |
-| `full` | operator + `organize.apply` | 可直接执行真实改名/移动与回滚 |
+| `full` | operator + `organize.apply` | 可按用户的 Agent 规则自主审核、执行真实改名/移动、恢复与回滚 |
 
 `--scopes` 可以精确覆盖档位。默认令牌只读；直接执行整理/回滚必须有 `organize.apply`。提交入库、运行订阅仍会进入系统已有的后台业务流程，其自动化策略由系统配置控制，不能把 `operator` 理解为所有业务都没有文件副作用。
 
@@ -107,21 +107,24 @@ docker exec -it fnos-media-import python -m fnos_media_import.agent.cli audit --
 |---|---|---|
 | `list_organizer_tasks` / `get_organizer_task` | 任务、分页文件/映射/阻塞项、身份、目标根、审核原因和计划摘要 | read |
 | `update_organizer_mappings` | 改 TMDB ID、片名、季集、状态和受约束的目标路径；返回新的 `plan_hash` | write |
-| `apply_organizer_task` | 按确认计划写身份清单、建目录、改名/移动，再请求异步刷新；两步确认 | destructive |
-| `retry_organizer_task` | 仅重新识别并生成待确认计划，不续跑执行或回滚 | write |
-| `rollback_organizer_run` | 回滚批次（必须 `confirm=true`） | destructive |
+| `apply_organizer_task` | `execute=true` 单次执行身份整理；默认预览，兼容 `plan_hash` 执行 | destructive |
+| `retry_organizer_task` | 默认仅重新识别；`execute=true` 可重新识别或续跑，额外需要 `organize.apply` | write / 执行分支 destructive |
+| `rollback_organizer_run` | 回滚批次；`confirm=true` 表示调用方明确意图，Agent 可按用户规则提供 | destructive |
 
-**`apply_organizer_task` 的两步流程：**
+**`apply_organizer_task` 的执行与预览：**
 
-1. 不带 `plan_hash` 调用 → 返回 `confirmation_required: true`、`can_apply` 和计划摘要，**不会执行**。
-   摘要包括身份/新增别名、`canonical_dir`、首次/追更意图、作品根/季目录/manifest 写入数量和目标样本；
-   `targets_total/targets_truncated`、`identities_total/identities_truncated` 明确标记样本不等于全部。
-   存在身份错误、`need_edit/conflict` 或旧删除状态时，`can_apply=false` 并说明原因。
-2. 把摘要给用户确认后，带同一个 `plan_hash` 再调用 → 执行。
-3. 期间映射被任何人改动 → `PLAN_CHANGED`，必须重新预览。
+- **自主执行：** `{"task_id": 123, "execute": true}` 单次调用即可执行，无须预先调用预览或提交 hash。Agent 按用户规则审核证据，哪些情况需要询问人也由这些规则决定。
+- **预览：** 显式 `execute=false` 始终只预览（即使同时给了 hash）；`execute/plan_hash` 两者都不提供也只预览。返回 `confirmation_required: true`、`human_confirmation_required: false`、`can_apply` 和计划摘要，**不会执行**。`confirmation_required` 是兼容预览流程的字段，不代表协议强制人类逐次批准。
+- **兼容 hash 流程：** Agent 也可自行取得摘要，再带同一 `plan_hash` 执行；不要求额外等待人的回复。计划变化时返回 `PLAN_CHANGED`，需重新读取并判断，而不是盲目重发旧 hash。
+
+摘要包括身份/新增别名、`canonical_dir`、首次/追更意图、作品根/季目录/manifest 写入数量和目标样本；
+`targets_total/targets_truncated`、`identities_total/identities_truncated` 明确标记样本不等于全部。
+存在身份错误、`need_edit/conflict` 或旧删除状态时，`can_apply=false` 并说明原因；自主执行也不能绕过这些检查。
+
+后台 `waiting_review` 或界面上的“人工确认”表示业务待审核，不是“只能由人类操作”。具备相应权限的 AI 可按用户规则修正映射，再调用 `apply_organizer_task(execute=true)`；仅在用户规则要求或确实无法判断时询问人。
 
 `plan_hash` 覆盖 revision、分类、根路径、映射身份/季集、规范化身份上下文以及按顺序排列的操作和 manifest 新旧内容摘要。
-操作数据库 ID、执行进度和时间戳不属于指纹。Agent 将 revision 和 hash 一并传到后端；批准事务内重新读取数据库核验，
+操作数据库 ID、执行进度和时间戳不属于指纹。`execute=true` 在调用内读取当前计划并绑定其 revision 和 hash；旧 hash 流程绑定调用方提供的指纹。批准事务内重新读取数据库核验，
 批准后的操作摘要还会在持锁写盘前复核，避免同 revision 的操作变化悄悄改变已确认计划。
 
 **修改映射的三条规则：**
@@ -138,13 +141,15 @@ TMDB ID 不传保留；单条 `null` 显式解绑，批量 `null` 拒绝；季�
 文件使用真实 `path/name/parent_path/ext/size/season/episode`；映射提供完整路径、TMDB ID、附件标记及审核原因，不暴露整个 raw_data。
 详情中的身份来自当前映射；列表只能读取缓存身份时标记 `identity_source=cached`。
 
-**安全重试：** `retry_organizer_task` 先持久化审核标记并使旧批准失效，再通过独立预览队列运行 `auto_apply=false`。
-即使重启或旧的自动扫描任务随后运行，新计划也会停在审核。已有部分执行/回滚记录时返回 `EXECUTION_CONFIRMATION_REQUIRED`，不覆盖恢复计划；
-继续执行用 `apply_organizer_task` 的新指纹确认，继续回滚用 `rollback_organizer_run(confirm=true)`。
+**重试的两种模式：**
+
+- `execute=false`（默认）：持久化审核标记并使旧批准失效，通过独立预览队列运行 `auto_apply=false`。即使重启或旧的自动扫描任务随后运行，也不会仅因这次重扫授权而移动文件；后续可由具备执行权限的 Agent 按用户规则放行。
+- `execute=true`：额外需要 `organize.apply`（`full`）；可重新识别后执行，或根据现有执行记录续跑。不通过重建计划抹去部分执行或回滚证据。
+- 仅重扫模式遇到已有执行/回滚记录会返回 `EXECUTION_CONFIRMATION_REQUIRED`。根据证据选择执行恢复，或用 `rollback_organizer_run(confirm=true)` 表达回滚意图；这些调用可由获授权 Agent 自主完成。
 `skip_organizer_task` 已移除，不提供原名直通入口。`queued=true` 只代表排队，不代表整理完成。
 
 **谁能执行移动：** 只有带 `organize.apply` 的令牌（`full` 档位）。`operator` 令牌看不到该工具，
-调用会被 `SCOPE_DENIED` 拒绝。执行前的计划确认仍然保留：`plan_hash` 不匹配就拒绝执行。
+调用会被 `SCOPE_DENIED` 拒绝。自主执行不扩大令牌权限，也不取消计划绑定：旧 hash 不匹配，或调用内计划发生变化时仍拒绝执行。
 
 ### 定时任务（`schedule.read` / `schedule.write`）
 
@@ -216,13 +221,13 @@ TMDB ID 不传保留；单条 `null` 显式解绑，批量 `null` 拒绝；季�
 
 1. **作用域双重校验**：`tools/list` 按作用域过滤，`tools/call` 再次校验。
 2. **最小权限默认**：新令牌只读；移动文件需要 `full` 档位。
-3. **计划绑定**：`apply` 必须匹配 `plan_hash`，否则 `PLAN_CHANGED`；批准事务内核验完整快照，写盘前核验已批准操作摘要。
-4. **破坏性操作**：取消任务、复核重提、回滚批次、拒绝提交、删除订阅都需要显式确认或原因。
-5. **重扫不放行**：整理重试工具不能调用 apply/rollback，延迟重试和重启也不能解除审核标记。
-5. **限流**：每令牌每分钟默认 60 次，超出返回 429 + `Retry-After`。
-6. **并发保护**：`AGENT_MAX_CONCURRENCY` 控制同时执行的工具数，满返回 503 + `SERVER_BUSY`。
-7. **审计**：每次调用写入 `agent_tool_calls`，只保存参数摘要（SHA-256 前 32 位）。
-8. **脱敏**：输出不返回提取码、Cookie、令牌。
+3. **计划绑定**：自主 `apply(execute=true)` 绑定当次计划，旧流程匹配传入的 `plan_hash`；批准事务内核验完整快照，写盘前核验操作摘要，变化时返回 `PLAN_CHANGED`。
+4. **调用方意图**：取消任务、复核重提、回滚批次、拒绝提交、删除订阅仍保留各自的确认参数或原因要求。Agent 可按用户规则提供这些参数，不等于每次必须询问人；规则要求或证据不足时才升级询问。
+5. **重扫与执行分权**：默认重试只重扫，不会因延迟或重启意外放行；`execute=true` 执行恢复必须额外具备 `organize.apply`，并遵守现有恢复记录与身份校验。
+6. **限流**：每令牌每分钟默认 60 次，超出返回 429 + `Retry-After`。
+7. **并发保护**：`AGENT_MAX_CONCURRENCY` 控制同时执行的工具数，满返回 503 + `SERVER_BUSY`。
+8. **审计**：每次调用写入 `agent_tool_calls`，只保存参数摘要（SHA-256 前 32 位）。
+9. **脱敏**：输出不返回提取码、Cookie、令牌。
 
 ## 9. 错误码
 
@@ -232,10 +237,10 @@ TMDB ID 不传保留；单条 `null` 显式解绑，批量 `null` 拒绝；季�
 |---|---|
 | `INVALID_PARAMS` | 参数缺失、越界或未知枚举 |
 | `SCOPE_DENIED` | 令牌没有该作用域 |
-| `CONFIRMATION_REQUIRED` | 需要 `confirm=true` |
+| `CONFIRMATION_REQUIRED` | 需要调用方提供 `confirm=true` 明确意图；Agent 可按用户规则提供 |
 | `PLAN_CHANGED` | 计划已变化，旧 `plan_hash` 失效 |
 | `REVIEW_REQUIRED` | 身份、目录或清单需审核，不自动重试 |
-| `EXECUTION_CONFIRMATION_REQUIRED` | 已有执行/回滚记录，必须走对应确认入口 |
+| `EXECUTION_CONFIRMATION_REQUIRED` | 仅重扫不能覆盖已有执行/回滚记录，应选择有权限的执行恢复或回滚入口 |
 | `METADATA_UNAVAILABLE` | TMDB 读取失败，检查服务后重试，不自动降级 local |
 | `TEMPORARILY_UNAVAILABLE` | 已知暂时性失败，可参考 retry_after_seconds 等待 |
 | `NOT_FOUND` | 任务 / 订阅 / 资源不存在或已过期 |
@@ -279,5 +284,5 @@ python -m ruff check fnos_media_import/agent
 ## 12. 本轮部署注意
 
 本轮不增加表、环境变量或令牌作用域，沿用 v30。更新 Web 和 Worker 的同一版本代码后重启，并让 MCP 客户端刷新工具清单。
-不要混跑新 Agent Web 与不识别审核标记的旧 Worker。已有 `plan_hash` 应重新预览；`operator` 不会因升级获得执行权限。
+不要混跑新 Agent Web 与不识别审核标记的旧 Worker。升级后重新获取工具定义；默认预览和旧 `plan_hash` 调用仍兼容，新增自主执行须显式传 `execute=true`。`operator` 不会因升级获得执行权限，是否询问人由用户的 Agent 规则决定。
 本轮验证均使用本地 mock / 临时 SQLite，未部署或操作真实媒体库。身份整理规则见 [organizer-identity.md](organizer-identity.md)。

@@ -1012,7 +1012,7 @@
                     <div class="section-title">
                         <div>
                             <h2>Agent 接入</h2>
-                            <p>为外部 AI Agent 签发 MCP 令牌，并为单个整理任务授予一次性「执行移动」权限。</p>
+                            <p>为外部 AI Agent 签发分级 MCP 令牌；Agent 可按用户规则自主审核和执行，身份与路径校验仍生效。</p>
                         </div>
                         <div class="filter-row">
                             <button class="secondary" type="button" id="agentAuditLoadBtn">刷新审计</button>
@@ -1036,7 +1036,7 @@
                             </span>
                             <button type="button" id="agentCreateBtn">创建</button>
                         </div>
-                        <p class="muted" id="agentProfileHint">只读档位默认选中；可写档位不能直接放行整理或回滚。入库与订阅按系统策略运行。</p>
+                        <p class="muted" id="agentProfileHint">默认只读；operator 可修改和仅重扫，full 可自主整理与恢复。是否询问人由用户的 Agent 规则决定，不强制逐次人工确认。</p>
                         <div class="notice-box" id="agentTokenReveal" hidden></div>
                     </section>
 
@@ -1114,7 +1114,7 @@
     <script src="/static/admin-storage-v1.js?v=20261011-storage-cas-v004"></script>
     <script src="/static/admin-notifications.js?v=20260805-notifications-v006"></script>
     <script src="/static/admin-adapters.js?v=20261009-recovery-v001"></script>
-    <script src="/static/admin-agent.js?v=20261104-agent-expiry-v002"></script>
+    <script src="/static/admin-agent.js?v=20261108-agent-autonomy-v003"></script>
     <script src="/static/admin-bootstrap.js?v=20261103-agent-mcp-v015"></script>
     <script src="/static/ui-dialog.js?v=20261009-recovery-v001"></script>
     <script src="/static/admin.js?v=20261103-agent-mcp-v015"></script>

@@ -23,7 +23,7 @@ class AgentWriteServices:
     review_job: Callable[..., tuple[dict[str, Any], int]]
     update_organizer_mappings: Callable[..., tuple[dict[str, Any], int]]
     apply_organizer_task: Callable[..., tuple[dict[str, Any], int]]
-    retry_organizer_task: Callable[[int], tuple[dict[str, Any], int]]
+    retry_organizer_task: Callable[..., tuple[dict[str, Any], int]]
     rollback_organizer_run: Callable[[int], tuple[dict[str, Any], int]]
     create_subscription: Callable[[dict[str, Any]], tuple[dict[str, Any], int]]
     preview_subscription: Callable[[dict[str, Any]], tuple[dict[str, Any], int]]

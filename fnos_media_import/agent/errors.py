@@ -99,8 +99,8 @@ def organizer_error(body: dict[str, Any], status_code: int, fallback: str) -> Ag
     if status_code == 404:
         code = "NOT_FOUND"
     hints = {
-        "PLAN_CHANGED": "重新读取并预览当前计划，确认新指纹后才能执行",
-        "EXECUTION_CONFIRMATION_REQUIRED": "保留现有恢复计划；继续执行用 apply 的计划确认，回滚用 rollback 的明确确认",
+        "PLAN_CHANGED": "重新读取计划并按调用方规则评估；可用 execute=true 执行当前版本，不沿用旧指纹",
+        "EXECUTION_CONFIRMATION_REQUIRED": "保留现有恢复计划；有执行权限的 AI 可按用户规则使用 apply(execute=true)、retry(execute=true) 或 rollback(confirm=true)",
         "REVIEW_REQUIRED": "先读取审核原因并修正身份或季集，不要直接重复执行",
         "IDENTITY_REQUIRED": "先重新识别生成身份计划，不允许原名直通入库",
         "STATE_CONFLICT": "重新读取任务状态；不要自动循环重试",

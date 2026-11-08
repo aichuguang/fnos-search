@@ -71,10 +71,13 @@ docker exec -it fnos-media-import python -m fnos_media_import.agent.cli create -
 docker exec -it fnos-media-import python -m fnos_media_import.agent.cli create --name hermes --profile operator
 ```
 
-Agent 端把 `http://服务器IP:5251/mcp` 加上 `Authorization: Bearer <令牌>` 即可。当前提供 35 个
-工具，覆盖搜索、入库、整理、追更订阅、媒体库检索与刷新、热榜采纳。执行移动前会先返回计划摘要与
-`plan_hash`；直接放行整理或回滚必须具备 `organize.apply`（`full` 档位），`operator` 只能修改/重新识别计划。
-整理重试不会自动移动文件；详情支持分页、身份与审核原因；已移除跳过整理入口。工具清单、权限档位、错误码与安全边界见
+Agent 端把 `http://服务器IP:5251/mcp` 加上 `Authorization: Bearer <令牌>` 即可。当前协议能力版本为 **0.3.0**，提供 35 个
+工具，覆盖搜索、入库、整理、追更订阅、媒体库检索与刷新、热榜采纳。`full` 令牌可按用户的 Agent 规则自主审核，
+通过 `apply_organizer_task(execute=true)` 单次执行整理；内部仍绑定当次 `plan_hash`，保留身份、路径和冲突校验。
+不给 `execute=true` 且不带 `plan_hash` 时只预览，旧的预览/hash 执行流程仍兼容，也可由 AI 自主完成，不强制逐次人工确认。
+后台 `waiting_review` / “人工确认”是业务待审核状态，不限制为人类操作；有权限的 AI 可修正映射后执行，仅在用户规则要求或确实无法判断时询问。
+`retry_organizer_task(execute=true)` 需要 `organize.apply`，可重新识别或续跑；默认 `execute=false` 仅重新识别，`operator` 不获得直接执行或回滚权限。
+`rollback_organizer_run(confirm=true)` 表达调用方的回滚意图，Agent 可在用户规则允许时自行提供。详情支持分页、身份与审核原因；已移除跳过整理入口。工具清单、权限档位、错误码与安全边界见
 [docs/mcp-agent.md](docs/mcp-agent.md)。
 
 ## 2. 准备工作
