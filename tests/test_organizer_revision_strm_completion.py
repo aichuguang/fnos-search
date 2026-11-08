@@ -567,7 +567,52 @@ class OrganizerStrmCompletionTests(unittest.TestCase):
         self.assertEqual(finalized[-1]["task_status"], "waiting_review")
         self.assertEqual(cleanup_calls, [])
 
+    def test_refresh_busy_is_deferred_without_parking_task_for_review(self) -> None:
+        service, finalized, cleanup_calls = _strm_service()
+        service._refresh_openlist_strm_for_task = lambda *_args, **_kwargs: {
+            "enabled": True,
+            "failed": 1,
+            "requested_at": "2026-01-01T00:00:00Z",
+            "refresh_prefix": "/strm/tv",
+            "resource_names": ["New Show"],
+            "refresh_paths": ["/strm/tv/New Show"],
+            "items": [
+                {
+                    "success": False,
+                    "path": "/strm/tv/New Show",
+                    "message": "OpenList 返回失败：manual scan is running, please try later",
+                }
+            ],
+        }
+        task = {
+            "id": 1,
+            "status": "executing",
+            "category": "tv",
+            "raw_data": {},
+            "evidence": {},
+            "mappings": [],
+        }
 
+        result = service._start_strm_completion(
+            1,
+            11,
+            task,
+            _Lease(),
+            summary={"task_id": 1},
+            undo=[],
+            task_evidence={},
+            confirmation={"success": True},
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(finalized[-1]["run_status"], "done")
+        self.assertEqual(finalized[-1]["task_status"], "done")
+        completion = finalized[-1]["raw_data"]["strm_completion"]
+        self.assertEqual(completion["status"], "refresh_deferred")
+        self.assertFalse(completion["confirmation_required"])
+        self.assertEqual(completion["handled_by"], "openlist")
+        self.assertEqual(cleanup_calls, [])
 
 
 if __name__ == "__main__":

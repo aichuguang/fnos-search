@@ -100,6 +100,23 @@ LINKED_JOB_IMMUTABLE_STATUSES = frozenset(
 )
 logger = logging.getLogger(__name__)
 
+_OPENLIST_REFRESH_BUSY_MARKERS = (
+    "manual scan is running",
+    "scan is running",
+    "please try later",
+)
+
+
+def _openlist_refresh_is_transient_busy(items: list[dict[str, Any]]) -> bool:
+    """A concurrent OpenList scan is transient and must not park a task for review."""
+    if not items:
+        return False
+    for item in items:
+        message = str(item.get("message") or "").lower()
+        if not any(marker in message for marker in _OPENLIST_REFRESH_BUSY_MARKERS):
+            return False
+    return True
+
 
 # A resolver is deliberately task-scoped.  It receives the linked Job and its
 # already validated immutable V1 plan, and must return a client built from the
@@ -5228,6 +5245,41 @@ class OrganizerService:
                 if isinstance(item, dict) and not item.get("success")
             ]
             detail = str((failed_items[0] if failed_items else {}).get("message") or "").strip()
+            if _openlist_refresh_is_transient_busy(failed_items):
+                logger.warning(
+                    "organizer_strm_refresh_deferred task_id=%s message=%s",
+                    task_id,
+                    detail[:300],
+                )
+                return self._finish_strm_completion(
+                    task_id,
+                    run_id,
+                    task,
+                    lease,
+                    state={
+                        "version": 2,
+                        "status": "refresh_deferred",
+                        "requested_at": str(strm_refresh.get("requested_at") or _utc_now_text()),
+                        "refresh_prefix": str(strm_refresh.get("refresh_prefix") or ""),
+                        "resource_names": [
+                            str(item or "").strip()
+                            for item in (strm_refresh.get("resource_names") or [])
+                            if str(item or "").strip()
+                        ],
+                        "refresh_paths": [
+                            str(item or "").strip()
+                            for item in (strm_refresh.get("refresh_paths") or [])
+                            if str(item or "").strip()
+                        ],
+                        "refresh": strm_refresh,
+                        "message": "OpenList 正在扫描，刷新已延后，不阻塞整理完成",
+                    },
+                    summary=summary,
+                    undo=undo,
+                    task_evidence=task_evidence,
+                    confirmation=confirmation,
+                    cleanup_enabled=False,
+                )
             message = "最终文件已确认，但 OpenList 文件夹刷新失败"
             if detail:
                 message = f"{message}：{detail[:300]}"
@@ -5307,7 +5359,7 @@ class OrganizerService:
         completed_state = {
             **state,
             "version": 2,
-            "status": "refresh_accepted",
+            "status": str(state.get("status") or "refresh_accepted"),
             "completed_at": _utc_now_text(),
             "confirmation_required": False,
             "handled_by": "openlist",
