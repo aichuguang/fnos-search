@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from ..database import utc_now
+from ..media_identity_contract import subscription_import_identity
 
 ImportServiceProvider = Callable[[], Any]
 ImportHandlerProvider = Callable[[], Callable[[dict[str, Any], str], Any] | None]
@@ -49,7 +50,7 @@ class UpdateCandidateImportService:
         payload.setdefault("title", candidate_row.get("title") or subscription.get("title") or "未命名资源")
         payload.setdefault("url", candidate_row.get("source_url") or "")
         payload.setdefault("password", candidate_row.get("password") or "")
-        payload.setdefault("category", subscription.get("category") or "movie")
+        payload["category"] = subscription.get("category") or "movie"
         # The candidate/subscription is not an infrastructure authority.
         # Destination, account, mount and organizer paths are resolved again
         # from the V1 source assignment when the import job is created.  Strip
@@ -68,8 +69,16 @@ class UpdateCandidateImportService:
             "executor_id",
             "config_revision",
             "idempotency_key",
+            "media_identity",
+            "organizer_intent",
+            "update_subscription_id",
         ):
             payload.pop(field, None)
+        identity, intent = subscription_import_identity(subscription)
+        if identity:
+            payload["media_identity"] = identity
+        payload["organizer_intent"] = intent
+        payload["update_subscription_id"] = int(subscription["id"])
         imports = self.import_service()
         creator = getattr(imports, "create_internal_import_job", None)
         if not callable(creator):

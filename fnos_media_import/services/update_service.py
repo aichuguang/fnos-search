@@ -4,6 +4,7 @@ import hashlib
 import logging
 import posixpath
 import re
+import unicodedata
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -11,8 +12,11 @@ from zoneinfo import ZoneInfo
 from ..constants import JOB_STATUS_LABELS
 from ..database import utc_now
 from ..repositories.repository_set import UpdateRepositories
+from ..media_identity_contract import subscription_import_identity
+from ..organizer.identity import Identity, IdentityError, format_dir_name, make_local_identity
+from ..organizer.library_scan import LibraryScanError, resolve_target_dir, scan_library
 from ..organizer.openlist_client import VIDEO_EXTENSIONS, basename, dirname, join_path
-from ..organizer.parser import parse_file_name
+from ..organizer.parser import invalid_title, parse_file_name, sanitize_candidate
 from ..media_path_rules import format_title_year, sanitize_resource_dir_name, split_title_year
 from ..organizer.tmdb import TmdbClient
 from ..updater.discovery import UpdateDiscovery
@@ -800,111 +804,54 @@ class UpdateService:
         return {"success": True, "message": "已拒绝候选"}
 
     def _resolve_update_root_context(self, subscription: dict[str, Any]) -> dict[str, Any]:
-        """Resolve an update scan root exclusively from the V1 DB graph."""
+        """Resolve within the V1 library by identity; never guess a title path."""
 
         raw_data = subscription.get("raw_data") if isinstance(subscription.get("raw_data"), dict) else {}
         raw_data = dict(raw_data)
         openlist, category_root, session_info = self._resolve_openlist_session(subscription)
-        configured_raw = _clean_openlist_root(
-            raw_data.get("canonical_openlist_root")
-            or raw_data.get("existing_openlist_root")
-            or raw_data.get("openlist_path")
-        )
-        configured = _resource_root_from_openlist_root(configured_raw)
-        candidates = self._canonical_title_candidates(subscription)
         resolved = ""
+        expected_root = ""
         confidence = 0
         reason = ""
-
-        if configured and not _path_within_openlist_root(category_root, configured):
-            configured = ""
-            configured_raw = ""
-            reason = "历史追更路径不属于当前 V1 存储目标，已忽略并重新定位"
-
-        if openlist is not None and configured and configured != category_root:
-            evidence = self._openlist_episode_evidence(
-                subscription,
-                configured_raw or configured,
-                openlist=openlist,
-            )
-            if evidence.get("count"):
-                resolved = _resource_root_from_openlist_root(evidence.get("root") or configured)
-                confidence = 106 if self._openlist_dir_matches_subscription(resolved, candidates) else 96
-                reason = f"使用已保存目录并检测到剧集文件证据，最新 E{evidence.get('latest_episode')}"
-                child_resolved, child_confidence, child_reason = (
-                    self._find_matching_openlist_child_resource_root(
-                        subscription,
-                        resolved,
-                        candidates,
-                        openlist=openlist,
-                    )
-                )
-                if child_resolved and _resource_root_standard_score(
-                    child_resolved, candidates
-                ) > _resource_root_standard_score(resolved, candidates):
-                    resolved = child_resolved
-                    confidence = max(confidence, child_confidence)
-                    reason = child_reason or "已切换到匹配 TMDB 标准命名的子目录"
-                better_resolved, better_confidence, better_reason = (
-                    self._find_existing_openlist_resource_root(
-                        subscription,
-                        category_root,
-                        candidates,
-                        openlist=openlist,
-                    )
-                )
-                if (
-                    better_resolved
-                    and _resource_root_standard_score(better_resolved, candidates)
-                    > _resource_root_standard_score(resolved, candidates)
-                    and better_confidence >= 95
-                ):
-                    resolved = better_resolved
-                    confidence = max(confidence, better_confidence)
-                    reason = f"{better_reason or '匹配 TMDB 标准目录'}，使用命名更规范的资源目录"
-            else:
-                better_resolved, better_confidence, better_reason = (
-                    self._find_existing_openlist_resource_root(
-                        subscription,
-                        category_root,
-                        candidates,
-                        openlist=openlist,
-                    )
-                )
-                if better_resolved and better_confidence >= 100:
-                    resolved = better_resolved
-                    confidence = better_confidence
-                    reason = better_reason
-                else:
-                    resolved = configured
-                    confidence = 100 if self._openlist_dir_matches_subscription(configured, candidates) else 88
-                    reason = "使用订阅已保存的 V1 OpenList 资源目录"
-        elif openlist is not None and category_root:
-            resolved, confidence, reason = self._find_existing_openlist_resource_root(
-                subscription,
-                category_root,
-                candidates,
-                openlist=openlist,
-            )
-
-        resolved = _resource_root_from_openlist_root(resolved)
-        expected_root = self._expected_canonical_openlist_root(subscription, category_root, candidates)
         auto_create_pending = False
-        if not resolved and expected_root:
-            resolved = expected_root
-            confidence = max(confidence, 82)
-            reason = "未找到既有标准目录，将由首次 V1 入库创建预期目录"
-            auto_create_pending = True
-        canonical_title = _canonical_update_title(subscription, resolved, candidates)
+        canonical_title = str(subscription.get("title") or "")
+        canonical_year = str(subscription.get("year") or "")
+        identity_payload: dict[str, Any] = {}
+        intent = "update_existing"
+        if openlist is not None and category_root:
+            try:
+                identity, aliases, intent = self._subscription_root_identity(subscription)
+                read_manifest = getattr(openlist, "read_identity_manifest", None)
+                if not callable(read_manifest):
+                    raise LibraryScanError("OpenList 客户端不支持读取身份清单")
+                index = scan_library(openlist, category_root, media_type=identity.media_type, read_manifest=read_manifest)
+                decision = resolve_target_dir(identity, index, is_first_import=intent == "create_or_match", aliases=aliases)
+                if not decision.success:
+                    raise LibraryScanError("; ".join(decision.errors))
+                resolved = decision.canonical_dir
+                auto_create_pending = decision.is_new
+                actual = decision.manifest.identity
+                canonical_title, canonical_year = actual.title, str(actual.year or "")
+                identity_payload = {**actual.to_dict(), "aliases": [list(key) for key in decision.manifest.aliases]}
+                expected_root = join_path(category_root, format_dir_name(identity))
+                confidence = 85 if decision.is_new else 100
+                reason = "首次订阅已确认身份，等待 Organizer 创建标准目录" if decision.is_new else "已按身份及清单确认现有资源目录"
+            except (IdentityError, LibraryScanError, ValueError, TypeError) as exc:
+                reason = f"追更身份目录需人工确认：{exc}"
+                resolved = ""
+                auto_create_pending = False
         previous_resolution = raw_data.get("canonical_root_resolution") if isinstance(raw_data.get("canonical_root_resolution"), dict) else {}
         context = {
             "canonical_openlist_root": resolved,
             "canonical_resource_root": resolved,
             "canonical_title": canonical_title,
-            "canonical_year": str(subscription.get("year") or ""),
+            "canonical_year": canonical_year,
             "category_root": category_root,
             "expected_openlist_root": expected_root,
             "auto_create_pending": auto_create_pending,
+            "identity_verified": bool(resolved),
+            "media_identity": identity_payload,
+            "organizer_intent": intent,
             "destination_id": str(session_info.get("destination_id") or ""),
             "mount_id": str(session_info.get("mount_id") or ""),
             "namespace_id": str(session_info.get("namespace_id") or ""),
@@ -919,12 +866,21 @@ class UpdateService:
         raw_data["canonical_root_resolution"] = context
         if resolved:
             raw_data["canonical_openlist_root"] = resolved
+            raw_data["media_identity"] = identity_payload
         else:
             raw_data.pop("canonical_openlist_root", None)
         subscription["raw_data"] = raw_data
+        # This marker is transient: persisted raw_data is only a cache, not scan authority.
+        subscription["_identity_root_context"] = context
+        cache_changed = bool(resolved and intent == "update_existing" and subscription.get("canonical_dir") != resolved)
+        if cache_changed:
+            subscription["canonical_dir"] = resolved
         if int(subscription.get("id") or 0):
-            if previous_resolution.get("canonical_openlist_root") != context.get("canonical_openlist_root") or previous_resolution.get("needs_manual_selection") != context.get("needs_manual_selection"):
-                self.db.update.update_update_subscription(int(subscription["id"]), {"raw_data": raw_data})
+            if cache_changed or previous_resolution.get("canonical_openlist_root") != context.get("canonical_openlist_root") or previous_resolution.get("needs_manual_selection") != context.get("needs_manual_selection"):
+                updates = {"raw_data": raw_data}
+                if cache_changed:
+                    updates["canonical_dir"] = resolved
+                self.db.update.update_update_subscription(int(subscription["id"]), updates)
                 level = "info" if resolved else "warn"
                 self.db.update.add_update_event(
                     int(subscription["id"]),
@@ -934,6 +890,31 @@ class UpdateService:
                     context,
                 )
         return context
+
+    def _subscription_root_identity(self, subscription: dict[str, Any]) -> tuple[Identity, list, str]:
+        payload, intent = subscription_import_identity(subscription)
+        raw = subscription.get("raw_data") if isinstance(subscription.get("raw_data"), dict) else {}
+        previous = raw.get("canonical_root_resolution") if isinstance(raw.get("canonical_root_resolution"), dict) else {}
+        legacy_path = raw.get("canonical_openlist_root") or raw.get("existing_openlist_root") or raw.get("openlist_path")
+        if intent == "create_or_match" and legacy_path and not previous.get("auto_create_pending") and not previous.get("identity_verified"):
+            raise IdentityError("历史目录未通过新身份绑定，不允许按标题猜测或创建目录")
+        if payload:
+            identity_title = sanitize_resource_dir_name(unicodedata.normalize("NFKC", str(payload.get("title") or subscription.get("title") or "")), fallback="")
+            identity = Identity(payload["media_type"], payload["ns"], payload["value"], identity_title, payload.get("year"))
+            expected_type = "movie" if subscription.get("category") == "movie" else "tv"
+            if identity.media_type != expected_type:
+                raise IdentityError("订阅身份类型与当前分类库不一致")
+            if invalid_title(sanitize_candidate(identity.title)):
+                raise IdentityError("订阅身份缺少有效标题")
+            return identity, payload.get("aliases") or [], intent
+        if intent == "update_existing":
+            raise IdentityError("已绑定订阅缺少有效身份，禁止新建或猜测目录")
+        title, detected_year = split_title_year(subscription.get("title") or "")
+        title = sanitize_resource_dir_name(unicodedata.normalize("NFKC", sanitize_candidate(title)), fallback="")
+        if invalid_title(title):
+            raise IdentityError("订阅标题无效，不能生成本地身份")
+        media_type = str(subscription.get("media_type") or ("movie" if subscription.get("category") == "movie" else "tv"))
+        return make_local_identity(title, subscription.get("year") or detected_year or None, media_type), [], intent
 
     def _decorate_update_candidate(
         self,
@@ -980,7 +961,7 @@ class UpdateService:
         item["update_context"] = update_context
         if canonical_root:
             payload["title"] = canonical_title or subscription.get("title") or payload.get("title") or item.get("title")
-        elif target_episodes and str(subscription.get("category") or "").strip().lower() in {"tv", "anime", "variety"}:
+        elif root_context.get("needs_manual_selection") or (target_episodes and str(subscription.get("category") or "").strip().lower() in {"tv", "anime", "variety"}):
             item["decision_hint"] = "review"
             item["canonical_root_missing"] = True
             item["update_context"] = {**update_context, "needs_manual_selection": True}
@@ -1010,21 +991,15 @@ class UpdateService:
         return result or [{"display": str(subscription.get("title") or ""), "title": str(subscription.get("title") or ""), "year": str(subscription.get("year") or ""), "norm": _norm(subscription.get("title"))}]
 
     def _expected_canonical_openlist_root(self, subscription: dict[str, Any], category_root: str, candidates: list[dict[str, str]]) -> str:
-        """根据 TMDB 标题/年份生成预期标准目录；不存在也可由 Organizer 入库时创建。"""
-
+        """Only an unbound first import may have a new identity-tagged target."""
         root = _clean_openlist_root(category_root)
         if not root or _invalid_openlist_path(root):
             return ""
-        tmdb_id = _to_int(subscription.get("tmdb_id"))
-        preferred = next((item for item in candidates if str(item.get("display") or "").strip() and str(item.get("year") or "").strip()), None)
-        preferred = preferred or next((item for item in candidates if str(item.get("display") or "").strip() and tmdb_id), None)
-        preferred = preferred or next((item for item in candidates if str(item.get("display") or "").strip()), None)
-        display = sanitize_resource_dir_name((preferred or {}).get("display"), fallback="")
-        if not display:
+        try:
+            identity, _aliases, intent = self._subscription_root_identity(subscription)
+        except (IdentityError, ValueError, TypeError):
             return ""
-        if _norm(display) == _norm(basename(root)):
-            return root
-        return _resource_root_from_openlist_root(join_path(root, display))
+        return join_path(root, format_dir_name(identity)) if intent == "create_or_match" else ""
 
     def _find_existing_openlist_resource_root(
         self,
@@ -1213,16 +1188,19 @@ class UpdateService:
     ) -> set[tuple[int | None, int]]:
         seen = self._seen_episodes(subscription)
         target_episodes = set(target_episodes or set())
+        root_context = subscription.get("_identity_root_context")
+        if not isinstance(root_context, dict):
+            root_context = self._resolve_update_root_context(subscription)
+        if root_context.get("needs_manual_selection") or root_context.get("auto_create_pending") or not root_context.get("identity_verified"):
+            return seen
         openlist, category_root, _session_info = self._resolve_openlist_session(subscription)
         if openlist is None or not category_root:
             return seen
         raw_data = subscription.get("raw_data") if isinstance(subscription.get("raw_data"), dict) else {}
-        configured_root = _resource_root_from_openlist_root(raw_data.get("canonical_openlist_root") or raw_data.get("openlist_path"))
+        configured_root = _clean_openlist_root(root_context.get("canonical_openlist_root"))
         if configured_root and not _path_within_openlist_root(category_root, configured_root):
             configured_root = ""
         root = configured_root
-        if not root:
-            root = category_root
         if allow_full_scan and not force_refresh and (not configured_root or configured_root == category_root):
             allow_full_scan = False
         if not root:
@@ -1251,7 +1229,7 @@ class UpdateService:
         except Exception as exc:  # noqa: BLE001
             self.db.update.add_update_event(int(subscription.get("id") or 0) or None, None, "warn", f"OpenList 基线扫描失败：{exc}", {"root": root})
             return seen
-        title_norms = [_norm(subscription.get("title")), *[_norm(item) for item in subscription.get("aliases") or []]]
+        title_norms = [_norm(root_context.get("canonical_title")), _norm(subscription.get("title")), *[_norm(item) for item in subscription.get("aliases") or []]]
         expected_season = _to_season(subscription.get("season"))
         episodes: set[tuple[int | None, int]] = set()
         for item in items:
@@ -1606,7 +1584,8 @@ class UpdateService:
         return self.db.update.get_update_subscription(int(subscription["id"]), include_sources=True) or {**subscription, **updates}
 
     def _episodes_from_snapshot(self, subscription: dict[str, Any], files: list[dict[str, Any]]) -> set[tuple[int | None, int]]:
-        title_norms = [_norm(subscription.get("title")), *[_norm(item) for item in subscription.get("aliases") or []]]
+        context = subscription.get("_identity_root_context") if isinstance(subscription.get("_identity_root_context"), dict) else {}
+        title_norms = [_norm(context.get("canonical_title")), _norm(subscription.get("title")), *[_norm(item) for item in subscription.get("aliases") or []]]
         expected_season = _to_season(subscription.get("season"))
         episodes: set[tuple[int | None, int]] = set()
         for item in files:

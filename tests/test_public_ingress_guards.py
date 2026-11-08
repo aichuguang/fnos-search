@@ -355,6 +355,17 @@ class PublicSelectionGuardsTests(unittest.TestCase):
                 self.assertEqual(prepared.payload[field]["selected_files"][0]["fid"], "file-1")
                 self.assertTrue(prepared.payload[field]["selected_folders"][0]["is_dir"])
 
+    def test_cloud139_episodes_with_same_parent_path_are_not_deduplicated(self) -> None:
+        prepared = self.prepare({"cloud139_selection": {
+            "mode": "items",
+            "selected_files": [
+                {"fid": "episode-01", "name": "01.mkv", "path": "show/season-01"},
+                {"fid": "episode-02", "name": "02.mkv", "path": "show/season-01"},
+            ],
+        }})
+        rows = prepared.payload["cloud139_selection"]["selected_files"]
+        self.assertEqual([row["fid"] for row in rows], ["episode-01", "episode-02"])
+
     def test_approval_rejects_invalid_saved_provider_selection_without_transition(self) -> None:
         for field in ("cloud139_selection", "tianyi_selection"):
             with self.subTest(field=field):

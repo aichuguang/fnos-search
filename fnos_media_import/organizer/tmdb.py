@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -9,6 +10,10 @@ import requests
 logger = logging.getLogger(__name__)
 
 PROXY_DEFAULT_PORTS = {"http": 80, "https": 443, "socks5": 1080, "socks5h": 1080}
+
+
+class TmdbLookupError(RuntimeError):
+    """Metadata lookup failed; this must not be treated as an empty search."""
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -112,12 +117,16 @@ class TmdbClient:
             "diagnostics": diagnostics,
         }
 
-    def search(self, query: str, media_type: str = "auto") -> list[dict[str, Any]]:
+    def search(self, query: str, media_type: str = "auto", *, strict: bool = False) -> list[dict[str, Any]]:
+        if strict and not self.configured:
+            raise TmdbLookupError("TMDB Token 未配置")
         if not self.configured or not str(query or "").strip():
             return []
         path = "/search/multi" if media_type not in {"tv", "movie"} else f"/search/{media_type}"
-        data = self._request(path, {"query": query, "include_adult": "false"})
+        data = self._request(path, {"query": query, "include_adult": "false"}, **({"strict": True} if strict else {}))
         rows = data.get("results") if isinstance(data, dict) else []
+        if strict and not isinstance(rows, list):
+            raise TmdbLookupError("TMDB 搜索返回无效结果结构")
         result: list[dict[str, Any]] = []
         for row in rows or []:
             if not isinstance(row, dict):
@@ -133,6 +142,7 @@ class TmdbClient:
                 "media_type": item_type,
                 "title": title,
                 "original_title": row.get("original_name") or row.get("original_title") or "",
+                "external_ids": row.get("external_ids") if isinstance(row.get("external_ids"), dict) else {},
                 "year": str(date or "")[:4],
                 "overview": row.get("overview") or "",
                 "poster_path": f"https://image.tmdb.org/t/p/w500{row.get('poster_path')}" if row.get("poster_path") else "",
@@ -143,10 +153,18 @@ class TmdbClient:
                 result.append(item)
         return result[:12]
 
-    def details(self, tmdb_id: int, media_type: str) -> dict[str, Any] | None:
+    def details(self, tmdb_id: int, media_type: str, *, strict: bool = False) -> dict[str, Any] | None:
+        if strict and (not self.configured or media_type not in {"tv", "movie"}):
+            raise TmdbLookupError("TMDB Token 未配置或媒体类型无效")
         if not self.configured or media_type not in {"tv", "movie"}:
             return None
-        data = self._request(f"/{media_type}/{int(tmdb_id)}")
+        data = self._request(
+            f"/{media_type}/{int(tmdb_id)}",
+            {"append_to_response": "external_ids"},
+            **({"strict": True} if strict else {}),
+        )
+        if strict and (not data.get("id") or not (data.get("name") or data.get("title"))):
+            raise TmdbLookupError("TMDB 详情返回无效结果结构")
         if not data:
             return None
         title = data.get("name") if media_type == "tv" else data.get("title")
@@ -155,6 +173,8 @@ class TmdbClient:
             "id": data.get("id"),
             "media_type": media_type,
             "title": title or "",
+            "original_title": data.get("original_name") or data.get("original_title") or "",
+            "external_ids": data.get("external_ids") if isinstance(data.get("external_ids"), dict) else {},
             "year": str(date or "")[:4],
             "overview": data.get("overview") or "",
             "poster_path": f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}" if data.get("poster_path") else "",
@@ -182,20 +202,105 @@ class TmdbClient:
             if isinstance(row, dict)
         ] if isinstance(data, dict) else []
 
-    def _request(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+    def _request(self, path: str, params: dict[str, str] | None = None, *, strict: bool = False) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         query = {"language": self.language, **(params or {})}
         try:
             response = self.session.get(url, params=query, headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"}, timeout=20)
             if response.status_code >= 400:
+                if strict:
+                    raise TmdbLookupError(f"TMDB 请求失败：HTTP {response.status_code}")
                 return {}
             data = response.json()
+            if strict and (not isinstance(data, dict) or not data or data.get("success") is False):
+                raise TmdbLookupError("TMDB 返回无效或失败响应")
             return data if isinstance(data, dict) else {}
-        except Exception:  # noqa: BLE001
+        except TmdbLookupError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if strict:
+                raise TmdbLookupError(f"TMDB 查询失败：{_describe_error(exc)}") from exc
             return {}
 
 
+def tmdb_match_rejection_reason(
+    expected_title: str,
+    expected_year: str,
+    category_key: str,
+    result: dict[str, Any],
+    has_episodes: bool = False,
+) -> str:
+    """Return a hard rejection reason for an obviously wrong TMDB result.
+
+    Title similarity alone is not enough: ``Voice`` matches ``The Voice`` and
+    ``鬼怪`` matches ``鬼怪异闻录`` when substring scoring is used.  A wrong
+    media type or a year gap of more than one year is also disqualifying.
+    """
+
+    result_type = str(result.get("media_type") or "").strip().lower()
+    if category_key == "movie" and result_type and result_type != "movie":
+        return "TMDB 结果类型不是电影"
+    if category_key in {"tv", "anime", "variety"} and result_type and result_type != "tv":
+        return "TMDB 结果类型不是剧集"
+    if has_episodes and result_type and result_type != "tv":
+        return "文件名包含集数，但 TMDB 结果不是剧集"
+
+    expected_year_text = str(expected_year or "").strip()
+    result_year_text = str(result.get("year") or "").strip()
+    expected_number = _year_number(expected_year_text)
+    result_number = _year_number(result_year_text)
+    if expected_number and result_number and abs(expected_number - result_number) > 1:
+        return f"TMDB 年份差距过大（{result_number} vs {expected_number}）"
+
+    expected_normalized = _normalize(expected_title)
+    title_normalized = _normalize(result.get("title") or "")
+    original_normalized = _normalize(result.get("original_title") or "")
+    if not expected_normalized:
+        return ""
+    candidates = [value for value in (title_normalized, original_normalized) if value]
+    if not candidates:
+        return "TMDB 结果没有标题"
+    if any(value == expected_normalized for value in candidates):
+        return ""
+    # Chinese localized titles often place the short query at the end
+    # ("孤单又灿烂的神：鬼怪") or add an English subtitle
+    # ("少女歌剧 Revue Starlight").  Do not apply this to arbitrary
+    # prefix/suffix matches such as "鬼怪异闻录" / "The Voice".
+    if re.search(r"[\u3400-\u9fff]", expected_normalized):
+        if any(value.endswith(expected_normalized) for value in candidates):
+            return ""
+        if len(expected_normalized) >= 4 and any(
+            value.startswith(expected_normalized) for value in candidates
+        ):
+            return ""
+    # Do not accept arbitrary containment: "Voice" must not accept
+    # "The Voice", and "鬼怪" must not accept "鬼怪异闻录".  A high similarity
+    # ratio still allows harmless punctuation/spacing and longer localized
+    # subtitles while rejecting those near-misses.
+    if any(_title_similarity(expected_normalized, value) >= 0.86 for value in candidates):
+        return ""
+    return "TMDB 标题不匹配"
+
+
+def _year_number(value: Any) -> int | None:
+    import re
+
+    matched = re.search(r"(?:19|20)\d{2}", str(value or ""))
+    return int(matched.group(0)) if matched else None
+
+
+def _title_similarity(left: str, right: str) -> float:
+    from difflib import SequenceMatcher
+
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
 def score_tmdb_result(expected_title: str, expected_year: str, category_key: str, result: dict[str, Any], has_episodes: bool) -> float:
+    rejection = tmdb_match_rejection_reason(expected_title, expected_year, category_key, result, has_episodes)
+    if rejection:
+        return 0.0
     score = 40.0
     normalized_expected = _normalize(expected_title)
     normalized_title = _normalize(result.get("title") or "")

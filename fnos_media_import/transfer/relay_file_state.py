@@ -9,9 +9,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
@@ -25,20 +27,92 @@ _THREAD_LOCKS: dict[str, threading.RLock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
 _LOCK_CONTEXT = threading.local()
 
+# Keep this in sync with fnos_media_import.accounts.repository.  A terminal
+# job may leave a partial cache behind after cancellation or a hard crash; it
+# must not block every later job forever.  Unknown/active statuses still use
+# the conservative cache barrier below.
+_TERMINAL_JOB_STATUSES = frozenset(
+    {
+        "done",
+        "success",
+        "failed",
+        "unsupported",
+        "cancelled",
+        "canceled",
+        "skipped",
+        "skipped_existing",
+        "rejected",
+    }
+)
+
+
+class RelayCacheOversized(BlockingIOError):
+    """单个文件本身超过中继缓存上限，等待其它任务释放不会自愈。"""
+
 
 class RelayFileState:
     NAME = ".fnos-relay-upload-sequential.json"
     LOCK_NAME = ".fnos-relay-upload-cache.lock"
     RESERVE_BYTES = 64 * 1024 * 1024
 
-    def __init__(self, local_dir: str, *, job_id: int, plan_key: str) -> None:
+    def __init__(
+        self,
+        local_dir: str,
+        *,
+        job_id: int,
+        plan_key: str,
+        job_status_lookup: Callable[[int], str | None] | None = None,
+    ) -> None:
         self.root = Path(local_dir).absolute()
         self.job_id = int(job_id)
         self.plan_key = str(plan_key)
+        self._job_status_lookup = job_status_lookup
         if self.job_id <= 0 or self.root.name != f"job-{self.job_id}" or not self.plan_key.strip():
             raise ValueError("逐文件中继缺少冻结的任务目录或操作身份")
         self._check_path(self.root)
         self.path = self.root / self.NAME
+
+    def _job_status(self, job_id: int) -> str:
+        """Read only the owning job's status; never import the app service layer."""
+        if self._job_status_lookup is not None:
+            try:
+                value = self._job_status_lookup(int(job_id))
+            except Exception:  # noqa: BLE001 - an unreadable status is not proof of terminal
+                return ""
+            return str(value or "").strip().lower()
+        return self._lookup_job_status(int(job_id))
+
+    @staticmethod
+    def _lookup_job_status(job_id: int) -> str:
+        configured = str(os.environ.get("FNOS_APP_DB_PATH") or "").strip()
+        candidates = [configured, "/app/data/app.db"]
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = Path(candidate).absolute()
+            identity = os.path.normcase(str(path))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if not path.is_file():
+                continue
+            connection = None
+            try:
+                # Immutable/read-only open: the worker must never create or
+                # migrate the shared app database just to inspect peer state.
+                uri = f"file:{path.as_posix()}?mode=ro"
+                connection = sqlite3.connect(uri, uri=True, timeout=1.0)
+                row = connection.execute(
+                    "SELECT status FROM import_jobs WHERE id=?", (int(job_id),)
+                ).fetchone()
+            except (OSError, sqlite3.Error, ValueError):
+                continue
+            finally:
+                if connection is not None:
+                    connection.close()
+            return str(row[0] or "").strip().lower() if row is not None else ""
+        return ""
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
@@ -258,7 +332,14 @@ class RelayFileState:
             # Cancellation is terminal for this pipeline, even if another
             # worker reports an older failure after cancellation was persisted.
             if state.get("prefetch_paused") != "cancelled":
-                state["prefetch_paused"] = reason.strip()
+                reason_text = reason.strip()
+                if not isinstance(state.get("prefetch_paused_at"), (int, float)) or isinstance(
+                    state.get("prefetch_paused_at"), bool
+                ):
+                    # Keep the first timestamp across reason changes; a
+                    # repeated poll must not reset the timeout clock.
+                    state["prefetch_paused_at"] = time.time()
+                state["prefetch_paused"] = reason_text
 
         return self.mutate(pause)
 
@@ -268,6 +349,7 @@ class RelayFileState:
             # Check inside the RMW lock, not against the caller's stale poll.
             if state.get("prefetch_paused") != "cancelled":
                 state["prefetch_paused"] = ""
+                state.pop("prefetch_paused_at", None)
 
         return self.mutate(resume)
 
@@ -280,6 +362,7 @@ class RelayFileState:
             self._wait_for_other_task_cache()
             state = copy.deepcopy(current)
             state.update(version=2, pipeline=config.to_dict(), revision=0, prefetch_paused="")
+            state.pop("prefetch_paused_at", None)
             for entry in state["files"]:
                 # A v1 prepare may already have launched a worker. Its durable
                 # size becomes a full reservation, including after a restart.
@@ -450,6 +533,15 @@ class RelayFileState:
             committed += missing
             if item["state"] == "pending":
                 remaining += missing
+        current_required = max(0, size - local_files.get(entry["path"], 0))
+        if current_required > config.cache_max_bytes:
+            # 等待不会让这个文件变小：这是配置/选片错误，不是背压。
+            # CLI 单独返回 78，让任务快速失败而不是无限重排。
+            raise RelayCacheOversized(
+                errno.EAGAIN,
+                f"单个文件超过中继缓存上限：{entry['path']} 需 {size} 字节，"
+                f"上限 {config.cache_max_bytes} 字节；请提高 RELAY_CACHE_MAX_BYTES 或跳过该文件",
+            )
         if committed > config.cache_max_bytes:
             raise BlockingIOError(errno.EAGAIN, f"中继全局缓存预算不足：需{committed}字节，上限{config.cache_max_bytes}字节")
         free = shutil.disk_usage(self.root).free
@@ -503,10 +595,22 @@ class RelayFileState:
         for directory in self.root.parent.iterdir():
             if directory == self.root or not re.fullmatch(r"job-[1-9][0-9]*", directory.name):
                 continue
+            peer_job_id = int(directory.name[4:])
+            if self._job_status(peer_job_id) in _TERMINAL_JOB_STATUSES:
+                # Cancelled/failed historical jobs can leave arbitrary cache
+                # residue.  It must not become a permanent global barrier.
+                continue
             checkpoint = directory / self.NAME
             try:
-                if self._cache_files(directory):
-                    raise BlockingIOError(errno.EAGAIN, f"{directory.name} 仍有缓存或部分文件，等待其恢复或清理")
+                cached_files = self._cache_files(directory)
+                if cached_files:
+                    total = sum(cached_files.values())
+                    sample = next(iter(cached_files))
+                    raise BlockingIOError(
+                        errno.EAGAIN,
+                        f"{directory.name} 仍有缓存或部分文件（{sample} 等 {len(cached_files)} 个，共 {total} 字节），"
+                        "等待其恢复或清理",
+                    )
                 if not checkpoint.exists():
                     continue
                 self._check_path(checkpoint)
@@ -525,6 +629,10 @@ class RelayFileState:
                 )
             except FileNotFoundError:
                 continue  # A concurrently completed task was safely cleaned.
+            except BlockingIOError:
+                # Our own backpressure decision.  It must not be re-labelled as
+                # an unreadable peer checkpoint by the broad handler below.
+                raise
             except (OSError, ValueError):
                 raise BlockingIOError(errno.EAGAIN, f"{directory.name} 的缓存回执暂不可确认，等待其恢复或清理")
             if occupied:
@@ -583,6 +691,9 @@ def main() -> int:
         else:
             store.mark_downloaded(args.index, args.size)
         return 0
+    except RelayCacheOversized as exc:
+        print(f"逐文件中继无法容纳单个文件：{exc}", file=sys.stderr)
+        return 78
     except BlockingIOError as exc:
         print(f"逐文件中继等待缓存：{exc}", file=sys.stderr)
         return 75

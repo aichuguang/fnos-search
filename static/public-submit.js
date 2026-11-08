@@ -709,7 +709,10 @@
         }
 
         function cloud139SelectionKey(item = {}) {
-            return String(item.path || item.share_fid_token || item.fid || item.id || "").trim();
+            // The share API can reuse the same parent path for every episode;
+            // prefer the provider's unique content id so episodes remain
+            // independently selectable.
+            return String(item.fid || item.id || item.share_fid_token || item.path || "").trim();
         }
 
         function cloud139SelectionSummaryText(publicId) {

@@ -41,6 +41,8 @@ from .config_persistence import (
     advanced_config_response,
     apply_persisted_config,
     normalize_advanced_config_payload,
+    persisted_config_from_settings,
+    trending_schedule_document,
 )
 from .content_guard import BT_SOURCE_TYPES, evaluate_submission_content_risk
 from .constants import (
@@ -147,7 +149,7 @@ from .services.public_resource_detail_service import PublicResourceDetailService
 from .services.media_dashboard_service import (
     MediaDashboardService,
 )
-from .services.durable_worker_runtime import DurableWorkerRuntime
+from .services.worker_lane_runtime import WorkerLaneRuntime
 from .services.worker_task_dispatcher import WorkerTaskDispatcher
 from .services.worker_queue_diagnostics_service import WorkerQueueDiagnosticsService
 from .services.readiness_service import ReadinessService, routes_require_openlist
@@ -248,6 +250,39 @@ __all__ = ["create_app"]
 
 ADMIN_PROFILE_KEY = "admin.profile"
 SITE_BRANDING_KEY = "site.branding"
+
+_ENV_TRUE = {"1", "true", "yes", "on"}
+
+
+def _agent_submission_result(body: dict[str, Any], row: dict[str, Any] | None) -> dict[str, Any]:
+    """Add the internal ids an agent needs to the visitor-safe submit response.
+
+    ``_public_request_response`` deliberately exposes no ``id`` or ``job_id``;
+    agents need them to poll or approve, so the bridge resolves the persisted
+    row by request token and adds them without touching the public API.
+    """
+
+    if isinstance(row, dict):
+        body["request_id"] = row.get("id")
+        body["job_id"] = row.get("job_id")
+        body["request_status"] = row.get("status")
+        body["title"] = row.get("title")
+        body["category"] = row.get("category")
+    return body
+
+
+def _agent_enabled_from_env() -> bool:
+    """Agent (MCP) surface is opt-in; an absent variable keeps it off."""
+
+    return str(os.getenv("FNOS_AGENT_ENABLED", "")).strip().lower() in _ENV_TRUE
+
+
+def _agent_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(os.getenv(name, "")).strip() or default)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
 
 
 class _MemoryLogHandler(logging.Handler):
@@ -422,7 +457,11 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 cache_namespace=f"account:{account_id}",
             )
         if provider_kind == "mobile":
-            return Cloud139Importer(config_values, cmcc_config=values)
+            return Cloud139Importer(
+                config_values,
+                cmcc_config=values,
+                authorization_update_callback=persist_credentials,
+            )
         if provider_kind == "sixpan":
             return SixPanOfflineImporter(
                 values,
@@ -947,17 +986,23 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
 
     db.job_commands.set_status_transition_emitter(_emit_job_status_notification)
 
-    durable_worker_runtime = DurableWorkerRuntime(
+    durable_worker_runtime = WorkerLaneRuntime(
         repository=db.worker_tasks,
         owner_id=f"{process_owner_id}-durable",
-        handlers={
-            "organizer_process": _worker_organizer_process,
-            "organizer_apply": _worker_organizer_apply,
-            "media_refresh": _worker_media_refresh,
-            "media_category_refresh": _worker_media_category_refresh,
-            "import_retry": _worker_import_retry,
-            "public_import_create": _worker_public_import_create,
-            "notification_deliver": notification_deliver_handler,
+        lane_handlers={
+            "organizer": {
+                "organizer_process": _worker_organizer_process,
+                "organizer_apply": _worker_organizer_apply,
+                "media_refresh": _worker_media_refresh,
+                "media_category_refresh": _worker_media_category_refresh,
+            },
+            "transfer": {
+                "import_retry": _worker_import_retry,
+                "public_import_create": _worker_public_import_create,
+            },
+            "maintenance": {
+                "notification_deliver": notification_deliver_handler,
+            },
         },
         poll_seconds=_config_int(app_config.raw.get("worker", {}), "poll_seconds", 1),
         lease_seconds=_config_int(app_config.raw.get("worker", {}), "lease_seconds", 120),
@@ -1790,62 +1835,83 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         result, status_code = _guest_request_admin_application().detail(request_id)
         return jsonify(result), status_code
 
+    def _perform_request_decision(
+        request_id: int,
+        payload: dict[str, Any] | None,
+        *,
+        action: str,
+        admin_username: Any,
+    ) -> tuple[dict[str, Any], int]:
+        """Shared approve / reject / cancel path for route and Agent callers."""
+
+        body = dict(payload or {})
+        if action == "approve":
+            return _request_approval_application().approve(request_id, body, admin=admin_username)
+
+        if action not in {"reject", "cancel"}:
+            return {"success": False, "message": "未知的提交处理动作"}, 400
+        default_reason = "管理员拒绝该提交" if action == "reject" else "管理员取消该提交"
+        reason = str(body.get("reason") or default_reason)
+        command = _request_review_command_application()
+        decision, status_code = (command.reject if action == "reject" else command.cancel)(
+            request_id,
+            reason=reason,
+            admin=admin_username,
+            force=_payload_bool(body, "force", False),
+        )
+        if status_code != 200:
+            return decision, status_code
+        item = decision["request"]
+        linked_job = decision["linked_job"]
+        label = "已拒绝" if action == "reject" else "已取消"
+        request_worker_cancel = db.worker_tasks.cancel_related(
+            guest_request_id=request_id,
+            reason=f"访客提交 #{request_id} {label}：{reason}",
+        )
+        cancel_result = None
+        if linked_job:
+            cancel_result = _cancel_job_and_cleanup(
+                linked_job,
+                reason=f"关联访客提交{label}：{reason}",
+                payload=body,
+                request_item=item,
+                cleanup_default=_payload_bool(body, "cleanup", True),
+                stop_running_default=(action == "cancel"),
+            )
+        return {
+            "success": True,
+            "message": f"{label}提交",
+            "request": db.guest_request_queries.get(request_id),
+            "job_cancel": cancel_result,
+            "worker_cancel": request_worker_cancel,
+        }, 200
+
     def api_admin_request_approve(request_id: int):
-        payload = request.get_json(silent=True) or {}
-        result, status_code = _request_approval_application().approve(request_id, payload, admin=session.get("admin_username"))
+        result, status_code = _perform_request_decision(
+            request_id,
+            request.get_json(silent=True),
+            action="approve",
+            admin_username=session.get("admin_username"),
+        )
         return jsonify(result), status_code
 
     def api_admin_request_reject(request_id: int):
-        payload = request.get_json(silent=True) or {}
-        reason = str(payload.get("reason") or "管理员拒绝该提交")
-        decision, status_code = _request_review_command_application().reject(
-            request_id, reason=reason, admin=session.get("admin_username"), force=_payload_bool(payload, "force", False)
+        result, status_code = _perform_request_decision(
+            request_id,
+            request.get_json(silent=True),
+            action="reject",
+            admin_username=session.get("admin_username"),
         )
-        if status_code != 200:
-            return jsonify(decision), status_code
-        item = decision["request"]
-        linked_job = decision["linked_job"]
-        request_worker_cancel = db.worker_tasks.cancel_related(
-            guest_request_id=request_id,
-            reason=f"访客提交 #{request_id} 已拒绝：{reason}",
-        )
-        cancel_result = None
-        if linked_job:
-            cancel_result = _cancel_job_and_cleanup(
-                linked_job,
-                reason=f"关联访客提交已拒绝：{reason}",
-                payload=payload,
-                request_item=item,
-                cleanup_default=_payload_bool(payload, "cleanup", True),
-                stop_running_default=False,
-            )
-        return jsonify({"success": True, "message": "已拒绝提交", "request": db.guest_request_queries.get(request_id), "job_cancel": cancel_result, "worker_cancel": request_worker_cancel})
+        return jsonify(result), status_code
 
     def api_admin_request_cancel(request_id: int):
-        payload = request.get_json(silent=True) or {}
-        reason = str(payload.get("reason") or "管理员取消该提交")
-        decision, status_code = _request_review_command_application().cancel(
-            request_id, reason=reason, admin=session.get("admin_username"), force=_payload_bool(payload, "force", False)
+        result, status_code = _perform_request_decision(
+            request_id,
+            request.get_json(silent=True),
+            action="cancel",
+            admin_username=session.get("admin_username"),
         )
-        if status_code != 200:
-            return jsonify(decision), status_code
-        item = decision["request"]
-        linked_job = decision["linked_job"]
-        request_worker_cancel = db.worker_tasks.cancel_related(
-            guest_request_id=request_id,
-            reason=f"访客提交 #{request_id} 已取消：{reason}",
-        )
-        cancel_result = None
-        if linked_job:
-            cancel_result = _cancel_job_and_cleanup(
-                linked_job,
-                reason=f"关联访客提交已取消：{reason}",
-                payload=payload,
-                request_item=item,
-                cleanup_default=_payload_bool(payload, "cleanup", True),
-                stop_running_default=True,
-            )
-        return jsonify({"success": True, "message": "已取消提交", "request": db.guest_request_queries.get(request_id), "job_cancel": cancel_result, "worker_cancel": request_worker_cancel})
+        return jsonify(result), status_code
 
     def api_admin_jobs():
         page, per_page, offset = _page_args(20, 200)
@@ -1882,7 +1948,14 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def api_admin_job_retry(job_id: int):
         return jsonify(_job_admin_command_application().retry(job_id))
 
-    def api_admin_job_review(job_id: int):
+    def _perform_job_review(
+        job_id: int,
+        payload: dict[str, Any] | None,
+        *,
+        admin_username: Any,
+    ) -> tuple[dict[str, Any], int]:
+        """Shared manual-review path for the admin route and the Agent surface."""
+
         from .planning.plan_validator import validate_plan
 
         service = TransferManualReviewService(
@@ -1894,12 +1967,20 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             ),
         )
         result, status_code = service.confirm_not_submitted(
-            job_id, request.get_json(silent=True), admin=str(session.get("admin_username") or "")
+            job_id, payload, admin=str(admin_username or "")
         )
         if result.get("recovered"):
             current_job = db.job_queries.get(job_id)
             if current_job:
                 _sync_guest_requests_for_job(job_id, str(current_job.get("status") or "retry_requested"))
+        return result, status_code
+
+    def api_admin_job_review(job_id: int):
+        result, status_code = _perform_job_review(
+            job_id,
+            request.get_json(silent=True),
+            admin_username=session.get("admin_username"),
+        )
         return jsonify(result), status_code
 
     def api_admin_job_delete(job_id: int):
@@ -1916,29 +1997,33 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             )
         )
 
-    def api_admin_job_cancel(job_id: int):
-        job = db.job_queries.get(job_id)
-        if not job:
-            return jsonify({"success": False, "message": "任务不存在"}), 404
-        payload = request.get_json(silent=True) or {}
-        if str(job.get("status") or "") in {"done", "success"}:
-            return jsonify({"success": False, "message": "任务已完成，不能取消；如需删除已入库资源请走人工清理"}), 400
-        reason = str(payload.get("reason") or "管理员取消任务")
+    def _perform_job_cancel(
+        job: dict[str, Any],
+        *,
+        reason: str,
+        payload: dict[str, Any],
+        admin_username: Any,
+        cleanup_default: bool = True,
+        stop_running_default: bool = True,
+    ) -> tuple[dict[str, Any], int]:
+        """Shared cancel path for the admin route and the Agent surface."""
+
         result = _cancel_job_and_cleanup(
             job,
             reason=reason,
             payload=payload,
             request_item=None,
-            cleanup_default=_payload_bool(payload, "cleanup", True),
-            stop_running_default=True,
+            cleanup_default=cleanup_default,
+            stop_running_default=stop_running_default,
         )
+        job_id = int(job.get("id") or 0)
         if result.get("cancelled") is False:
-            return jsonify({
+            return {
                 "success": False,
                 "message": result.get("message") or "任务状态已变化，取消未执行",
                 "job": result.get("job") or db.job_queries.get(job_id),
                 "cleanup": result.get("cleanup"),
-            }), 409
+            }, 409
         for guest_request in db.guest_request_queries.list_by_job(job_id):
             request_id = guest_request.get("id")
             if not request_id:
@@ -1948,9 +2033,77 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 int(request_id),
                 status=JOB_CANCELLED,
                 public_status="已取消",
-                raw_data=_merge_raw_data(guest_request.get("raw_data"), {"cancelled_by": session.get("admin_username"), "reason": reason, "job_id": job_id}),
+                raw_data=_merge_raw_data(
+                    guest_request.get("raw_data"),
+                    {"cancelled_by": admin_username, "reason": reason, "job_id": job_id},
+                ),
             )
-        return jsonify({"success": True, "message": result.get("message") or "已取消任务", "job": db.job_queries.get(job_id), "cleanup": result.get("cleanup")})
+        return {
+            "success": True,
+            "message": result.get("message") or "已取消任务",
+            "job": db.job_queries.get(job_id),
+            "cleanup": result.get("cleanup"),
+        }, 200
+
+    def api_admin_job_cancel(job_id: int):
+        job = db.job_queries.get(job_id)
+        if not job:
+            return jsonify({"success": False, "message": "任务不存在"}), 404
+        payload = request.get_json(silent=True) or {}
+        if str(job.get("status") or "") in {"done", "success"}:
+            return jsonify({"success": False, "message": "任务已完成，不能取消；如需删除已入库资源请走人工清理"}), 400
+        reason = str(payload.get("reason") or "管理员取消任务")
+        body, status_code = _perform_job_cancel(
+            job,
+            reason=reason,
+            payload=payload,
+            admin_username=session.get("admin_username"),
+            cleanup_default=_payload_bool(payload, "cleanup", True),
+            stop_running_default=True,
+        )
+        return jsonify(body), status_code
+
+    def _quarantine_cancelled_relay_cache(job: dict[str, Any]) -> dict[str, Any]:
+        """Move a cancelled relay job out of the global cache barrier.
+
+        The worker may be blocked by this job's own partial cache, so the web
+        cancellation path must not wait for another worker tick to release it.
+        Only the immutable relay strategy and its job-scoped cache are eligible.
+        """
+
+        dispatch = app.extensions.get("v1_transfer_dispatch")
+        if dispatch is None:
+            return {"success": True, "skipped": True, "message": "V1 传输调度尚未初始化"}
+        job_id = _safe_int(job.get("id"), 0, 1, 999999999)
+        if job_id <= 0:
+            return {"success": False, "message": "缺少有效任务 ID，未隔离中继缓存"}
+        try:
+            plan = dispatch.executions.plan(job_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "message": f"读取冻结执行计划失败：{exc}"}
+        if not isinstance(plan, dict):
+            return {"success": True, "skipped": True, "message": "任务没有可隔离的中继计划"}
+        strategy = str((plan.get("transfer") or {}).get("strategy") or "").strip().lower()
+        if strategy != "relay_upload_provider":
+            return {"success": True, "skipped": True, "message": "当前策略没有中继缓存"}
+        try:
+            result = dispatch.cleanup.release_staging(
+                plan,
+                target_root=os.path.join(
+                    str(dispatch.relay_root),
+                    "relay_backups",
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "message": f"隔离中继缓存异常：{exc}"}
+        payload = result.to_dict() if hasattr(result, "to_dict") else result
+        if not isinstance(payload, dict):
+            return {"success": bool(result), "message": "中继缓存隔离结果未确认"}
+        success = bool(payload.get("ok"))
+        return {
+            "success": success,
+            "message": str(payload.get("reason") or ("中继缓存已隔离" if success else "中继缓存隔离未完成")),
+        }
 
     def _job_cancellation_service() -> JobCancellationService:
         return JobCancellationService(
@@ -1969,6 +2122,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                     None,
                 ),
                 enqueue_transfer=worker_task_dispatcher.import_transfer_execute,
+                relay_cache_quarantine=_quarantine_cancelled_relay_cache,
             )
         )
 
@@ -3033,6 +3187,45 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
     def api_admin_maintenance_cleanup_history():
         return _settings_response(settings_service.cleanup_history(request.get_json(silent=True) or {}))
 
+    def api_admin_trending_scheduler_save():
+        """Persist and live-apply the daily trending schedule.
+
+        The settings page speaks the versioned export/import document, but this
+        dialog only owns ``hot_discovery``. Merge that one section server-side
+        and apply it to the running scheduler directly: a schedule toggle must
+        not depend on an unrelated full runtime reload (rclone worker, providers).
+        """
+
+        payload = request.get_json(silent=True) or {}
+        enabled = _payload_bool(payload, "enabled", False)
+        run_at = str(payload.get("run_at") or "").strip()
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", run_at):
+            return jsonify({"success": False, "message": "请选择有效的每日执行时间"}), 400
+
+        try:
+            stored = persisted_config_from_settings(db.app_settings.get_all())
+        except ValueError as exc:
+            return jsonify({"success": False, "message": str(exc)}), 409
+        document = trending_schedule_document(stored, enabled=enabled, run_at=run_at)
+
+        def updater(previous: Any, _existed: bool) -> dict[str, Any]:
+            current = previous if isinstance(previous, dict) else {}
+            return normalize_advanced_config_payload({"config": document, "mode": "merge"}, current_stored=current)
+
+        try:
+            db.app_settings.update_atomic(ADVANCED_CONFIG_KEY, updater)
+        except ValueError as exc:
+            return jsonify({"success": False, "message": str(exc)}), 400
+
+        trending_scheduler.apply_config(enabled=enabled, run_at=run_at)
+        return jsonify(
+            {
+                "success": True,
+                "message": "每日热榜调度配置已保存",
+                "scheduler": trending_scheduler.status(),
+            }
+        )
+
     def api_admin_advanced_config():
         return _settings_response(settings_service.advanced())
 
@@ -3873,25 +4066,36 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         ),
     )
 
-    def api_public_submit():
-        limited = _rate_limit("public_submit", "public_submit_rate_limit")
-        if limited:
-            return limited
-        payload = dict(request.get_json(silent=True) or {})
+    def _perform_public_submission(
+        raw_payload: dict[str, Any],
+        *,
+        client_ip: str,
+        user_agent: str,
+        skip_captcha: bool = False,
+    ) -> tuple[dict[str, Any], int]:
+        """Shared submit path for the public route and the Agent surface.
+
+        The Agent surface is authenticated by token and therefore skips the
+        anonymous captcha, but it must not diverge on preparation, duplicate
+        detection, content guard or job coordination.
+        """
+
+        payload = dict(raw_payload or {})
         selection_token = payload.pop("tmdb_selection_token", None)
         media_identity = public_tmdb_service.resolve_token(selection_token)
         payload.pop("media_identity", None)
         if media_identity:
             payload["media_identity"] = media_identity
-        captcha_ok, captcha_message = _verify_public_captcha(
-            payload, security_config, _client_ip(), str(app.secret_key or "")
-        )
-        if not captcha_ok:
-            return jsonify({"success": False, "message": captcha_message}), 400
+        if not skip_captcha:
+            captcha_ok, captcha_message = _verify_public_captcha(
+                payload, security_config, client_ip, str(app.secret_key or "")
+            )
+            if not captcha_ok:
+                return {"success": False, "message": captcha_message}, 400
         try:
             prepared_submission = public_submission_preparation.prepare(payload)
         except (PublicInputError, PublicSubmissionPreparationError) as exc:
-            return jsonify({"success": False, "message": str(exc)}), getattr(exc, "status_code", 400)
+            return {"success": False, "message": str(exc)}, getattr(exc, "status_code", 400)
 
         submit_payload = prepared_submission.payload
         link = prepared_submission.link
@@ -3899,15 +4103,15 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             intake = public_submission_intake.begin(
                 prepared_submission,
                 client_ip_hash=_hash_client_ip(
-                    _client_ip(),
+                    client_ip,
                     str(security_config.get("ip_hash_salt") or app.secret_key or ""),
                 ),
-                user_agent=_clip_text(request.headers.get("User-Agent"), 200),
+                user_agent=_clip_text(user_agent, 200),
             )
         except ValueError as exc:
-            return jsonify({"success": False, "message": str(exc)}), 400
+            return {"success": False, "message": str(exc)}, 400
         if intake.response is not None:
-            return jsonify(intake.response)
+            return intake.response, 200
         preflight = intake.preflight
         request_token = intake.request_token
         guest_request_id = intake.guest_request_id
@@ -3925,7 +4129,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
             content_guard=content_guard,
         )
         if decision_response is not None:
-            return jsonify(decision_response)
+            return decision_response, 200
 
         import_outcome = public_import_job_coordinator.execute(
             guest_request_id=guest_request_id,
@@ -3935,15 +4139,53 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         result = import_outcome.result
         public_status = import_outcome.public_status
         bound_request = import_outcome.bound_request
-        return jsonify(
-            {
-                "success": bool(result.get("success", True)),
-                "message": _public_submit_message(result),
-                "request_token": request_token,
-                "status": public_status,
-                "request": _public_request_response(bound_request or db.guest_request_queries.get(guest_request_id)),
-            }
+        return {
+            "success": bool(result.get("success", True)),
+            "message": _public_submit_message(result),
+            "request_token": request_token,
+            "status": public_status,
+            "request": _public_request_response(bound_request or db.guest_request_queries.get(guest_request_id)),
+        }, 200
+
+    def _preview_public_submission(raw_payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """Validate a submission without creating a request, job or provider call."""
+
+        payload = dict(raw_payload or {})
+        selection_token = payload.pop("tmdb_selection_token", None)
+        media_identity = public_tmdb_service.resolve_token(selection_token)
+        payload.pop("media_identity", None)
+        if media_identity:
+            payload["media_identity"] = media_identity
+        try:
+            prepared = public_submission_preparation.prepare(payload)
+        except (PublicInputError, PublicSubmissionPreparationError) as exc:
+            return {"success": False, "message": str(exc)}, getattr(exc, "status_code", 400)
+        link = prepared.link
+        return {
+            "success": True,
+            "dry_run": True,
+            "public_id": prepared.public_id,
+            "title": prepared.payload.get("title"),
+            "category": prepared.category_key,
+            "provider_kind": link.provider_kind,
+            "source_form": link.source_form,
+            "supported": link.supported,
+            "reason": link.reason,
+            "media_identity": prepared.payload.get("media_identity"),
+            "scoped_selection": prepared.scoped_selection,
+            "message": "预检通过。真实提交还会执行网盘可用性与文件内容检查。",
+        }, 200
+
+    def api_public_submit():
+        limited = _rate_limit("public_submit", "public_submit_rate_limit")
+        if limited:
+            return limited
+        body, status_code = _perform_public_submission(
+            request.get_json(silent=True) or {},
+            client_ip=_client_ip(),
+            user_agent=request.headers.get("User-Agent") or "",
         )
+        return jsonify(body), status_code
 
     def api_public_request(token: str):
         query_enabled = _current_public_settings().get("request_query_enabled", True)
@@ -4273,6 +4515,7 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
                 handlers={
                     "status": api_admin_trending_status,
                     "run": api_admin_trending_run,
+                    "scheduler_save": api_admin_trending_scheduler_save,
                     "runs": api_admin_trending_runs,
                     "candidates": api_admin_trending_candidates,
                     "candidate_detail": api_admin_trending_candidate_detail,
@@ -4399,4 +4642,385 @@ def create_app(config_path: str | None = None, process_role: str | None = None) 
         recovery_timer.start()
         if worker_watchdog is not None:
             worker_watchdog.start()
+
+    def _agent_service_builders() -> dict[str, Any]:
+        """Callables handed to the MCP tools; closures keep the service graph intact."""
+
+        def _agent_search(keyword: str, *, sources: list[str], refresh: bool) -> dict[str, Any]:
+            options: dict[str, Any] = {"trace_id": secrets.token_hex(4)}
+            if refresh:
+                options["refresh"] = True
+            return _public_search_application(admin=True).search(
+                keyword,
+                sources=list(sources or []),
+                token="",
+                options=options,
+                hide_full_links=False,
+                trace_id=str(options["trace_id"]),
+            )
+
+        def _agent_resource_detail(public_id: str) -> tuple[dict[str, Any], int]:
+            return _public_resource_application().detail(public_id, hide_full_links=False)
+
+        def _agent_resource_files(public_id: str, fid: str) -> tuple[dict[str, Any], int]:
+            return _public_resource_application().files(public_id, fid=fid)
+
+        def _agent_detect_link(url: str, password: str) -> dict[str, Any]:
+            link = detect_link(url, password=password)
+            return {
+                "provider_kind": link.provider_kind,
+                "source_form": link.source_form,
+                "search_source_id": link.search_source_id,
+                "supported": link.supported,
+                "reason": link.reason,
+                "url": link.url,
+            }
+
+        def _agent_tmdb_search(keyword: str) -> dict[str, Any]:
+            return public_tmdb_service.search(keyword)
+
+        def _agent_list_jobs(**kwargs: Any) -> dict[str, Any]:
+            return _job_admin_query_application().list_jobs(**kwargs)
+
+        def _agent_job_detail(job_id: int) -> tuple[dict[str, Any], int]:
+            return _job_admin_query_application().detail(job_id)
+
+        def _agent_list_requests(**kwargs: Any) -> dict[str, Any]:
+            return _guest_request_admin_application().list_requests(**kwargs)
+
+        def _agent_request_detail(request_id: int) -> tuple[dict[str, Any], int]:
+            return _guest_request_admin_application().detail(request_id)
+
+        def _agent_list_organizer_tasks(**kwargs: Any) -> dict[str, Any]:
+            return _organizer_admin_query_application().tasks(**kwargs)
+
+        def _agent_organizer_task_detail(task_id: int) -> tuple[dict[str, Any], int]:
+            return _organizer_admin_query_application().detail(task_id)
+
+        def _agent_list_subscriptions(**kwargs: Any) -> dict[str, Any]:
+            return update_service.list_subscriptions(**kwargs)
+
+        def _agent_subscription_detail(subscription_id: int) -> tuple[dict[str, Any], int]:
+            try:
+                update_service.sync_subscription_completion(subscription_id)
+            except Exception:  # noqa: BLE001 - detail must work even if sync fails
+                app.logger.debug("agent subscription completion sync failed", exc_info=True)
+            item = update_service.get_subscription(subscription_id)
+            if not item:
+                return {"success": False, "message": "追更订阅不存在"}, 404
+            runs = db.update.list_update_runs(subscription_id=subscription_id, limit=3)
+            candidates = update_service.filter_display_candidates(
+                db.update.list_update_candidates(subscription_id=subscription_id, limit=100)
+            )[:30]
+            events = db.update.list_update_events(subscription_id=subscription_id, limit=20)
+            return {
+                "success": True,
+                "item": item,
+                "runs": runs,
+                "candidates": candidates,
+                "events": events,
+            }, 200
+
+        def _agent_submit_import(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+            body, status_code = _perform_public_submission(
+                payload,
+                client_ip=_client_ip(),
+                user_agent=f"fnos-agent/{active_process_role}",
+                skip_captcha=True,
+            )
+            # The public response is intentionally visitor-safe and carries no
+            # internal ids; resolve them here so agents can poll or approve.
+            token = str(body.get("request_token") or "")
+            row = db.guest_request_queries.get_by_token(token) if token else None
+            return _agent_submission_result(body, row), status_code
+
+        def _agent_approve_request(request_id: int, payload: dict[str, Any], admin: str) -> tuple[dict[str, Any], int]:
+            return _perform_request_decision(request_id, payload, action="approve", admin_username=admin)
+
+        def _agent_reject_request(request_id: int, payload: dict[str, Any], admin: str) -> tuple[dict[str, Any], int]:
+            return _perform_request_decision(request_id, payload, action="reject", admin_username=admin)
+
+        def _agent_retry_job(job_id: int, reason: str) -> tuple[dict[str, Any], int]:
+            try:
+                return _job_admin_command_application().retry(job_id, reason=reason), 200
+            except ValueError as exc:
+                # ImportService raises for a missing/unretryable job; map that to
+                # the same status the admin route would report.
+                not_found = "不存在" in str(exc)
+                return {"success": False, "message": str(exc)}, 404 if not_found else 400
+
+        def _agent_cancel_job(job_id: int, payload: dict[str, Any], admin: str) -> tuple[dict[str, Any], int]:
+            job = db.job_queries.get(job_id)
+            if not job:
+                return {"success": False, "message": "任务不存在"}, 404
+            if str(job.get("status") or "") in {"done", "success"}:
+                return {"success": False, "message": "任务已完成，不能取消"}, 400
+            return _perform_job_cancel(
+                job,
+                reason=str(payload.get("reason") or f"{admin} 取消任务"),
+                payload=payload,
+                admin_username=admin,
+                cleanup_default=False,
+                stop_running_default=True,
+            )
+
+        def _agent_review_job(job_id: int, payload: dict[str, Any], admin: str) -> tuple[dict[str, Any], int]:
+            return _perform_job_review(job_id, payload, admin_username=admin)
+
+        def _agent_update_organizer_mappings(task_id: int, mapping_id: int, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+            application = _organizer_admin_command_application()
+            if mapping_id:
+                return application.update_mapping(task_id, int(mapping_id), payload)
+            return application.batch_update_mappings(task_id, payload)
+
+        def _agent_apply_organizer(task_id: int, expected_revision: int | None = None, expected_plan_hash: str | None = None) -> tuple[dict[str, Any], int]:
+            return _organizer_admin_command_application().apply(
+                task_id, expected_revision=expected_revision, expected_plan_hash=expected_plan_hash
+            )
+
+        def _agent_retry_organizer(task_id: int) -> tuple[dict[str, Any], int]:
+            return _organizer_admin_command_application().rescan_only(task_id)
+
+        def _agent_rollback_organizer(run_id: int) -> tuple[dict[str, Any], int]:
+            return _organizer_admin_command_application().rollback(run_id)
+
+        def _agent_create_subscription(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+            try:
+                item = update_service.create_subscription(payload)
+            except ValueError as exc:
+                return {"success": False, "message": str(exc)}, 400
+            return {"success": True, "item": item}, 200
+
+        def _agent_preview_subscription(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+            # Reuse the service's own normalizer so the preview cannot drift from
+            # what creation would persist; nothing is written here.
+            try:
+                normalized, _sources = update_service._normalize_subscription_payload(payload)
+            except ValueError as exc:
+                return {"success": False, "message": str(exc)}, 400
+            try:
+                next_run_at = update_service._compute_next_run(normalized)
+            except Exception:  # noqa: BLE001 - preview must still report the plan
+                app.logger.debug("agent subscription preview next-run failed", exc_info=True)
+                next_run_at = ""
+            return {
+                "success": True,
+                "title": normalized.get("title"),
+                "category": normalized.get("category"),
+                "media_type": normalized.get("media_type"),
+                "season": normalized.get("season"),
+                "schedule_kind": normalized.get("schedule_kind"),
+                "days_of_week": normalized.get("days_of_week"),
+                "time_of_day": normalized.get("time_of_day"),
+                "timezone": normalized.get("timezone"),
+                "next_run_at": next_run_at,
+            }, 200
+
+        def _agent_update_subscription(subscription_id: int, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+            try:
+                item = update_service.update_subscription(subscription_id, payload)
+            except ValueError as exc:
+                return {"success": False, "message": str(exc)}, 400
+            return {"success": True, "item": item}, 200
+
+        def _agent_set_subscription_status(subscription_id: int, status: str) -> tuple[dict[str, Any], int]:
+            try:
+                item = update_service.set_status(subscription_id, status)
+            except ValueError as exc:
+                return {"success": False, "message": str(exc)}, 400
+            labels = {"enabled": "已启用追更", "paused": "已暂停追更", "archived": "已归档追更"}
+            return {"success": True, "item": item, "message": labels.get(status, "已更新")}, 200
+
+        def _agent_run_subscription(subscription_id: int) -> tuple[dict[str, Any], int]:
+            result = update_service.run_subscription(subscription_id, trigger_type="manual")
+            if isinstance(result, dict) and result.get("success") is False:
+                return result, 409
+            return {"success": True, **(result if isinstance(result, dict) else {})}, 200
+
+        def _agent_delete_subscription(subscription_id: int) -> tuple[dict[str, Any], int]:
+            try:
+                result = update_service.delete_subscription(subscription_id)
+            except ValueError as exc:
+                return {"success": False, "message": str(exc)}, 404
+            return (result if isinstance(result, dict) else {"success": True}), 200
+
+        def _agent_media_libraries() -> dict[str, Any]:
+            return _media_admin_query_application().libraries()
+
+        def _agent_search_media_library(keyword: str, limit: int) -> dict[str, Any]:
+            return fnos.search_media(keyword, limit=limit)
+
+        def _agent_refresh_media(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+            service = MediaAdminCommandService(
+                MediaAdminCommandDependencies(
+                    imports=import_service,
+                    client=fnos,
+                    directory_required_message=ImportService.FNOS_DIR_REQUIRED_MESSAGE,
+                    worker_dispatcher=worker_task_dispatcher,
+                )
+            )
+            return service.refresh(payload), 200
+
+        def _agent_trending_list(**kwargs: Any) -> dict[str, Any]:
+            return trending_service.list_candidates(**kwargs)
+
+        def _agent_trending_import(candidate_id: int, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+            prepared = {
+                "public_id": str(payload.get("public_id") or "").strip(),
+                "resource_id": payload.get("resource_id"),
+                "category": str(payload.get("category") or "").strip(),
+                "quark_selection": _safe_public_quark_selection(payload.get("quark_selection")),
+                "cloud139_selection": _safe_public_cloud139_selection(payload.get("cloud139_selection")),
+                "ignore_files": _safe_public_string_list(payload.get("ignore_files"), max_items=2000, max_length=512),
+            }
+            if prepared["ignore_files"]:
+                prepared["sixpan_selection"] = {"ignore_files": prepared["ignore_files"]}
+            try:
+                result = trending_initial_import_service.create_initial_import(candidate_id, prepared)
+            except TrendingInitialImportError as exc:
+                return {"success": False, "message": str(exc)}, exc.status_code
+            except Exception:  # noqa: BLE001
+                app.logger.exception("agent trending initial import failed: candidate_id=%s", candidate_id)
+                return {"success": False, "message": "创建热榜首次入库任务失败"}, 502
+            return result, 200 if result.get("success", True) else 502
+
+        def _agent_trending_subscribe(candidate_id: int) -> tuple[dict[str, Any], int]:
+            item = db.trending.get_candidate(candidate_id)
+            if not item:
+                return {"success": False, "message": "热榜候选不存在"}, 404
+            result, status_code = hot_subscription.create_from_candidate(
+                item,
+                update_service.tmdb,
+                lambda payload: update_service.create_subscription_from_trending_candidate(candidate_id, payload),
+            )
+            result["item"] = db.trending.get_candidate(candidate_id)
+            return result, status_code
+
+        from .agent.services import AgentWriteServices
+
+        writes = AgentWriteServices(
+            submit_import=_agent_submit_import,
+            preview_import=_preview_public_submission,
+            approve_request=_agent_approve_request,
+            reject_request=_agent_reject_request,
+            retry_job=_agent_retry_job,
+            cancel_job=_agent_cancel_job,
+            review_job=_agent_review_job,
+            update_organizer_mappings=_agent_update_organizer_mappings,
+            apply_organizer_task=_agent_apply_organizer,
+            retry_organizer_task=_agent_retry_organizer,
+            rollback_organizer_run=_agent_rollback_organizer,
+            create_subscription=_agent_create_subscription,
+            preview_subscription=_agent_preview_subscription,
+            update_subscription=_agent_update_subscription,
+            set_subscription_status=_agent_set_subscription_status,
+            run_subscription=_agent_run_subscription,
+            delete_subscription=_agent_delete_subscription,
+            list_media_libraries=_agent_media_libraries,
+            search_media_library=_agent_search_media_library,
+            refresh_media_library=_agent_refresh_media,
+            list_trending_candidates=_agent_trending_list,
+            import_trending_candidate=_agent_trending_import,
+            subscribe_trending_candidate=_agent_trending_subscribe,
+        )
+
+        return {
+            "database": db,
+            "search": _agent_search,
+            "resource_detail": _agent_resource_detail,
+            "resource_files": _agent_resource_files,
+            "detect_link": _agent_detect_link,
+            "tmdb_search": _agent_tmdb_search,
+            "list_jobs": _agent_list_jobs,
+            "job_detail": _agent_job_detail,
+            "list_requests": _agent_list_requests,
+            "request_detail": _agent_request_detail,
+            "list_organizer_tasks": _agent_list_organizer_tasks,
+            "organizer_task_detail": _agent_organizer_task_detail,
+            "list_subscriptions": _agent_list_subscriptions,
+            "subscription_detail": _agent_subscription_detail,
+            "scheduler_status": lambda: update_scheduler.status(),
+            "system_status": _admin_system_status,
+            "categories": lambda: app_config.categories,
+            "writes": writes,
+        }
+
+    def _agent_admin_deps() -> dict[str, Any]:
+        """Admin routes only need the guard and a database handle."""
+
+        return {"admin_required": admin_required, "database": db}
+
+    _agent_ready = _agent_enabled_from_env() and role_runs(active_process_role, "web")
+    _register_agent_surface(
+        app,
+        _agent_service_builders() if _agent_ready else None,
+        # Admin routes stay registered on the web role even when the surface is
+        # off, so the UI can explain the switch instead of showing a raw 404.
+        _agent_admin_deps() if role_runs(active_process_role, "web") else None,
+    )
     return app
+
+
+def _register_agent_surface(
+    app: Flask,
+    builders: dict[str, Any] | None,
+    admin_deps: dict[str, Any] | None = None,
+) -> None:
+    """Mount the MCP endpoint and its admin routes when the deployment opts in.
+
+    The agent surface is intentionally additive: it reads the same service graph
+    the admin UI uses, and a failure here must never prevent the web app from
+    starting. The MCP endpoint itself is only mounted when the switch is on and
+    the process runs the web role; the admin routes are always mounted on the web
+    role so a disabled deployment reports ``Agent 接口未启用`` instead of a 404.
+    """
+
+    from .agent.auth import ALL_SCOPES, SCOPE_PROFILES
+    from .blueprints.agent_admin import AgentAdminRouteContext, create_agent_admin_blueprint
+
+    deps = admin_deps or {}
+    token_store = None
+    audit = None
+
+    if _agent_enabled_from_env() and builders:
+        try:
+            from .agent import AgentServices, create_agent_blueprint
+            from .agent.audit import AgentAuditLog
+            from .agent.auth import AgentTokenStore
+            from .agent.tools import build_registry
+
+            agent_services = AgentServices(**builders)
+            token_store = AgentTokenStore(agent_services.database)
+            audit = AgentAuditLog(agent_services.database)
+            app.extensions["agent_services"] = agent_services
+            app.extensions["agent_token_store"] = token_store
+            app.register_blueprint(
+                create_agent_blueprint(
+                    registry=build_registry(agent_services),
+                    services=agent_services,
+                    token_store=token_store,
+                    audit=audit,
+                    enabled=True,
+                    max_concurrency=_agent_env_int("AGENT_MAX_CONCURRENCY", 2, 1, 8),
+                )
+            )
+            app.logger.info("agent MCP endpoint enabled at /mcp")
+        except Exception:  # noqa: BLE001 - never block the web app on the agent surface
+            app.logger.exception("failed to initialize agent MCP endpoint")
+
+    admin_guard = deps.get("admin_required")
+    if callable(admin_guard) and deps.get("database") is not None:
+        try:
+            app.register_blueprint(
+                create_agent_admin_blueprint(
+                    AgentAdminRouteContext(
+                        admin_required=admin_guard,
+                        token_store=lambda: token_store,
+                        audit=lambda: audit,
+                        token_profiles=SCOPE_PROFILES,
+                        all_scopes=ALL_SCOPES,
+                    )
+                )
+            )
+        except Exception:  # noqa: BLE001
+            app.logger.exception("failed to initialize agent admin routes")

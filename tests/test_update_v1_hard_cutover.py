@@ -51,7 +51,7 @@ class UpdateV1HardCutoverTests(unittest.TestCase):
         self.assertEqual(context["canonical_openlist_root"], "")
         self.assertTrue(context["needs_manual_selection"])
 
-    def test_db_root_replaces_out_of_scope_persisted_subscription_path(self) -> None:
+    def test_legacy_subscription_path_requires_identity_instead_of_title_retargeting(self) -> None:
         client = _EmptyOpenList()
         service = _service(
             lambda _subscription, _category: {
@@ -75,10 +75,9 @@ class UpdateV1HardCutoverTests(unittest.TestCase):
         )
 
         self.assertEqual(context["category_root"], "/OpenList/Main/TV")
-        self.assertTrue(
-            context["canonical_openlist_root"].startswith("/OpenList/Main/TV/")
-        )
-        self.assertNotIn("legacy", context["canonical_openlist_root"].lower())
+        self.assertEqual(context["canonical_openlist_root"], "")
+        self.assertTrue(context["needs_manual_selection"])
+        self.assertFalse(context["auto_create_pending"])
         self.assertEqual(context["destination_id"], "media_main")
         self.assertEqual(context["mount_id"], "mount_main")
 

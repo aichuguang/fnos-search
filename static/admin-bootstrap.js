@@ -1,6 +1,6 @@
 (function () {
     function create(context) {
-        const { state, getElement, api, toast, captureActionButton, loadOverview, loadRequests, loadJobs, loadUpdates, openUpdateEditor, runDueUpdates, loadTrending, runTrending, openTrendingScheduler, startRclone, stopRclone, checkRclone, loadRclone, loadTransfers, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer, loadAdapters, loadMediaLibraries, refreshAllMedia, saveSettings, saveAllSettingsTransaction, saveProfile, uploadSiteLogo, saveSearchProviders, loadAdvancedConfig, saveAdvancedConfig, loadRcloneWebdavConfig, saveRcloneWebdavConfig, testRcloneWebdavConfig, exportAdvancedConfig, importAdvancedConfig, loadSecurityStatus, openAdvancedSecretManager, loadHistoryMaintenanceSummary, cleanupHistoryRecords, loadNotificationSettings, bindNotificationSettings, probeSixpan, testBtbtlaProxy, testOrganizerEndpoint, syncAdvancedDependencies, closeRawLogModal, startRcloneLivePolling } = context;
+        const { state, getElement, api, toast, captureActionButton, loadOverview, loadRequests, loadJobs, loadUpdates, openUpdateEditor, runDueUpdates, loadTrending, runTrending, openTrendingScheduler, startRclone, stopRclone, checkRclone, loadRclone, loadTransfers, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer, loadAdapters, loadMediaLibraries, refreshAllMedia, loadAgentTokens, saveSettings, saveAllSettingsTransaction, saveProfile, uploadSiteLogo, saveSearchProviders, loadAdvancedConfig, saveAdvancedConfig, loadRcloneWebdavConfig, saveRcloneWebdavConfig, testRcloneWebdavConfig, exportAdvancedConfig, importAdvancedConfig, loadSecurityStatus, openAdvancedSecretManager, loadHistoryMaintenanceSummary, cleanupHistoryRecords, loadNotificationSettings, bindNotificationSettings, probeSixpan, testBtbtlaProxy, testOrganizerEndpoint, syncAdvancedDependencies, closeRawLogModal, startRcloneLivePolling } = context;
         const adminState = state;
         const $ = getElement;
 
@@ -12,6 +12,7 @@
                 updates: loadUpdates,
                 trending: loadTrending,
                 media: loadMediaLibraries,
+                agent: loadAgentTokens,
                 organizer: loadOrganizer,
                 rclone: loadRclone,
                 transfers: loadTransfers,

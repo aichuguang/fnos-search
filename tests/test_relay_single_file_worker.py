@@ -83,13 +83,13 @@ copy_scoped_job
             updated = RelayFileState(str(root / "relay/job-1"), job_id=1, plan_key="plan:one").load()
             self.assertEqual([item["state"] for item in updated["files"]], ["downloaded", "downloaded"])
 
-    def test_preflight_disk_shortage_does_not_start_copy(self):
+    def test_preflight_cache_oversize_does_not_start_copy(self):
         with tempfile.TemporaryDirectory(prefix="relay-full-") as folder:
             result = self._run(folder, size=10**18)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((Path(folder) / "copy-calls").exists())
-            self.assertEqual(result.returncode, 75)
-            self.assertIn("缓存预算不足", result.stderr)
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("单个文件超过中继缓存上限", result.stderr)
 
     def test_storage_full_exit_is_not_retried(self):
         with tempfile.TemporaryDirectory(prefix="relay-enospc-") as folder:

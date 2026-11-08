@@ -49,17 +49,41 @@ class JobQueryRepository:
                         ELSE 0 END, te.updated_at DESC, te.job_id DESC
                     LIMIT ?
                 )
-                SELECT j.id AS job_id, j.title, j.status AS job_status,
-                    j.error_message AS job_error, j.updated_at AS job_updated_at,
+                SELECT j.id AS job_id, j.*,
                     te.phase AS execution_phase, te.updated_at AS state_updated_at,
                     te.final_verified, te.app_acked, te.last_error_message AS execution_message
-                FROM import_jobs j LEFT JOIN transfer_executions te ON te.job_id = j.id
+                FROM import_jobs j
+                LEFT JOIN transfer_executions te ON te.job_id = j.id
                 WHERE j.id IN (SELECT job_id FROM recent) OR j.id IN ({placeholders})
                 ORDER BY j.id DESC
                 """,
                 [max(1, min(int(limit), 50)), *ids],
             ).fetchall()
-        return [dict(row) for row in rows]
+            plan_by_job: dict[int, str] = {}
+            try:
+                plan_rows = connection.execute(
+                    f"""
+                    SELECT job_id, plan_json FROM import_execution_plans
+                    WHERE job_id IN (
+                        SELECT j.id FROM import_jobs j
+                        WHERE j.id IN (SELECT job_id FROM recent) OR j.id IN ({placeholders})
+                    )
+                    """,
+                    [max(1, min(int(limit), 50)), *ids],
+                ).fetchall()
+                plan_by_job = {int(row["job_id"]): row["plan_json"] for row in plan_rows}
+            except sqlite3.OperationalError:
+                # Old/minimal read-model fixtures may not have the plan table.
+                plan_by_job = {}
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["job_status"] = item.get("job_status") or item.get("status")
+            item["job_error"] = item.get("job_error") or item.get("error_message")
+            item["job_updated_at"] = item.get("job_updated_at") or item.get("updated_at")
+            item["execution_plan_json"] = plan_by_job.get(int(item["job_id"]))
+            result.append(item)
+        return result
 
     def get_many(self, job_ids: list[int]) -> dict[int, dict[str, Any]]:
         normalized = self._normalize_ids(job_ids)

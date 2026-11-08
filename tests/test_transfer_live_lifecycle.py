@@ -16,6 +16,27 @@ from fnos_media_import.transfer.orchestrator import TransferStepResult
 from tests.test_transfer_submission_diagnostics import _Executions
 
 
+class _FakeGate:
+    def __init__(self, active_job_id: int = 0) -> None:
+        self.active_job_id = int(active_job_id)
+
+    def try_acquire(self, job_id: int):
+        normalized = int(job_id)
+        if self.active_job_id in {0, normalized}:
+            self.active_job_id = normalized
+            return True, normalized
+        return False, self.active_job_id
+
+    def renew(self, job_id: int) -> bool:
+        return bool(self.try_acquire(job_id)[0])
+
+    def release(self, job_id: int) -> bool:
+        if self.active_job_id == int(job_id):
+            self.active_job_id = 0
+            return True
+        return False
+
+
 class TransferLiveLifecycleTests(unittest.TestCase):
     def _service(self, phase="cleanup_pending", next_phase="completed", *, save_error=False, concurrent_cancel=False):
         plan = {"version": 1, "job_id": 14, "transfer": {"strategy": "native_save"}}
@@ -58,6 +79,31 @@ class TransferLiveLifecycleTests(unittest.TestCase):
         self.enterContext(patch("fnos_media_import.transfer.dispatch.v1_plan_or_review", return_value=(plan, None)))
         self.enterContext(patch("fnos_media_import.transfer.dispatch._LOGGER.warning"))
         return service, emitted
+
+    def test_gate_blocks_another_job_until_the_active_job_enters_organizing(self):
+        service, _emitted = self._service(phase="target_verifying", next_phase="organizing")
+        gate = _FakeGate(active_job_id=87)
+        service.transfer_gate = gate
+
+        blocked = service.handle_worker({"job_id": 14}, {})
+        self.assertEqual(blocked["worker_outcome"], "deferred")
+        self.assertIn("#87", blocked["message"])
+        self.assertEqual(gate.active_job_id, 87)
+
+        gate.active_job_id = 0
+        completed = service.handle_worker({"job_id": 14}, {})
+        self.assertEqual(completed["phase"], "organizing")
+        self.assertEqual(gate.active_job_id, 0)
+
+    def test_gate_is_released_when_a_transfer_job_reaches_terminal_phase(self):
+        service, _emitted = self._service(phase="target_verifying", next_phase="failed")
+        gate = _FakeGate(active_job_id=14)
+        service.transfer_gate = gate
+
+        result = service.handle_worker({"job_id": 14}, {})
+
+        self.assertEqual(result["phase"], "failed")
+        self.assertEqual(gate.active_job_id, 0)
 
     def test_completed_message_only_follows_persisted_execution_and_done_job(self):
         service, emitted = self._service()

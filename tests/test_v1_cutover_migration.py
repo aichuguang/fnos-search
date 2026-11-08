@@ -45,8 +45,9 @@ class V1CutoverMigrationTests(unittest.TestCase):
                 candidate.unlink()
         backup_dir = self.path.parent / "backups"
         if backup_dir.exists():
-            for candidate in backup_dir.glob("app_before_schema_migration_v29_*.db"):
-                candidate.unlink()
+            for version in (29, 30):
+                for candidate in backup_dir.glob(f"app_before_schema_migration_v{version}_*.db"):
+                    candidate.unlink()
             try:
                 backup_dir.rmdir()
             except OSError:
@@ -90,6 +91,8 @@ class V1CutoverMigrationTests(unittest.TestCase):
         self.assertEqual(summary.get("jobs", {}).get("deleted"), 7)
         self.assertTrue(summary.get("jobs", {}).get("deleted_job_ids_sha256"))
         self.assertNotIn("deleted_job_ids", summary.get("jobs", {}))
+        self.assertEqual(30, summary["target_schema_version"])
+        self.assertEqual([30], summary["post_cutover_migrations"])
 
         with closing(sqlite3.connect(self.path)) as connection:
             connection.row_factory = sqlite3.Row
@@ -222,7 +225,7 @@ class V1CutoverMigrationTests(unittest.TestCase):
             )
             self.assertEqual([], connection.execute("PRAGMA foreign_key_check").fetchall())
 
-    def test_offline_apply_backs_up_and_old_runner_rejects_v29(self) -> None:
+    def test_offline_apply_backs_up_and_old_runner_rejects_v30(self) -> None:
         self._build_v28_mixed_database()
 
         summary = apply_database(self.path)
@@ -238,7 +241,7 @@ class V1CutoverMigrationTests(unittest.TestCase):
             for version in range(1, 29)
         )
         with closing(sqlite3.connect(self.path)) as connection:
-            with self.assertRaisesRegex(RuntimeError, "v29.*v28"):
+            with self.assertRaisesRegex(RuntimeError, "v30.*v28"):
                 old_runner.ensure_compatible(connection)
 
     def test_offline_apply_does_not_remove_another_process_lock(self) -> None:
@@ -320,7 +323,7 @@ class V1CutoverMigrationTests(unittest.TestCase):
             contender.close()
             owner.close()
 
-    def test_fresh_database_uses_v29_contract_directly(self) -> None:
+    def test_fresh_database_uses_v30_schema_and_v29_contract_directly(self) -> None:
         database = Database(self.path)
         database.init_schema()
 
@@ -332,6 +335,7 @@ class V1CutoverMigrationTests(unittest.TestCase):
             self.assertIn("source_form", columns)
             self.assertNotIn("source_type", columns)
             self.assertNotIn("target_route", columns)
+            self.assertEqual(30, connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])
             self.assertEqual(
                 (CUTOVER_NAME,),
                 connection.execute(
@@ -339,7 +343,7 @@ class V1CutoverMigrationTests(unittest.TestCase):
                 ).fetchone(),
             )
 
-    def test_already_cut_over_database_retires_strm_pending_state_idempotently(self) -> None:
+    def test_v29_additive_upgrade_preserves_strm_history_idempotently(self) -> None:
         Database(self.path).init_schema()
         with closing(sqlite3.connect(self.path)) as connection:
             connection.row_factory = sqlite3.Row
@@ -409,12 +413,15 @@ class V1CutoverMigrationTests(unittest.TestCase):
                     ),
                 ),
             )
+            connection.execute("DELETE FROM schema_migrations WHERE version=30")
             connection.commit()
 
         summary = apply_database(self.path)
-        self.assertTrue(summary["already_applied"])
-        self.assertEqual(1, summary["cleanup"]["organizer_strm_pending_tasks"])
-        self.assertEqual(1, summary["cleanup"]["organizer_strm_worker_tasks"])
+        self.assertTrue(summary["additive_only"])
+        self.assertEqual(29, summary["upgraded_from_schema_version"])
+        self.assertEqual(30, summary["target_schema_version"])
+        self.assertEqual([30], summary["post_cutover_migrations"])
+        self.assertNotIn("cleanup", summary)
         self.assertTrue(Path(summary["backup_path"]).is_file())
 
         with closing(sqlite3.connect(self.path)) as connection:
@@ -425,21 +432,21 @@ class V1CutoverMigrationTests(unittest.TestCase):
                     "scan_lease_expires_at FROM organizer_tasks WHERE id=1"
                 ).fetchone()
             )
-            self.assertEqual("waiting_review", task["status"])
-            self.assertEqual(STRM_PENDING_CUTOVER_MESSAGE, task["error_message"])
-            self.assertEqual(4, task["revision"])
-            self.assertIsNone(task["scan_owner"])
-            self.assertIsNone(task["scan_lease_expires_at"])
+            self.assertEqual("strm_pending", task["status"])
+            self.assertEqual("旧错误", task["error_message"])
+            self.assertEqual(3, task["revision"])
+            self.assertEqual("old-owner", task["scan_owner"])
+            self.assertEqual("2099-01-01T00:00:00+00:00", task["scan_lease_expires_at"])
             self.assertEqual(
-                "retired_by_v1_cutover",
+                "pending",
                 json.loads(task["raw_data"])["strm_completion"]["status"],
             )
             self.assertEqual(
-                "retired_by_v1_cutover",
+                "pending",
                 json.loads(task["evidence"])["strm_completion"]["status"],
             )
             self.assertEqual(
-                [(2, "completed"), (3, "pending")],
+                [(1, "pending"), (2, "completed"), (3, "pending")],
                 [
                     tuple(row)
                     for row in connection.execute(
@@ -450,9 +457,10 @@ class V1CutoverMigrationTests(unittest.TestCase):
 
         repeated = apply_database(self.path)
         self.assertTrue(repeated["already_applied"])
-        self.assertEqual(0, repeated["cleanup"]["organizer_strm_pending_tasks"])
-        self.assertEqual(0, repeated["cleanup"]["organizer_strm_worker_tasks"])
-        self.assertEqual("", repeated["backup_path"])
+        self.assertTrue(repeated["additive_only"])
+        self.assertEqual([], repeated["post_cutover_migrations"])
+        self.assertNotIn("cleanup", repeated)
+        self.assertFalse(repeated.get("backup_path"))
 
     def _build_v28_mixed_database(self) -> None:
         Database(self.path).init_schema()
@@ -495,7 +503,7 @@ class V1CutoverMigrationTests(unittest.TestCase):
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES import_jobs(id) ON DELETE CASCADE
                 );
-                DELETE FROM schema_migrations WHERE version=29;
+                DELETE FROM schema_migrations WHERE version>=29;
                 """
             )
             for job_id in range(1, 9):

@@ -16,15 +16,19 @@ source_landing（openlist 描述符）的清理永远返回「OpenList 删除适
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
 from fnos_media_import.transfer import (
+    ErrorCode,
     PHASE_COMPLETED,
     PHASE_FAILED,
+    TransferError,
     VisibilityStatus,
 )
 from fnos_media_import.transfer.cleanup import (
+    CleanupResult,
     CompositeFilesystemOps,
     LocalFilesystemOps,
     OpenListFilesystemOps,
@@ -289,6 +293,87 @@ class RelayCompletedWithRealCleanupTests(unittest.TestCase):
         self.assertTrue(
             any("OpenList 删除适配器未配置" in str(item.get("message") or "") for item in items)
         )
+
+    def test_release_staging_quarantines_job_local_temp_without_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            relay_root = str(Path(temporary) / "relay")
+            job_dir = Path(relay_root) / "job-1"
+            job_dir.mkdir(parents=True)
+            (job_dir / "partial.mkv").write_bytes(b"x" * 8)
+            cleanup = TransferCleanupService(
+                LocalFilesystemOps((relay_root,)),
+                local_roots=(relay_root,),
+                relay_root=relay_root,
+            )
+            plan = make_plan(
+                job_id=1,
+                strategy="relay_upload_provider",
+                landing="/_入库暂存/job-1",
+                final="/移动云/电影",
+                local_temp=str(job_dir),
+            )
+
+            result = cleanup.release_staging(plan)
+
+            self.assertTrue(result.ok, result.reason)
+            self.assertFalse(job_dir.exists())
+            held = list((Path(relay_root) / ".held").glob("job-1-*"))
+            self.assertEqual(len(held), 1)
+            self.assertEqual((held[0] / "partial.mkv").read_bytes(), b"x" * 8)
+
+    def test_release_staging_can_use_a_same_mount_quarantine_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            relay_root = str(Path(temporary) / "relay")
+            job_dir = Path(relay_root) / "job-1"
+            job_dir.mkdir(parents=True)
+            (job_dir / "partial.mkv").write_bytes(b"x" * 8)
+            cleanup = TransferCleanupService(
+                LocalFilesystemOps((relay_root,)),
+                local_roots=(relay_root,),
+                relay_root=relay_root,
+            )
+            plan = make_plan(
+                job_id=1,
+                strategy="relay_upload_provider",
+                landing="/_入库暂存/job-1",
+                final="/移动云/电影",
+                local_temp=str(job_dir),
+            )
+            target_root = Path(relay_root) / "relay_backups"
+
+            result = cleanup.release_staging(plan, target_root=str(target_root))
+
+            self.assertTrue(result.ok, result.reason)
+            self.assertFalse(job_dir.exists())
+            self.assertEqual(
+                len(list(target_root.glob("job-1-*"))),
+                1,
+            )
+
+    def test_terminal_failure_releases_relay_staging(self) -> None:
+        class _Cleanup:
+            def __init__(self) -> None:
+                self.released: list[int] = []
+
+            def release_staging(self, plan) -> CleanupResult:
+                self.released.append(plan.job_id)
+                return CleanupResult(ok=True)
+
+        plan = make_plan(
+            job_id=1,
+            strategy="relay_upload_provider",
+            landing="/_入库暂存/job-1",
+            final="/移动云/电影",
+            local_temp="/nonexistent-relay/job-1",
+        )
+        cleanup = _Cleanup()
+        orchestrator = TransferOrchestrator(plan, {}, cleanup=cleanup)
+
+        result = orchestrator._fail(TransferError(ErrorCode.AUTH_EXPIRED, "账号失效，请重新登录"))
+
+        self.assertEqual(result.phase, PHASE_FAILED)
+        self.assertEqual(cleanup.released, [1])
+        self.assertTrue((orchestrator.state.cleanup or {}).get("ok"))
 
 
 class CleanupWiringContractTests(unittest.TestCase):

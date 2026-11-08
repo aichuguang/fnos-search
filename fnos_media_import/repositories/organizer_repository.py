@@ -28,6 +28,34 @@ def _decode_json_fields(item: dict[str, Any], fields: tuple[str, ...]) -> dict[s
     return item
 
 
+def _organizer_progress(item: dict[str, Any]) -> dict[str, Any]:
+    operations = item.get("operations")
+    if isinstance(operations, list):
+        moves = [row for row in operations if isinstance(row, dict) and row.get("type") == "move_file"]
+        total = len(moves)
+        done = sum(1 for row in moves if str(row.get("status") or "") == "done")
+    else:
+        total = int(item.get("move_total") or 0)
+        done = int(item.get("move_done") or 0)
+    status = str(item.get("status") or "")
+    if total:
+        text = f"已移动 {done}/{total}"
+        if status == "done" or done >= total:
+            text = f"移动完成 {done}/{total}"
+    elif status == "executing":
+        text = "正在扫描/规划文件"
+    elif status == "done":
+        text = "整理完成"
+    else:
+        text = ""
+    return {
+        "done": done,
+        "total": total,
+        "percent": round((done / total) * 100) if total else None,
+        "text": text,
+    }
+
+
 class OrganizerRepository:
     """Persists Organizer tasks, runs, plans and their audit trail."""
 
@@ -394,6 +422,7 @@ class OrganizerRepository:
                     for item in conn.execute("SELECT * FROM organizer_tmdb_matches WHERE task_id = ? ORDER BY score DESC, id ASC", (task_id,)).fetchall()
                 ]
                 task.update({"files": files, "mappings": mappings, "operations": operations, "ai_suggestions": ai_suggestions, "tmdb_matches": tmdb_matches})
+                task["progress"] = _organizer_progress(task)
             return task
 
     def delete_organizer_task_if_status(
@@ -426,12 +455,31 @@ class OrganizerRepository:
     def list_organizer_tasks(self, limit: int = 100, status: str | None = None, offset: int = 0) -> list[dict[str, Any]]:
         safe_limit = max(1, int(limit or 100))
         safe_offset = max(0, int(offset or 0))
+        progress_sql = """
+            SELECT t.*,
+                   (SELECT COUNT(*) FROM organizer_operations o
+                     WHERE o.task_id = t.id AND o.type = 'move_file') AS move_total,
+                   (SELECT COUNT(*) FROM organizer_operations o
+                     WHERE o.task_id = t.id AND o.type = 'move_file' AND o.status = 'done') AS move_done
+            FROM organizer_tasks t
+        """
         with self._connection_factory() as conn:
             if status:
-                rows = conn.execute("SELECT * FROM organizer_tasks WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?", (status, safe_limit, safe_offset)).fetchall()
+                rows = conn.execute(
+                    f"{progress_sql} WHERE t.status = ? ORDER BY t.id DESC LIMIT ? OFFSET ?",
+                    (status, safe_limit, safe_offset),
+                ).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM organizer_tasks ORDER BY id DESC LIMIT ? OFFSET ?", (safe_limit, safe_offset)).fetchall()
-        return [_decode_json_fields(dict(row), ("evidence", "raw_data")) for row in rows]
+                rows = conn.execute(
+                    f"{progress_sql} ORDER BY t.id DESC LIMIT ? OFFSET ?",
+                    (safe_limit, safe_offset),
+                ).fetchall()
+        result = []
+        for row in rows:
+            item = _decode_json_fields(dict(row), ("evidence", "raw_data"))
+            item["progress"] = _organizer_progress(item)
+            result.append(item)
+        return result
 
     def list_organizer_tasks_by_job(self, job_id: int, limit: int = 20) -> list[dict[str, Any]]:
         with self._connection_factory() as conn:
@@ -660,6 +708,7 @@ class OrganizerRepository:
         expected_revision: int | None = None,
         task_updates: dict[str, Any] | None = None,
         clear_scan_lease: bool = False,
+        expected_plan_hash: str | None = None,
     ) -> bool:
         """Atomically replace all edited mappings and the derived operation plan.
 
@@ -726,6 +775,20 @@ class OrganizerRepository:
                 return False
             if expected_revision is not None and int(task["revision"] or 1) != max(1, int(expected_revision)):
                 return False
+            if expected_plan_hash is not None:
+                from ..organizer.plan_contract import organizer_plan_hash
+
+                current = _decode_json_fields(dict(conn.execute(
+                    "SELECT * FROM organizer_tasks WHERE id = ?", (int(task_id),),
+                ).fetchone()), ("raw_data", "evidence"))
+                current["mappings"] = [_decode_json_fields(dict(row), ("raw_data", "reason")) for row in conn.execute(
+                    "SELECT * FROM organizer_mappings WHERE task_id = ? ORDER BY id", (int(task_id),),
+                ).fetchall()]
+                current["operations"] = [_decode_json_fields(dict(row), ("raw_data", "reason", "undo_data")) for row in conn.execute(
+                    "SELECT * FROM organizer_operations WHERE task_id = ? ORDER BY id", (int(task_id),),
+                ).fetchall()]
+                if organizer_plan_hash(current) != expected_plan_hash:
+                    return False
             current_evidence = _decode_json_fields(dict(task), ("evidence",)).get("evidence")
             rollback = current_evidence.get("rollback") if isinstance(current_evidence, dict) else None
             if isinstance(rollback, dict) and rollback.get("status") in {"running", "failed"}:
@@ -1413,11 +1476,68 @@ class OrganizerRepository:
         now = utc_now()
         with self._connection_factory() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            return self._recover_expired_organizer_runs_in_connection(
+            result = self._recover_expired_organizer_runs_in_connection(
                 conn,
                 now=now,
                 message=message,
             )
+            orphaned_rows = conn.execute(
+                """
+                SELECT t.id AS task_id, t.job_id, t.title
+                FROM organizer_tasks t
+                WHERE t.status = 'executing'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM organizer_runs active
+                      WHERE active.task_id = t.id AND active.status = 'running'
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM organizer_runs failed
+                      WHERE failed.task_id = t.id AND failed.status = 'failed'
+                  )
+                """
+            ).fetchall()
+            # A failed run can leave its task in ``executing`` forever.  This
+            # is safe at startup (and at the top of every lock acquisition)
+            # because an active run is explicitly excluded.
+            orphaned = conn.execute(
+                """
+                UPDATE organizer_tasks
+                SET status = 'failed', error_message = ?, updated_at = ?
+                WHERE status = 'executing'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM organizer_runs active
+                      WHERE active.task_id = organizer_tasks.id
+                        AND active.status = 'running'
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM organizer_runs failed
+                      WHERE failed.task_id = organizer_tasks.id
+                        AND failed.status = 'failed'
+                  )
+                """,
+                (message, now),
+            )
+            result = dict(result)
+            result["orphaned_tasks"] = int(orphaned.rowcount)
+            existing_job_ids = {
+                int(item.get("job_id") or 0) for item in (result.get("jobs") or [])
+            }
+            jobs = list(result.get("jobs") or [])
+            for row in orphaned_rows:
+                job_id = int(row["job_id"] or 0)
+                if job_id <= 0 or job_id in existing_job_ids:
+                    continue
+                existing_job_ids.add(job_id)
+                jobs.append({
+                    "run_id": 0,
+                    "task_id": int(row["task_id"]),
+                    "owner_id": "",
+                    "job_id": job_id,
+                    "title": row["title"] or "",
+                    "task_status": "executing",
+                })
+            result["jobs"] = jobs
+            return result
 
     def _recover_expired_organizer_runs_in_connection(
         self,
@@ -1427,6 +1547,31 @@ class OrganizerRepository:
         task_id: int | None = None,
         message: str = "Organizer 运行租约已过期，已中止遗留执行",
     ) -> dict[str, Any]:
+        # Locks from a previous process must not survive a failed or expired
+        # run.  This cleanup is deliberately independent of the expired-run
+        # query below: a run can already be marked failed while its lock rows
+        # remain, which used to make every later apply fail with IntegrityError.
+        conn.execute(
+            """
+            DELETE FROM organizer_locks
+            WHERE expires_at IS NOT NULL AND expires_at <= ?
+            """,
+            (now,),
+        )
+        conn.execute(
+            """
+            DELETE FROM organizer_locks
+            WHERE run_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM organizer_runs active
+                  WHERE active.id = organizer_locks.run_id
+                    AND active.status = 'running'
+                    AND active.lease_expires_at IS NOT NULL
+                    AND active.lease_expires_at > ?
+              )
+            """,
+            (now,),
+        )
         where = [
             "r.status = 'running'",
             "r.lease_expires_at IS NOT NULL",

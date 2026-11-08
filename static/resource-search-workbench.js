@@ -1,5 +1,12 @@
 (function () {
     function resultKey(item = {}) {
+        // File previews from share providers have stable provider ids.  Their
+        // size/title fallback is not unique (many episodes share a size), so
+        // never collapse selectable files onto one key.
+        const fid = String(item.fid || "").trim();
+        if (fid) return `fid:${fid}`;
+        const path = String(item.path || "").trim();
+        if (path && !item.public_id && !item.resource_id) return `path:${path}`;
         return String(item.result_key || item.public_id || item.resource_id || item.source_url || item.source_url_masked || `${item.provider_kind || ""}:${item.source_form || ""}:${item.title || ""}:${item.size_text || item.size || ""}`).trim();
     }
 

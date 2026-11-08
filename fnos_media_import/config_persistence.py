@@ -484,6 +484,24 @@ def normalize_advanced_config_payload(payload: dict[str, Any], current_stored: d
     return normalized
 
 
+def trending_schedule_document(stored: dict[str, Any], *, enabled: bool, run_at: str) -> dict[str, Any]:
+    """Build a versioned document that changes only ``hot_discovery``.
+
+    The advanced-config API only accepts full export documents. The trending
+    dialog owns a single section, so build the envelope here from the stored
+    config instead of asking the browser to round-trip secrets.
+    """
+
+    section = stored.get("hot_discovery")
+    section = dict(section) if isinstance(section, dict) else {}
+    section.update({"enabled": bool(enabled), "run_at": str(run_at)})
+    return {
+        "format": ADVANCED_CONFIG_EXPORT_FORMAT,
+        "version": ADVANCED_CONFIG_EXPORT_VERSION,
+        "stored": {**stored, "hot_discovery": section},
+    }
+
+
 def advanced_config_payload_mode(payload: dict[str, Any]) -> str:
     """Return the effective persistence mode without exposing configuration values."""
 
@@ -720,7 +738,10 @@ def sanitize_advanced_config(
         for field, field_type in schema.items():
             if field not in section_payload:
                 continue
-            converted, should_set = _convert_value(section_payload.get(field), field_type, preserve_secret_placeholders)
+            converted, should_set = _convert_value(
+                section_payload.get(field), field_type, preserve_secret_placeholders,
+                preserve_whitespace=(section, field) == ("fnos", "password"),
+            )
             if should_set:
                 section_result[field] = converted
 
@@ -823,9 +844,11 @@ def redact_advanced_config(config: dict[str, Any]) -> dict[str, Any]:
     return redact(copy.deepcopy(config))
 
 
-def _convert_value(value: Any, field_type: str, preserve_secret_placeholders: bool) -> tuple[Any, bool]:
+def _convert_value(value: Any, field_type: str, preserve_secret_placeholders: bool, *, preserve_whitespace: bool = False) -> tuple[Any, bool]:
     if field_type == "secret":
-        text = str(value or "").strip()
+        text = str(value or "")
+        if not preserve_whitespace:
+            text = text.strip()
         if preserve_secret_placeholders and text in SECRET_PLACEHOLDERS:
             return "", False
         return text, True

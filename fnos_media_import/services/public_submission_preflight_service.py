@@ -163,6 +163,15 @@ class PublicSubmissionPreflightService:
 
     @staticmethod
     def _checked(provider: str, ok: bool, message: str, inspection: dict[str, Any]) -> dict[str, Any]:
+        if ok and PublicSubmissionPreflightService._empty_share(inspection):
+            message = "分享内没有可入库的视频文件，请确认资源不是空壳目录后再提交"
+            return {
+                "allowed": False,
+                "checked": True,
+                "provider": provider,
+                "message": f"提交前检测失败：{message}",
+                "inspection": inspection,
+            }
         return {
             "allowed": bool(ok),
             "checked": True,
@@ -170,6 +179,19 @@ class PublicSubmissionPreflightService:
             "message": message if ok else f"提交前检测失败：{message}",
             "inspection": inspection,
         }
+
+    @staticmethod
+    def _empty_share(inspection: dict[str, Any]) -> bool:
+        summary = inspection.get("summary") if isinstance(inspection, dict) else None
+        if not isinstance(summary, dict):
+            return False
+        raw = summary.get("video_file_count", summary.get("file_count"))
+        if raw is None or raw == "":
+            return False
+        try:
+            return int(raw) == 0
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     @staticmethod
     def _configured(importer: Any | None) -> bool:

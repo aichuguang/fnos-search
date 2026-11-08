@@ -55,7 +55,7 @@
             if (!status.tmdb_configured) missing.push("TMDB");
             box.innerHTML = `
                 <strong>标准化${enabled ? "已启用" : "未启用"}</strong>
-                <p>${enabled ? "入库完成后会自动整理文件名和目录。" : "开启后可自动整理入库后的文件。"}${missing.length ? ` 需配置：${escapeHtml(missing.join("、"))}` : ""}</p>
+                <p>${enabled ? "视频通过身份、季集及目标目录校验后才进入媒体库。关联字幕随视频保留，不支持的文件不进入库。" : "开启后可在入库前校验并整理视频和关联字幕。"}${missing.length ? ` 需配置：${escapeHtml(missing.join("、"))}` : ""}</p>
             `;
         }
 
@@ -85,6 +85,7 @@
             const matchText = item.tmdb_id
                 ? `${item.tmdb_title || item.title || "-"}${item.tmdb_year ? ` (${item.tmdb_year})` : ""}`
                 : "待确认";
+            const progressText = item.progress && item.progress.text ? String(item.progress.text) : "";
             return `
                 <tr>
                     <td><code>#${escapeHtml(item.id)}</code></td>
@@ -94,7 +95,7 @@
                     </td>
                     <td><code title="${escapeHtml(item.openlist_root_path || "")}">${escapeHtml(item.openlist_root_path || "-")}</code></td>
                     <td>${escapeHtml(matchText)}</td>
-                    <td>${statusPill(item.status)}</td>
+                    <td>${statusPill(item.status)}${progressText ? `<small>${escapeHtml(progressText)}</small>` : ""}</td>
                     <td>${escapeHtml(formatDate(item.updated_at || item.created_at))}</td>
                     <td class="table-actions">${organizerTaskButtons(item)}</td>
                 </tr>
@@ -129,13 +130,10 @@
             if (status === "waiting_review") {
                 const completing = organizerNeedsCompletion(item);
                 buttons.push(`<button class="mini" type="button" data-organizer-task="${id}" data-organizer-action="apply">${completing ? "继续完成确认" : "确认并整理"}</button>`);
-                buttons.push(`<button class="secondary mini danger" type="button" title="保留原目录和文件名，仅移入正式分类目录。" data-organizer-task="${id}" data-organizer-action="skip">跳过整理</button>`);
             } else if (["auto_approved", "manual_confirmed"].includes(status)) {
                 buttons.push(`<button class="mini" type="button" data-organizer-task="${id}" data-organizer-action="apply">开始整理</button>`);
-                buttons.push(`<button class="secondary mini danger" type="button" title="保留原目录和文件名，仅移入正式分类目录。" data-organizer-task="${id}" data-organizer-action="skip">跳过整理</button>`);
             } else if (status === "failed") {
                 buttons.push(`<button class="secondary mini" type="button" data-organizer-task="${id}" data-organizer-action="retry">重试</button>`);
-                buttons.push(`<button class="secondary mini danger" type="button" title="保留原目录和文件名，仅移入正式分类目录。" data-organizer-task="${id}" data-organizer-action="skip">跳过整理</button>`);
             } else if (["done", "cancelled"].includes(status)) {
                 buttons.push(`<button class="secondary mini danger" type="button" data-organizer-task="${id}" data-organizer-action="delete">删除</button>`);
             }
@@ -152,6 +150,7 @@
                     <div class="organizer-action-copy">
                         <strong>${escapeHtml(guide.title)}</strong>
                         <p>${escapeHtml(guide.body)}</p>
+                        ${task.progress && task.progress.text ? `<small>${escapeHtml(task.progress.text)}</small>` : ""}
                     </div>
                     <div class="organizer-action-buttons">
                         ${organizerDrawerActionButtons(task)}
@@ -192,7 +191,7 @@
                 },
                 waiting_review: {
                     title: blockedCount ? "需要人工审核" : "需要确认",
-                    body: blockedCount ? `有 ${blockedCount} 条映射需要处理。` : "请确认标题、年份和目标目录。",
+                    body: blockedCount ? `有 ${blockedCount} 条映射需要处理，身份或季集不明确时不会入库。` : "请确认作品身份、标题、年份、季集和目标目录；关联字幕随视频保留。",
                 },
                 auto_approved: {
                     title: "计划已自动通过",
@@ -215,8 +214,8 @@
                     body: "任务已结束。",
                 },
                 skipped: {
-                    title: "任务已跳过",
-                    body: "不会继续执行整理。",
+                    title: "历史任务已停止整理",
+                    body: "此状态不代表已通过入库校验；新任务必须审核并完成整理。",
                 },
                 cancelled: {
                     title: "任务已取消",
@@ -242,21 +241,18 @@
             } else if (status === "failed") {
                 buttons.push(
                     { action: "retry", label: "重试", className: "mini", title: "优先续跑当前计划，保留已有修改。" },
-                    { action: "skip", label: "跳过整理", className: "secondary mini danger", title: "保留原目录和文件名，仅移入正式分类目录。" },
                     { action: "rebuild", label: "重新识别", className: "secondary mini", title: "放弃当前计划，重新扫描和识别。" },
                 );
             } else if (status === "waiting_review") {
                 buttons.push(
                     { action: "rename", label: "修改计划", className: "secondary mini", title: "修改片名、季号或映射目标。" },
                     { action: "apply", label: organizerNeedsCompletion(task) ? "继续完成确认" : "确认并整理", className: "mini danger", title: "确认当前保存的计划并续跑，保留已经完成的操作。" },
-                    { action: "skip", label: "跳过整理", className: "secondary mini danger", title: "保留原目录和文件名，仅移入正式分类目录。" },
                     { action: "rebuild", label: "重新识别", className: "secondary mini", title: "识别不准或文件有变化时重新扫描。" },
                 );
             } else if (["auto_approved", "manual_confirmed"].includes(status)) {
                 buttons.push(
                     { action: "rename", label: "修改计划", className: "secondary mini", title: "修改片名、季号或映射目标。" },
                     { action: "apply", label: "开始整理", className: "mini danger", title: "按当前计划执行真实移动/重命名。" },
-                    { action: "skip", label: "跳过整理", className: "secondary mini danger", title: "保留原目录和文件名，仅移入正式分类目录。" },
                     { action: "rebuild", label: "重新识别", className: "secondary mini", title: "放弃当前计划，重新扫描和识别。" },
                 );
             } else if (["done", "cancelled"].includes(status)) {
@@ -769,7 +765,7 @@
                                 <option value="need_edit" ${status === "need_edit" ? "selected" : ""}>需编辑</option>
                                 <option value="conflict" ${status === "conflict" ? "selected" : ""}>冲突</option>
                                 <option value="delete_ad" ${status === "delete_ad" ? "selected" : ""}>广告删除</option>
-                                <option value="skipped" ${status === "skipped" ? "selected" : ""}>跳过</option>
+                                <option value="skipped" ${status === "skipped" ? "selected" : ""}>本文件不入库</option>
                             </select>
                             <button class="mini" type="button" data-organizer-mapping-save="${escapeHtml(mapping.id)}">保存本条</button>
                         </div>
@@ -777,14 +773,14 @@
                     <label class="organizer-mapping-target">
                         <span>最终目标路径（确认并整理后按这里移动/重命名）</span>
                         <textarea data-map-field="target_path" rows="3">${escapeHtml(mapping.target_path || "")}</textarea>
-                        <small>改标题/年份/季集后保存，会自动重算这里；如果你直接改了目标路径，则以你手写的目标路径为准。</small>
+                        <small>改标题/年份/季集后保存，会自动重算这里；手写目标路径仍须通过作品身份、分类目录及季集校验。</small>
                     </label>
                     <div class="organizer-mapping-fields">
                         <label><span>标题</span><input data-map-field="title" type="text" value="${escapeHtml(mapping.title || "")}" placeholder="标题"></label>
                         <label><span>年份</span><input data-map-field="year" type="text" value="${escapeHtml(mapping.year || "")}" placeholder="年份"></label>
                         <label><span>季</span><input data-map-field="season" type="number" value="${escapeHtml(mapping.season ?? "")}" placeholder="季"></label>
                         <label><span>集</span><input data-map-field="episode" type="number" value="${escapeHtml(mapping.episode ?? "")}" placeholder="集"></label>
-                        <label><span>TMDB ID</span><input data-map-field="tmdb_id" type="number" value="${escapeHtml(mapping.tmdb_id ?? "")}" placeholder="可空"></label>
+                        <label><span>TMDB ID（清空解除绑定）</span><input data-map-field="tmdb_id" type="number" min="1" step="1" value="${escapeHtml(mapping.tmdb_id ?? "")}" placeholder="可空，保存后解除 TMDB 绑定"></label>
                         <label><span>类型</span><select data-map-field="media_type">
                             <option value="movie" ${mediaType === "movie" ? "selected" : ""}>电影</option>
                             <option value="tv" ${mediaType === "tv" ? "selected" : ""}>剧集</option>
@@ -836,6 +832,10 @@
                     }
                     payload[key] = value;
                 });
+                if (payload.tmdb_id !== null && (!Number.isSafeInteger(payload.tmdb_id) || payload.tmdb_id <= 0)) {
+                    toast("TMDB ID 必须是正整数，或留空解除绑定。", "error");
+                    return;
+                }
                 toast("正在保存映射...", "info");
                 try {
                     const data = await api(`/api/admin/organizer/tasks/${encodeURIComponent(taskId)}/mappings/${encodeURIComponent(mappingId)}`, {
@@ -856,6 +856,10 @@
         }
 
         async function organizerTaskAction(taskId, action, keepDrawer = false, button = null) {
+            if (!["rename", "apply", "retry", "rebuild", "delete"].includes(action)) {
+                toast("此操作不可用，请审核修改计划后执行整理。", "warning");
+                return;
+            }
             if (action === "rename") {
                 openBatchRenameDialog(taskId);
                 return;
@@ -865,8 +869,7 @@
                 return;
             }
             const messages = {
-                apply: "确认当前保存的计划并执行 OpenList 整理？标记为“广告删除”的文件会被彻底删除；目标已存在时不会覆盖，已完成的操作不会重复执行。",
-                skip: "确认跳过整理？系统会保留原目录和文件名，仅将暂存内容移到正确的媒体分类目录，后续交给飞牛影视刮削；目标已存在时不会覆盖。",
+                apply: "确认当前保存的计划并执行 OpenList 整理？视频及关联字幕须通过校验，不支持的文件不进入库。标记为“广告删除”的文件会被彻底删除；目标已存在时不会覆盖，已完成的操作不会重复执行。",
                 delete: "确认删除这条记录？此操作不可撤销。",
                 rebuild: "",
                 retry: "",
@@ -880,7 +883,7 @@
                 });
                 if (!ok) return;
             }
-            const labelMap = { apply: "执行中...", rebuild: "识别中...", retry: "重试中...", skip: "提交中...", delete: "删除中..." };
+            const labelMap = { apply: "执行中...", rebuild: "识别中...", retry: "重试中...", delete: "删除中..." };
             await withButtonBusy(button, labelMap[action] || "处理中...", async () => {
                 const deleting = action === "delete";
                 if (action === "apply") {
@@ -929,7 +932,7 @@
         }
 
         function organizerActionText(action) {
-            return { apply: "确认并整理", rebuild: "重新识别", retry: "重试", skip: "跳过整理", delete: "删除记录" }[action] || "操作";
+            return { apply: "确认并整理", rebuild: "重新识别", retry: "重试", delete: "删除记录" }[action] || "操作";
         }
 
         function openBatchRenameDialog(taskId) {
@@ -940,7 +943,7 @@
                     <header class="ui-dialog-head">
                         <div>
                             <span class="ui-dialog-eyebrow">统一修改文件</span>
-                            <h2>修改文件夹名 / 季号</h2>
+                            <h2>修改作品信息 / 季号</h2>
                         </div>
                         <button class="ui-dialog-close secondary mini icon-only" type="button" data-batch-close aria-label="关闭">×</button>
                     </header>
@@ -953,6 +956,10 @@
                         <label class="ui-dialog-prompt">
                             <span>季号</span>
                             <input id="batchRenameSeason" type="number" min="0" max="99" autocomplete="off" placeholder="留空不改">
+                        </label>
+                        <label class="ui-dialog-prompt">
+                            <span>TMDB ID（可选）</span>
+                            <input id="batchRenameTmdbId" type="number" min="1" step="1" autocomplete="off" placeholder="留空保留每条映射的现有身份">
                         </label>
                     </div>
                     <footer class="ui-dialog-actions">
@@ -968,11 +975,20 @@
             overlay.querySelector("[data-batch-confirm]").addEventListener("click", async () => {
                 const title = overlay.querySelector("#batchRenameTitle").value.trim();
                 const seasonRaw = overlay.querySelector("#batchRenameSeason").value.trim();
+                const tmdbIdRaw = overlay.querySelector("#batchRenameTmdbId").value.trim();
                 const payload = {};
                 if (title) payload.title = title;
                 if (seasonRaw !== "") payload.season = Number(seasonRaw);
-                if (!payload.title && !("season" in payload)) {
-                    toast("请填写片名或季号", "error");
+                if (tmdbIdRaw !== "") {
+                    const tmdbId = Number(tmdbIdRaw);
+                    if (!Number.isSafeInteger(tmdbId) || tmdbId <= 0) {
+                        toast("TMDB ID 必须是正整数；留空则保留现有身份。", "error");
+                        return;
+                    }
+                    payload.tmdb_id = tmdbId;
+                }
+                if (!Object.keys(payload).length) {
+                    toast("请填写片名、季号或 TMDB ID", "error");
                     return;
                 }
                 const confirmButton = overlay.querySelector("[data-batch-confirm]");

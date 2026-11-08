@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
+from ..media_identity_contract import normalize_media_identity
 from .update_values import allowed_choice, non_negative_int, positive_int, positive_int_list, unique_string_list
 
 
@@ -101,6 +102,25 @@ class UpdateSubscriptionNormalizer:
             "status": _choice(payload.get("status"), {"enabled", "paused", "archived"}, "enabled"),
             "raw_data": raw_data,
         }
+        identity = normalize_media_identity({
+            "tmdb_id": tmdb_id,
+            "media_type": media_type,
+            "title": title,
+            "year": data["year"],
+            "season_number": season,
+        })
+        if not identity:
+            raise ValueError("Invalid subscription media identity")
+        previous_identity = raw_data.get("media_identity") if isinstance(raw_data.get("media_identity"), dict) else {}
+        if payload.get("canonical_dir") and previous_identity and (
+            previous_identity.get("media_type"), previous_identity.get("ns"), str(previous_identity.get("value") or "")
+        ) != (identity["media_type"], identity["ns"], identity["value"]):
+            raise ValueError("A bound subscription cannot change media identity")
+        if previous_identity.get("aliases"):
+            identity = normalize_media_identity({**identity, "aliases": previous_identity["aliases"]})
+        data["identity_ns"] = identity["ns"]
+        data["identity_value"] = identity["value"]
+        raw_data["media_identity"] = identity
         if data["schedule_kind"] == "tmdb" and media_type != "tv":
             data["schedule_kind"] = "weekly"
         return data, normalized_sources

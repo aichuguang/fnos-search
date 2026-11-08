@@ -123,6 +123,21 @@ class SequentialRelay:
             return dataclasses.replace(receipt, metadata=dict(metadata))
         return None
 
+    def _align_receipt_index(self, receipt: OperationReceipt, index: int) -> None:
+        """Make the outer receipt describe the file the ledger is actually on.
+
+        A worker can finish downloading the next file and then lose its reply;
+        the app may still hold ``relay_file_index=0``.  Reusing that stale
+        nested receipt would wait for/retry the wrong file forever.  The
+        operation key remains the submission fence (``relay-dl:...``); only
+        the per-file locator and its nested download receipt are replaced.
+        """
+        metadata = receipt.metadata
+        if not isinstance(metadata, dict) or metadata.get("relay_file_index") == index:
+            return
+        metadata["relay_file_index"] = index
+        metadata.pop("relay_file_receipt", None)
+
     def _download(self, receipt: OperationReceipt, index: int) -> tuple[OperationReceipt, OperationStatus]:
         nested = self._nested(receipt, index)
         if nested is None:
@@ -154,10 +169,15 @@ class SequentialRelay:
             if legacy is not None:
                 return legacy
         index = self.store.next_index(state) if state else 0
+        if state:
+            self._align_receipt_index(receipt, index)
         if state and index == len(state["files"]):
             return self._complete(state)
         entry = state["files"][index] if state else None
-        if entry is None or entry["state"] in {"pending", "downloaded"}:
+        # ``downloaded`` is already a durable worker receipt.  Re-issuing the
+        # download after a restart can race an old run and leave the app
+        # waiting on a stale index; go straight to upload instead.
+        if entry is None or entry["state"] == "pending":
             nested, status = self._download(receipt, index)
             if status.status != "completed":
                 return status

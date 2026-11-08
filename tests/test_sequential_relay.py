@@ -159,6 +159,32 @@ class SequentialRelayTests(unittest.TestCase):
         self.assertEqual(restored.operation_id, self.receipt.operation_id)
         self.assertEqual(restored.metadata["operation_key"], self.receipt.metadata["operation_key"])
 
+    def test_restart_with_stale_receipt_index_uses_cached_next_file_without_redownload(self):
+        self.executor.poll(self.receipt)
+        self.assertEqual(self.receipt.metadata["relay_file_index"], 0)
+
+        # Simulate a worker that downloaded file index 1 after the app
+        # persisted the outer receipt for index 0, then crashed before the
+        # coordinator observed it.
+        state = self.adapter.store.load()
+        data = self.files[state["files"][1]["path"]]
+        self.adapter.store.prepare_file(1, len(data))
+        Path(self.adapter.store.file_path(state["files"][1]["path"])).write_bytes(data)
+        self.adapter.store.mark_downloaded(1, len(data))
+
+        restored = OperationReceipt(**dataclasses.asdict(self.receipt))
+        result = self._executor().poll(restored)
+
+        self.assertEqual(result.status, "completed", result.message)
+        self.assertEqual(restored.metadata["relay_file_index"], 1)
+        self.assertEqual(restored.metadata["operation_key"], self.receipt.metadata["operation_key"])
+        self.assertEqual(
+            [event for event in self.events if event[0] == "download"],
+            [("download", "season/01.mkv")],
+            "the cached next file must be uploaded without issuing another download",
+        )
+        self.assertEqual(len(self.native.calls), 2)
+
     def test_small_disk_stops_before_downloading_any_bytes(self):
         with patch("fnos_media_import.transfer.relay_file_state.shutil.disk_usage", return_value=SimpleNamespace(free=3)):
             result = self.executor.poll(self.receipt)

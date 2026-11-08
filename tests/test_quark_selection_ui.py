@@ -166,6 +166,16 @@ process.stdout.write(JSON.stringify({ state: publicUi.quarkSelectionState('r'), 
         self.assertNotIn("selected_dirs", selection)
         self.assertNotIn("UNSELECTED", json.dumps(selection))
 
+    def test_workbench_merge_keeps_cloud139_episodes_with_identical_size(self) -> None:
+        result = self.run_ui("""
+const merged = FnosResourceSearchWorkbench.mergeResults([], [
+    { fid: 'ep-01', name: '01.mkv', size_text: '2.39 GB', is_dir: false },
+    { fid: 'ep-02', name: '02.mkv', size_text: '2.39 GB', is_dir: false },
+]);
+process.stdout.write(JSON.stringify({ keys: merged.items.map(item => item.fid) }));
+""")
+        self.assertEqual(result["keys"], ["ep-01", "ep-02"])
+
     def test_all_visible_children_even_a_single_file_do_not_expand_to_hidden_content(self) -> None:
         for visible_count in (1, 2):
             with self.subTest(visible_count=visible_count):

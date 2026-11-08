@@ -891,6 +891,10 @@ prepare_relay_file() {
     else
       relay_prepare_rc=$?
     fi
+    if [ "$relay_prepare_rc" -eq 78 ]; then
+      log "RELAY_CACHE_IMPOSSIBLE: 单个文件超过中继缓存上限，请提高 RELAY_CACHE_MAX_BYTES 或跳过该文件"
+      return 78
+    fi
     if [ "$relay_prepare_rc" -ne 75 ]; then return "$relay_prepare_rc"; fi
     if [ "${copy_relay_version:-1}" = "2" ]; then
       log "RELAY_CACHE_DEFERRED: 中继缓存预算暂不可用，释放下载锁并交回队列等待"
@@ -1164,6 +1168,7 @@ copy_scoped_job() {
       else
         relay_prepare_rc=$?
         if is_interrupted_rc "$relay_prepare_rc"; then return "$relay_prepare_rc"; fi
+        if [ "$relay_prepare_rc" -eq 78 ]; then return 78; fi
         if [ "$relay_prepare_rc" -eq 75 ]; then return 75; fi
         log "当前文件空间或状态检查失败，停止本轮搬运；保留来源，不重试下载也不处理下一文件"
         return 1

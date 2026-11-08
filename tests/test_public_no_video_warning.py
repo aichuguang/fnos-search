@@ -98,7 +98,7 @@ class PublicNoVideoWarningTests(unittest.TestCase):
         self.assertEqual(self.submit_template.count(marker), 2)
         self.assertEqual(request_template.count(marker), 2)
         for template in (self.submit_template, request_template):
-            self.assertIn('/static/public-submit.js?v=20261012-quark-selection-v008', template)
+            self.assertIn('/static/public-submit.js?v=20261107-cloud139-items-v010', template)
 
 
 if __name__ == "__main__":

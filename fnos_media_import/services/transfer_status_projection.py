@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -126,9 +127,105 @@ def project_transfer_status(
             state_updated_at=record.get("state_updated_at") or record.get("job_updated_at"),
             state_conflict=conflict,
         )
+        file_total, bytes_total = _expected_totals(record)
+        files_done = _positive_int(observation.get("upload_files_done")) if preserve_metrics else None
+        bytes_done = _positive_int(observation.get("upload_bytes_done")) if preserve_metrics else None
+        if file_total is not None or bytes_total is not None or files_done is not None:
+            file_value = min(files_done, file_total) if files_done is not None and file_total is not None else files_done
+            byte_value = min(bytes_done, bytes_total) if bytes_done is not None and bytes_total is not None else bytes_done
+            item["file_progress"] = {
+                "done": file_value,
+                "total": file_total,
+                "text": _progress_text("已传", file_value, file_total, "个文件"),
+            }
+            item["bytes_progress"] = {
+                "done": byte_value,
+                "total": bytes_total,
+                "text": _progress_text("已传", byte_value, bytes_total, "", is_bytes=True),
+            }
+            parts = [
+                part for part in (item["file_progress"]["text"], item["bytes_progress"]["text"])
+                if part
+            ]
+            item["progress_text"] = "，".join(parts)
         # An old download batch belongs to the observation, not a reconstructed
         # task after retry/rollback. Never attach it to a new attempt.
         if stage in {"planning", "retry_wait"} or observed_phase in _DONE and not completed:
             item["run_id"] = None
         result[job_id] = item
     return list(result.values())
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number >= 0 else None
+
+
+def _expected_totals(record: dict[str, Any]) -> tuple[int | None, int | None]:
+    sources: list[dict[str, Any]] = []
+    raw_plan = record.get("execution_plan_json")
+    if raw_plan:
+        try:
+            plan = json.loads(str(raw_plan))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            plan = {}
+        if isinstance(plan, dict):
+            verification = plan.get("verification")
+            if isinstance(verification, dict):
+                sources.append(verification)
+    raw_job = record.get("job_raw_data")
+    if raw_job:
+        try:
+            job_data = json.loads(str(raw_job))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            job_data = {}
+        if isinstance(job_data, dict):
+            sources.append(job_data)
+    file_total = None
+    bytes_total = None
+    for source in sources:
+        if file_total is None:
+            file_total = _positive_int(
+                source.get("expected_file_count", source.get("file_count"))
+            )
+        if bytes_total is None:
+            bytes_total = _positive_int(
+                source.get("expected_total_size", source.get("total_size", source.get("total_bytes")))
+            )
+    if not file_total:
+        file_total = None
+    if not bytes_total:
+        bytes_total = None
+    return file_total, bytes_total
+
+
+def _format_bytes(value: int) -> str:
+    number = float(max(0, value))
+    for unit in ("B", "K", "M", "G", "T"):
+        if number < 1024 or unit == "T":
+            if unit == "B":
+                return f"{int(number)}B"
+            return f"{number:.1f}{unit}".rstrip("0").rstrip(".")
+        number /= 1024
+    return f"{number:.1f}T"
+
+
+def _progress_text(
+    prefix: str,
+    done: int | None,
+    total: int | None,
+    suffix: str,
+    *,
+    is_bytes: bool = False,
+) -> str:
+    if total is None:
+        return ""
+    done_text = _format_bytes(done or 0) if is_bytes else str(done or 0)
+    total_text = _format_bytes(total) if is_bytes else str(total)
+    tail = f" {suffix}" if suffix else ""
+    return f"{prefix} {done_text}/{total_text}{tail}"

@@ -35,6 +35,7 @@ class JobCancellationDependencies:
     organizer: Any | None = None
     execution_repository: Any | None = None
     enqueue_transfer: Callable[..., Any] | None = None
+    relay_cache_quarantine: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 class JobCancellationService:
@@ -123,6 +124,11 @@ class JobCancellationService:
             and durable_transfer_owned
             and self._should_defer_transfer_cleanup(job_id)
         )
+        relay_quarantine = (
+            self._quarantine_relay_cache(cancelled_job)
+            if defer_transfer_cleanup
+            else None
+        )
 
         propagation = self._cancel_related_execution(
             cancelled_job,
@@ -147,6 +153,17 @@ class JobCancellationService:
                 "warnings": [*propagation["warnings"]],
                 "errors": [],
             }
+            if relay_quarantine is not None:
+                cleanup["items"].append(
+                    {"type": "quarantine_relay_cache", **relay_quarantine}
+                )
+                if not relay_quarantine.get("success", False):
+                    cleanup["warnings"].append(
+                        str(relay_quarantine.get("message") or "中继缓存隔离未完成")
+                    )
+            cleanup["success"] = not any(
+                str(item or "").strip() for item in cleanup["warnings"]
+            )
             if transfer_wakeup is None:
                 cleanup["warnings"].append(
                     "V1 传输队列未配置；为安全起见未执行任何破坏性清理"
@@ -563,6 +580,32 @@ class JobCancellationService:
         if phase in {"completed", "failed", "manual_review", "cancelled"} and not has_receipt:
             return False
         return True
+
+    def _quarantine_relay_cache(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        """Move a cancelled job's relay cache out of the single-task channel.
+
+        This is deliberately non-destructive: the worker may still be shutting
+        down, so the cache is renamed under ``relay_backups`` rather than
+        deleted.  It lets new tasks proceed even when the cancelled job never
+        gets another worker tick.
+        """
+
+        callback = self._deps.relay_cache_quarantine
+        if not callable(callback):
+            return None
+        try:
+            result = callback(job)
+        except Exception as exc:  # noqa: BLE001 - cancellation must still succeed
+            return {
+                "success": False,
+                "message": f"中继缓存隔离异常：{exc}",
+            }
+        if isinstance(result, dict):
+            return dict(result)
+        return {
+            "success": bool(result),
+            "message": "中继缓存已隔离" if result else "中继缓存隔离未确认",
+        }
 
     def _enqueue_transfer_cancellation(
         self,

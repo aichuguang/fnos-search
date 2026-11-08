@@ -198,12 +198,27 @@ class WorkerTaskRepository:
         )
         return int(cursor.lastrowid), True
 
+    def recover_expired_leases(self, *, now: str | None = None) -> dict[str, int]:
+        """Requeue or fail every expired running task, regardless of handler.
+
+        A worker may no longer have a handler for an old task type (or may have
+        restarted before it could claim that type).  Such a task must not stay
+        ``running`` forever: it either gets another attempt or reaches a
+        terminal failure.
+        """
+
+        current = now or _utc_now()
+        with self._connection_factory() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            result = self._recover_expired_leases_in_connection(connection, current)
+        return result
+
     def claim(self, owner_id: str, *, lease_seconds: int = 120, task_types: list[str] | None = None) -> dict[str, Any] | None:
         now = _utc_now()
         lease_until = _utc_after(lease_seconds)
         with self._connection_factory() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._expire_exhausted_leases(connection, now)
+            self._recover_expired_leases_in_connection(connection, now)
             filters = [
                 "attempts < max_attempts",
                 "available_at <= ?",
@@ -513,6 +528,42 @@ class WorkerTaskRepository:
             "expired_leases": expired,
             "next_task": self._row_to_dict(next_task) if next_task else None,
             "oldest_pending": self._row_to_dict(oldest_pending) if oldest_pending else None,
+        }
+
+    @classmethod
+    def _recover_expired_leases_in_connection(
+        cls, connection: sqlite3.Connection, now: str,
+    ) -> dict[str, int]:
+        expired = int(connection.execute(
+            """
+            SELECT COUNT(*) FROM worker_tasks
+            WHERE status='running' AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            """,
+            (now,),
+        ).fetchone()[0])
+        failed = cls._expire_exhausted_leases(connection, now)
+        cursor = connection.execute(
+            """
+            UPDATE worker_tasks
+            SET status='pending', owner_id=NULL, lease_expires_at=NULL,
+                available_at=?, completed_at=NULL, updated_at=?,
+                error_message=CASE
+                    WHEN TRIM(COALESCE(error_message, '')) = ''
+                    THEN 'Worker lease expired; task requeued'
+                    ELSE error_message || '; Worker lease expired; task requeued'
+                END
+            WHERE status='running'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+              AND attempts < max_attempts
+            """,
+            (now, now, now),
+        )
+        return {
+            "expired": expired,
+            "failed": failed,
+            "requeued": int(cursor.rowcount),
         }
 
     @staticmethod

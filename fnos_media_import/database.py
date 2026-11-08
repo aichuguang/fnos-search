@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .migrations import Migration, MigrationRunner
-from .schema import BASE_SCHEMA_SQL
+from .schema import AGENT_SCHEMA_SQL, BASE_SCHEMA_SQL
 from .update_schema_migrator import UpdateSchemaMigrator
 from .time_utils import utc_now_iso, utc_now_iso_offset
 from .v1_cutover import CUTOVER_NAME, V1JobContractHardCutover
@@ -69,6 +69,7 @@ class Database:
                 Migration(27, "provider_auth_session_cas", self._apply_provider_auth_session_cas_migration),
                 Migration(28, "openlist_mount_native_locator_column", self._apply_openlist_mount_native_locator_migration),
                 Migration(29, CUTOVER_NAME, self._apply_v1_job_contract_hard_cutover),
+                Migration(30, "organizer_subscription_identity", self._apply_organizer_subscription_identity_migration),
         )
         self.migration_runner = MigrationRunner(migrations)
         self.pre_cutover_migration_runner = MigrationRunner(
@@ -111,6 +112,7 @@ class Database:
             # 避免每次短连接都执行 PRAGMA journal_mode=WAL 造成额外磁盘同步开销。
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(BASE_SCHEMA_SQL)
+            conn.executescript(AGENT_SCHEMA_SQL)
             if fresh:
                 self.migration_runner.run(conn, utc_now)
         if self.last_cutover_summary is not None:
@@ -193,6 +195,10 @@ class Database:
 
     def _apply_update_schema_migration(self, conn: sqlite3.Connection) -> None:
         UpdateSchemaMigrator(self._ensure_column).apply(conn)
+
+    def _apply_organizer_subscription_identity_migration(self, conn: sqlite3.Connection) -> None:
+        for column in ("identity_ns", "identity_value", "canonical_dir"):
+            self._ensure_column(conn, "update_subscriptions", column, "TEXT")
 
     def _apply_job_idempotency_migration(self, conn: sqlite3.Connection) -> None:
         self._ensure_column(conn, "import_jobs", "idempotency_key", "TEXT")
@@ -719,6 +725,16 @@ class Database:
             "verification_token_encrypted",
             "TEXT NOT NULL DEFAULT ''",
         )
+
+    @staticmethod
+    def _apply_agent_token_migration(conn: sqlite3.Connection) -> None:
+        """Create the agent tables without touching the schema version.
+
+        Kept as a helper so the token CLI can prepare an already-initialized
+        database without running the full migration chain.
+        """
+
+        conn.executescript(AGENT_SCHEMA_SQL)
 
     @staticmethod
     def _apply_rate_limit_migration(conn: sqlite3.Connection) -> None:

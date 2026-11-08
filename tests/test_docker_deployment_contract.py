@@ -14,7 +14,7 @@ def test_documented_transfer_timeouts_reach_both_application_containers() -> Non
         (ROOT / ".env.example").read_text(encoding="utf-8"),
         flags=re.MULTILINE,
     ))
-    assert len(timeouts) == 4
+    assert len(timeouts) == 5
     for service_name in ("fnos-media-import", "fnos-rclone-worker"):
         environment = compose["services"][service_name]["environment"]
         for name, default in timeouts.items():
@@ -75,6 +75,8 @@ def test_compose_supports_release_image_and_source_build() -> None:
         "TRANSFER_NATIVE_WAIT_TIMEOUT_SECONDS": "${TRANSFER_NATIVE_WAIT_TIMEOUT_SECONDS:-604800}",
         "TRANSFER_WAIT_TIMEOUT_SECONDS": "${TRANSFER_WAIT_TIMEOUT_SECONDS:-10800}",
         "TRANSFER_CANCEL_TIMEOUT_SECONDS": "${TRANSFER_CANCEL_TIMEOUT_SECONDS:-3600}",
+        "TRANSFER_CACHE_WAIT_TIMEOUT_SECONDS": "${TRANSFER_CACHE_WAIT_TIMEOUT_SECONDS:-1800}",
+        "MOBILE_UPLOAD_UNCONFIRMED_TIMEOUT_SECONDS": "${MOBILE_UPLOAD_UNCONFIRMED_TIMEOUT_SECONDS:-600}",
         "RELAY_PREFETCH_FILES": "${RELAY_PREFETCH_FILES:-1}",
         "RELAY_CACHE_MAX_BYTES": "${RELAY_CACHE_MAX_BYTES:-21474836480}",
         "RELAY_DISK_RESERVE_BYTES": "${RELAY_DISK_RESERVE_BYTES:-1073741824}",
@@ -84,6 +86,8 @@ def test_compose_supports_release_image_and_source_build() -> None:
         "PANSOU_BASE_URL": "http://pansou:8888",
         "PANSOU_USERNAME": "${PANSOU_USERNAME:-fnos-search}",
         "PANSOU_PASSWORD": "${PANSOU_PASSWORD:-fnos-search}",
+        "FNOS_AGENT_ENABLED": "${FNOS_AGENT_ENABLED:-false}",
+        "AGENT_MAX_CONCURRENCY": "${AGENT_MAX_CONCURRENCY:-2}",
     }
 
     development_app = development["services"]["fnos-media-import"]
@@ -186,6 +190,8 @@ def test_optional_env_example_only_exposes_common_user_settings() -> None:
         "TRANSFER_NATIVE_WAIT_TIMEOUT_SECONDS",
         "TRANSFER_WAIT_TIMEOUT_SECONDS",
         "TRANSFER_CANCEL_TIMEOUT_SECONDS",
+        "TRANSFER_CACHE_WAIT_TIMEOUT_SECONDS",
+        "MOBILE_UPLOAD_UNCONFIRMED_TIMEOUT_SECONDS",
         "RELAY_PREFETCH_FILES",
         "RELAY_CACHE_MAX_BYTES",
         "RELAY_DISK_RESERVE_BYTES",

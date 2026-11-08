@@ -267,14 +267,21 @@ class RcloneLiveProgress:
             keep_upload = new_run and pipeline and previous["stage"] not in _TERMINAL_PHASES | _POST_TRANSFER_PHASES
             if previous is None or (reset and event["stage"] == "planning") or (new_run and not keep_upload):
                 item = {"job_id": target_job, "run_id": run_id, "stage": "transferring", "completed": False,
+                        "_upload_done": set(), "_upload_bytes_done": 0, "_upload_seen": {},
                         **{name: _channel() for name in _CHANNELS}}
             else:
                 item = previous
                 if run_id is not None and (kind == "start" or event.get("channel") == "download"):
                     item["run_id"] = run_id
+            item.setdefault("_upload_done", set())
+            item.setdefault("_upload_bytes_done", 0)
+            item.setdefault("_upload_seen", {})
             if reset:
                 item.pop("relay_buffer", None)
                 item.pop("_file_contexts", None)
+                item["_upload_done"] = set()
+                item["_upload_bytes_done"] = 0
+                item["_upload_seen"] = {}
                 pipeline = False
             if kind == "buffer":
                 item["relay_buffer"] = {**event["values"], "updated_at": timestamp}
@@ -312,7 +319,27 @@ class RcloneLiveProgress:
                         return True
                     contexts[context_key] = context
                 context = contexts.get(context_key, {})
+                upload_key = ""
+                if channel == "upload":
+                    upload_key = str(
+                        old_values.get("file_id")
+                        or context.get("file_id")
+                        or old_values.get("filename")
+                        or context.get("filename")
+                        or ""
+                    )
+                    upload_total = old_values.get("bytes_total")
+                    if upload_key and upload_total is not None:
+                        item["_upload_seen"].setdefault(upload_key, _number(upload_total))
                 if kind == "channel_done":
+                    if channel == "upload" and upload_key and upload_key not in item["_upload_done"]:
+                        item["_upload_done"].add(upload_key)
+                        completed_bytes = (
+                            old_values.get("bytes_total")
+                            if old_values.get("bytes_total") is not None
+                            else old_values.get("bytes_done")
+                        )
+                        item["_upload_bytes_done"] += int(_number(completed_bytes) or 0)
                     old_values.update(state="completed", active=False, speed_bps=None, eta_seconds=None,
                                       updated_at=timestamp)
                     if channel == "upload":
@@ -414,6 +441,9 @@ class RcloneLiveProgress:
                     **{key: value for key, value in item.items() if not key.startswith("_")},
                     **channels,
                     **({"relay_buffer": dict(item["relay_buffer"])} if "relay_buffer" in item else {}),
+                    "upload_files_done": len(item.get("_upload_done") or ()),
+                    "upload_bytes_done": int(item.get("_upload_bytes_done") or 0),
+                    "upload_files_seen": len(item.get("_upload_seen") or ()),
                     "age_seconds": round(age, 3),
                     "stale": stale,
                 })

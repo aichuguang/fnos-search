@@ -5,6 +5,7 @@ import posixpath
 import re
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -49,6 +50,11 @@ from .rclone_webdav_config_service import RcloneWebdavConfigError
 
 _REMOTE_ADMISSION_FAILED = "托管 Remote 运行前确认失败，搬运进程未启动"
 _REMOTE_CONFIRMATION_UNVERIFIED = "托管 Remote 自动确认未返回成功结果"
+# 这些状态已是终态：再为一个失败/取消的任务重新排队只会制造 85 秒死循环，
+# 并把已下载的中继缓存永久占在全局单通道上。
+_TERMINAL_STAGING_JOB_STATUSES = frozenset(
+    {"failed", "cancelled", "done", "success", "skipped_existing"}
+)
 
 
 class RcloneService:
@@ -109,6 +115,9 @@ class RcloneService:
         # 互斥锁被占用而未启动的任务级 run：按 run_id 记录延后重排定时器与次数。
         self._deferred_run_timers: dict[int, threading.Timer] = {}
         self._deferred_run_attempts: dict[int, int] = {}
+        # Cache backpressure is unbounded by itself; track how long a run has
+        # been waiting so a dead peer cannot hold the pipeline forever.
+        self._deferred_cache_wait_started: dict[int, float] = {}
         self._completion_retry_timers: dict[RcloneRunResult, threading.Timer] = {}
         self._completion_retry_attempts: dict[RcloneRunResult, int] = {}
         self._active_completion_identity: tuple[int | None, str | None, str | None] | None = None
@@ -1761,6 +1770,15 @@ class RcloneService:
         config = getattr(self, "config", {})
         return max(0, min(1000, self._int_value(config.get("staging_retry_max_attempts"), 8)))
 
+    def _cache_wait_timeout_seconds(self) -> int:
+        """Maximum time one scoped run may wait for peer cache release."""
+        raw = os.environ.get("TRANSFER_CACHE_WAIT_TIMEOUT_SECONDS", "1800")
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return 1800
+        return max(0, min(86400, value))
+
     @classmethod
     def _staging_retry_attempts_from_job(cls, job: dict[str, Any] | None) -> int:
         raw_data = job.get("raw_data") if isinstance(job, dict) and isinstance(job.get("raw_data"), dict) else {}
@@ -1914,6 +1932,27 @@ class RcloneService:
         descriptor = dict(staging_run) if isinstance(staging_run, dict) else {}
         if run_id <= 0 or not descriptor:
             return {"success": False, "message": "延后重排缺少持久 run 描述符"}
+        job_id = self._int_value(descriptor.get("job_id"))
+        job_queries = getattr(self.db, "job_queries", None) if self.db else None
+        if job_id > 0 and job_queries is not None:
+            try:
+                latest_job = job_queries.get(job_id) or {}
+            except Exception as exc:  # noqa: BLE001 - a transient read must not drop the timer
+                self._append_log(f"run #{run_id} 读取任务状态失败，继续延后重排：{exc}")
+                latest_job = {}
+            latest_status = str(latest_job.get("status") or "").strip().lower()
+            if latest_status in _TERMINAL_STAGING_JOB_STATUSES:
+                message = f"任务 #{job_id} 当前状态为 {latest_status}，run #{run_id} 不再延后重排"
+                try:
+                    if pending_finish_error is not None:
+                        self.run_completion.persist_result(run_id, RCLONE_EXIT_LOCK_BUSY, pending_finish_error)
+                        pending_finish_error = None
+                    self._fail_deferred_run(run_id, message)
+                except Exception as exc:  # noqa: BLE001 - keep the timer if terminal persistence fails
+                    self._append_log(f"run #{run_id} 终态暂未落库，将延后重试收敛：{exc}")
+                else:
+                    self._clear_deferred_run_attempts(run_id)
+                    return {"success": False, "terminal_job": True, "run_id": run_id}
         max_attempts = self._staging_retry_max_attempts()
         with self.lock:
             if getattr(self, "_shutdown_requested", False):
@@ -1925,12 +1964,32 @@ class RcloneService:
             attempt = 1 if cache_wait else int(attempts.get(run_id, 0) or 0) + 1
             attempts[run_id] = attempt
             self._deferred_run_attempts = attempts
-            exhausted = not cache_wait and attempt > max_attempts
-        if exhausted:
-            message = (
-                f"rclone 延后重排已达 {max_attempts} 次上限，run #{run_id} 未能启动，"
-                "请检查 Worker 内的残留进程及数据库状态"
+            cache_wait_started = getattr(self, "_deferred_cache_wait_started", {})
+            cache_wait_exhausted = False
+            cache_wait_timeout = self._cache_wait_timeout_seconds()
+            if cache_wait:
+                started = cache_wait_started.setdefault(run_id, time.monotonic())
+                cache_wait_exhausted = bool(
+                    cache_wait_timeout
+                    and time.monotonic() - float(started) >= cache_wait_timeout
+                )
+            else:
+                cache_wait_started.pop(run_id, None)
+            self._deferred_cache_wait_started = cache_wait_started
+            exhausted = cache_wait_exhausted or (
+                not cache_wait and attempt > max_attempts
             )
+        if exhausted:
+            if cache_wait_exhausted:
+                message = (
+                    f"等待其它任务释放中继缓存超过 {cache_wait_timeout} 秒，"
+                    f"run #{run_id} 未启动，已按超时失败；请检查残留任务缓存"
+                )
+            else:
+                message = (
+                    f"rclone 延后重排已达 {max_attempts} 次上限，run #{run_id} 未能启动，"
+                    "请检查 Worker 内的残留进程及数据库状态"
+                )
             try:
                 if pending_finish_error is not None:
                     self.run_completion.persist_result(run_id, RCLONE_EXIT_LOCK_BUSY, pending_finish_error)
@@ -1940,7 +1999,13 @@ class RcloneService:
                 self._append_log(f"run #{run_id} 终态暂未落库，将延后重试收敛：{exc}")
             else:
                 self._clear_deferred_run_attempts(run_id)
-                return {"success": False, "exhausted": True, "run_id": run_id, "attempts": attempt}
+                return {
+                    "success": False,
+                    "exhausted": True,
+                    "run_id": run_id,
+                    "attempts": attempt,
+                    "message": message,
+                }
         delay = self._staging_retry_delay_seconds(attempt)
         if not exhausted:
             self._append_log(
@@ -2034,6 +2099,7 @@ class RcloneService:
     def _clear_deferred_run_attempts(self, run_id: int) -> None:
         with self.lock:
             getattr(self, "_deferred_run_attempts", {}).pop(run_id, None)
+            getattr(self, "_deferred_cache_wait_started", {}).pop(run_id, None)
             timer = getattr(self, "_deferred_run_timers", {}).pop(run_id, None)
         if timer is not None:
             timer.cancel()
@@ -2043,6 +2109,7 @@ class RcloneService:
             timers = list(getattr(self, "_deferred_run_timers", {}).values())
             self._deferred_run_timers = {}
             self._deferred_run_attempts = {}
+            self._deferred_cache_wait_started = {}
         for timer in timers:
             timer.cancel()
 

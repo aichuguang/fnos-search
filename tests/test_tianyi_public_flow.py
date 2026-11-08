@@ -529,14 +529,14 @@ class TianyiPublicFlowTests(unittest.TestCase):
         self.assertIn("...tianyiPayload", submit)
         self.assertIn("handleTianyiSelectionChange", search)
         self.assertIn("tianyi_selection", workbench)
-        self.assertEqual(template.count("20260809-v1-cutover-v001"), 1)
-        self.assertEqual(request_template.count("20260809-v1-cutover-v001"), 2)
+        self.assertEqual(template.count("20261107-cloud139-items-v002"), 1)
+        self.assertEqual(request_template.count("20261107-cloud139-items-v002"), 1)
         self.assertEqual(template.count("20260902-no-video-warn-v002"), 2)
         self.assertEqual(request_template.count("20260902-no-video-warn-v002"), 2)
-        self.assertIn('/static/public-submit.js?v=20261012-quark-selection-v008', template)
-        self.assertIn('/static/public-submit.js?v=20261012-quark-selection-v008', request_template)
+        self.assertIn('/static/public-submit.js?v=20261107-cloud139-items-v010', template)
+        self.assertIn('/static/public-submit.js?v=20261107-cloud139-items-v010', request_template)
         self.assertIn(
-            "/static/resource-search-workbench.js?v=20261009-recovery-v001",
+            "/static/resource-search-workbench.js?v=20261107-cloud139-items-v002",
             admin_template,
         )
 

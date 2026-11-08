@@ -7,7 +7,6 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 
 import requests
 from requests import RequestException
@@ -16,11 +15,17 @@ from ..fnos_paths import path_tails
 
 
 API_LOGIN = "/v/api/v1/login"
+API_LOGIN_V2 = "/v/api/v2/user/loginByPassword"
+API_LOGIN_PATHS = frozenset({API_LOGIN, API_LOGIN_V2})
 API_MDB_LIST = "/v/api/v1/mdb/list"
 API_MDB_SCAN = "/v/api/v1/mdb/scan/{guid}"
 API_TASK_STOP = "/v/api/v1/task/stop"
 API_MEDIADB_SUM = "/v/api/v1/mediadb/sum"
 API_MEDIADB_LIST = "/v/api/v1/mediadb/list"
+# Media-item search over the scanned media DB. Returns both TMDB metadata and
+# local season/episode counts, which is what "is this title already imported"
+# needs. Confirmed against a live FNOS instance.
+API_SEARCH_LIST = "/v/api/v1/search/list"
 API_TASK_RUNNING = "/v/api/v1/task/running"
 API_TASK_RUNNING_FALLBACKS = (API_TASK_RUNNING, "/api/v1/task/running")
 
@@ -28,7 +33,13 @@ SIGN_MODE_AUTO = "auto"
 SIGN_MODE_PHP = "php"
 SIGN_MODE_FNV = "fnv"
 
-MSG_REFRESH_NOT_CONFIGURED = "飞牛刷新配置不完整，请配置 FNOS_SERVER_URL / FNOS_API_KEY / FNOS_SECRET"
+# Public trimemedia-web protocol identifiers, not user credentials. Verified
+# against MoviePilot 26f066df (app/modules/trimemedia/api.py, trimemedia.py)
+# and thshu/fnos-tv-web (common.vue). Explicit compatibility overrides remain.
+DEFAULT_WEB_API_KEY = "16CCEB3D-AB42-077D-36A1-F355324E4237"
+DEFAULT_WEB_SIGNING_SECRET = "NDzZTVxnRKP8Z0jXg1VAMonaG8akvh"
+
+MSG_REFRESH_NOT_CONFIGURED = "飞牛媒体库尚未配置完整，请填写飞牛影视地址、用户名和密码"
 MSG_LOGIN_NOT_CONFIGURED = "飞牛账号密码未配置，无法自动重新登录"
 MSG_LOGIN_FAILED = "飞牛登录失败"
 MSG_LIBRARY_REQUIRED = "飞牛媒体库名称不能为空"
@@ -61,10 +72,10 @@ class FnosMediaRefresher:
             or ""
         )
         self.username = str(self.config.get("username") or "").strip()
-        self.password = str(self.config.get("password") or "").strip()
+        self.password = str(self.config.get("password") or "")
         self.app_name = str(self.config.get("app_name") or "trimemedia-web").strip()
-        self.api_key = str(self.config.get("api_key") or "").strip()
-        self.secret = str(self.config.get("secret") or self.config.get("secret_string") or "").strip()
+        self.api_key = str(self.config.get("api_key") or "").strip() or DEFAULT_WEB_API_KEY
+        self.secret = str(self.config.get("secret") or self.config.get("secret_string") or "").strip() or DEFAULT_WEB_SIGNING_SECRET
         self.timeout = int(self.config.get("timeout", 20) or 20)
         self.verify_ssl = _as_bool(self.config.get("verify_ssl"), False)
         self.max_auth_retries = max(1, int(self.config.get("max_auth_retries", 3) or 3))
@@ -73,6 +84,9 @@ class FnosMediaRefresher:
         self.log_enabled = _as_bool(self.config.get("log_enabled"), True)
         self.log_path = _resolve_cache_path(self.config.get("log_path") or "data/fnos_refresh.log")
         self.sign_mode = _normalize_sign_mode(self.config.get("sign_mode") or SIGN_MODE_AUTO)
+        self._active_sign_mode: str | None = None
+        self._direct_api = False
+        self._login_error = ""
         self.token_cache_path = _resolve_cache_path(self.config.get("token_cache_path") or "data/fnos_token.json")
         self.session = requests.Session()
         self.lock = threading.RLock()
@@ -111,7 +125,7 @@ class FnosMediaRefresher:
 
         with self.lock:
             if not self.token and not self.login(force=True):
-                return {"success": False, "message": MSG_LOGIN_FAILED, "library": library_name, "dir_list": requested_dirs}
+                return {"success": False, "message": self._login_error or MSG_LOGIN_FAILED, "library": library_name, "dir_list": requested_dirs}
 
             list_result = self._request("GET", API_MDB_LIST, require_auth=True)
             if not _is_success_response(list_result):
@@ -162,7 +176,7 @@ class FnosMediaRefresher:
 
         with self.lock:
             if not self.token and not self.login(force=True):
-                return {"success": False, "message": MSG_LOGIN_FAILED, "library": library_name, "guid": media_guid, "dir_list": requested_dirs}
+                return {"success": False, "message": self._login_error or MSG_LOGIN_FAILED, "library": library_name, "guid": media_guid, "dir_list": requested_dirs}
 
             library_item: dict[str, Any] | None = None
             list_result = self._request("GET", API_MDB_LIST, require_auth=True)
@@ -201,7 +215,7 @@ class FnosMediaRefresher:
             return {"success": False, "message": MSG_REFRESH_NOT_CONFIGURED, "summary": {}, "data": {}, "response": {}}
         with self.lock:
             if not self.token and not self.login(force=True):
-                return {"success": False, "message": MSG_LOGIN_FAILED, "summary": {}, "data": {}, "response": {}}
+                return {"success": False, "message": self._login_error or MSG_LOGIN_FAILED, "summary": {}, "data": {}, "response": {}}
             result = self._request("GET", API_MEDIADB_SUM, require_auth=True)
             success = _is_success_response(result)
             data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else {}
@@ -218,7 +232,7 @@ class FnosMediaRefresher:
             return {"success": False, "message": MSG_REFRESH_NOT_CONFIGURED, "items": [], "summary": {}, "response": {}}
         with self.lock:
             if not self.token and not self.login(force=True):
-                return {"success": False, "message": MSG_LOGIN_FAILED, "items": [], "summary": {}, "response": {}}
+                return {"success": False, "message": self._login_error or MSG_LOGIN_FAILED, "items": [], "summary": {}, "response": {}}
             result = self._request("GET", API_MEDIADB_LIST, require_auth=True)
             success = _is_success_response(result)
             items = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), list) else []
@@ -253,7 +267,7 @@ class FnosMediaRefresher:
             return {"success": False, "message": MSG_REFRESH_NOT_CONFIGURED, "items": [], "response": {}}
         with self.lock:
             if not self.token and not self.login(force=True):
-                return {"success": False, "message": MSG_LOGIN_FAILED, "items": [], "response": {}}
+                return {"success": False, "message": self._login_error or MSG_LOGIN_FAILED, "items": [], "response": {}}
             result = self._request("GET", API_MDB_LIST, require_auth=True)
             success = _is_success_response(result)
             items = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), list) else []
@@ -264,12 +278,71 @@ class FnosMediaRefresher:
                 "response": _compact_response(result),
             }
 
+    def search_media(self, keyword: str, *, limit: int = 20) -> dict[str, Any]:
+        """Search the scanned media DB for a title.
+
+        ``/v/api/v1/search/list?q=`` answers "is this already imported": every row
+        is a media-DB entry, and ``local_number_of_episodes`` /
+        ``local_number_of_seasons`` say how much of it actually exists on disk.
+
+        This is read-only and safe to call before submitting an import.
+        """
+
+        query = str(keyword or "").strip()
+        if not query:
+            return {
+                "success": False,
+                "code": "INVALID_KEYWORD",
+                "message": "检索关键词不能为空",
+                "keyword": "",
+                "items": [],
+                "count": 0,
+                "total": 0,
+            }
+        if not self._configured():
+            return {
+                "success": False,
+                "code": "NOT_CONFIGURED",
+                "message": MSG_REFRESH_NOT_CONFIGURED,
+                "keyword": query,
+                "items": [],
+                "count": 0,
+                "total": 0,
+            }
+        with self.lock:
+            if not self.token and not self.login(force=True):
+                return {
+                    "success": False,
+                    "code": "LOGIN_FAILED",
+                    "message": self._login_error or MSG_LOGIN_FAILED,
+                    "keyword": query,
+                    "items": [],
+                    "count": 0,
+                    "total": 0,
+                }
+            result = self._request("GET", API_SEARCH_LIST, params={"q": query}, require_auth=True)
+            success = _is_success_response(result)
+            rows = _extract_task_items(result.get("data") if isinstance(result, dict) else None)
+            safe_limit = max(1, min(int(limit or 20), 100))
+            items = [_media_search_item(row) for row in rows[:safe_limit]]
+            return {
+                "success": success,
+                "code": "" if success else "UPSTREAM_ERROR",
+                "upstream_code": _response_code(result),
+                "message": "已检索飞牛媒体库" if success else _response_message(result, "飞牛媒体库检索失败"),
+                "keyword": query,
+                "items": items,
+                "count": len(items),
+                "total": len(rows),
+                "response": _compact_response(result),
+            }
+
     def running_tasks(self) -> dict[str, Any]:
         if not self._configured():
             return {"success": False, "message": MSG_REFRESH_NOT_CONFIGURED, "items": [], "response": {}}
         with self.lock:
             if not self.token and not self.login(force=True):
-                return {"success": False, "message": MSG_LOGIN_FAILED, "items": [], "response": {}}
+                return {"success": False, "message": self._login_error or MSG_LOGIN_FAILED, "items": [], "response": {}}
             result: dict[str, Any] = {}
             attempted: list[dict[str, Any]] = []
             for path in API_TASK_RUNNING_FALLBACKS:
@@ -304,17 +377,37 @@ class FnosMediaRefresher:
         if self.token and not force:
             return True
         if not self.username or not self.password:
+            self._login_error = MSG_LOGIN_NOT_CONFIGURED
             return False
 
-        payload = {"app_name": self.app_name, "username": self.username, "password": self.password}
-        result = self._request_once("POST", API_LOGIN, data=payload, token="")
+        self._login_error = ""
+        payload = {"app_name": self.app_name, "username": self.username,
+                   "password": hashlib.sha256(self.password.encode("utf-8")).hexdigest()}
+        # Only a definitely unsupported endpoint permits the legacy protocol.
+        # Bad passwords, access challenges, rate limits and network failures
+        # must not silently downgrade to cleartext login or multiply attempts.
+        routes = [self._direct_api, not self._direct_api]
+        for direct_api in routes:
+            self._direct_api = direct_api
+            result = self._request_once("POST", API_LOGIN_V2, data=payload, token="")
+            if _http_status(result) in {404, 405}:
+                result = self._request_once("POST", API_LOGIN, data={**payload, "password": self.password}, token="")
+            if _http_status(result) not in {404, 405}:
+                break
         token = ""
-        if isinstance(result, dict):
-            token = str((result.get("data") or {}).get("token") or "").strip()
+        if _is_success_response(result) and (_http_status(result) is None or 200 <= _http_status(result) < 300):
+            data = result.get("data")
+            if isinstance(data, dict):
+                token = str(data.get("token") or "").strip()
         if token:
             self.token = token
             self._save_cached_token(token)
             return True
+        detail = _response_message(result, MSG_LOGIN_FAILED)
+        for value in (self.password, self.token, payload["password"]):
+            if value:
+                detail = detail.replace(value, "***")
+        self._login_error = f"{MSG_LOGIN_FAILED}：{detail}" if detail != MSG_LOGIN_FAILED else MSG_LOGIN_FAILED
         return False
 
     def _scan_library(self, guid: str, dir_list: list[str]) -> dict[str, Any]:
@@ -433,7 +526,7 @@ class FnosMediaRefresher:
         for _attempt in range(self.max_auth_retries):
             if require_auth and not self.token:
                 if not self.login(force=True):
-                    return _error_response(MSG_LOGIN_NOT_CONFIGURED, path=path)
+                    return _error_response(self._login_error or MSG_LOGIN_FAILED, path=path)
 
             result = self._request_once(method, path, data=data, params=params, token=self.token if require_auth else "")
             if not isinstance(result, dict):
@@ -443,7 +536,7 @@ class FnosMediaRefresher:
                 return result
 
             last_result = result
-            if not require_auth or path == API_LOGIN:
+            if not require_auth or path in API_LOGIN_PATHS:
                 return result
 
             self._clear_token()
@@ -468,7 +561,10 @@ class FnosMediaRefresher:
             return _error_response(MSG_REFRESH_NOT_CONFIGURED, path=path)
 
         method = method.upper()
-        url = f"{self.server_url}{path}"
+        # The NAS gateway exposes /v/api, while a direct video service may
+        # expose /api. Authx always signs the canonical /v-prefixed path.
+        request_path = path[2:] if self._direct_api and path.startswith("/v/") else path
+        url = f"{self.server_url}{request_path}"
         params = params or None
         last_result: dict[str, Any] | None = None
 
@@ -489,6 +585,7 @@ class FnosMediaRefresher:
                     "params": params,
                     "timeout": self.timeout,
                     "verify": self.verify_ssl,
+                    "allow_redirects": False,
                 }
                 if method in {"POST", "PUT", "PATCH"}:
                     request_kwargs["data"] = body_text.encode("utf-8")
@@ -511,8 +608,16 @@ class FnosMediaRefresher:
             decoded["_sign_mode"] = sign_mode
             last_result = decoded
 
-            # In auto sign mode, try the alternate sign rule when login fails.
-            if self.sign_mode == SIGN_MODE_AUTO and path == API_LOGIN and not _is_success_response(decoded):
+            if _is_success_response(decoded):
+                if self.sign_mode == SIGN_MODE_AUTO and 200 <= response.status_code < 300:
+                    self._active_sign_mode = sign_mode
+                return decoded
+            # Do not retry invalid credentials under a second signature. Only
+            # an explicit signature rejection is evidence to try compatibility.
+            message = _response_message(decoded, "").lower()
+            if (self.sign_mode == SIGN_MODE_AUTO and path in API_LOGIN_PATHS
+                    and response.status_code in {200, 400, 422}
+                    and any(marker in message for marker in ("signature", "authx", "签名"))):
                 continue
             return decoded
 
@@ -542,7 +647,7 @@ class FnosMediaRefresher:
         auth_nonce = _random_digits()
         timestamp = str(int(time.time() * 1000))
         if method.upper() == "GET" and sign_mode == SIGN_MODE_FNV and params:
-            hash_source = urlencode(sorted(params.items()))
+            hash_source = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         elif method.upper() == "GET":
             hash_source = ""
         else:
@@ -557,11 +662,11 @@ class FnosMediaRefresher:
 
     def _sign_modes(self) -> list[str]:
         if self.sign_mode == SIGN_MODE_AUTO:
-            return [SIGN_MODE_PHP, SIGN_MODE_FNV]
+            return [self._active_sign_mode] if self._active_sign_mode else [SIGN_MODE_FNV, SIGN_MODE_PHP]
         return [self.sign_mode]
 
     def _configured(self) -> bool:
-        return bool(self.server_url and self.api_key and self.secret)
+        return bool(self.server_url and (self.token or (self.username and self.password)))
 
     def _load_cached_token(self) -> str:
         try:
@@ -570,14 +675,27 @@ class FnosMediaRefresher:
             payload = json.loads(self.token_cache_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             return ""
-        if str(payload.get("server_url") or "").rstrip("/") != self.server_url.rstrip("/"):
+        if not isinstance(payload, dict):
             return ""
+        if _clean_base_url(payload.get("server_url")) != self.server_url:
+            return ""
+        # Legacy server-only caches cannot establish which account owns them.
+        if payload.get("username") != self.username or payload.get("app_name") != self.app_name:
+            return ""
+        if payload.get("signing_identity") != self._signing_identity():
+            return ""
+        if payload.get("sign_mode") in {SIGN_MODE_FNV, SIGN_MODE_PHP}:
+            self._active_sign_mode = payload["sign_mode"]
+        self._direct_api = payload.get("direct_api") is True
         return str(payload.get("token") or "").strip()
 
     def _save_cached_token(self, token: str) -> None:
         try:
             self.token_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"server_url": self.server_url, "token": token, "updated_at": int(time.time())}
+            payload = {"server_url": self.server_url, "username": self.username, "app_name": self.app_name,
+                       "signing_identity": self._signing_identity(), "sign_mode": self._sign_modes()[0],
+                       "direct_api": self._direct_api,
+                       "token": token, "updated_at": int(time.time())}
             self.token_cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError:
             return
@@ -589,9 +707,13 @@ class FnosMediaRefresher:
         except OSError:
             return
 
+    def _signing_identity(self) -> str:
+        return hashlib.sha256(json.dumps([self.api_key, self.secret]).encode("utf-8")).hexdigest()
+
 
 def _clean_base_url(value: Any) -> str:
-    return str(value or "").strip().rstrip("/")
+    url = str(value or "").strip().rstrip("/")
+    return url[:-2] if url.endswith("/v") else url
 
 
 def _resolve_cache_path(value: Any) -> Path:
@@ -657,6 +779,50 @@ def _extract_task_items(data: Any) -> list[dict[str, Any]]:
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _media_search_item(row: dict[str, Any]) -> dict[str, Any]:
+    """Project one media-DB search row into the fields that answer "已入库吗"."""
+
+    local_episodes = _as_int(row.get("local_number_of_episodes"))
+    local_seasons = _as_int(row.get("local_number_of_seasons"))
+    media_type = str(row.get("type") or "").strip()
+    kind = media_type.lower()
+    local_files = local_episodes + local_seasons
+    # A TV row only counts as imported when the media DB reports local files; a
+    # bare row can be a placeholder for a season or special with nothing on disk.
+    in_library = local_files > 0 or kind == "movie"
+    overview = str(row.get("overview") or "")
+    return {
+        "guid": row.get("guid"),
+        "title": row.get("title") or row.get("tv_title") or "",
+        "type": media_type,
+        "library": row.get("ancestor_name") or "",
+        "library_category": row.get("ancestor_category") or "",
+        "parent_title": row.get("parent_title") or "",
+        "year": str(row.get("release_date") or row.get("first_air_date") or "")[:4],
+        "status": row.get("status") or "",
+        "season_number": row.get("season_number"),
+        "episode_number": row.get("episode_number"),
+        "total_seasons": row.get("number_of_seasons"),
+        "total_episodes": _as_int(row.get("number_of_episodes")),
+        "local_seasons": local_seasons,
+        "local_episodes": local_episodes,
+        "in_library": in_library,
+        "watched": bool(row.get("watched")),
+        "favorite": bool(row.get("is_favorite")),
+        "vote_average": row.get("vote_average"),
+        "trim_id": row.get("trim_id") or "",
+        "imdb_id": row.get("imdb_id") or "",
+        "overview": overview[:400],
+    }
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _error_response(message: str, *, path: str = "") -> dict[str, Any]:

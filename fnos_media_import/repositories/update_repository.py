@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import sqlite3
 from contextlib import AbstractContextManager
 from typing import Any, Callable
 
 from ..time_utils import utc_now_iso, utc_now_iso_offset
+from ..media_identity_contract import normalize_media_identity, subscription_import_identity
 from .update_run_repository import UpdateRunRepository
 from .update_subscription_query_repository import UpdateSubscriptionQueryRepository
 from .worker_task_sequence import preserve_worker_task_sequence
@@ -75,6 +77,23 @@ def _json_text(value: Any) -> str | None:
     if value is None:
         return None
     return json.dumps(value, ensure_ascii=False)
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        result = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
+def _positive_id(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _decode_json_fields(item: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
@@ -262,8 +281,9 @@ class UpdateRepository:
              aliases, schedule_kind, days_of_week, time_of_day, interval_minutes, timezone,
              next_run_at, last_run_at, last_success_at, next_episode, last_success_episode,
              missing_episodes, source_strategy, auto_import_policy, min_score, quality_profile,
-             include_keywords, exclude_keywords, status, raw_data, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             include_keywords, exclude_keywords, status, raw_data, created_at, updated_at,
+             identity_ns, identity_value, canonical_dir)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data.get("title") or "",
@@ -296,6 +316,9 @@ class UpdateRepository:
                 _json_text(data.get("raw_data")),
                 now,
                 now,
+                data.get("identity_ns"),
+                data.get("identity_value"),
+                data.get("canonical_dir"),
             ),
         )
         subscription_id = int(cur.lastrowid)
@@ -321,6 +344,66 @@ class UpdateRepository:
             if sources is not None:
                 conn.execute("DELETE FROM update_sources WHERE subscription_id = ?", (subscription_id,))
                 self._replace_update_sources_conn(conn, subscription_id, sources, now)
+
+    def bind_organized_subscription(
+        self,
+        job_id: int,
+        identity: dict[str, Any],
+        canonical_dir: str,
+        subscription_id: int | None = None,
+    ) -> bool:
+        """Bind a confirmed library result using only persisted job relationships.
+
+        The caller must already have verified the remote result. The request
+        reference handles an Organizer completion racing the candidate update.
+        No matching subscription is a normal no-op for non-subscription imports.
+        """
+        identity = normalize_media_identity(identity)
+        path = str(canonical_dir or "").strip()
+        if not identity or not path.startswith("/") or path == "/" or "\\" in path or ".." in path.split("/"):
+            raise ValueError("Invalid organized subscription binding")
+        path = posixpath.normpath(path)
+        with self._connection_factory() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = conn.execute("SELECT raw_data FROM import_jobs WHERE id = ?", (int(job_id),)).fetchone()
+            if not job:
+                return False
+            job_raw = _json_object(job["raw_data"])
+            request = job_raw.get("request") if isinstance(job_raw.get("request"), dict) else {}
+            ids = {int(row["subscription_id"]) for row in conn.execute(
+                "SELECT DISTINCT subscription_id FROM update_candidates WHERE job_id = ?", (int(job_id),)
+            ).fetchall() if row["subscription_id"]}
+            request_id = _positive_id(request.get("update_subscription_id"))
+            if request_id:
+                ids.add(request_id)
+            if not ids:
+                return False
+            if len(ids) != 1 or (subscription_id is not None and int(subscription_id) not in ids):
+                raise ValueError("Conflicting subscription references for organized job")
+            resolved_id = next(iter(ids))
+            row = conn.execute("SELECT * FROM update_subscriptions WHERE id = ?", (resolved_id,)).fetchone()
+            if not row:
+                return False
+            subscription = dict(row)
+            if str(subscription.get("media_type") or "tv") != identity["media_type"]:
+                raise ValueError("Organized media type conflicts with subscription")
+            raw = _json_object(subscription.get("raw_data"))
+            subscription["raw_data"] = raw
+            previous, _intent = subscription_import_identity(subscription)
+            keys = {(identity["media_type"], identity["ns"], identity["value"]), *(tuple(key) for key in identity.get("aliases", []))}
+            if previous and (previous["media_type"], previous["ns"], previous["value"]) not in keys:
+                raise ValueError("Organized identity conflicts with subscription")
+            # The caller has just rescanned the frozen library scope. This path
+            # is a cache, not identity authority; a renamed canonical directory
+            # may refresh it as long as the stable identity still agrees.
+            raw["media_identity"] = identity
+            raw["canonical_openlist_root"] = path
+            raw["organized_binding"] = {"job_id": int(job_id), "canonical_dir": path, "confirmed_at": utc_now()}
+            conn.execute(
+                "UPDATE update_subscriptions SET identity_ns = ?, identity_value = ?, canonical_dir = ?, raw_data = ?, updated_at = ? WHERE id = ?",
+                (identity["ns"], identity["value"], path, _json_text(raw), utc_now(), resolved_id),
+            )
+            return True
 
     def delete_update_subscription(self, subscription_id: int) -> bool:
         with self._connection_factory() as conn:

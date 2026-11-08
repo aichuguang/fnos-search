@@ -6,7 +6,7 @@
     <title>管理员后台 - {{ app_name }}</title>
     <link rel="stylesheet" href="/static/styles.css?v=20261009-recovery-v001">
     <link rel="stylesheet" href="/static/product.css?v=20261009-recovery-v001">
-    <link rel="stylesheet" href="/static/admin-transfers.css?v=20261015-relay-prefetch-v013">
+    <link rel="stylesheet" href="/static/admin-transfers.css?v=20261107-progress-lanes-v014">
     {% if site_logo_url %}<style>:root { --site-logo-bg: url("{{ site_logo_url }}"); }</style>{% endif %}
 </head>
 <body class="ui-dark" data-page="admin">
@@ -66,6 +66,10 @@
                     <button class="tab" id="adminTabAdapters" type="button" role="tab" aria-selected="false" aria-controls="tab-adapters" tabindex="-1" data-tab="adapters">
                         <span class="icon-slot icon-settings" aria-hidden="true"></span>
                         <span>系统设置</span>
+                    </button>
+                    <button class="tab" id="adminTabAgent" type="button" role="tab" aria-selected="false" aria-controls="tab-agent" tabindex="-1" data-tab="agent">
+                        <span class="icon-slot icon-audit" aria-hidden="true"></span>
+                        <span>Agent 接入</span>
                     </button>
                 </nav>
                 <div class="nas-card">
@@ -933,12 +937,17 @@
                         </section>
                         <section class="settings-card advanced-config-card" data-settings-section="transport">
                             <h3>飞牛媒体刷新</h3>
+                            <p class="muted">填写飞牛地址、用户名和密码即可。保存后加载媒体库时自动登录并缓存 Token，无需手动填写签名参数。</p>
                             <label class="advanced-field"><span>飞牛地址</span><input id="advFnosServerUrl" type="text" placeholder="http://127.0.0.1:5668"></label>
                             <label class="advanced-field"><span>用户名</span><input id="advFnosUsername" type="text" autocomplete="off"></label>
                             <label class="advanced-field"><span>密码</span><input id="advFnosPassword" type="password" autocomplete="new-password"></label>
-                            <label class="advanced-field"><span>API Key</span><input id="advFnosApiKey" type="password" autocomplete="new-password"></label>
-                            <label class="advanced-field"><span>Secret</span><input id="advFnosSecret" type="password" autocomplete="new-password"></label>
-                            <label class="advanced-field"><span>Token</span><input id="advFnosToken" type="password" autocomplete="new-password"></label>
+                            <details class="advanced-details">
+                                <summary>高级兼容设置（普通登录无需填写）</summary>
+                                <p class="muted">仅为旧配置保留 API Key、Secret 和 Token 覆盖；Token 默认自动获取。已保存的敏感值留空会保留，清除请使用“凭据管理”。</p>
+                                <label class="advanced-field"><span>API Key（可选覆盖）</span><input id="advFnosApiKey" type="password" autocomplete="new-password"></label>
+                                <label class="advanced-field"><span>Secret（可选覆盖）</span><input id="advFnosSecret" type="password" autocomplete="new-password"></label>
+                                <label class="advanced-field"><span>Token（可选覆盖）</span><input id="advFnosToken" type="password" autocomplete="new-password"></label>
+                            </details>
                         </section>
                         <section class="settings-card advanced-config-card security-status-card" data-settings-section="security">
                             <div class="security-status-head">
@@ -998,6 +1007,67 @@
                         </section>
                     </div>
                 </section>
+
+                <section class="glass-panel pad admin-tab-panel" id="tab-agent" role="tabpanel" aria-labelledby="adminTabAgent" hidden>
+                    <div class="section-title">
+                        <div>
+                            <h2>Agent 接入</h2>
+                            <p>为外部 AI Agent 签发 MCP 令牌，并为单个整理任务授予一次性「执行移动」权限。</p>
+                        </div>
+                        <div class="filter-row">
+                            <button class="secondary" type="button" id="agentAuditLoadBtn">刷新审计</button>
+                        </div>
+                    </div>
+                    <div class="notice-box" id="agentStatusBox">Agent 接口状态未知。</div>
+
+                    <section class="glass-panel pad">
+                        <h3>创建令牌</h3>
+                        <div class="filter-row">
+                            <input id="agentCreateName" type="text" placeholder="令牌名称，例如 hermes" maxlength="80">
+                            <select id="agentCreateProfile" aria-label="权限档位"></select>
+                            <select id="agentCreateExpiryMode" aria-label="有效期">
+                                <option value="never">长期有效</option>
+                                <option value="date">指定日期</option>
+                            </select>
+                            <span id="agentCreateExpiryDate" style="display:none; gap:6px; align-items:center;">
+                                <select id="agentCreateExpiryYear" aria-label="到期年份"></select>
+                                <select id="agentCreateExpiryMonth" aria-label="到期月份"></select>
+                                <select id="agentCreateExpiryDay" aria-label="到期日期"></select>
+                            </span>
+                            <button type="button" id="agentCreateBtn">创建</button>
+                        </div>
+                        <p class="muted" id="agentProfileHint">只读档位默认选中；可写档位不能直接放行整理或回滚。入库与订阅按系统策略运行。</p>
+                        <div class="notice-box" id="agentTokenReveal" hidden></div>
+                    </section>
+
+                    <section class="glass-panel pad">
+                        <h3>现有令牌</h3>
+                        <div class="table-wrap">
+                            <table class="data-table">
+                                <thead>
+                                    <tr><th>名称</th><th>前缀</th><th>作用域</th><th>状态</th><th>最近使用</th><th>操作</th></tr>
+                                </thead>
+                                <tbody id="agentTokenBody">
+                                    <tr><td colspan="6" class="empty-cell">正在加载。</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <section class="glass-panel pad">
+                        <h3>最近调用</h3>
+                        <div class="table-wrap">
+                            <table class="data-table">
+                                <thead>
+                                    <tr><th>时间</th><th>令牌</th><th>工具</th><th>结果</th><th>耗时</th></tr>
+                                </thead>
+                                <tbody id="agentAuditBody">
+                                    <tr><td colspan="5" class="empty-cell">点「刷新审计」加载。</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+                </section>
             </section>
         </div>
     </main>
@@ -1032,20 +1102,21 @@
     <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
     <script src="/static/ui-core.js?v=20260808-request-core-v015"></script>
     <script src="/static/ui-select.js?v=20260808-custom-select-v017"></script>
-    <script src="/static/resource-search-workbench.js?v=20261009-recovery-v001"></script>
+    <script src="/static/resource-search-workbench.js?v=20261107-cloud139-items-v002"></script>
     <script src="/static/admin-system.js?v=20261011-history-cleanup-v001"></script>
     <script src="/static/admin-jobs.js?v=20261011-request-retry-v006"></script>
-    <script src="/static/admin-media.js?v=20261009-recovery-v001"></script>
-    <script src="/static/admin-rclone.js?v=20261015-relay-prefetch-v013"></script>
-    <script src="/static/admin-organizer.js?v=20261011-review-guard-v003"></script>
+    <script src="/static/admin-media.js?v=20261103-fnos-login-v014"></script>
+    <script src="/static/admin-rclone.js?v=20261107-progress-lanes-v014"></script>
+    <script src="/static/admin-organizer.js?v=20261107-progress-lanes-v004"></script>
     <script src="/static/admin-updates.js?v=20261009-recovery-v001"></script>
-    <script src="/static/admin-trending.js?v=20261012-quark-selection-v008"></script>
+    <script src="/static/admin-trending.js?v=20261104-trending-scheduler-v009"></script>
     <script src="/static/admin-settings.js?v=20261009-recovery-v001"></script>
     <script src="/static/admin-storage-v1.js?v=20261011-storage-cas-v004"></script>
     <script src="/static/admin-notifications.js?v=20260805-notifications-v006"></script>
     <script src="/static/admin-adapters.js?v=20261009-recovery-v001"></script>
-    <script src="/static/admin-bootstrap.js?v=20261014-transfer-center-v009"></script>
+    <script src="/static/admin-agent.js?v=20261104-agent-expiry-v002"></script>
+    <script src="/static/admin-bootstrap.js?v=20261103-agent-mcp-v015"></script>
     <script src="/static/ui-dialog.js?v=20261009-recovery-v001"></script>
-    <script src="/static/admin.js?v=20261014-transfer-center-v009"></script>
+    <script src="/static/admin.js?v=20261103-agent-mcp-v015"></script>
 </body>
 </html>

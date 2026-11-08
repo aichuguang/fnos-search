@@ -62,7 +62,7 @@ class WorkerTaskDispatcher:
                 "auto_apply": bool(auto_apply),
                 "respect_schedule": bool(respect_schedule),
             },
-            f"organizer-process:{int(task_id)}",
+            f"organizer-process:{int(task_id)}" if auto_apply else f"organizer-preview:{int(task_id)}",
             reactivate_terminal=True,
             force=True,
         )

@@ -148,7 +148,7 @@ def _safe_public_cloud139_selection(value: Any) -> dict[str, Any]:
             name = _clip_text(raw.get("name") or raw.get("fileName"), 240) or fid
             path = _clip_text(raw.get("path"), 1024)
             token = _clip_text(raw.get("share_fid_token"), 2048)
-            key = path or token or fid
+            key = fid or token or path
             if not key or key in seen:
                 continue
             seen.add(key)
@@ -950,17 +950,31 @@ def _cloud139_inspection_summary(ok: bool, data: Any, fallback_size: Any = "") -
     share = body.get("share") if isinstance(body.get("share"), dict) else {}
     rows = _extract_file_rows(body)
     items = [_public_file_item(row) for row in rows[:200]]
-    file_count = (
-        share.get("file_num")
-        or share.get("file_count")
-        or share.get("fileCount")
-        or body.get("file_num")
-        or body.get("file_count")
-        or body.get("fileCount")
-        or len(rows)
-        or ""
+    file_count = share.get("file_num")
+    if file_count in (None, ""):
+        file_count = share.get("file_count")
+    if file_count in (None, ""):
+        file_count = share.get("fileCount")
+    if file_count in (None, ""):
+        file_count = body.get("file_num")
+    if file_count in (None, ""):
+        file_count = body.get("file_count")
+    if file_count in (None, ""):
+        file_count = body.get("fileCount")
+    if file_count in (None, ""):
+        file_count = len(rows) or ""
+    video_file_count = share.get("video_file_count")
+    size_value = (
+        share.get("total_size")
+        if share.get("total_size") is not None
+        else (
+            share.get("size")
+            or share.get("totalSize")
+            or body.get("total_size")
+            or body.get("totalSize")
+            or fallback_size
+        )
     )
-    size_value = share.get("size") or share.get("total_size") or share.get("totalSize") or body.get("total_size") or body.get("totalSize") or fallback_size
     message = str(payload.get("message") or payload.get("msg") or "")
     if not message:
         message = "资源有效，可快速入库" if ok else "资源可能已失效，请换一个资源"
@@ -973,6 +987,7 @@ def _cloud139_inspection_summary(ok: bool, data: Any, fallback_size: Any = "") -
             "title": share.get("title") or share.get("name") or body.get("title") or body.get("name") or "",
             "share_status": share.get("status") or share.get("state") or body.get("status") or body.get("state") or "",
             "file_count": file_count,
+            "video_file_count": video_file_count,
             "total_size_text": _format_size(size_value),
         },
         "items": items,
@@ -982,6 +997,7 @@ def _cloud139_inspection_summary(ok: bool, data: Any, fallback_size: Any = "") -
             "code": payload.get("code"),
             "share_status": share.get("status") or share.get("state") or body.get("status") or body.get("state") or "",
             "file_count": file_count,
+            "video_file_count": video_file_count,
         },
     }
 

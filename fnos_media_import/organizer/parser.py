@@ -21,7 +21,7 @@ NOISE_TOKEN_PATTERN = re.compile(
     r"h\.?265|x265|h\.?264|x264|ddp\s*\d(?:\.\d)?|aac\s*\d(?:\.\d)?|truehd|dts(?:-?hd)?|atmos|hifi|60fps|120fps)\b"
 )
 CN_NOISE_PATTERN = re.compile(
-    r"(?:臻彩|高码率|内嵌|内封|外挂|简中|繁中|中字|中文字幕|字幕|国语|国配|粤语|英语|双语|合集|全集|完结|更新至|更\s*\d+\s*[集话話回]|[0-9.]+\s*(?:GB|G|MB|M)\s*[集话話回]?)",
+    r"(?:臻彩|高码率|超清|高清|内嵌|内封|外挂|简中|繁中|中字|中文字幕|字幕|国语|国配|粤语|英语|双语|合集|全集|完结|更新至|更\s*\d+\s*[集话話回]|[0-9.]+\s*(?:GB|G|MB|M)\s*[集话話回]?)",
     re.I,
 )
 CHINESE_NUMERAL_MAP = {
@@ -40,6 +40,19 @@ CHINESE_NUMERAL_MAP = {
 }
 CHINESE_NUMBER_CHARS = "零〇一二两三四五六七八九十百千万"
 EPISODE_MARKERS = "集话話回级"
+CONTAINER_PATTERNS = (
+    re.compile(r"mobile[\s_-]*share[\s_-]+[0-9a-f]{8,}", re.I),
+    re.compile(r"job[\s_-]*\d+", re.I),
+    re.compile(r"\d{1,3}"),
+    re.compile(r"新建文件夹.*"),
+    re.compile(r"_?入库暂存"),
+    re.compile(r"[0-9a-f]{16,}", re.I),
+)
+ID_TAG = re.compile(r"\[(?P<ns>tmdb|imdb|tvdb|douban|local)-(?P<id>[A-Za-z0-9]+)\]", re.I)
+STATUS_WORDS = re.compile(
+    rf"(?:更新\s*至(?:\s*第?\s*(?:\d+|[{CHINESE_NUMBER_CHARS}]+)\s*[集话話回]?)?|"
+    rf"(?:全|共)\s*(?:\d+|[{CHINESE_NUMBER_CHARS}]+)\s*[集话話回]|持续更新|更新中|完结|合集|完整版)"
+)
 
 
 @dataclass
@@ -52,13 +65,26 @@ class ParsedFile:
     confidence: float = 0
     reasons: list[str] = field(default_factory=list)
     version: str = ""
+    review_reasons: list[str] = field(default_factory=list)
+    has_explicit_season: bool = False
 
 
 def parse_file_name(name: str, *, current_dir: str = "", parent_dir: str = "", siblings: list[str] | None = None) -> ParsedFile:
     stem = posixpath.splitext(str(name or "").replace("\\", "/"))[0]
+    current_season = parse_season(current_dir)
     parent_season = parse_season(parent_dir)
-    season = parent_season if parent_season is not None else parse_season(current_dir)
+    file_season = parse_season(stem)
+    season = file_season if file_season is not None else current_season
+    if season is None:
+        season = parent_season
     parsed_season, episode, reason = parse_episode(stem, season)
+    review_reasons = []
+    season_evidence = {item for item in (file_season, current_season, parent_season, parsed_season) if item is not None}
+    if len(season_evidence) > 1:
+        review_reasons.append("文件与目录的季号证据冲突，需要人工确认")
+    has_explicit_season = any(item is not None for item in (file_season, current_season, parent_season)) or reason in {
+        "命中 SxxExx 规则", "命中中文季集规则", "命中罗马数字季集规则",
+    }
     title = choose_title(stem, current_dir=current_dir, parent_dir=parent_dir, siblings=siblings or [], has_episode=episode is not None)
     title, year = split_title_year(title or "")
     if not year:
@@ -92,15 +118,42 @@ def parse_file_name(name: str, *, current_dir: str = "", parent_dir: str = "", s
         confidence=float(max(0, min(100, confidence))),
         reasons=reasons,
         version=extract_version_tags(name),
+        review_reasons=review_reasons,
+        has_explicit_season=has_explicit_season,
     )
+
+
+def is_container_dir(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text and any(pattern.fullmatch(text) for pattern in CONTAINER_PATTERNS))
+
+
+def parse_dir_name(value: Any) -> dict[str, Any]:
+    """Read title/tag hints; a full library identity also needs the media type."""
+    text = str(value or "").strip()
+    if is_container_dir(text):
+        return {"container": True, "title": None, "year": None, "ns": None, "id": None}
+    tag = ID_TAG.search(text)
+    if tag is not None and tag.end() != len(text):
+        tag = None
+    body = text[:tag.start()].strip() if tag is not None else text
+    matched = re.fullmatch(r"(?P<title>.+?)\s*\((?P<year>(?:19|20)\d{2})\)", body)
+    title = matched.group("title").strip() if matched else body
+    year = int(matched.group("year")) if matched else None
+    title = re.sub(r"\s+", " ", title)
+    return {
+        "container": False,
+        "title": None if invalid_title(title) else title,
+        "year": year,
+        "ns": tag.group("ns").lower() if tag else None,
+        "id": tag.group("id") if tag else None,
+    }
 
 
 def parse_season(value: Any) -> int | None:
     text = str(value or "").strip()
-    if re.fullmatch(r"\d{1,2}", text):
-        return int(text)
     patterns = [
-        r"(?i)(?:^|[\s._\-[(【])s(?:eason)?\s*0*(\d{1,2})(?=$|[\s._\-)\]】])",
+        r"(?i)(?<![A-Za-z])s(?:eason)?\s*0*(\d{1,2})(?=$|[\s._\-)\]】])",
         r"(?i)(?:^|[\s._\-[(【])season\s*0*(\d{1,2})(?=$|[\s._\-)\]】])",
         rf"第\s*(\d{{1,2}}|[{CHINESE_NUMBER_CHARS}]+)\s*季",
     ]
@@ -117,7 +170,7 @@ def parse_episode(value: Any, season_hint: int | None = None) -> tuple[int | Non
     patterns = [
         (r"(?i)(?:^|[^0-9A-Za-z])S\s*0*(\d{1,2})\s*E\s*0*(\d{1,4})(?:v\d+)?(?=$|[^0-9A-Za-z])", "命中 SxxExx 规则", True),
         (rf"第\s*({cn_number})\s*季.*?第\s*({cn_number})\s*[{EPISODE_MARKERS}]", "命中中文季集规则", True),
-        (r"(?:^|[\s._-])0*(\d{1,2})\s*-\s*0*(\d{1,4})(?:\D|$)", "命中 季-集 规则", True),
+        (r"(?:^|[\s._-])0*(\d{1,2})\s*-\s*0*(\d{1,4})(?![\dA-Za-z\u4e00-\u9fff])", "命中 季-集 规则", True),
     ]
     for pattern, reason, has_season in patterns:
         match = re.search(pattern, text)
@@ -273,7 +326,7 @@ def _strip_trailing_metadata_for_episode(value: Any) -> str:
         r"(?:^|[\s._\-\[\]()【】])"
         r"(?:4k|8k|2160p|1080p|720p|480p|uhd|hdr10?|dv|sdr|web[- ]?dl|webrip|bluray|remux|hevc|avc|"
         r"h\.?265|x265|h\.?264|x264|aac(?:\s*\d(?:\.\d)?)?|ddp(?:\s*\d(?:\.\d)?)?|dts(?:-?hd)?|"
-        r"60fps|120fps|10bit|8bit|中字|中文字幕|国语|国配|粤语|简中|繁中|内嵌|内封|高码率|臻彩)"
+        r"60fps|120fps|10bit|8bit|中字|中文字幕|国语|国配|粤语|简中|繁中|内嵌|内封|高码率|超清|高清|臻彩)"
         r"[\s._\-\[\]()【】]*$"
     )
     changed = True
@@ -363,9 +416,12 @@ def choose_title(stem: str, *, current_dir: str = "", parent_dir: str = "", sibl
 
 
 def sanitize_candidate(value: Any) -> str:
+    if is_container_dir(value):
+        return ""
     raw = _normalize_text(value)
     if not raw:
         return ""
+    raw = ID_TAG.sub(" ", raw)
     # 广告/谐音资源经常用逗号后给出更干净的别名：例如“...更25集,一人之下6”。
     # 先分段清洗，再选最像片名的一段。
     segments = [segment for segment in re.split(r"[,，;；]+", raw) if segment.strip()]
@@ -388,6 +444,9 @@ def _normalize_text(value: Any) -> str:
 
 def _clean_candidate_segment(value: Any) -> str:
     text = _normalize_text(value)
+    if is_container_dir(text):
+        return ""
+    text = STATUS_WORDS.sub(" ", text)
     text = re.sub(r"【[^】]*】|\[[^\]]*\]", " ", text)
     text = re.sub(r"(?i)\b(BY|HD|BD|WEB|DL|REMUX|资源库|小谢|公众号)\b", " ", text)
     text = re.sub(r"(?i)\bS\s*0*\d{1,2}\s*E\s*0*\d{1,4}\b", " ", text)
@@ -462,6 +521,8 @@ def _candidate_score(value: Any) -> float:
 def invalid_title(value: Any) -> bool:
     text = str(value or "").strip()
     if not text or len(text) <= 1:
+        return True
+    if is_container_dir(text) or not STATUS_WORDS.sub("", text).strip(" .-_()（）[]【】"):
         return True
     if re.fullmatch(r"\d{1,4}", text):
         return True

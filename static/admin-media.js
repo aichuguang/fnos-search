@@ -65,7 +65,7 @@
                 renderMediaMappings();
                 const message = data.success
                     ? `已加载 ${adminState.mediaLibraries.length} 个飞牛媒体库，运行中任务 ${adminState.mediaRunning.length} 个。`
-                    : data.message || "飞牛媒体库加载失败，请检查 FNOS_SERVER_URL / API Key / Secret / 登录配置。";
+                    : data.message || "飞牛媒体库加载失败，请检查飞牛地址、账号、密码和连接状态。";
                 if (statusBox) {
                     statusBox.className = `notice-box ${data.success ? "status-ok" : "status-error"}`;
                     statusBox.innerHTML = `

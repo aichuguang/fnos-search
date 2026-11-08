@@ -224,6 +224,7 @@ class OrganizerRepositories:
     job_commands: JobCommandRepository
     guest_request_queries: GuestRequestQueryRepository
     guest_request_commands: GuestRequestCommandRepository
+    update: UpdateRepository | None = None
 
     @classmethod
     def from_set(cls, repositories: RepositorySet) -> "OrganizerRepositories":
@@ -233,6 +234,7 @@ class OrganizerRepositories:
             job_commands=repositories.job_commands,
             guest_request_queries=repositories.guest_request_queries,
             guest_request_commands=repositories.guest_request_commands,
+            update=repositories.update,
         )
 
 

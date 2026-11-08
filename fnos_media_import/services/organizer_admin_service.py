@@ -52,8 +52,9 @@ class OrganizerCommands(Protocol):
     def rebuild_task(self, task_id: int) -> dict[str, Any]: ...
     def update_mapping(self, mapping_id: int, payload: dict[str, Any], *, task_id: int) -> dict[str, Any]: ...
     def batch_update_mappings(self, task_id: int, payload: dict[str, Any]) -> dict[str, Any]: ...
-    def approve_task(self, task_id: int) -> dict[str, Any]: ...
-    def start_apply_task(self, task_id: int) -> dict[str, Any]: ...
+    def approve_task(self, task_id: int, *, expected_revision: int | None = None, expected_plan_hash: str | None = None) -> dict[str, Any]: ...
+    def request_agent_rescan(self, task_id: int) -> dict[str, Any]: ...
+    def start_apply_task(self, task_id: int, *, expected_revision: int | None = None) -> dict[str, Any]: ...
     def skip_task(self, task_id: int) -> dict[str, Any]: ...
     def delete_task(self, task_id: int) -> dict[str, Any]: ...
     def process_task(self, task_id: int, *, auto_apply: bool) -> dict[str, Any]: ...
@@ -113,7 +114,7 @@ class OrganizerAdminCommandService:
     def approve(self, task_id: int):
         return self._with_status(self._organizer.approve_task(task_id))
 
-    def apply(self, task_id: int):
+    def apply(self, task_id: int, *, expected_revision: int | None = None, expected_plan_hash: str | None = None):
         task = self._organizer.get_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}, 404
@@ -125,7 +126,14 @@ class OrganizerAdminCommandService:
         # The UI's confirmation is one action: validate/approve its exact saved
         # plan, then enqueue it. In particular, mapping edits have not yet
         # authorized deletion operations, and a resume must retain done work.
-        approved = self._organizer.approve_task(task_id)
+        # ``expected_revision`` is only forwarded when a caller previewed a
+        # specific plan, so existing callers and test doubles keep working.
+        if expected_plan_hash is not None:
+            approved = self._organizer.approve_task(task_id, expected_revision=expected_revision, expected_plan_hash=expected_plan_hash)
+        elif expected_revision is None:
+            approved = self._organizer.approve_task(task_id)
+        else:
+            approved = self._organizer.approve_task(task_id, expected_revision=expected_revision)
         if approved.get("success") is False:
             return approved, (409 if approved.get("conflict") else 400)
         if self._worker_dispatcher:
@@ -201,6 +209,22 @@ class OrganizerAdminCommandService:
             result.setdefault("retry_mode", "resume_apply" if resume_apply else "rescan")
         return self._with_status(result)
 
+    def rescan_only(self, task_id: int):
+        """Agent write permission can generate a plan, never resume disk writes."""
+        prepare = getattr(self._organizer, "request_agent_rescan", None)
+        if not callable(prepare):
+            return {"success": False, "code": "RESCAN_UNAVAILABLE", "message": "整理器不支持安全的仅识别模式"}, 409
+        result = prepare(task_id)
+        if not result.get("success"):
+            return self._with_status(result)
+        if self._worker_dispatcher:
+            queued = self._worker_dispatcher.organizer_process(task_id, auto_apply=False, respect_schedule=False)
+            if queued:
+                return {**queued, "retry_mode": "rescan_only", "executed": False,
+                        "requires_confirmation": True, "message": "已排队重新识别，仅生成计划，不移动文件"}, 200
+        scanned = self._organizer.process_task(task_id, auto_apply=False)
+        return self._with_status({**scanned, "retry_mode": "rescan_only", "executed": False, "requires_confirmation": True})
+
     def rollback(self, run_id: int):
         return self._with_status(self._organizer.rollback_run(run_id))
 
@@ -225,8 +249,9 @@ class OrganizerAdminCommandService:
             return {"success": False, "message": "标准化任务不存在"}, 404
         has_title = payload.get("title") is not None and str(payload.get("title") or "").strip()
         season = payload.get("season")
-        if not has_title and season is None:
-            return {"success": False, "message": "请填写要修改的片名或季号"}, 400
+        tmdb_supplied = "tmdb_id" in payload
+        if not has_title and season is None and not tmdb_supplied:
+            return {"success": False, "message": "请填写要修改的片名、季号或 TMDB ID"}, 400
         season_int: int | None = None
         if season is not None:
             try:
@@ -244,6 +269,11 @@ class OrganizerAdminCommandService:
             mapping_payload["title"] = title
         if season_int is not None:
             mapping_payload["season"] = season_int
+        if tmdb_supplied:
+            value = payload.get("tmdb_id")
+            if value is not None and (isinstance(value, bool) or not str(value).isdigit() or int(value) <= 0):
+                return {"success": False, "message": "TMDB ID 必须是正整数或 null"}, 400
+            mapping_payload["tmdb_id"] = int(value) if value is not None else None
         updater = getattr(self._organizer, "batch_update_mappings", None)
         if not callable(updater):
             return {"success": False, "message": "当前 Organizer 不支持原子批量修改，未写入任何映射"}, 500

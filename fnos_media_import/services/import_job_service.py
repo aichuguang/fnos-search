@@ -30,6 +30,7 @@ from ..constants import (
     JOB_WAITING_TRANSFER,
 )
 from ..domain.models import EXECUTION_PLAN_VERSION, DestinationDescriptor, SourceDescriptor
+from ..media_identity_contract import ORGANIZER_INTENTS, normalize_media_identity
 
 
 class V1PlanningError(ValueError):
@@ -222,7 +223,7 @@ class ImportJobCreationService:
         """Create a job from an untrusted HTTP/public payload."""
 
         payload = dict(payload or {})
-        forbidden = sorted(field for field in GUEST_FORBIDDEN_FIELDS if field in payload)
+        forbidden = sorted(field for field in GUEST_FORBIDDEN_FIELDS | {"organizer_intent", "update_subscription_id"} if field in payload)
         if forbidden:
             raise V1PlanningError(
                 f"保存位置由管理员配置，提交不得包含：{', '.join(forbidden)}",
@@ -245,6 +246,21 @@ class ImportJobCreationService:
         self, payload: dict[str, Any], *, public_request_token: str = ""
     ) -> dict[str, Any]:
 
+        payload = dict(payload)
+        identity = normalize_media_identity(payload.get("media_identity"), default_media_type="movie" if payload.get("category") == "movie" else "tv")
+        if payload.get("media_identity") and not identity:
+            raise ValueError("Invalid media identity")
+        if identity:
+            payload["media_identity"] = identity
+        intent = str(payload.get("organizer_intent") or "create_or_match")
+        if intent not in ORGANIZER_INTENTS:
+            raise ValueError("Invalid organizer intent")
+        payload["organizer_intent"] = intent
+        if "update_subscription_id" in payload:
+            subscription_id = _to_nonneg_int(payload.get("update_subscription_id"))
+            if not subscription_id:
+                raise ValueError("Invalid update subscription reference")
+            payload["update_subscription_id"] = subscription_id
         title = str(payload.get("title") or "未命名资源").strip()
         # 访客经 TMDB 选片提交时，任务标题使用 TMDB 正式标题；
         # 原始分享标题保留在 raw_data.request.raw_title 便于追溯。
@@ -644,17 +660,16 @@ class ImportJobCreationService:
         if raw_title and isinstance(media_identity, dict) and str(media_identity.get("title") or "").strip():
             # 任务标题已被 TMDB 正式标题替换，这里保留访客提交的原始标题。
             summary["raw_title"] = raw_title[:500]
-        media_identity = payload.get("media_identity")
-        if isinstance(media_identity, dict):
-            allowed = (
-                "tmdb_id", "media_type", "title", "original_title", "year",
-                "poster_url", "overview", "season_number", "original_query",
-            )
-            summary["media_identity"] = {
-                key: media_identity[key]
-                for key in allowed
-                if media_identity.get(key) not in (None, "")
-            }
+        media_identity = normalize_media_identity(payload.get("media_identity"), default_media_type="movie" if category_key == "movie" else "tv")
+        if media_identity:
+            summary["media_identity"] = media_identity
+        intent = str(payload.get("organizer_intent") or "create_or_match")
+        if intent not in ORGANIZER_INTENTS:
+            raise ValueError("Invalid organizer intent")
+        summary["organizer_intent"] = intent
+        subscription_id = _to_nonneg_int(payload.get("update_subscription_id"))
+        if subscription_id:
+            summary["update_subscription_id"] = subscription_id
         return summary
 
     def _trusted_config_revision(self) -> int:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import posixpath
 import logging
@@ -45,6 +46,20 @@ from ..services.execution_plan_guard import (
     require_v1_execution_plan,
 )
 from .ai import AiCalibrator
+from .identity import IDENTITY_MANIFEST_NAME, IdentityError, parse_identity_manifest
+from .library_scan import LibraryScanError
+from .identity_pipeline import (
+    IdentityReviewRequired,
+    execute_manifest_write,
+    job_request,
+    manifest_operation,
+    mapping_identity,
+    plan_identity,
+    request_identity,
+    restore_manifest,
+    revalidate_identity_plan,
+    validate_identity_mappings,
+)
 from .openlist_client import (
     VIDEO_EXTENSIONS,
     OpenListClient,
@@ -65,12 +80,14 @@ from .parser import (
     evidence_title,
     extract_season_from_title,
     extract_version_tags,
+    is_container_dir,
     parse_file_name,
     sanitize_candidate,
     standard_target_path,
 )
+from .plan_contract import organizer_operation_digest, organizer_plan_hash
 from .run_lease import OrganizerRunLease, OrganizerRunLeaseLost, OrganizerScanLease, OrganizerScanLeaseLost
-from .tmdb import TmdbClient, score_tmdb_result
+from .tmdb import TmdbClient, TmdbLookupError, score_tmdb_result, tmdb_match_rejection_reason
 
 AD_FILE_DELETE_THRESHOLD_BYTES = 50 * 1024 * 1024
 OPENLIST_STRM_SCAN_ENDPOINT = "/api/admin/scan/start"
@@ -394,6 +411,21 @@ def build_frozen_openlist_client_resolver(
     return resolve
 
 
+def _serialized_organizer_execution(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep scan/apply paths in one process from moving files concurrently."""
+
+    @functools.wraps(method)
+    def wrapper(self: "OrganizerService", *args: Any, **kwargs: Any) -> Any:
+        lock = getattr(self, "_organizer_execution_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._organizer_execution_lock = lock
+        with lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class OrganizerService:
     def __init__(
         self,
@@ -429,6 +461,10 @@ class OrganizerService:
         self._timers: dict[int, threading.Timer] = {}
         self._worker_context = threading.local()
         self._background_suspended = False
+        # Every execution path (durable worker handler, startup recovery timer,
+        # admin apply thread) shares one process-wide organizer slot.  Nested
+        # apply calls from process_task require a re-entrant lock.
+        self._organizer_execution_lock = threading.RLock()
         self._background_apply_lock = threading.Lock()
         self._background_apply_tasks: set[int] = set()
         try:
@@ -1280,7 +1316,18 @@ class OrganizerService:
             ):
                 recovered.append({"type": "move_file", "source_path": operation.get("target_path"), "target_path": source})
                 covered.add(source)
-        return recovered + undo
+        result = recovered + undo
+        for operation in reversed(task.get("operations") or []):
+            if operation.get("run_id") != run.get("id") or operation.get("type") != "write_identity_manifest" or operation.get("status") not in {"pending", "done", "failed"}:
+                continue
+            target = str(operation.get("target_path") or "")
+            if any(item.get("type") == "restore_identity_manifest" and item.get("target_path") == target for item in result):
+                continue
+            raw = operation.get("raw_data") or {}
+            inverse = {"type": "restore_identity_manifest", "target_path": target, "previous_content": raw.get("previous_content"), "written_content": raw.get("content")}
+            index = next((i for i, item in enumerate(result) if item.get("type") == "remove_empty_directory" and item.get("target_path") == dirname(target)), len(result))
+            result.insert(index, inverse)
+        return result
 
     def create_manual_task(self, payload: dict[str, Any], *, defer_process: bool = False) -> dict[str, Any]:
         _ = payload, defer_process
@@ -2349,6 +2396,7 @@ class OrganizerService:
         result = self.db.organizer.update_organizer_task(task_id, **guarded)
         return result is not False
 
+    @_serialized_organizer_execution
     def process_task(self, task_id: int, *, auto_apply: bool = True) -> dict[str, Any]:
         """Scan one task using the OpenList connection frozen in its V1 plan."""
 
@@ -2564,7 +2612,11 @@ class OrganizerService:
             # 计划生成阶段必须保持只读。广告删除也作为持久化 operation 留到
             # 后续 apply 阶段执行；即使高置信计划会自动衔接 apply，也不会在
             # 扫描或写入计划的过程中直接修改远端文件。
-            status = "auto_approved" if summary["auto_applicable"] else "waiting_review"
+            review_hold = bool((task.get("raw_data") or {}).get("agent_review_required"))
+            status = "auto_approved" if summary["auto_applicable"] and not review_hold else "waiting_review"
+            if review_hold:
+                summary["auto_applicable"] = False
+                summary["evidence"]["agent_review_required"] = True
             if scan_lease is not None:
                 scan_lease.ensure_owned()
             self._ensure_task_active(
@@ -2637,7 +2689,8 @@ class OrganizerService:
             if str(latest.get("status") or "").strip().lower() in {"skipped", "cancelled"}:
                 return {"success": False, "skipped": True, "cancelled": True, "task_id": task_id, "message": str(latest.get("error_message") or "任务已停止")}
             message = f"扫描或生成标准化计划失败：root={normalize_path(task.get('openlist_root_path'))}；{exc}"
-            updated = self._update_claimed_scan_task(task_id, scan_revision, status="failed", error_message=message)
+            review_error = isinstance(exc, (IdentityReviewRequired, IdentityError, LibraryScanError, TmdbLookupError))
+            updated = self._update_claimed_scan_task(task_id, scan_revision, status="waiting_review" if review_error else "failed", error_message=message)
             if updated:
                 self._sync_linked_job(task, status=JOB_REVIEW, stage="review", message=message, level=EVENT_ERROR, error_message=message)
             return {"success": False, "message": message, "task_id": task_id}
@@ -2745,6 +2798,8 @@ class OrganizerService:
                     result.append(item)
                     if len(result) >= max_files:
                         return
+                elif posixpath.splitext(item.name)[1].lower() not in VIDEO_EXTENSIONS:
+                    logger.info("organizer_file_ignored task_id=%s path=%s reason=unsupported_extension action=leave_in_staging", task.get("id"), item.path)
             for item in items:
                 if len(result) >= max_files:
                     return
@@ -2800,10 +2855,48 @@ class OrganizerService:
         # 自动执行，避免任务停在 auto_approved 后还要求管理员再次点“执行”。
         return self.process_task(task_id, auto_apply=True)
 
-    def approve_task(self, task_id: int) -> dict[str, Any]:
+    def request_agent_rescan(self, task_id: int) -> dict[str, Any]:
+        """Persist a review hold before scheduling an unprivileged Agent scan."""
+        task = self.db.organizer.get_organizer_task(task_id)
+        if not task:
+            return {"success": False, "code": "NOT_FOUND", "message": "整理任务不存在"}
+        _job, _plan, rejection = self._task_v1_plan(task, context="Agent organizer rescan")
+        if rejection:
+            return rejection
+        status = str(task.get("status") or "")
+        if status not in {"failed", "waiting_review", "auto_approved", "manual_confirmed", "pending", "stabilizing", "waiting_openlist"}:
+            return {"success": False, "conflict": True, "code": "STATE_CONFLICT", "message": "当前任务状态不允许重新识别"}
+        evidence = dict(task.get("evidence") or {})
+        rollback = evidence.get("rollback") or {}
+        progressed = any(
+            str(op.get("status") or "pending") != "pending" or op.get("run_id") or op.get("undo_data")
+            for op in task.get("operations") or []
+        )
+        if progressed or rollback.get("status") in {"running", "failed"} or self._mapping_recovery_conflict(task):
+            return {"success": False, "conflict": True, "code": "EXECUTION_CONFIRMATION_REQUIRED",
+                    "message": "已有执行或回滚记录，不能用重新识别覆盖恢复计划",
+                    "hint": "读取当前计划；继续整理需 apply 的计划确认，继续回滚需 rollback 的明确确认",
+                    "retryable": False}
+        evidence.pop("manual_approval", None)
+        evidence.pop("execution_approval", None)
+        evidence.pop("agent_confirmation", None)
+        raw = dict(task.get("raw_data") or {})
+        raw["agent_review_required"] = True
+        updated = self.db.organizer.update_organizer_task(
+            task_id, status="waiting_review", raw_data=raw, evidence=evidence,
+            expected_revision=_safe_positive_int(task.get("revision")), expected_statuses={status},
+            bump_revision=True, clear_scan_lease=True,
+        )
+        if updated is False:
+            return {"success": False, "conflict": True, "code": "STATE_CONFLICT", "message": "任务已变化，未提交重新识别"}
+        return {"success": True, "task_id": task_id, "retry_mode": "rescan_only", "executed": False}
+
+    def approve_task(self, task_id: int, *, expected_revision: int | None = None, expected_plan_hash: str | None = None) -> dict[str, Any]:
         task = self.db.organizer.get_organizer_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
+        if expected_plan_hash is not None and organizer_plan_hash(task) != expected_plan_hash:
+            return {"success": False, "conflict": True, "code": "PLAN_CHANGED", "message": "身份或操作计划已变化，请重新预览确认"}
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer approve")
         if rejection:
             return rejection
@@ -2842,9 +2935,19 @@ class OrganizerService:
             return {"success": False, "conflict": True, "message": str(exc)}
         mapping_updates: list[dict[str, Any]] = []
 
-        expected_revision = _safe_positive_int(task.get("revision"))
-        if not expected_revision:
+        current_revision = _safe_positive_int(task.get("revision"))
+        if not current_revision:
             return {"success": False, "conflict": True, "message": "Organizer 任务版本缺失"}
+        # A caller that previewed a specific plan passes its revision: the atomic
+        # write below then fails instead of approving a plan the caller never saw.
+        if expected_revision is not None and int(expected_revision) != current_revision:
+            return {
+                "success": False,
+                "conflict": True,
+                "message": "整理计划已变化，请刷新后确认当前计划",
+                "current_revision": current_revision,
+            }
+        expected_revision = current_revision
         try:
             category = self.categories.get(str(task.get("category") or ""), {})
             target_category = self._target_category_for_task(task, category)
@@ -2854,7 +2957,16 @@ class OrganizerService:
                 include_auto_delete=True,
             )
             operations = _preserve_completed_operations(operations, task.get("operations") or [])
+            if expected_plan_hash is not None and organizer_operation_digest(operations) != organizer_operation_digest(task.get("operations") or []):
+                return {"success": False, "conflict": True, "code": "PLAN_CHANGED", "message": "计划操作需要重新生成，请重新识别并预览确认"}
             evidence = dict(task.get("evidence") or {}) if isinstance(task.get("evidence"), dict) else {}
+            evidence.pop("agent_confirmation", None)
+            if expected_plan_hash is not None:
+                evidence["agent_confirmation"] = {
+                    "plan_hash": expected_plan_hash,
+                    "revision": expected_revision + 1,
+                    "operations_digest": organizer_operation_digest(operations),
+                }
             evidence["manual_approval"] = {
                 "revision": expected_revision + 1,
                 "confirmed_at": _utc_now_text(),
@@ -2876,12 +2988,13 @@ class OrganizerService:
                     "error_message": "",
                 },
                 clear_scan_lease=True,
+                **({"expected_plan_hash": expected_plan_hash} if expected_plan_hash is not None else {}),
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("organizer_approve_atomic_write_failed task_id=%s", task_id)
             return {"success": False, "message": f"任务放行失败且已回滚：{exc}"}
         if updated is False:
-            return {"success": False, "conflict": True, "message": "任务状态已变化，请刷新后重试"}
+            return {"success": False, "conflict": True, "code": "PLAN_CHANGED" if expected_plan_hash is not None else "STATE_CONFLICT", "message": "任务状态或计划已变化，请重新预览确认"}
         return {"success": True, "task": self.db.organizer.get_organizer_task(task_id)}
 
     def _validate_approval_mappings(
@@ -2898,6 +3011,7 @@ class OrganizerService:
         if not frozen_plan:
             raise OpenListError("Organizer 确认需要有效的 V1 execution_plan")
         final_root = normalize_path(self._v1_target_root(frozen_plan))
+        validate_identity_mappings(mappings, final_root)
         owners: dict[str, int] = {}
         for mapping in mappings:
             if str(mapping.get("status") or "") not in {"ready", "skipped_existing"}:
@@ -2917,103 +3031,10 @@ class OrganizerService:
             raise OpenListError(f"存在 {len(duplicates)} 个重复目标路径，不能批准")
 
     def skip_task(self, task_id: int) -> dict[str, Any]:
-        task = self.db.organizer.get_organizer_task(task_id)
-        if not task:
-            return {"success": False, "message": "标准化任务不存在"}
-        _job, _plan, rejection = self._task_v1_plan(task, context="Organizer skip")
-        if rejection:
-            return rejection
-        status = str(task.get("status") or "").strip().lower()
-        if status == "executing":
-            return {
-                "success": False,
-                "conflict": True,
-                "message": "Organizer 已开始真实移动，不能用‘跳过’中断；请使用入库任务取消",
-            }
-        if status == "done":
-            return {"success": False, "conflict": True, "message": "标准化任务已完成，不能跳过"}
-        execution_plan = self._validated_task_v1_plan(task)
-        if execution_plan:
-            if status == "scanning":
-                return {
-                    "success": False,
-                    "conflict": True,
-                    "message": "Organizer 正在扫描暂存目录，请等待进入审核后再选择跳过整理并入库",
-                }
-            if status in {"cancelled", "skipped"}:
-                return {
-                    "success": False,
-                    "conflict": True,
-                    "message": f"任务已处于 {status}，不能再执行直通入库",
-                }
-            recovery_conflict = self._mapping_recovery_conflict(task)
-            if recovery_conflict:
-                return recovery_conflict
-            unconfirmed_run_ids = sorted({
-                run_id
-                for operation in task.get("operations") or []
-                if operation.get("type") == "move_file" and operation.get("status") == "failed"
-                if (run_id := _safe_positive_int(operation.get("run_id")))
-            })
-            if unconfirmed_run_ids:
-                return {
-                    "success": False,
-                    "conflict": True,
-                    "code": "MOVE_RESULT_UNCONFIRMED",
-                    "run_ids": unconfirmed_run_ids,
-                    "message": (
-                        f"run #{unconfirmed_run_ids[0]} 存在结果未确认的移动，不能重建直通计划。"
-                        "请先点击「重试」完成文件位置对账，再决定回滚或跳过整理。"
-                    ),
-                }
-            try:
-                with self._task_openlist_scope(task, execution_plan, context="Organizer skip"):
-                    return self._prepare_v1_passthrough(task, execution_plan)
-            except FrozenOpenListResolutionError as exc:
-                return self._reject_frozen_openlist_task(
-                    task,
-                    context="Organizer skip",
-                    error=exc,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("organizer_passthrough_prepare_failed task_id=%s", task_id)
-                return {
-                    "success": False,
-                    "message": f"生成原名直通入库计划失败：{exc}",
-                }
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        updated = self.db.organizer.update_organizer_task(
-            task_id,
-            status="skipped",
-            error_message="",
-            raw_data={**raw_data, "skip_requested": {"at": _utc_now_text(), "previous_status": status}},
-            expected_revision=_safe_positive_int(task.get("revision")),
-            expected_statuses={status},
-            bump_revision=True,
-            clear_scan_lease=True,
-        )
-        if updated is False:
-            return {"success": False, "conflict": True, "message": "任务状态已变化，请刷新后重试"}
-        # V1 Transfer owns final verification, ACK and cleanup.  Organizer
-        # must leave the linked Job in a non-terminal state until that tail
-        # phase completes; standalone legacy tasks may still report done.
-        linked_status = self._linked_completion_status(task)
-        self._sync_linked_job(
-            task,
-            status=linked_status,
-            stage=linked_status,
-            message=(
-                "资源已位于正式分类目录，等待 Transfer 完成最终校验和清理"
-                if linked_status != JOB_DONE
-                else "资源已位于正式分类目录，已按管理员要求跳过命名整理"
-            ),
-            extra={"organizer_passthrough": False, "organizer_skipped": True},
-        )
         return {
-            "success": True,
-            "skipped": True,
-            "message": "资源已位于正式分类目录，已跳过命名整理",
-            "task": self.db.organizer.get_organizer_task(task_id),
+            "success": False,
+            "code": "IDENTITY_REQUIRED",
+            "message": "原名直通入库已停用；请修改并确认身份整理计划，文件会保留在暂存目录",
         }
 
     def delete_task(self, task_id: int) -> dict[str, Any]:
@@ -3052,182 +3073,21 @@ class OrganizerService:
         task: dict[str, Any],
         execution_plan: dict[str, Any],
     ) -> dict[str, Any]:
-        task_id = _safe_positive_int(task.get("id"))
-        if not task_id:
-            raise OpenListError("Organizer 任务 ID 无效")
-        category_key = str(task.get("category") or "").strip()
-        category = self.categories.get(category_key, {})
-        task_root = normalize_path(task.get("openlist_root_path") or "")
-        staging_root = self._plan_path_text(execution_plan, "organizer")
-        final_root = self._v1_target_root(execution_plan)
-        if not task_root or task_root == "/":
-            raise OpenListError("暂存任务扫描目录为空")
-        if not staging_root or staging_root == "/" or not _path_is_same_or_child(task_root, staging_root):
-            raise OpenListError("暂存任务扫描目录不在固化的 job 目录内")
-        if not final_root or final_root == "/":
-            raise OpenListError("暂存任务缺少最终分类目录")
-        target_category = self._target_category_for_task(task, category)
-        self._validate_v1_task_boundaries(
-            task,
-            scan_root=task_root,
-            target_category=target_category,
-        )
+        raise IdentityReviewRequired("原名直通入库已停用，不能绕过身份闸门")
 
-        try:
-            configured_limit = int(self.organizer_config.get("skip_passthrough_max_files") or 5000)
-        except (TypeError, ValueError):
-            configured_limit = 5000
-        passthrough_limit = max(1, min(configured_limit, 20000))
-        source_paths = sorted(
-            self._list_openlist_tree_files(
-                task_root,
-                refresh=True,
-                limit=passthrough_limit,
-            ),
-            key=str.casefold,
-        )
-        if not source_paths:
-            raise OpenListError("暂存目录为空，没有可直通入库的文件")
-        if not any(posixpath.splitext(path)[1].lower() in VIDEO_EXTENSIONS for path in source_paths):
-            raise OpenListError("暂存目录中没有视频文件，不能完成直通入库")
-
-        files: list[dict[str, Any]] = []
-        mappings: list[dict[str, Any]] = []
-        target_owners: set[str] = set()
-        staging_prefix = staging_root.rstrip("/")
-        media_type = "movie" if category_key == "movie" else "tv"
-        for source_path in source_paths:
-            source = normalize_path(source_path)
-            if not _is_child_path(source, staging_root):
-                raise OpenListError(f"直通源文件不在任务暂存目录：{source}")
-            relative = source[len(staging_prefix) :].lstrip("/")
-            if not relative:
-                raise OpenListError(f"无法计算直通相对路径：{source}")
-            target = join_path(final_root, relative)
-            if not _is_child_path(target, final_root):
-                raise OpenListError(f"直通目标路径越界：{target}")
-            target_key = target.casefold()
-            if target_key in target_owners:
-                raise OpenListError(f"直通计划存在重复目标路径：{target}")
-            target_owners.add(target_key)
-            name = basename(source)
-            files.append(
-                {
-                    "path": source,
-                    "name": name,
-                    "parent_path": dirname(source),
-                    "ext": posixpath.splitext(name)[1].lower(),
-                    "raw_data": {"passthrough_import": True},
-                }
-            )
-            mappings.append(
-                {
-                    "source_path": source,
-                    "source_name": name,
-                    "target_path": target,
-                    "target_name": basename(target),
-                    "media_type": media_type,
-                    "title": str(task.get("title") or ""),
-                    "confidence": 100,
-                    "status": "ready",
-                    "reason": ["管理员跳过命名整理，按暂存相对路径原名移入正式分类"],
-                    "raw_data": {
-                        "staging_file": True,
-                        "passthrough_import": True,
-                        "preserve_relative_path": relative,
-                    },
-                }
-            )
-
-        passthrough_category = {
-            **target_category,
-            "source_category_root_path": staging_root,
-            V1_DESTINATION_FINAL_FIELD: final_root,
-            V1_DESTINATION_IS_RESOURCE_FIELD: False,
-        }
-        operations = self._operations_for_mappings(
-            mappings,
-            passthrough_category,
-            include_auto_delete=False,
-        )
-        now = _utc_now_text()
-        raw_data = task.get("raw_data") if isinstance(task.get("raw_data"), dict) else {}
-        passthrough_state = {
-            "enabled": True,
-            "requested_at": now,
-            "source_root": task_root,
-            "organizer_root": staging_root,
-            "target_root": final_root,
-            "file_count": len(files),
-            "preserve_names": True,
-            "skip_openlist_strm_refresh": True,
-        }
-        expected_revision = _safe_positive_int(task.get("revision"))
-        if not expected_revision:
-            raise OpenListError("Organizer 任务版本缺失")
-        evidence = dict(task.get("evidence")) if isinstance(task.get("evidence"), dict) else {}
-        evidence.pop("execution_approval", None)
-        # Choosing passthrough explicitly approves this replacement plan, not
-        # the previous plan whose approval belongs to an older revision.
-        evidence["manual_approval"] = {
-            "revision": expected_revision + 1,
-            "confirmed_at": now,
-            "deletion_count": 0,
-        }
-        replaced = self.db.organizer.replace_organizer_plan(
-            task_id,
-            files=files,
-            mappings=mappings,
-            operations=operations,
-            expected_revision=expected_revision,
-            expected_status=str(task.get("status") or ""),
-            task_updates={
-                "status": "manual_confirmed",
-                "confidence": 0,
-                "error_message": "",
-                "media_type": media_type,
-                "tmdb_id": None,
-                "tmdb_title": "",
-                "tmdb_year": "",
-                "evidence": {**evidence, "passthrough_import": passthrough_state},
-                "raw_data": {
-                    **raw_data,
-                    "skip_requested": {"at": now, "previous_status": str(task.get("status") or "")},
-                    "passthrough_import": passthrough_state,
-                },
-            },
-        )
-        if not replaced:
-            return {
-                "success": False,
-                "conflict": True,
-                "message": "任务状态已变化，原名直通入库计划未写入，请刷新后重试",
-            }
-        logger.info(
-            "organizer_passthrough_prepared task_id=%s source_root=%s target_root=%s files=%s",
-            task_id,
-            task_root,
-            final_root,
-            len(files),
-        )
-        return {
-            "success": True,
-            "ready_for_apply": True,
-            "passthrough": True,
-            "task_id": task_id,
-            "status": "manual_confirmed",
-            "file_count": len(files),
-            "target_root": final_root,
-            "message": f"已生成原名直通入库计划，共 {len(files)} 个文件，正在移入正式分类目录",
-            "task": self.db.organizer.get_organizer_task(task_id),
-        }
-
-    def start_apply_task(self, task_id: int) -> dict[str, Any]:
+    def start_apply_task(self, task_id: int, *, expected_revision: int | None = None) -> dict[str, Any]:
         """提交真实 OpenList 整理到后台线程执行，接口只负责快速确认已接收。"""
 
         task = self.db.organizer.get_organizer_task(task_id)
         if not task:
             return {"success": False, "message": "标准化任务不存在"}
+        if expected_revision is not None and _safe_positive_int(task.get("revision")) != int(expected_revision):
+            return {
+                "success": False,
+                "conflict": True,
+                "task_id": task_id,
+                "message": "整理计划已变化，请刷新后确认当前计划",
+            }
         _job, _plan, rejection = self._task_v1_plan(task, context="Organizer start apply")
         if rejection:
             return rejection
@@ -3415,7 +3275,11 @@ class OrganizerService:
                 if mapping_before:
                     category = self.categories.get(str(task_before.get("category") or ""), {})
                     target_category = self._target_category_for_task(task_before, category)
-                    recalculated_target = self._recalculate_mapping_target_if_needed(mapping_before, updates, task_before, target_category)
+                    try:
+                        with self._task_openlist_scope(task_before, _plan or {}, context="Organizer mapping update"):
+                            recalculated_target = self._recalculate_mapping_target_if_needed(mapping_before, updates, task_before, target_category)
+                    except (OpenListError, ValueError, LibraryScanError, TmdbLookupError) as exc:
+                        return {"success": False, "message": f"身份映射修改失败，未写入：{exc}"}
                     if recalculated_target:
                         updates["target_path"] = recalculated_target
                         updates["target_name"] = basename(recalculated_target)
@@ -3516,6 +3380,14 @@ class OrganizerService:
         if title_supplied and not title:
             return {"success": False, "message": "片名不能为空"}
         season_supplied = payload.get("season") is not None
+        tmdb_supplied = "tmdb_id" in payload
+        tmdb_id = None
+        if tmdb_supplied:
+            value = payload.get("tmdb_id")
+            if value not in (None, ""):
+                if isinstance(value, bool) or not re.fullmatch(r"[1-9]\d*", str(value)):
+                    return {"success": False, "message": "TMDB ID 必须是正整数"}
+                tmdb_id = int(value)
         season: int | None = None
         if season_supplied:
             try:
@@ -3524,8 +3396,8 @@ class OrganizerService:
                 return {"success": False, "message": "季号必须是数字"}
             if season < 0 or season > 99:
                 return {"success": False, "message": "季号超出范围（0-99）"}
-        if not title_supplied and not season_supplied:
-            return {"success": False, "message": "请填写要修改的片名或季号"}
+        if not title_supplied and not season_supplied and not tmdb_supplied:
+            return {"success": False, "message": "请填写要修改的片名、季号或 TMDB ID"}
 
         mappings = [dict(item) for item in task.get("mappings") or [] if int(item.get("id") or 0) > 0]
         if not mappings:
@@ -3535,13 +3407,20 @@ class OrganizerService:
         target_category = self._target_category_for_task(task, category)
         mapping_updates: list[dict[str, Any]] = []
         updated_mappings: list[dict[str, Any]] = []
+        identity_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         for mapping in mappings:
             updates: dict[str, Any] = {}
             if title_supplied:
                 updates["title"] = title
             if season_supplied:
                 updates["season"] = season
-            recalculated_target = self._recalculate_mapping_target_if_needed(mapping, updates, task, target_category)
+            if tmdb_supplied:
+                updates["tmdb_id"] = tmdb_id
+            try:
+                with self._task_openlist_scope(task, _plan or {}, context="Organizer batch mapping update"):
+                    recalculated_target = self._recalculate_mapping_target_if_needed(mapping, updates, task, target_category, identity_cache=identity_cache)
+            except (OpenListError, ValueError, LibraryScanError, TmdbLookupError) as exc:
+                return {"success": False, "message": f"批量身份修改失败，未写入任何映射：{exc}"}
             if recalculated_target:
                 updates["target_path"] = recalculated_target
                 updates["target_name"] = basename(recalculated_target)
@@ -3679,8 +3558,8 @@ class OrganizerService:
             "rollback_run_ids": run_ids, "current_paths": paths,
         }
 
-    def _recalculate_mapping_target_if_needed(self, mapping: dict[str, Any], updates: dict[str, Any], task: dict[str, Any], target_category: dict[str, Any]) -> str:
-        identity_keys = {"media_type", "title", "year", "season", "episode"}
+    def _recalculate_mapping_target_if_needed(self, mapping: dict[str, Any], updates: dict[str, Any], task: dict[str, Any], target_category: dict[str, Any], *, identity_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None) -> str:
+        identity_keys = {"media_type", "title", "year", "season", "episode", "tmdb_id"}
         if not (identity_keys & set(updates.keys())):
             return ""
         old_target = str(mapping.get("target_path") or "").strip()
@@ -3698,11 +3577,43 @@ class OrganizerService:
         source_path = str(mapping.get("source_path") or "").strip()
         ext = posixpath.splitext(basename(source_path or old_target))[1]
         raw_data = mapping.get("raw_data") if isinstance(mapping.get("raw_data"), dict) else {}
+        context = mapping_identity(mapping)
+        changed_identity = any(key in updates and str(updates[key] or "") != str(mapping.get(key) or "") for key in ("title", "year", "media_type", "tmdb_id"))
+        if changed_identity:
+            tmdb_item = None
+            selected_tmdb_id = updates.get("tmdb_id") if "tmdb_id" in updates else mapping.get("tmdb_id")
+            cache_key = (media_type, title, year, selected_tmdb_id, context["intent"], context["scope_root"])
+            cached = identity_cache.get(cache_key) if identity_cache is not None else None
+            if selected_tmdb_id and cached is None:
+                tmdb_item = self.tmdb.details(int(selected_tmdb_id), media_type, strict=True)
+                if not tmdb_item:
+                    raise IdentityReviewRequired("指定的 TMDB 身份不存在")
+                rejection = tmdb_match_rejection_reason(title, year, "movie" if media_type == "movie" else "tv", tmdb_item)
+                if rejection:
+                    raise IdentityReviewRequired(rejection)
+            if cached is not None:
+                context = cached
+            else:
+                context = plan_identity(
+                    self.openlist, root=category_target_root(target_category), media_type=media_type,
+                    title=title, year=year, tmdb_item=tmdb_item,
+                    request={"organizer_intent": context["intent"]},
+                )
+                if identity_cache is not None:
+                    identity_cache[cache_key] = context
+            updates["tmdb_id"] = int(selected_tmdb_id) if selected_tmdb_id else None
+        manifest = parse_identity_manifest(context["manifest"])
+        title, year = manifest.identity.title, str(manifest.identity.year or "")
+        updates["title"], updates["year"] = title, year
+        updates["raw_data"] = {**raw_data, "organizer_identity": context}
+        if "season" in updates or "episode" in updates:
+            updates["raw_data"]["manual_episode_override"] = True
+        naming_category = {**target_category, V1_DESTINATION_FINAL_FIELD: context["canonical_dir"], V1_DESTINATION_IS_RESOURCE_FIELD: True}
         parsed = raw_data.get("parsed") if isinstance(raw_data.get("parsed"), dict) else {}
         version = _mapping_version(source_path or old_target, parsed.get("version") if isinstance(parsed, dict) else "")
         return standard_target_path(
             category_key="movie" if media_type == "movie" else "tv",
-            category=target_category,
+            category=naming_category,
             title=title,
             year=year,
             season=season,
@@ -3722,6 +3633,7 @@ class OrganizerService:
         finally:
             worker_context.active = False
 
+    @_serialized_organizer_execution
     def apply_task(self, task_id: int, *, run_id: int | None = None) -> dict[str, Any]:
         """Apply a task using only its frozen V1 OpenList connection."""
 
@@ -3974,6 +3886,15 @@ class OrganizerService:
             acquired = self._acquire_organizer_locks(task, run_id, lock_keys, lease=lease)
             lease.ensure_owned()
             task = self._ensure_task_active(task_id, allowed_statuses={"executing"})
+            confirmation = (task.get("evidence") or {}).get("agent_confirmation")
+            if isinstance(confirmation, dict):
+                if confirmation.get("revision") != task.get("revision") or confirmation.get("operations_digest") != organizer_operation_digest(task.get("operations") or []):
+                    raise IdentityReviewRequired("Agent 确认后的操作计划已变化，拒绝写盘")
+            revalidate_identity_plan(
+                self.openlist, task.get("mappings") or [], task.get("operations") or [],
+                category_target_root(target_category), staging_root=str(task.get("openlist_root_path") or ""),
+            )
+            lease.ensure_owned()
             if not self._update_organizer_task_from_snapshot(task, status="executing", error_message=""):
                 raise OrganizerTaskCancelled("Organizer 任务状态已变化，停止写入执行进度")
             self._sync_linked_job(task, status=JOB_ORGANIZING, stage="organizing", message="Organizer 正在执行标准化移动/重命名")
@@ -4028,6 +3949,10 @@ class OrganizerService:
                 try:
                     self._ensure_task_active(task_id, allowed_statuses={"executing"})
                     lease.ensure_owned()
+                    if op.get("type") == "write_identity_manifest":
+                        # Record ownership before a PUT: a process crash after
+                        # upload but before ACK must still be recoverable.
+                        self.db.organizer.update_organizer_operation(int(op["id"]), run_id=run_id, status="pending")
                     inverse = self._execute_operation(op)
                     lease.ensure_owned()
                     self.db.organizer.update_organizer_operation(int(op["id"]), run_id=run_id, status="done", undo_data=inverse)
@@ -4059,6 +3984,10 @@ class OrganizerService:
                         op.get("type"),
                         exc,
                     )
+                    if op.get("type") in {"create_dir", "write_identity_manifest"}:
+                        # Identity/directory prerequisites are not independent
+                        # file failures. Never move media after either failed.
+                        break
                 op_index += 1
             lease.ensure_owned()
             summary = {"done": done, "skipped": skipped, "failed": len(failures), "task_id": task_id}
@@ -4140,6 +4069,19 @@ class OrganizerService:
                     "status": "done", "cleanup_only": True, "message": message,
                     "summary": summary, "fnos_refresh_scheduled": False,
                 }
+            update_repository = getattr(self.db, "update", None)
+            if update_repository is not None and task.get("job_id"):
+                identity_contexts = validate_identity_mappings(task.get("mappings") or [], category_target_root(target_category))
+                request = job_request(self._linked_job(task))
+                if request.get("update_subscription_id") and len(identity_contexts) != 1:
+                    raise IdentityReviewRequired("订阅任务必须对应唯一作品身份")
+                for canonical, context in identity_contexts.items():
+                    manifest = parse_identity_manifest(context["manifest"])
+                    update_repository.bind_organized_subscription(
+                        int(task["job_id"]),
+                        {**manifest.identity.to_dict(), "aliases": [list(key) for key in manifest.aliases]},
+                        canonical,
+                    )
             # 标准目录确认后只触发一次 OpenList 文件夹刷新。OpenList 接受刷新
             # 即表示 Organizer 的职责完成；STRM 生成、同步及后续维护由 OpenList
             # 自己异步处理，不再阻塞入库任务终态。
@@ -4202,7 +4144,7 @@ class OrganizerService:
                 run_id,
                 task_id,
                 run_status="failed",
-                task_status="failed",
+                task_status="waiting_review" if isinstance(exc, (IdentityReviewRequired, IdentityError, LibraryScanError, TmdbLookupError)) else "failed",
                 summary={"task_id": task_id},
                 error_message=str(exc),
             )
@@ -4469,6 +4411,12 @@ class OrganizerService:
             source = normalize_path(inverse.get("source_path") or "")
             if inverse.get("type") == "move_file":
                 allowed = _is_child_path(source, final_root) and _is_child_path(target, staging_root)
+            elif inverse.get("type") == "restore_identity_manifest":
+                allowed = _is_child_path(target, final_root) and basename(target) == IDENTITY_MANIFEST_NAME and dirname(dirname(target)) == final_root
+                if allowed:
+                    parse_identity_manifest(inverse.get("written_content"))
+                    if inverse.get("previous_content") is not None:
+                        parse_identity_manifest(inverse["previous_content"])
             else:
                 allowed = inverse.get("type") == "remove_empty_directory" and _is_child_path(target, final_root)
             if not allowed:
@@ -4569,6 +4517,10 @@ class OrganizerService:
             self._ensure_task_active(task_id, allowed_statuses={"executing"})
 
         target = normalize_path(inverse.get("target_path") or "")
+        if inverse["type"] == "restore_identity_manifest":
+            ensure_active()
+            restore_manifest(self.openlist, inverse)
+            return
         if inverse["type"] == "remove_empty_directory":
             if not self.openlist.exists(target) or self.openlist.list_dir(target, refresh=True):
                 return
@@ -4639,8 +4591,17 @@ class OrganizerService:
             raise OpenListError("Organizer 计划生成需要有效的 V1 execution_plan")
         root_name = basename(task.get("openlist_root_path") or "")
         parent_name = basename(dirname(task.get("openlist_root_path") or ""))
+        request = job_request(self._linked_job(task))
         names = [item.name for item in videos]
-        parsed = [parse_file_name(item.name, current_dir=basename(dirname(item.path)), parent_dir=root_name, siblings=names) for item in videos]
+        parsed = []
+        for item in videos:
+            dirs = _relative_virtual_parts(dirname(item.path), task.get("openlist_root_path") or "")
+            parsed.append(parse_file_name(
+                item.name,
+                current_dir=dirs[-1] if dirs else root_name,
+                parent_dir=dirs[-2] if len(dirs) > 1 else root_name,
+                siblings=names,
+            ))
         has_episodes = any(item.episode is not None for item in parsed)
         inferred_media_type = "movie" if category_key == "movie" else ("tv" if category_key in EPISODIC_CATEGORIES or has_episodes or len(videos) > 1 else "movie")
         context_title = _task_context_title(task)
@@ -4751,6 +4712,44 @@ class OrganizerService:
                 confidence = max(confidence, _confidence_percent(ai_suggestion["confidence"]))
             except (TypeError, ValueError):
                 pass
+        selected_identity = request_identity(request)
+        if tmdb_item and selected_identity and selected_identity.ns not in {"tmdb", "local"}:
+            tmdb_item = self.tmdb.details(int(tmdb_item["id"]), media_type, strict=True)
+            if not tmdb_item:
+                raise IdentityReviewRequired("无法校验外部身份与 TMDB 的关联")
+        identity_context = plan_identity(
+            self.openlist,
+            root=category_target_root(target_category),
+            media_type=media_type,
+            title=title,
+            year=year,
+            tmdb_item=tmdb_item,
+            request=request,
+        )
+        canonical_identity = parse_identity_manifest(identity_context["manifest"]).identity
+        if canonical_identity.ns == "local" and identity_context["is_new"]:
+            # A deterministic hash is not evidence that two translated titles
+            # denote different works. New weak identities require confirmation.
+            confidence = min(confidence, float(self.organizer_config.get("auto_apply_confidence") or 85) - 1)
+        # Reuse the confirmed physical directory, not this task's spelling.
+        naming_category = {
+            **target_category,
+            V1_DESTINATION_FINAL_FIELD: identity_context["canonical_dir"],
+            V1_DESTINATION_IS_RESOURCE_FIELD: True,
+        }
+        title, year = canonical_identity.title, str(canonical_identity.year or "")
+        identity_errors = list(identity_context.get("errors") or [])
+        accepted_title = {"title": title, "original_title": (tmdb_item or {}).get("original_title") or "", "year": year, "media_type": media_type}
+        for candidate in [task.get("title"), *(item.title for item in parsed)]:
+            candidate_title, candidate_year = _lookup_title_year(candidate)
+            candidate_title, _candidate_season = extract_season_from_title(candidate_title)
+            if not _is_valid_tmdb_query(candidate_title) or is_container_dir(candidate_title):
+                continue
+            rejection = tmdb_match_rejection_reason(candidate_title, candidate_year, category_key, accepted_title)
+            if rejection and (not tmdb_item or tmdb_match_rejection_reason(candidate_title, candidate_year, category_key, tmdb_item)):
+                identity_errors.append(f"内容/任务标题与身份不一致：{candidate_title}：{rejection}")
+        identity_errors = _dedupe_texts(identity_errors)
+        logger.info("organizer_identity_resolve task_id=%s identity=%s path=%s new=%s", task.get("id"), canonical_identity.key, identity_context["canonical_dir"], identity_context["is_new"])
         files: list[dict[str, Any]] = []
         mappings: list[dict[str, Any]] = []
         target_index: dict[str, int] = {}
@@ -4765,46 +4764,11 @@ class OrganizerService:
             season = _first_not_none(parsed_item.season, season_hint, 1 if media_type == "tv" else None)
             episode = parsed_item.episode
             version = _mapping_version(item.path, parsed_item.version)
-            if _should_auto_delete_ad_file(category_key, media_type, parsed_item, item.size):
-                reason = [
-                    *parsed_item.reasons,
-                    f"未识别到剧集且文件小于 50MB（{_size_text(item.size)}），判定为广告小文件，自动彻底删除",
-                ]
-                files.append(
-                    {
-                        "path": item.path,
-                        "name": item.name,
-                        "parent_path": dirname(item.path),
-                        "ext": ext,
-                        "size": item.size,
-                        "season": season,
-                        "episode": episode,
-                        "raw_data": item.raw,
-                    }
-                )
-                mappings.append(
-                    {
-                        "source_path": item.path,
-                        "source_name": item.name,
-                        "target_path": item.path,
-                        "target_name": item.name,
-                        "media_type": media_type,
-                        "title": title,
-                        "year": year,
-                        "season": season,
-                        "episode": episode,
-                        "tmdb_id": (tmdb_item or {}).get("id"),
-                        "confidence": round(confidence, 2),
-                        "status": "delete_ad",
-                        "reason": reason,
-                        "raw_data": {"parsed": parsed_item.__dict__, "tmdb": tmdb_item, "ai": ai_suggestion, "season_hint": season_hint, "auto_delete_ad": True},
-                    }
-                )
-                continue
             use_version = bool(episode is not None and episode_groups.get((season, episode), 0) > 1 and version)
+            path_category_key = "movie" if media_type == "movie" else "tv"
             target = standard_target_path(
-                category_key="movie" if media_type == "movie" else "tv",
-                category=target_category,
+                category_key=path_category_key,
+                category=naming_category,
                 title=title,
                 year=year,
                 season=season,
@@ -4819,18 +4783,70 @@ class OrganizerService:
             if media_type == "tv" and episode is None:
                 status = "need_edit"
                 reason.append("未识别到集数，需要人工确认")
+            review_reasons = [*identity_errors, *parsed_item.review_reasons]
+            if media_type == "tv" and season is not None and season > 10 and not parsed_item.has_explicit_season:
+                review_reasons.append(f"季号 S{season} 可疑且无显式季号证据")
+            if ext.lower() not in VIDEO_EXTENSIONS:
+                review_reasons.append("不支持的非视频后缀，禁止入库")
+            if review_reasons:
+                status = "need_edit"
+                reason.extend(review_reasons)
+
+            def use_versioned_target() -> bool:
+                """Use the explicit resolution tag when the plain path is taken.
+
+                This is the common 4K/1080P coexistence case: an earlier file
+                already occupies ``S01E01.mkv`` and the current file carries a
+                version tag.  The old code only versioned files when both
+                versions were present in the *same* task, so a single 4K file
+                against an existing 1080P target was reported as a conflict.
+                """
+
+                nonlocal target
+                if not version or not episode:
+                    return False
+                candidate = standard_target_path(
+                    category_key=path_category_key,
+                    category=naming_category,
+                    title=title,
+                    year=year,
+                    season=season,
+                    episode=episode,
+                    ext=ext,
+                    version=version,
+                )
+                if candidate == target:
+                    return False
+                target = candidate
+                reason.append(f"目标已存在，追加版本后缀：{version}")
+                return True
+
             if target in target_index:
                 status = "conflict"
                 reason.append("多个源文件指向同一目标路径")
+                if use_versioned_target():
+                    status = "ready" if target not in target_index else "conflict"
             target_index[target] = target_index.get(target, 0) + 1
-            if target_index[target] > 1 and version and not use_version:
-                target = standard_target_path(category_key="tv", category=target_category, title=title, year=year, season=season, episode=episode, ext=ext, version=version)
-                status = "ready" if target not in target_index else "conflict"
-                reason.append("多版本文件追加版本后缀")
-                target_index[target] = target_index.get(target, 0) + 1
-            if self.openlist.exists(target) and normalize_path(item.path) != normalize_path(target):
-                status = "conflict"
-                reason.append("任务级暂存源文件仍存在且目标路径已存在，拒绝自动删除或覆盖")
+            if status == "conflict" and version and not use_version:
+                if use_versioned_target():
+                    status = "ready" if target not in target_index else "conflict"
+                    target_index[target] = target_index.get(target, 0) + 1
+            if (
+                status != "conflict"
+                and self.openlist.exists(target)
+                and normalize_path(item.path) != normalize_path(target)
+            ):
+                # An existing plain target is exactly why two resolutions end
+                # up colliding.  Try the explicit version suffix before asking
+                # a human to resolve it.
+                if use_versioned_target() and not self.openlist.exists(target):
+                    status = "ready"
+                    target_index[target] = target_index.get(target, 0) + 1
+                else:
+                    status = "conflict"
+                    reason.append("任务级暂存源文件仍存在且目标路径已存在，拒绝自动删除或覆盖")
+            if status != "conflict" and (review_reasons or (media_type == "tv" and episode is None)):
+                status = "need_edit"
             files.append(
                 {
                     "path": item.path,
@@ -4864,6 +4880,7 @@ class OrganizerService:
                         "ai": ai_suggestion,
                         "season_hint": season_hint,
                         "staging_file": True,
+                        "organizer_identity": identity_context,
                     },
                 }
             )
@@ -4879,6 +4896,8 @@ class OrganizerService:
             confidence=confidence,
         )
         files.extend(companion_plan_files)
+        for mapping in companion_mappings:
+            mapping["raw_data"] = {**(mapping.get("raw_data") or {}), "organizer_identity": identity_context}
         mappings.extend(companion_mappings)
         operations = self._operations_for_mappings(mappings, target_category)
         blocked = [item for item in mappings if item["status"] in {"conflict", "need_edit"}]
@@ -4889,6 +4908,7 @@ class OrganizerService:
         )
         episode_completeness = _episode_completeness_report(category_key, mappings)
         evidence = {
+            "organizer_identity": identity_context,
             "title": title,
             "year": year,
             "season": season_hint,
@@ -4898,9 +4918,9 @@ class OrganizerService:
             "tmdb": tmdb_item,
             "tmdb_trace": {"configured": self.tmdb.configured, "query_rule": "仅向 TMDB 传清洗后的基础片名，不携带 4K/1080P/编码/字幕等垃圾词"},
             "auto_delete_rule": {
-                "enabled": True,
+                "enabled": False,
                 "threshold_bytes": AD_FILE_DELETE_THRESHOLD_BYTES,
-                "message": "剧集类整理中，未识别集数且小于 50MB 的视频/压缩包判定为广告并自动彻底删除",
+                "message": "无法识别的文件保留在暂存目录，不自动删除",
                 "count": auto_delete_count,
             },
             "problem_summary": problem_summary,
@@ -6012,6 +6032,17 @@ class OrganizerService:
         *,
         extra_queries: list[Any] | None = None,
     ) -> tuple[float, dict[str, Any] | None]:
+        selected = request_identity(job_request(self._linked_job(task)))
+        if selected and selected.ns == "tmdb":
+            if not self.tmdb.configured:
+                raise IdentityReviewRequired("已提交 TMDB 身份，但 TMDB 未配置，无法校验")
+            item = self.tmdb.details(int(selected.value), selected.media_type, strict=True)
+            if not item:
+                raise IdentityReviewRequired("提交的 TMDB 身份不存在，禁止降级创建 local 目录")
+            rejection = tmdb_match_rejection_reason(selected.title, str(selected.year or ""), category_key, item, has_episodes)
+            if rejection:
+                raise IdentityReviewRequired(rejection)
+            return 100.0, item
         queries = [title, f"{title} {year}".strip(), *(extra_queries or []), task.get("source_keyword"), task.get("title")]
         best: tuple[float, dict[str, Any] | None] = (0, None)
         for query in _dedupe_texts(str(item or "").strip() for item in queries if str(item or "").strip()):
@@ -6021,7 +6052,7 @@ class OrganizerService:
             tmdb_query = query_title or sanitize_candidate(query)
             if not tmdb_query or not _is_valid_tmdb_query(tmdb_query):
                 continue
-            for item in self.tmdb.search(tmdb_query, "movie" if media_type == "movie" else "tv"):
+            for item in self.tmdb.search(tmdb_query, "movie" if media_type == "movie" else "tv", strict=True):
                 score = max(
                     score_tmdb_result(title, year, category_key, item, has_episodes),
                     score_tmdb_result(query_title or title, query_year or year, category_key, item, has_episodes),
@@ -6053,6 +6084,7 @@ class OrganizerService:
         dirs = []
         cleanup_dirs: list[str] = []
         category_root = normalize_path(category_target_root(category))
+        identity_contexts = validate_identity_mappings(mappings, category_root)
         source_category_root = normalize_path(category.get("source_category_root_path") or category_root)
         resource_root = (
             category_root
@@ -6137,7 +6169,17 @@ class OrganizerService:
                     "reason": ["文件已移动后删除空的原目录"],
                 }
             )
-        return operations
+        # The undo order is video, season dirs, identity record, then work root.
+        identity_operations: list[dict[str, Any]] = []
+        for canonical, context in identity_contexts.items():
+            if context["is_new"]:
+                identity_operations.append({
+                    "type": "create_dir", "target_path": canonical,
+                    "description": f"创建作品身份目录：{canonical}", "status": "pending",
+                    "raw_data": {"identity_root": True, "allow_create": context["intent"] == "create_or_match"},
+                })
+            identity_operations.append(manifest_operation(context))
+        return identity_operations + [op for op in operations if not (op["type"] == "create_dir" and op["target_path"] in identity_contexts)]
 
     @staticmethod
     def _source_cleanup_dirs(source_path: str, category_root: str) -> list[str]:
@@ -6220,10 +6262,22 @@ class OrganizerService:
         op_type = str(op.get("type") or "")
         source = str(op.get("source_path") or "")
         target = str(op.get("target_path") or "")
+        if op_type == "write_identity_manifest":
+            return execute_manifest_write(self.openlist, op)
         if op_type == "create_dir":
+            raw = op.get("raw_data") or {}
+            if raw.get("identity_root"):
+                matches = [item for item in self.openlist.list_dir(dirname(target), refresh=True) if item.name == basename(target)]
+                if matches:
+                    if not matches[0].is_dir:
+                        raise IdentityReviewRequired("作品根被文件占用")
+                    raise SkipOperation("作品身份目录已存在")
+                if not raw.get("allow_create"):
+                    raise IdentityReviewRequired("追更作品目录已消失，禁止重建")
             if self.openlist.exists(target):
                 raise SkipOperation("目录已存在")
-            self.openlist.mkdir(target)
+            if not self.openlist.mkdir(target):
+                raise RuntimeError(f"创建目录失败：{target}")
             if not self._wait_for_openlist_path(target):
                 raise RuntimeError(f"创建目录后仍不可见：{target}")
             return {"type": "remove_empty_directory", "target_path": target}
@@ -7792,6 +7846,10 @@ class OrganizerService:
 
     def _lock_keys(self, task: dict[str, Any]) -> list[str]:
         keys = {f"category:{task.get('category')}", f"root:{normalize_path(task.get('openlist_root_path'))}"}
+        _job, plan, _rejection = self._task_v1_plan(task, reject=False)
+        if plan:
+            scope = plan_path(plan, "organizer")
+            keys.add(f"library:{scope.get('namespace_id')}:{self._v1_target_root(plan)}")
         for op in task.get("operations") or []:
             if op.get("target_path"):
                 keys.add(f"target:{dirname(op['target_path'])}")

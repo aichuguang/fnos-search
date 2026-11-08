@@ -1,4 +1,4 @@
-"""V1 任务契约硬切换的分析、迁移与离线 CLI。
+"""V1 任务契约硬切换及后续加列升级的分析、迁移与离线 CLI。
 
 该模块只处理 ``import_jobs`` 的任务语义字段和与被清理任务直接关联的
 执行数据。资源、搜索缓存、追更来源等表中的 ``source_type`` 仍表示资源
@@ -939,11 +939,13 @@ def analyze_database(path: Path) -> dict[str, Any]:
         sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
     ) as connection:
         current = database.migration_runner.current_version(connection)
-    if current > CUTOVER_VERSION:
+    if current > database.migration_runner.latest_version:
         raise RuntimeError(
-            f"数据库迁移版本 v{current} 高于当前程序支持的 v{CUTOVER_VERSION}；"
+            f"数据库迁移版本 v{current} 高于当前程序支持的 v{database.migration_runner.latest_version}；"
             "拒绝降级预检"
         )
+    if current >= CUTOVER_VERSION:
+        return _analyze_post_cutover_database(path, database, current)
 
     prepared: Path | None = None
     try:
@@ -961,7 +963,7 @@ def analyze_database(path: Path) -> dict[str, Any]:
                 "current_schema_version": current,
                 "simulated_from_schema_version": simulated_from,
                 "pre_cutover_migrations": pre_cutover_migrations,
-                "target_schema_version": CUTOVER_VERSION,
+                "target_schema_version": database.migration_runner.latest_version,
                 "simulation_validated": True,
             }
         )
@@ -984,6 +986,40 @@ def _clone_database(source: Path, target: Path) -> None:
         source_connection.close()
 
 
+def _apply_post_cutover_migrations(connection: sqlite3.Connection, database: Any) -> list[int]:
+    applied = []
+    for migration in database.migration_runner.pending(connection):
+        if migration.version <= CUTOVER_VERSION:
+            continue
+        migration.apply(connection)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+            (migration.version, migration.name, utc_now_iso()),
+        )
+        applied.append(migration.version)
+    return applied
+
+
+def _analyze_post_cutover_database(path: Path, database: Any, current: int) -> dict[str, Any]:
+    prepared, _version, _pre = _prepare_cutover_copy(path)
+    try:
+        with closing(sqlite3.connect(prepared)) as connection:
+            connection.row_factory = sqlite3.Row
+            applied = _apply_post_cutover_migrations(connection, database)
+            _validate_database(connection)
+            connection.commit()
+        return {
+            "dry_run": True,
+            "current_schema_version": current,
+            "target_schema_version": database.migration_runner.latest_version,
+            "post_cutover_migrations": applied,
+            "simulation_validated": True,
+            "additive_only": True,
+        }
+    finally:
+        prepared.unlink(missing_ok=True)
+
+
 def _prepare_cutover_copy(path: Path) -> tuple[Path, int, list[int]]:
     handle, raw_target = tempfile.mkstemp(
         prefix="v1-cutover-",
@@ -1000,9 +1036,9 @@ def _prepare_cutover_copy(path: Path) -> tuple[Path, int, list[int]]:
         with closing(sqlite3.connect(target)) as connection:
             connection.row_factory = sqlite3.Row
             current = database.migration_runner.current_version(connection)
-            if current > CUTOVER_VERSION:
+            if current > database.migration_runner.latest_version:
                 raise RuntimeError(
-                    f"数据库迁移版本 v{current} 高于当前程序支持的 v{CUTOVER_VERSION}"
+                    f"数据库迁移版本 v{current} 高于当前程序支持的 v{database.migration_runner.latest_version}"
                 )
             applied: list[int] = []
             if current < database.PRE_CUTOVER_VERSION:
@@ -1043,7 +1079,7 @@ def _apply_v29_to_prepared_copy(path: Path) -> dict[str, Any]:
             else "PRAGMA foreign_keys=ON"
         )
         connection.execute("BEGIN EXCLUSIVE")
-        summary = V1JobContractHardCutover().apply(connection)
+        summary = V1JobContractHardCutover().apply(connection) if current < CUTOVER_VERSION else {"additive_only": True}
         if current < CUTOVER_VERSION:
             if current != database.PRE_CUTOVER_VERSION:
                 raise RuntimeError(
@@ -1053,6 +1089,8 @@ def _apply_v29_to_prepared_copy(path: Path) -> dict[str, Any]:
                 "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                 (CUTOVER_VERSION, CUTOVER_NAME, utc_now_iso()),
             )
+        summary["post_cutover_migrations"] = _apply_post_cutover_migrations(connection, database)
+        summary["target_schema_version"] = database.migration_runner.latest_version
         _validate_database(connection)
         connection.commit()
         return summary
@@ -1105,24 +1143,20 @@ def apply_database(path: Path) -> dict[str, Any]:
         os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
         with database.connect() as connection:
             current = database.migration_runner.current_version(connection)
-        if current > CUTOVER_VERSION:
+        if current > database.migration_runner.latest_version:
             raise RuntimeError(
-                f"数据库迁移版本 v{current} 高于当前程序支持的 v{CUTOVER_VERSION}；"
+                f"数据库迁移版本 v{current} 高于当前程序支持的 v{database.migration_runner.latest_version}；"
                 "拒绝降级执行离线升级"
             )
-        if current == CUTOVER_VERSION:
+        if current >= CUTOVER_VERSION:
             pending = analyze_database(path)
-            needs_cleanup = bool(pending.get("jobs", {}).get("deleted")) or any(
-                int(value or 0) > 0
-                for value in pending.get("cleanup", {}).values()
-            )
-            if not needs_cleanup:
+            if not pending.get("post_cutover_migrations"):
                 pending["dry_run"] = False
                 pending["already_applied"] = True
                 return pending
 
         _assert_database_offline(path)
-        backup = database.backup_database(prefix="app_before_schema_migration_v29")
+        backup = database.backup_database(prefix=f"app_before_schema_migration_v{database.migration_runner.latest_version}")
         prepared: Path | None = None
         try:
             prepared, _simulated_from, pre_cutover_migrations = _prepare_cutover_copy(path)
@@ -1137,8 +1171,6 @@ def apply_database(path: Path) -> dict[str, Any]:
         summary["backup"] = backup
         summary["upgraded_from_schema_version"] = current
         summary["pre_cutover_migrations"] = pre_cutover_migrations
-        if current == CUTOVER_VERSION:
-            summary["already_applied"] = True
         return summary
     finally:
         if lock_fd is not None:
@@ -1153,8 +1185,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="V1 任务契约硬切换")
     parser.add_argument("--database", required=True, type=Path, help="SQLite 数据库路径")
     action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument("--dry-run", action="store_true", help="只输出删除统计，不修改数据库")
-    action.add_argument("--apply", action="store_true", help="备份并执行 v29 硬切换")
+    action.add_argument("--dry-run", action="store_true", help="模拟升级并输出统计，不修改原数据库")
+    action.add_argument("--apply", action="store_true", help="备份并执行离线升级；v29 以后仅执行增量迁移")
     return parser
 
 

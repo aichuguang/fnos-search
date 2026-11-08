@@ -29,6 +29,12 @@ class PublicSubmissionDependencies:
     emit_notification: Callable[..., Any] | None = None
 
 
+def _normalized_title(value: str) -> str:
+    import re
+
+    return re.sub(r"[\s._\-()[\]【】（）:：·]+", "", str(value or "").casefold())
+
+
 class PublicSubmissionService:
     TERMINAL_DUPLICATE_STATUSES = {"rejected", "cancelled", "failed", "unsupported"}
 
@@ -44,6 +50,7 @@ class PublicSubmissionService:
         enabled: bool,
         scoped_selection: bool,
         destination_id: str | None = None,
+        title: str = "",
     ) -> dict[str, Any] | None:
         if not enabled or scoped_selection:
             return None
@@ -54,6 +61,13 @@ class PublicSubmissionService:
             destination_id=str(destination_id or "").strip() or None,
         )
         if not duplicate:
+            return None
+        # A corrected title is a new submission intent.  Keeping the old
+        # request token here made a wrong TMDB match (for example Shogun 1980
+        # instead of 2024) impossible to fix without cancelling the job.
+        incoming_title = str(title or "").strip()
+        existing_title = str(duplicate.get("title") or "").strip()
+        if incoming_title and existing_title and _normalized_title(incoming_title) != _normalized_title(existing_title):
             return None
         duplicate = self._deps.sync_request(duplicate)
         status = str(duplicate.get("status") or "").strip().lower()

@@ -214,6 +214,14 @@ class DeferredRunRecoveryTests(unittest.TestCase):
         _ImmediateTimer.instances[-1].fire()
         self.assertEqual(len(self.service.start_calls), 1)
 
+    def test_terminal_job_status_stops_deferred_reschedule(self):
+        self.service.db.job_queries = SimpleNamespace(get=lambda job_id: {"status": "failed"})
+        result = self.service._schedule_deferred_run(8, self.descriptor, "transfer:9:rclone_copy")
+        self.assertTrue(result.get("terminal_job"))
+        self.assertEqual(self.repo.run["status"], "failed")
+        self.assertEqual(self.wakeups, [9])
+        self.assertEqual(self.service._deferred_run_timers, {})
+
     def test_repeated_errors_have_bounded_starts_and_wake_transfer(self):
         self.service.start = Mock(side_effect=sqlite3.OperationalError("database is locked"))
         self._schedule()

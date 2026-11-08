@@ -83,6 +83,7 @@ def _service(
     *,
     execution: _Execution | None,
     enqueue: Any = None,
+    quarantine: Any = None,
 ) -> JobCancellationService:
     return JobCancellationService(
         JobCancellationDependencies(
@@ -94,6 +95,7 @@ def _service(
             cancelled_status="cancelled",
             execution_repository=_ExecutionRepository(execution),
             enqueue_transfer=enqueue,
+            relay_cache_quarantine=quarantine,
         )
     )
 
@@ -254,6 +256,41 @@ class JobCancellationV1Tests(unittest.TestCase):
         self.assertEqual(calls, [(42, True)])
         self.assertFalse(
             jobs.job["raw_data"]["cancel"]["include_title_matches_requested"]
+        )
+
+    def test_active_v1_execution_quarantines_relay_cache_without_worker(self) -> None:
+        jobs = _Jobs()
+        cleaner = _Cleaner()
+        quarantined: list[int] = []
+
+        result = _service(
+            jobs,
+            cleaner,
+            execution=_Execution("transferring", {"receipt": {"operation_id": "op-42"}}),
+            enqueue=lambda _job_id, **_kwargs: {"success": True},
+            quarantine=lambda job: (
+                quarantined.append(int(job["id"]))
+                or {"success": True, "message": "已移动到 relay_backups"}
+            ),
+        ).cancel(
+            copy.deepcopy(jobs.job),
+            reason="admin cancel",
+            payload={"cleanup": True},
+            request_item=None,
+            cleanup_default=True,
+            stop_running_default=False,
+            admin_username="admin",
+        )
+
+        self.assertTrue(result["cancelled"])
+        self.assertTrue(result["cleanup"]["deferred"])
+        self.assertEqual(quarantined, [42])
+        self.assertEqual(cleaner.cancel_calls, [])
+        self.assertTrue(
+            any(
+                item.get("type") == "quarantine_relay_cache"
+                for item in result["cleanup"]["items"]
+            )
         )
 
     def test_final_verified_execution_rejects_cancel_and_resumes_worker(self) -> None:

@@ -4,31 +4,15 @@ import posixpath
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 
+from ..media_file_types import VIDEO_EXTENSIONS
 
-VIDEO_EXTENSIONS = {
-    ".mkv",
-    ".mp4",
-    ".avi",
-    ".mov",
-    ".rmvb",
-    ".ts",
-    ".m2ts",
-    ".iso",
-    ".wmv",
-    ".flv",
-    ".mpg",
-    ".mpeg",
-    # 139 等网盘常把每一集以未压缩 tar 包保存；与其它影视压缩包一样，
-    # Organizer 需要先识别并按集号整理，后续是否解包由用户/媒体端决定。
-    ".tar",
-    # 影视资源常见压缩包：用户会自行解压，整理时仍按影视文件参与 SxxEyy 命名。
-    ".zip",
-    ".rar",
-    ".7z",
-}
+
+IDENTITY_MANIFEST_NAME = ".fnos-identity.json"
+IDENTITY_MANIFEST_MAX_BYTES = 64 * 1024
 
 
 class OpenListError(RuntimeError):
@@ -316,6 +300,70 @@ class OpenListClient:
 
     def exists(self, path: str) -> bool:
         return self.get_item(path) is not None
+
+    def read_identity_manifest(self, path: str) -> str | None:
+        manifest_path = _identity_manifest_path(path)
+        entries = [item for item in self.list_dir(dirname(manifest_path), refresh=True) if item.name == IDENTITY_MANIFEST_NAME]
+        if not entries:
+            return None
+        if len(entries) != 1 or entries[0].is_dir:
+            raise OpenListError("身份清单路径不是唯一文件")
+        _check_identity_manifest_size(entries[0].size)
+        response = self._request("POST", "/api/fs/get", json={"path": manifest_path, "password": ""}, retryable=True)
+        metadata = response.get("data")
+        if not isinstance(metadata, dict) or metadata.get("is_dir"):
+            raise OpenListError("身份清单元数据无效或不是文件")
+        _check_identity_manifest_size(metadata.get("size"))
+        raw_url = str(metadata.get("raw_url") or "").strip()
+        if not raw_url and metadata.get("sign"):
+            raw_url = f"{self.base_url}/d{quote(manifest_path, safe='/')}?sign={quote(str(metadata['sign']), safe='')}"
+        if not raw_url:
+            raise OpenListError("身份清单缺少签名下载地址")
+        download_url = urljoin(f"{self.base_url}/", raw_url)
+        parsed_url = urlsplit(download_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname or parsed_url.username or parsed_url.password:
+            raise OpenListError("身份清单下载地址无效")
+        # Provider URLs must never inherit OpenList JWTs, cookies or netrc credentials.
+        try:
+            with requests.Session() as download_session:
+                download_session.trust_env = False
+                with download_session.get(download_url, stream=True, timeout=self.timeout, verify=self.verify_tls) as download:
+                    if download.status_code != 200:
+                        raise OpenListError(f"身份清单下载失败：HTTP {download.status_code}")
+                    _check_identity_manifest_size(download.headers.get("Content-Length"))
+                    body = bytearray()
+                    for chunk in download.iter_content(chunk_size=8192):
+                        body.extend(chunk)
+                        _check_identity_manifest_size(len(body))
+            return body.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise OpenListError("身份清单不是有效 UTF-8") from exc
+        except requests.exceptions.RequestException as exc:
+            raise OpenListError("身份清单下载网络请求失败") from exc
+
+    def write_identity_manifest(self, path: str, content: str) -> bool:
+        manifest_path = _identity_manifest_path(path)
+        if not isinstance(content, str):
+            raise OpenListError("身份清单内容必须是 UTF-8 文本")
+        try:
+            body = content.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise OpenListError("身份清单不是有效 UTF-8") from exc
+        _check_identity_manifest_size(len(body))
+        data = self._request(
+            "PUT", "/api/fs/put", data=body,
+            headers={
+                "File-Path": quote(manifest_path, safe=""),
+                "As-Task": "false",
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(body)),
+            },
+            allow_redirects=False,
+            retryable=False,
+        )
+        if not isinstance(data, dict) or data.get("code") not in {0, 200, "0", "200"} or not _ok(data):
+            raise OpenListError("身份清单上传未返回成功确认")
+        return True
 
     def mkdir(self, path: str) -> bool:
         data = self._request("POST", "/api/fs/mkdir", json={"path": normalize_path(path)})
@@ -621,6 +669,24 @@ class OpenListClient:
         delay = self.retry_backoff_seconds * (2 ** max(0, failed_attempt - 1))
         if delay > 0:
             time.sleep(min(delay, 10.0))
+
+
+def _identity_manifest_path(value: Any) -> str:
+    raw = str(value or "").replace("\\", "/").strip()
+    if any(part in {".", ".."} for part in raw.split("/")):
+        raise OpenListError("身份清单路径不能包含越级目录")
+    path = normalize_path(raw)
+    if basename(path) != IDENTITY_MANIFEST_NAME:
+        raise OpenListError("只允许读写 .fnos-identity.json 身份清单")
+    return path
+
+
+def _check_identity_manifest_size(value: Any) -> None:
+    if value is None:
+        return
+    size = _safe_int(value)
+    if size is None or size < 0 or size > IDENTITY_MANIFEST_MAX_BYTES:
+        raise OpenListError("身份清单大小无效或超过 64 KiB")
 
 
 def _ok(data: dict[str, Any]) -> bool:

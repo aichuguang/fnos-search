@@ -532,6 +532,7 @@
                     ${transfer.job_id ? `<button type="button" class="secondary mini transfer-detail-button" data-transfer-job="${escapeHtml(transfer.job_id)}">${PROGRESS_COPY.details}</button>` : ""}
                 </header>
                 ${channel && !dual && !pipeline && filename && filename !== title ? `<div class="transfer-current-file"><small>${PROGRESS_COPY.currentFile}</small><span title="${escapeHtml(filename)}">${escapeHtml(filename)}</span></div>` : ""}
+                ${transfer.progress_text ? `<div class="transfer-aggregate" role="status">${escapeHtml(transfer.progress_text)}</div>` : ""}
                 ${channels.length ? `<div class="transfer-metrics${dual ? " is-parallel" : ""}">${channels.map((kind) => renderTransferMetric(kind, transfer[kind], dual || pipeline)).join("")}</div>` : `<div class="transfer-phase-summary">${escapeHtml(label)}<small>${phaseHint}</small></div>`}
                 ${renderRelayBuffer(transfer)}
                 <footer class="transfer-card-footer"><small class="transfer-feedback">${PROGRESS_COPY.lastFeedback}：${escapeHtml(feedbackTime)}${age === null ? "" : ` · ${PROGRESS_COPY.age} ${metricDuration(age)}`}</small>${stale ? `<small class="transfer-stale">${PROGRESS_COPY.stale}</small>` : ""}</footer>

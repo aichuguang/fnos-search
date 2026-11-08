@@ -160,6 +160,17 @@ class CacheWaitRetryTests(unittest.TestCase):
             _ImmediateTimer.instances[-1].fire()
         self.assertEqual(len(service.start_calls), 1)
 
+    def test_cache_wait_timeout_fails_instead_of_waiting_forever(self):
+        repo = _ServiceRepo({"id": 8, "job_id": 9, "status": "queued", "operation_key": "relay-file:1:k9"})
+        service, _logs, _wakeups = _bare_service(repo, max_attempts=2)
+        service._deferred_cache_wait_started = {8: -10**9}
+        with patch.dict(os.environ, {"TRANSFER_CACHE_WAIT_TIMEOUT_SECONDS": "1"}):
+            result = service._schedule_deferred_run(8, _descriptor(8), "prefetch", cache_wait=True)
+        self.assertFalse(result.get("deferred", False))
+        self.assertTrue(result.get("exhausted"))
+        self.assertIn("中继缓存", result.get("message", ""))
+        self.assertEqual(repo.run["status"], "failed")
+
     def test_only_real_adapter_advertises_bounded_prefetch(self):
         self.assertIs(RcloneOperationAdapter.supports_bounded_prefetch, True)
 

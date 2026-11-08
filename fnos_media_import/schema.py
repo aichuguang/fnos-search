@@ -361,6 +361,9 @@ BASE_SCHEMA_SQL = r"""
                     season INTEGER,
                     year TEXT,
                     tmdb_id INTEGER,
+                    identity_ns TEXT,
+                    identity_value TEXT,
+                    canonical_dir TEXT,
                     query_template TEXT,
                     aliases TEXT,
                     schedule_kind TEXT NOT NULL,
@@ -523,5 +526,53 @@ BASE_SCHEMA_SQL = r"""
 
                 CREATE INDEX IF NOT EXISTS idx_rate_limit_buckets_expires_at
                 ON rate_limit_buckets(expires_at);
+
+"""
+
+
+# Agent (MCP) tables. They are applied on every startup rather than through a
+# numbered migration: the schema version is owned by the v1 hard cutover, and a
+# post-cutover version bump would make the cutover CLI reject the database.
+# Both statements are idempotent and independent of every other table.
+AGENT_SCHEMA_SQL = r"""
+                CREATE TABLE IF NOT EXISTS agent_tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    token_hash TEXT NOT NULL,
+                    token_prefix TEXT NOT NULL DEFAULT '',
+                    scopes TEXT NOT NULL DEFAULT '[]',
+                    rate_limit INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT NOT NULL DEFAULT '',
+                    revoked_at TEXT NOT NULL DEFAULT '',
+                    last_used_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_tokens_hash
+                ON agent_tokens(token_hash);
+
+                CREATE TABLE IF NOT EXISTS agent_tool_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_id INTEGER,
+                    token_name TEXT NOT NULL DEFAULT '',
+                    tool TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT '',
+                    risk TEXT NOT NULL DEFAULT 'read',
+                    args_digest TEXT NOT NULL DEFAULT '',
+                    outcome TEXT NOT NULL DEFAULT '',
+                    error_code TEXT NOT NULL DEFAULT '',
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_created_at
+                ON agent_tool_calls(created_at, id);
+
+                CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_token
+                ON agent_tool_calls(token_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_tool
+                ON agent_tool_calls(tool, created_at);
 
 """

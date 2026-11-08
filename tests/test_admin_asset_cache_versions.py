@@ -25,8 +25,10 @@ class AdminAssetCacheVersionTests(unittest.TestCase):
             match = re.search(rf'/static/{re.escape(asset)}\?v=([^"\s]+)', source)
             self.assertIsNotNone(match, asset)
             version = "20261011-bugfix-v002" if asset in {"admin-organizer.js", "admin.js"} else expected_version
+            if asset == "admin-media.js":
+                version = "20261103-fnos-login-v014"
             if asset == "admin-organizer.js":
-                version = "20261011-review-guard-v003"
+                version = "20261107-progress-lanes-v004"
             if asset == "admin-storage-v1.js":
                 version = "20261011-storage-cas-v004"
             if asset in {"admin-jobs.js", "admin-rclone.js"}:
@@ -36,11 +38,15 @@ class AdminAssetCacheVersionTests(unittest.TestCase):
             if asset == "admin-rclone.js":
                 version = "20261011-live-progress-v007"
             if asset == "admin-trending.js":
-                version = "20261012-quark-selection-v008"
+                version = "20261104-trending-scheduler-v009"
             if asset in {"admin.js", "admin-bootstrap.js", "admin-rclone.js"}:
                 version = "20261014-transfer-center-v009"
             if asset == "admin-rclone.js":
-                version = "20261015-relay-prefetch-v013"
+                version = "20261107-progress-lanes-v014"
+            if asset == "admin.js":
+                version = "20261103-agent-mcp-v015"
+            if asset == "admin-bootstrap.js":
+                version = "20261103-agent-mcp-v015"
             self.assertEqual(match.group(1), version, f"{asset}: {match.group(1)}")
 
         css_match = re.search(r'/static/product\.css\?v=([^"\s]+)', source)
@@ -49,13 +55,13 @@ class AdminAssetCacheVersionTests(unittest.TestCase):
 
         transfer_css_match = re.search(r'/static/admin-transfers\.css\?v=([^"\s]+)', source)
         self.assertIsNotNone(transfer_css_match, "admin-transfers.css")
-        self.assertEqual(transfer_css_match.group(1), "20261015-relay-prefetch-v013")
+        self.assertEqual(transfer_css_match.group(1), "20261107-progress-lanes-v014")
 
         workbench_match = re.search(
             r'/static/resource-search-workbench\.js\?v=([^"\s]+)', source
         )
         self.assertIsNotNone(workbench_match, "resource-search-workbench.js")
-        self.assertEqual(workbench_match.group(1), expected_version)
+        self.assertEqual(workbench_match.group(1), "20261107-cloud139-items-v002")
 
 
 if __name__ == "__main__":

@@ -314,15 +314,11 @@
             const button = $("saveTrendingSchedulerBtn");
             if (button) button.disabled = true;
             try {
-                const data = await api("/api/admin/advanced-config", {
+                const data = await api("/api/admin/trending/scheduler", {
                     method: "POST",
                     body: JSON.stringify({
-                        config: {
-                            hot_discovery: {
-                                enabled,
-                                run_at: runAt,
-                            },
-                        },
+                        enabled,
+                        run_at: runAt,
                     }),
                 });
                 toast(data.message || "每日热榜调度配置已保存", "success");

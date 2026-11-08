@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import multiprocessing
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -9,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from fnos_media_import.transfer.relay_file_state import RelayFileState
+from fnos_media_import.transfer.relay_file_state import RelayCacheOversized, RelayFileState
 from fnos_media_import.transfer.relay_pipeline_config import RelayPipelineConfig
 
 
@@ -375,6 +376,83 @@ class RelayPrefetchStateTests(unittest.TestCase):
             latest = self.store.apply_environment_budget_increase()
         self.assertEqual(latest["pipeline"]["cache_max_bytes"], 40)
         self.assertEqual(latest["prefetch_paused"], "cancelled")
+
+    def test_peer_cache_block_reports_real_owner_and_bytes(self):
+        peer = self._store(2)
+        peer.root.mkdir(parents=True, exist_ok=True)
+        (peer.root / "22.mkv").write_bytes(b"x" * 10)
+
+        with self.assertRaises(BlockingIOError) as raised:
+            self.store.prepare_file(0, 10)
+
+        message = str(raised.exception)
+        self.assertIn("job-2 仍有缓存或部分文件", message)
+        self.assertIn("共 10 字节", message)
+        self.assertNotIn("缓存回执", message)
+
+    def test_success_peer_cache_is_also_skipped(self):
+        peer = self._store(2)
+        peer.root.mkdir(parents=True, exist_ok=True)
+        (peer.root / "leftover.mkv").write_bytes(b"x" * 10)
+        store = RelayFileState(
+            str(self.parent / "job-1"), job_id=1, plan_key="plan",
+            job_status_lookup=lambda job_id: "success" if job_id == 2 else "transferring",
+        )
+        store.prepare_file(0, 10)
+        self.assertEqual(store.load()["files"][0]["size"], 10)
+
+    def test_terminal_peer_cache_is_skipped_but_active_peer_still_blocks(self):
+        peer = self._store(2)
+        peer.root.mkdir(parents=True, exist_ok=True)
+        (peer.root / "leftover.mkv").write_bytes(b"x" * 10)
+        store = RelayFileState(
+            str(self.parent / "job-1"), job_id=1, plan_key="plan",
+            job_status_lookup=lambda job_id: "cancelled" if job_id == 2 else "transferring",
+        )
+        store.prepare_file(0, 10)
+        self.assertEqual(store.load()["files"][0]["size"], 10)
+
+        active = RelayFileState(
+            str(self.parent / "job-1"), job_id=1, plan_key="plan",
+            job_status_lookup=lambda _job_id: "transferring",
+        )
+        with self.assertRaises(BlockingIOError) as raised:
+            active.prepare_file(0, 10)
+        self.assertIn("job-2 仍有缓存或部分文件", str(raised.exception))
+
+    def test_terminal_peer_status_is_read_from_app_database(self):
+        peer = self._store(2)
+        peer.root.mkdir(parents=True, exist_ok=True)
+        (peer.root / "leftover.mkv").write_bytes(b"x" * 10)
+        database = self.parent / "app.db"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("CREATE TABLE import_jobs (id INTEGER PRIMARY KEY, status TEXT NOT NULL)")
+            connection.execute("INSERT INTO import_jobs (id, status) VALUES (2, 'failed')")
+            connection.commit()
+        finally:
+            connection.close()
+        with patch.dict("os.environ", {"FNOS_APP_DB_PATH": str(database)}):
+            store = RelayFileState(str(self.parent / "job-1"), job_id=1, plan_key="plan")
+            store.prepare_file(0, 10)
+        self.assertEqual(store.load()["files"][0]["size"], 10)
+
+    def test_single_file_over_budget_is_an_oversized_error(self):
+        self._enable(depth=0, budget=9, reserve=0)
+        with self.assertRaises(RelayCacheOversized) as raised:
+            self.store.prepare_file(0, 10)
+        self.assertIn("单个文件超过中继缓存上限", str(raised.exception))
+
+    def test_cli_returns_78_for_single_file_over_budget(self):
+        from fnos_media_import.transfer.relay_file_state import main
+
+        self._enable(depth=0, budget=9, reserve=0)
+        arguments = [
+            "relay_file_state", "prepare", "--local-dir", str(self.store.root),
+            "--job-id", "1", "--plan-key", "plan", "--index", "0", "--size", "10",
+        ]
+        with patch("sys.argv", arguments):
+            self.assertEqual(main(), 78)
 
 
 if __name__ == "__main__":

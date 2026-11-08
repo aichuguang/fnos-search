@@ -662,6 +662,10 @@ class TransferOrchestrator:
         except Exception as exc:  # noqa: BLE001
             return self._to_manual_review(f"传输轮询异常：{exc}")
         status = normalize_operation_status(status)
+        if status.status == "running" and status.message:
+            # Keep the visible execution message in step with the worker; the
+            # submit receipt's "relay ready" text is not a progress message.
+            self.state.message = status.message
         self._record_terminal_poll_result(receipt, status)
         if status.status == "completed":
             self.state.phase = PHASE_TARGET_VERIFYING
@@ -1347,7 +1351,34 @@ class TransferOrchestrator:
         self.state.phase = PHASE_FAILED
         self.state.message = error.message
         self.state.error_code = error.code
+        self._release_staging_on_terminal_failure()
         return TransferStepResult(PHASE_FAILED, error.message, finished=True)
+
+    def _release_staging_on_terminal_failure(self) -> None:
+        """终态失败时释放 relay 本地缓存，避免堵死全局单任务通道。"""
+        if self.cleanup is None or self.plan is None:
+            return
+        if str(self.plan.strategy or "").strip().lower() != "relay_upload_provider":
+            return
+        release = getattr(self.cleanup, "release_staging", None)
+        if not callable(release):
+            return
+        try:
+            result = release(self.plan)
+        except Exception as exc:  # noqa: BLE001 - cleanup must never hide the real failure
+            self.state.cleanup = {
+                "ok": False,
+                "retryable": True,
+                "reason": f"释放任务级中继缓存异常：{exc}",
+            }
+            return
+        if hasattr(result, "to_dict"):
+            try:
+                self.state.cleanup = result.to_dict()
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        self.state.cleanup = result if isinstance(result, dict) else {"ok": bool(getattr(result, "ok", False))}
 
     def _to_manual_review(
         self,

@@ -253,7 +253,7 @@ class OpenListClientRetryTests(unittest.TestCase):
             ],
         )
 
-    def test_recursive_scan_includes_tar_episode_archives(self) -> None:
+    def test_recursive_scan_excludes_tar_episode_archives(self) -> None:
         client = self._client()
 
         def list_dir(path: str, *, refresh: bool | None = None) -> list[OpenListItem]:
@@ -262,14 +262,17 @@ class OpenListClientRetryTests(unittest.TestCase):
             if path == "/library/show":
                 return [OpenListItem(name="Season 01", path="/library/show/Season 01", is_dir=True)]
             if path == "/library/show/Season 01":
-                return [OpenListItem(name="第1集 4K.tar", path="/library/show/Season 01/第1集 4K.tar", is_dir=False)]
+                return [
+                    OpenListItem(name="第1集 4K.tar", path="/library/show/Season 01/第1集 4K.tar", is_dir=False),
+                    OpenListItem(name="第1集 4K.mp4", path="/library/show/Season 01/第1集 4K.mp4", is_dir=False),
+                ]
             return []
 
         client.list_dir = list_dir  # type: ignore[method-assign]
 
         rows = client.scan_videos("/library/show", refresh=True)
 
-        self.assertEqual([item.name for item in rows], ["第1集 4K.tar"])
+        self.assertEqual([item.name for item in rows], ["第1集 4K.mp4"])
 
     def test_expected_name_stops_category_scan_after_target_is_found(self) -> None:
         client = self._client()

@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 from ..cmcc.auth import CmccAuthConfigError, CmccAuthProvider
 from ..cmcc.client import CmccApiError, CmccClient
 from ..constants import JOB_FAILED, JOB_SUBMITTED
 from ..media_path_rules import append_resource_dir, sanitize_resource_dir_name
+from ..media_file_types import VIDEO_EXTENSIONS
 from ..provider_errors import provider_error_details
 from .base import AdapterCheckResult, ImportResult
 
@@ -20,9 +21,18 @@ class Cloud139Importer:
     cmcc_upload 官方 API 认证，不需要额外转存服务。
     """
 
-    def __init__(self, config: dict[str, Any], cmcc_config: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        cmcc_config: dict[str, Any] | None = None,
+        *,
+        authorization_update_callback: Callable[[dict[str, Any]], bool] | None = None,
+    ):
         self.config = config if isinstance(config, dict) else {}
         self.cmcc_config = cmcc_config if isinstance(cmcc_config, dict) else {}
+        self.authorization_update_callback = (
+            authorization_update_callback if callable(authorization_update_callback) else None
+        )
         self.timeout = int(self.config.get("timeout", self.cmcc_config.get("timeout", 30)) or 30)
         # Destination roots/mount identities are frozen in the V1 storage
         # target binding.  They are deliberately not read from importer
@@ -118,6 +128,16 @@ class Cloud139Importer:
             }
         share_title = title or "139 分享"
         normalized = [_normalize_share_item(item) for item in items]
+        try:
+            scan = self._scan_share_videos(link_id, passcode, pdir)
+        except (CmccApiError, CmccAuthConfigError, RuntimeError) as exc:
+            scan = {
+                "complete": False,
+                "video_file_count": 0,
+                "total_size": 0,
+                "folder_count": 0,
+                "error": str(exc),
+            }
         return True, {
             "success": True,
             "message": "139 官方分享检测通过",
@@ -127,12 +147,71 @@ class Cloud139Importer:
                     "title": share_title,
                     "name": share_title,
                     "status": "valid",
-                    "file_count": len(normalized),
+                    # A root directory is not a playable video.  The public
+                    # preflight uses this *recursive* count to reject empty
+                    # shell shares before they create a job.
+                    "file_count": scan["video_file_count"] if scan["complete"] else "",
+                    "video_file_count": scan["video_file_count"],
+                    "root_file_count": len(normalized),
+                    "total_size": scan["total_size"],
+                    "folder_count": scan["folder_count"],
+                    "scan_complete": bool(scan["complete"]),
+                    **({"scan_error": scan["error"]} if scan.get("error") else {}),
                     "link_id": link_id,
                     "pdir_fid": pdir,
                 },
                 "items": normalized,
             },
+        }
+
+    def _scan_share_videos(
+        self,
+        link_id: str,
+        password: str,
+        root: str,
+        *,
+        max_depth: int = 6,
+        max_entries: int = 10000,
+    ) -> dict[str, Any]:
+        """Recursively count video files without trusting a folder-only root."""
+
+        stack: list[tuple[str, int]] = [(root or "root", 0)]
+        seen: set[str] = set()
+        video_count = 0
+        total_size = 0
+        folder_count = 0
+        complete = True
+        while stack:
+            folder, depth = stack.pop()
+            if folder in seen:
+                continue
+            seen.add(folder)
+            if depth > max_depth:
+                complete = False
+                continue
+            rows = self._cmcc().list_share_dir(link_id, password=password, pdir_fid=folder)
+            if len(rows) > max_entries:
+                complete = False
+                rows = rows[:max_entries]
+            for raw in rows:
+                item = _normalize_share_item(raw)
+                if item["is_dir"]:
+                    folder_count += 1
+                    fid = str(item.get("fid") or "").strip()
+                    if fid and depth < max_depth:
+                        stack.append((fid, depth + 1))
+                    elif depth >= max_depth:
+                        complete = False
+                    continue
+                if not _is_video_name(str(item.get("name") or "")):
+                    continue
+                video_count += 1
+                total_size += _size_bytes(item.get("size"))
+        return {
+            "complete": complete,
+            "video_file_count": video_count,
+            "total_size": total_size,
+            "folder_count": folder_count,
         }
 
     def list_files(self, share_url: str, fid: str, password: str = "", title: str = "") -> dict[str, Any]:
@@ -316,7 +395,13 @@ class Cloud139Importer:
 
     def _cmcc(self) -> CmccClient:
         if self._cmcc_client is None:
-            self._cmcc_client = CmccClient(CmccAuthProvider(self.cmcc_config), timeout=self.timeout)
+            self._cmcc_client = CmccClient(
+                CmccAuthProvider(
+                    self.cmcc_config,
+                    authorization_update_callback=self.authorization_update_callback,
+                ),
+                timeout=self.timeout,
+            )
         return self._cmcc_client
 
     def _build_directory_plan(
@@ -440,9 +525,10 @@ def _normalize_selected_files(value: Any) -> list[dict[str, Any]]:
         fid = str(item.get("fid") or item.get("id") or "").strip()
         token = str(item.get("share_fid_token") or "").strip()
         path = str(item.get("path") or "").strip() or _path_from_token(token) or fid
-        if not path or path in seen:
+        dedupe_key = fid or token or path
+        if not path or not dedupe_key or dedupe_key in seen:
             continue
-        seen.add(path)
+        seen.add(dedupe_key)
         result.append({"name": name or fid or path, "fid": fid, "path": path, "share_fid_token": token, "type": "file", "is_dir": False})
     return result
 
@@ -461,9 +547,10 @@ def _normalize_selected_folders(value: Any) -> list[dict[str, Any]]:
             path = str(item.get("path") or "").strip() or _path_from_token(token) or fid
         else:
             continue
-        if not path or path in seen:
+        dedupe_key = fid or token or path
+        if not path or not dedupe_key or dedupe_key in seen:
             continue
-        seen.add(path)
+        seen.add(dedupe_key)
         result.append({"name": name or fid or path, "fid": fid, "path": path, "share_fid_token": token, "type": "dir", "is_dir": True})
     return result
 
@@ -571,6 +658,21 @@ def _first_non_empty(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+_VIDEO_EXTENSIONS = VIDEO_EXTENSIONS
+
+
+def _is_video_name(name: str) -> bool:
+    return os.path.splitext(str(name or "").lower())[1] in _VIDEO_EXTENSIONS
+
+
+def _size_bytes(value: Any) -> int:
+    try:
+        number = int(float(str(value or "0").replace(",", "").strip()))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, number)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:

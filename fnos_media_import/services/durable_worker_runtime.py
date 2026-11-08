@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 
@@ -73,6 +73,9 @@ class DurableWorkerRuntime:
         self._last_heartbeat_monotonic: float | None = None
         self._last_claim_at = ""
         self._last_task_at = ""
+        self._active_task_id: int | None = None
+        self._active_task_type = ""
+        self._active_task_lease_expires_at = ""
         self._last_error: dict[str, str] = {}
         self._last_task_error: dict[str, str] = {}
         self._consecutive_runtime_errors = 0
@@ -90,6 +93,14 @@ class DurableWorkerRuntime:
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return False
+            recover = getattr(self.repository, "recover_expired_leases", None)
+            if callable(recover):
+                try:
+                    recovered = recover()
+                    if isinstance(recovered, dict) and any(int(value or 0) for value in recovered.values()):
+                        self._safe_log(f"worker lease recovery: {recovered}")
+                except Exception as exc:  # noqa: BLE001
+                    self._record_runtime_error("lease_recovery", exc)
             self._stop.clear()
             self._thread = threading.Thread(
                 target=self._run,
@@ -122,6 +133,11 @@ class DurableWorkerRuntime:
                 else None
             )
             stale = heartbeat_age is None or heartbeat_age > health_timeout
+            lease_expired = bool(
+                self._active_task_id is not None
+                and self._active_task_lease_expires_at
+                and self._active_task_lease_expires_at <= _utc_now_text()
+            )
             return {
                 "runtime_running": running,
                 "stop_requested": self._stop.is_set(),
@@ -134,6 +150,10 @@ class DurableWorkerRuntime:
                 "heartbeat_stale": stale,
                 "last_claim_at": self._last_claim_at,
                 "last_task_at": self._last_task_at,
+                "active_task_id": self._active_task_id,
+                "active_task_type": self._active_task_type,
+                "active_task_lease_expires_at": self._active_task_lease_expires_at,
+                "active_task_lease_expired": lease_expired,
                 "last_error": dict(self._last_error),
                 "last_task_error": dict(self._last_task_error),
                 "consecutive_runtime_errors": self._consecutive_runtime_errors,
@@ -142,7 +162,8 @@ class DurableWorkerRuntime:
                 "deferred_count": self._deferred_count,
                 "retryable_count": self._retryable_count,
                 "business_failed_count": self._business_failed_count,
-                "healthy": running and not stale and self._consecutive_runtime_errors == 0,
+                "healthy": running and not stale and not lease_expired
+                and self._consecutive_runtime_errors == 0,
             }
 
     def run_once(self) -> bool:
@@ -161,6 +182,7 @@ class DurableWorkerRuntime:
         task_id = int(task["id"])
         task_type = str(task.get("task_type") or "")
         self._record_claim()
+        self._set_active_task(task, task_id=task_id, task_type=task_type)
         handler = self.handlers.get(task_type)
         if not handler:
             transitioned = self._transition_failure(
@@ -171,6 +193,8 @@ class DurableWorkerRuntime:
             )
             if transitioned:
                 self._record_outcome(WORKER_BUSINESS_FAILED)
+            else:
+                self._clear_active_task()
             return True
 
         try:
@@ -191,6 +215,8 @@ class DurableWorkerRuntime:
             )
             if transitioned:
                 self._record_outcome(WORKER_RETRYABLE)
+            else:
+                self._clear_active_task()
             return True
 
         outcome = _worker_outcome(result)
@@ -215,6 +241,8 @@ class DurableWorkerRuntime:
             transitioned = self._transition_completed(task_id, result)
         if transitioned:
             self._record_outcome(outcome)
+        else:
+            self._clear_active_task()
         return True
 
     def _execute_with_heartbeat(
@@ -257,6 +285,7 @@ class DurableWorkerRuntime:
                         WorkerLeaseLostError(f"Worker task #{task_id} lease renewal was rejected"),
                     )
                     return
+                self._touch_active_lease()
                 self._touch_runtime_heartbeat()
 
         thread = threading.Thread(
@@ -422,8 +451,30 @@ class DurableWorkerRuntime:
         with self._state_lock:
             self._last_claim_at = _utc_now_text()
 
+    def _set_active_task(self, task: dict[str, Any], *, task_id: int, task_type: str) -> None:
+        with self._state_lock:
+            self._active_task_id = task_id
+            self._active_task_type = task_type
+            self._active_task_lease_expires_at = str(task.get("lease_expires_at") or "")
+
+    def _touch_active_lease(self) -> None:
+        with self._state_lock:
+            if self._active_task_id is not None:
+                self._active_task_lease_expires_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=self.lease_seconds)
+                ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _clear_active_task(self) -> None:
+        with self._state_lock:
+            self._active_task_id = None
+            self._active_task_type = ""
+            self._active_task_lease_expires_at = ""
+
     def _record_outcome(self, outcome: str) -> None:
         with self._state_lock:
+            self._active_task_id = None
+            self._active_task_type = ""
+            self._active_task_lease_expires_at = ""
             self._processed_count += 1
             self._last_task_at = _utc_now_text()
             if outcome == WORKER_DEFERRED:

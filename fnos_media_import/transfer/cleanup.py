@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import shutil
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from fnos_media_import.transfer import TransferPlan
@@ -331,6 +332,80 @@ class TransferCleanupService:
                 items=items,
             )
         return CleanupResult(ok=True, items=items)
+
+    def release_staging(
+        self,
+        plan: TransferPlan | dict[str, Any],
+        *,
+        target_root: str | None = None,
+    ) -> CleanupResult:
+        """终态失败时把任务级中继缓存移出单任务通道，不删除任何文件。
+
+        与 :meth:`cleanup` 不同，这里不要求目标校验/应用 ACK：任务已经失败，
+        缓存留在原目录只会永久占住 relay 的单任务通道。目录默认被移到同级
+        ``.held/`` 下，也可由调用方指定同一挂载内的 ``relay_backups``；移动
+        仍然经过 ``_job_scope_check``，只允许 ``job-<id>`` 叶子目录。
+        """
+        if not isinstance(plan, TransferPlan):
+            try:
+                plan = TransferPlan.from_dict(plan)
+            except Exception as exc:  # noqa: BLE001
+                return CleanupResult(
+                    ok=False,
+                    retryable=False,
+                    reason=f"清理计划无效，拒绝移动：{exc}",
+                    items=[],
+                )
+        local_temp = plan.local_temp
+        if local_temp is None:
+            return CleanupResult(ok=True, skipped=True, reason="当前任务没有本地中继缓存", items=[])
+        refused = _job_scope_check(local_temp, plan.job_id, self.filesystem, self.local_roots)
+        if refused is not None:
+            return CleanupResult(
+                ok=False,
+                warning=True,
+                retryable=False,
+                reason=refused.message or "任务级中继缓存路径不安全，拒绝移动",
+                items=[refused],
+            )
+        real = os.path.realpath(str(self.filesystem.resolve_real(local_temp)))
+        if not os.path.exists(real):
+            return CleanupResult(ok=True, skipped=True, reason="当前任务没有本地中继缓存", items=[])
+        if not os.path.isdir(real):
+            return CleanupResult(
+                ok=False,
+                warning=True,
+                retryable=False,
+                reason=f"任务级中继缓存不是目录，拒绝移动：{real}",
+                items=[],
+            )
+        held_root = (
+            str(target_root).strip()
+            if isinstance(target_root, str) and target_root.strip()
+            else os.path.join(os.path.dirname(real), ".held")
+        )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        target = os.path.join(held_root, f"{os.path.basename(real)}-{stamp}")
+        try:
+            os.makedirs(held_root, exist_ok=True)
+            suffix = 1
+            while os.path.exists(target):
+                suffix += 1
+                target = os.path.join(held_root, f"{os.path.basename(real)}-{stamp}-{suffix}")
+            os.replace(real, target)
+        except OSError as exc:
+            return CleanupResult(
+                ok=False,
+                warning=True,
+                retryable=True,
+                reason=f"隔离任务级中继缓存失败：{exc}",
+                items=[],
+            )
+        return CleanupResult(
+            ok=True,
+            reason=f"任务级中继缓存已隔离至 {target}",
+            items=[CleanupItem(local_temp, True, message=f"已移动到 {target}")],
+        )
 
     def _delete_scoped(self, descriptor: dict[str, str], job_id: int) -> CleanupItem:
         refused = _job_scope_check(descriptor, job_id, self.filesystem, self.local_roots)

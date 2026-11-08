@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -160,6 +161,57 @@ class BoundedRelayTests(unittest.TestCase):
             self.executor.poll(self.receipt)
         self.assertEqual(len(self.adapter.runs), 2)
 
+    def test_unconfirmed_upload_timeout_fails_without_reupload(self):
+        upload_calls = []
+
+        def upload(*args, **kwargs):
+            upload_calls.append(1)
+            return UploadOutcome("unknown", "remote result unavailable")
+
+        with patch.object(self.executor, "_upload", side_effect=upload):
+            first = self.executor.poll(self.receipt)
+        self.assertEqual(first.status, "unknown", first.message)
+        self.adapter.store.mutate(
+            lambda state: state.update(prefetch_paused_at=time.time() - 1000)
+        )
+        with patch.dict("os.environ", {"MOBILE_UPLOAD_UNCONFIRMED_TIMEOUT_SECONDS": "1"}):
+            second = self.executor.poll(self.receipt)
+        self.assertEqual(second.status, "failed", second.message)
+        self.assertIn("上传结果等待超时", second.message)
+        self.assertEqual(len(upload_calls), 1, "timeout must never retry an uncertain upload")
+
+    def test_unconfirmed_upload_timeout_recovers_when_target_is_present(self):
+        def upload(*args, **kwargs):
+            return UploadOutcome("unknown", "remote result unavailable")
+
+        with patch.object(self.executor, "_upload", side_effect=upload):
+            first = self.executor.poll(self.receipt)
+        self.assertEqual(first.status, "unknown", first.message)
+        self.native.items.append({"file_id": "remote-1", "name": "01.mkv", "size": 5})
+        self.adapter.store.mutate(
+            lambda state: state.update(prefetch_paused_at=time.time() - 1000)
+        )
+        with patch.dict("os.environ", {"MOBILE_UPLOAD_UNCONFIRMED_TIMEOUT_SECONDS": "1"}):
+            second = self.executor.poll(self.receipt)
+        self.assertEqual(second.status, "running", second.message)
+        state = self.adapter.store.load()
+        self.assertEqual(state["files"][0]["state"], "verified")
+        self.assertEqual(state["prefetch_paused"], "")
+        uploader = self.executor.provider_uploader
+        manifest = uploader._read_operation_manifest(
+            uploader._operation_manifest_path(
+                self.executor._relay_dir(),
+                self.executor._sequential._upload_key(0),
+            )
+        )
+        self.assertEqual(manifest["status"], "completed")
+        result = second
+        for _ in range(6):
+            if result.status == "completed":
+                break
+            result = self.executor.poll(self.receipt)
+        self.assertEqual(result.status, "completed", result.message)
+
     def test_verified_checkpoint_failure_preserves_cache_and_does_not_reupload(self):
         self._hold_upload_for_prefetch(1)
         update = self.executor._sequential.store.update_entry
@@ -253,6 +305,19 @@ class BoundedRelayTests(unittest.TestCase):
         self.assertEqual(result.status, "unknown", result.message)
         self.assertEqual(self.native.calls, [])
         self.assertFalse(self.adapter.store.load()["files"][0].get("upload_started"))
+
+    def test_align_receipt_index_returns_replacement_with_current_cursor(self):
+        relay = object.__new__(BoundedRelay)
+        original = OperationReceipt(
+            "relay-operation",
+            "running",
+            metadata={"operation_key": "relay-dl:test:0", "relay_file_index": 0},
+        )
+        aligned = relay._align_receipt_index(original, 2)
+        self.assertIsNot(aligned, original)
+        self.assertEqual(aligned.metadata["relay_file_index"], 2)
+        self.assertEqual(aligned.metadata["relay_sequence_version"], 1)
+        self.assertEqual(original.metadata["relay_file_index"], 0)
 
 
 if __name__ == "__main__":

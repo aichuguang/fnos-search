@@ -1185,3 +1185,349 @@ Node 语法、Shell 语法、定向 Ruff、应用导入通过。未用真实网�
 - 通用队列增加显式 `replace_pending=False` 选项，通知发射器在普通连接和业务同事务路径均启用：保留第一次事件载荷、时间、任务 ID 和重试状态。其他命令仍保留原 pending 更新行为；跨任务类型的幂等键碰撞拒绝覆盖。
 - 增补跨秒、事件内容变化、重试退避、同事务及跨类型冲突检查；83 项针对性测试、5 个子用例及全仓 Ruff 通过（40.65 秒），未靠重复重跑或跳过测试规避问题。
 - 发布流程新增 master push 只校验的入口，publish job 仅 tag/manual 事件可执行；先确认真实 Linux 全量测试通过，再打新 tag。用户已授权后续发布 v1.0.5，v1.0.3/v1.0.4 保留不覆盖。
+
+## 35. 飞牛媒体库三字段登录（2026-11-03）
+
+- 用户报告只填地址/账号/密码仍被要求 `FNOS_API_KEY / FNOS_SECRET`。根因是 `_configured()` 把空的签名配置当成未配置，在尝试登录前就阻断所有媒体库查询。
+- 内置已公开的 trimemedia-web 客户端签名参数，保留自定义覆盖。依据是 MoviePilot 提交 `26f066df53704a77e1d12480ff43f0a5d3f8f76f` 的 `app/modules/trimemedia/trimemedia.py:122`、`api.py:682-711`，并与 thshu/fnos-tv-web 的 `common.vue` 交叉核实；这些是客户端协议参数，不是用户个人凭证，也不是省略或绕过认证。
+- 普通配置仅需地址、账号、密码；优先 v2 SHA-256 密码登录，只有404/405明确端点不支持才兼容v1，拒绝因错误密码/权限/限流/网络异常而降级重试。网关 `/v/api` 与直连 `/api` 路由在同一配置地址内有限尝试，禁止跨站自动重定向。
+- 记住实际成功的签名模式，避免登录用FNV、后续查询却继续使用PHP顺序；Token自动缓存并绑定地址、账号、应用及签名配置，旧无账号身份缓存需重新登录一次。保存链路与客户端保留飞牛密码原始首尾空格，其他字段清洗和空值保留语义不变。
+- UI 默认只展示地址/账号/密码，Key/Secret/Token移入高级兼容折叠区；保留字段ID、历史配置和凭据管理。错误提示区分真实登录失败与缺目录，未移除无目录整库扫描保护。
+- 59项离线定向测试、30个子用例通过（3.99秒），覆盖签名已知向量、新旧登录、成功模式复用、账号缓存隔离、Token过期、拒绝无效token/错误响应、密码保存、目录扫描保护及UI保存/缓存契约；定向Ruff、两份JS语法检查通过。
+- 未连接用户NAS、未读取用户飞牛账号密码、未触发真实登录或扫描。公开协议常量不保证适配未来所有服务端版本，现场仍需用读取媒体库做验证。
+- 发布时同步Python客户端/配置持久化、管理模板、admin-media.js及admin.js；静态资源版本为 `20261103-fnos-login-v014`。无需新增环境变量或Schema迁移。本轮仅本地修改，未推送、打tag、更新Release或部署；现有v1.0.5镜像尚不包含此修复。
+
+## 36. Agent MCP 接口第一阶段（2026-11-03）
+
+### 目标与范围
+
+为外部 AI Agent 暴露一套受控能力面，覆盖“搜索 → 入库任务 → 整理任务 → 追更订阅 → 运行状态”的读取路径。
+本阶段只做**只读工具 + 鉴权 + 审计 + 协议层**，不含任何写操作；移动/改名授权模型留待下一阶段。
+
+### 实现
+
+- 新增 `fnos_media_import/agent/` 包：`registry`（工具定义）、`auth`（令牌与作用域）、
+  `audit`（调用审计）、`projection`（响应投影）、`args`（参数校验）、`errors`（错误码）、
+  `services`（应用注入的可调用集合）、`mcp/`（JSON-RPC 2.0 编解码、方法分发、Flask 蓝图）、
+  `tools/`（按领域拆分的工具）、`cli`（令牌管理命令行）。
+- 新增 `agent_tokens`、`agent_tool_calls` 两张表及索引，DDL 放在 `schema.AGENT_SCHEMA_SQL` 并由
+  `init_schema()` 每次启动幂等执行；**未新增编号迁移**，因为 schema 版本号由 v1 硬切换独占
+  （`v1_cutover.CUTOVER_VERSION = 29`），新增 v30 会让 cutover CLI 拒绝已升级的数据库（本轮首版
+  实现踩到该坑，已由 `tests/test_v1_cutover_migration.py` 与 `tests/test_schema_upgrade_compatibility.py`
+  回归覆盖）。只保存令牌 SHA-256 摘要与参数摘要。
+- `app.py` 末尾新增 `_agent_service_builders()` 与 `_register_agent_surface()`：以闭包形式把既有
+  `PublicSearchService`、`PublicResourceService`、`JobAdminQueryService`、`OrganizerAdminQueryService`、
+  `UpdateService` 包装成 Agent 可调用项，**未改动任何现有业务逻辑**。
+- 接口默认关闭；`FNOS_AGENT_ENABLED=true` 且进程角色为 `web` 时才挂载 `/mcp`，失败只记日志、不阻断启动。
+- 传输为无状态 HTTP POST + JSON 响应（不启用 SSE），并用 `AGENT_MAX_CONCURRENCY` 限制并发，避免占用
+  gunicorn 的 8 个工作线程。
+
+### 安全边界
+
+- 令牌格式 `fnos_agent_<random>`，明文只在创建时输出一次；作用域九档，移动授权 `organize.apply` 默认不授予。
+- 作用域在 `tools/list` 与 `tools/call` 两处分别校验；缺失返回 `isError` + `SCOPE_DENIED`。
+- 每令牌每分钟默认 60 次限流，超出返回 429 + `Retry-After`；并发满返回 503 + `SERVER_BUSY`。
+- 审计只记录工具名、作用域、风险等级、参数 SHA-256 摘要、结果码与耗时，不落明文参数。
+- 工具输出经过字段投影与长度截断，不返回 `raw_data`、提取码、Cookie 或令牌。
+
+### 验证
+
+- 新增 4 个测试文件、41 个用例：协议编解码与方法分发、作用域过滤与拒绝、蓝图鉴权/限流/批处理/解析错误、
+  真实 SQLite 上的令牌生命周期与审计、`_register_agent_surface` 端到端挂载（含真实迁移建表与工具调用落审计）。
+- `python -m pytest tests/test_agent_mcp_protocol.py tests/test_agent_mcp_blueprint.py tests/test_agent_token_store.py tests/test_agent_surface_wiring.py -q` → 41 passed。
+- `python -m ruff check fnos_media_import/agent` → 通过。
+- 手动烟测：临时库上执行 `python -m fnos_media_import.agent.cli create/list`，令牌可创建并可列出。
+
+### 未覆盖
+
+- 未在真实 NAS 上启动带 `FNOS_AGENT_ENABLED=true` 的容器，也未连接真实搜索源或网盘账号；
+  `search_resources` / `get_resource` 的联网路径需要现场用真实关键词验证。
+- 未提供管理后台的令牌页面，当前通过 `python -m fnos_media_import.agent.cli` 管理。
+- 写工具（提交、审核、重试、映射修改、移动执行）与 `plan_hash` 票据模型尚未实现。
+
+## 37. Agent MCP 接口第二阶段：写工具与移动授权（2026-11-03）
+
+### 目标与范围
+
+在第一阶段只读能力之上补齐写路径：提交入库、审核、任务重试/取消/复核、整理映射修改与执行、
+追更订阅增改与立即运行。本阶段同时落地"由用户授权是否移动文件"的模型。
+
+### App 侧的最小抽取（不改业务语义）
+
+为让路由与 Agent 共用同一份逻辑，把四处路由体抽成闭包函数，路由退化为薄包装：
+
+| 抽取出的函数 | 原路由 | 共同调用方 |
+|---|---|---|
+| `_perform_public_submission` | `api_public_submit` | 公开提交路由、`submit_import` |
+| `_preview_public_submission` | 新增 | `submit_import` 的 `dry_run` |
+| `_perform_request_decision` | `api_admin_request_approve/reject/cancel` | 三个路由、审核工具 |
+| `_perform_job_cancel` | `api_admin_job_cancel` | 路由、`cancel_job` |
+| `_perform_job_review` | `api_admin_job_review` | 路由、`confirm_job_not_submitted` |
+
+路由返回值、状态码、事件写入与通知行为保持不变；区别仅在于 `admin_username` 由参数传入，
+公开提交的验证码校验由 `skip_captcha` 控制（Agent 走令牌鉴权，但仍执行内容风控、重复检查与协调器）。
+
+### 写工具（新增 15 个，总计 29 个）
+
+- 入库：`submit_import`、`approve_import_request`、`reject_import_request`、`retry_job`、
+  `cancel_job`、`confirm_job_not_submitted`
+- 整理：`update_organizer_mappings`、`apply_organizer_task`、`skip_organizer_task`、
+  `retry_organizer_task`、`rollback_organizer_run`
+- 定时任务：`create_subscription`、`update_subscription`、`set_subscription_status`、
+  `run_subscription_now`
+
+`AgentWriteServices` 作为 `AgentServices` 的可选子对象注入，只读场景与既有测试无需改造。
+
+### 移动授权模型
+
+1. **档位最小权限**：新令牌默认为 `read`（只读）。`operator` 增加 `import.write` /
+   `organize.write` / `schedule.write`，但**不含** `organize.apply`；只有 `full` 档位才能移动文件。
+   即"是否允许 Agent 移动"由用户建令牌时决定。
+2. **计划指纹**：`plan_hash` 覆盖任务 revision、分类、OpenList 根、以及每条映射的
+   源/目标路径与状态。任务标题等不影响落盘位置的字段不参与，避免无意义失效。
+3. **两步执行**：`apply_organizer_task` 首次调用只返回计划摘要与 `plan_hash`，不执行；
+   带同一 `plan_hash` 再调用才执行。期间映射被改动 → `PLAN_CHANGED` 并返回新指纹。
+   因此"批准旧计划、执行新计划"无法发生。
+4. **破坏性操作显式确认**：`cancel_job`、`confirm_job_not_submitted`、`rollback_organizer_run`
+   必须 `confirm=true`；拒绝操作必须提供原因；Agent 取消/拒绝默认 `cleanup=false`，不删除已产生的文件。
+
+### 验证
+
+- 新增 `tests/test_agent_write_tools.py`：24 个用例，覆盖 `plan_hash` 稳定性（改目标路径变、
+  改任务标题不变）、`submit_import` 的 dry-run 不落库、`cancel_job` 未确认被拒且默认不清理、
+  `apply` 首调只预览 / 旧指纹被拒 / 指纹匹配才执行、批量子改只接受 title+season、
+  订阅 dry-run 不创建、枚举校验、以及无写作用域时写工具不出现在 `tools/list`。
+- Agent 相关测试合计 65 个通过：`pytest tests/test_agent_*.py -q`。
+- `ruff check fnos_media_import/agent fnos_media_import/app.py` 通过。
+- 全量回归：`2128 passed, 4 skipped, 1054 subtests passed`（433 秒，exit 0），
+  覆盖被抽取的四个路由（公开提交、提交单批准/拒绝/取消、任务取消、任务人工复核）的原有测试。
+- CLI 手测：`create --profile read` 得到 5 个只读作用域；`--profile full` 额外得到
+  `import.write / organize.write / organize.apply / schedule.write`，确认默认档位不含移动授权。
+
+### 未覆盖
+
+- 未在真实 NAS 上连接真实网盘账号执行 `submit_import` / `apply_organizer_task`，
+  联网与真实移动路径需要现场验证一次。
+- 未提供管理后台的令牌管理与"按任务一次性授权"界面；当前授权粒度是令牌档位 + 计划指纹。
+- 未实现 `delete_subscription`、热榜候选采纳与媒体库刷新工具。
+
+## 38. Agent 后台页面、一次性移动授权与新工具（2026-11-03，P3）
+
+### 目标
+
+补齐第三阶段：①管理后台可直接签发/撤销 Agent 令牌；②按整理任务签发一次性移动授权，
+让 `operator` 档位也能执行单次移动；③补上删除订阅、媒体库刷新与热榜采纳工具。
+
+### 实现
+
+- **后台页面**：新增「系统配置 → Agent 接入」页签（`templates/admin.html` + `static/admin-agent.js`），
+  支持创建令牌（名称 / 档位 / 可选过期时间）、显示明文一次、撤销、查看最近调用审计，
+  以及按整理任务「加载计划 → 授权移动 → 撤销授权」。新增路由集中在
+  `fnos_media_import/blueprints/agent_admin.py`：`/api/admin/agent/tokens`、
+  `/api/admin/agent/audit`、`/api/admin/agent/organizer/tasks/<id>/grants`、`/api/admin/agent/grants/<id>`。
+- **一次性授权**：新增 `organizer_grants` 表（`schema.AGENT_SCHEMA_SQL`，随启动幂等创建）与
+  `agent/grants.py`。授权绑定 `task_id + plan_hash`，默认 600 秒、单次消费、可撤销；消费使用单条
+  `UPDATE ... WHERE id = (SELECT ...)` 保证并发下只有一次成功。
+- **apply 的权限判定**：`apply_organizer_task` 的作用域从 `organize.apply` 改为 `organize.write`
+  （让 `operator` 能看到该工具），执行前分两路：带 `organize.apply` 直接放行；否则尝试消费
+  一条匹配当前 `plan_hash` 的授权，没有则返回 `authorization_required` 且不执行。
+- **新工具（6 个，总计 35 个）**：`delete_subscription`、`list_media_libraries`、
+  `refresh_media_library`、`list_trending_candidates`、`import_trending_candidate`、
+  `subscribe_trending_candidate`。
+- **CLI**：新增 `grant --task N` 与 `grants --task N`，用于无浏览器场景签发/查看授权。
+
+### 验证
+
+- 新增 `tests/test_agent_grants_admin.py`：15 个用例，覆盖授权单次消费、指纹/任务不匹配、
+  过期与撤销、默认 600 秒、后台令牌生命周期、过期指纹授权返回 409、审计读取。
+- `tests/test_agent_write_tools.py` 扩展到 35 个用例：无 grant 时返回 `authorization_required`
+  且不执行、有 grant 时执行并落 `consume_grant`、带 `organize.apply` 时不消费 grant、
+  删除订阅需确认、媒体库刷新校验分类、热榜三类工具。
+- `tests/test_agent_surface_wiring.py` 增加后台路由注册断言；`tests/test_admin_asset_cache_versions.py`
+  与 `tests/test_docker_deployment_contract.py` 同步更新（新增页签脚本版本 `20261103-agent-mcp-v015`）。
+- `ruff check fnos_media_import tests/test_agent_*.py` 通过；`node --check` 三份改动 JS 通过。
+- 全量回归：`2155 passed, 4 skipped, 1054 subtests passed`（465 秒，exit 0）。
+- CLI 手测：在临时库上插入整理任务后执行 `grant --task 1`，得到 `g_...` 与 `plan_hash`，
+  `grants --task 1` 显示 `state=active`。
+
+### 未覆盖
+
+- 未在浏览器中实际点击新页面（无头环境无 GUI）；元素 id 与 JS 引用做了静态对齐检查，
+  真实交互需在 NAS 上打开一次「Agent 接入」确认。
+- 未连接真实网盘/飞牛执行 `apply_organizer_task`、`refresh_media_library` 与热榜入库，
+  真实外部调用仍需现场验证。
+- 整理抽屉里尚未放「授权移动」快捷按钮；当前入口统一在「Agent 接入」页签。
+
+## 39. Agent 适配层与真实契约对齐（2026-11-03）
+
+### 背景
+
+外部评审用真实返回结构、临时数据库与内存替身复现了 6 组不一致：适配层读的字段与业务实际返回不符，
+而单测里的 mock 恰好按错误字段构造，所以全绿。本轮只改适配层与最小必要的业务入参，没有推倒分层。
+
+### 修复
+
+1. **提交后的编号**：`_public_request_response` 是访客安全视图，本来就不含 `id`/`job_id`。
+   新增 `app._agent_submission_result()`，由 bridge 用 `request_token` 反查 `guest_requests`
+   补上 `request_id`/`job_id`/`request_status`，不改公共接口。`approve_required` 改为按
+   `job_id` 是否为空判断。热榜两处同类问题一并修正：入库读 `result["job"]["id"]`，
+   转订阅读顶层 `subscription_id`。
+2. **人工复核字段**：`compact_job` 之前丢弃 `transfer_execution`。现在保留 `phase`、`row_version`、
+   `receipt`、`last_error` 与 `review.{required,reason,resume_phase,can_resume,can_confirm_not_submitted,guidance,paths}`，
+   使 `confirm_job_not_submitted` 要求的 `row_version` 能通过 `get_job` 取到。
+3. **映射修改不生效**：`update_organizer_mappings` 补 `status`（ready/need_edit/conflict/delete_ad/skipped）
+   与 `target_path`；只给 `target_name` 时按原目录推导 `target_path`，避免“改名但按旧路径移动”。
+   `get_organizer_task` 增加 `blocked_count`、`blocked[]` 与 `delete_count`，并提示先用 status=ready 解锁。
+4. **确认的计划被替换**：`apply` 现在把预览时的 revision 传给 `approve_task`，其原子写用该 revision
+   做一次一致性检查；不匹配返回 conflict。为避免影响既有调用与测试替身，revision 仅在非空时透传。
+5. **预览漏报删除**：`organizer_plan_summary` 改为按映射状态推导 `action`（delete/rename/move/skip/keep），
+   新增 `delete_count`、`skip_count`、`blocked_count`；`apply` 首调在存在删除项时返回 `warning`。
+6. **选集 Schema**：新增 `schema.selection_entry/quark_selection_schema/cloud139_selection_schema/
+   tianyi_selection_schema/sixpan_selection_schema/source_schema`，按 `_safe_public_*_selection` 的真实结构
+   声明嵌套字段，不再用 `obj({})`（其 `additionalProperties=false` 会拒绝合法选集）。
+
+另外 4 处轻量修正：
+
+- MCP `instructions` 不再声称“写操作默认不执行”。
+- `resources/list` 与 `resources/read` 按 `RESOURCE_SCOPES` 校验（分类需 `search`，状态需 `ops.read`），
+  不能绕过工具作用域读运维状态。
+- 订阅更新中“出现即生效”：`include_keywords: []` / `quality_profile: ""` 可清空原配置。
+- `list_resource_files` 支持 `offset` 翻页并返回 `has_more` / `next_offset`；任务与整理状态枚举改为真实值
+  （`done`/`review`/`waiting_review` 等），`_next_hint` 按状态与 review 能力给出对应动作。
+
+### 验证
+
+- 新增 `tests/test_agent_contracts.py`（16 个用例）：bridge 编号补全、`compact_job` 保留复核字段、
+  resources 作用域拦截与列表过滤、订阅清空语义、选集 Schema 结构、文件列表分页、
+  `apply` 透传 revision。
+- `tests/test_agent_write_tools.py` 改用真实返回结构（`job.id`、`subscription_id`、补全后的提交响应），
+  并补充 rename / delete_ad / blocked 三种计划摘要断言。
+- Agent 相关测试合计 110 个通过；`ruff check fnos_media_import` 通过。
+- 全量回归：`2174 passed, 4 skipped, 1054 subtests passed`（464 秒，exit 0）。
+- 附带调整：`compact_organizer_task` 不再重复内联 files/mappings，任务详情只返回一次并标明
+  `files_truncated` / `mappings_truncated`，减少上下文浪费。
+
+### 未覆盖
+
+- 未在真实网盘/飞牛上执行一次完整“提交 → 复核 → 整理”链路；字段契约按服务层序列化函数逐项核对，
+  真实外部返回仍需现场跑一遍。
+- 整理任务详情仍保留 task 内全量映射，同时返回精简列表；后续可考虑只返回精简映射以节省上下文。
+
+## 40. 飞牛媒体库检索：自己封装缺失端点（2026-11-03）
+
+### 背景
+
+此前 `FnOSMediaRefresher` 只封装了 `mediadb/list`（库）、`mediadb/sum`（统计）、`mdb/list`、
+`mdb/scan` 四个端点，能回答"每个库有多少资源"，不能回答"某部片入库了吗"。
+用户提供了一次真实抓包，确认媒体库检索端点为 `GET /v/api/v1/search/list?q=<keyword>`，
+响应 envelope 为 `{code, msg, data:[...]}`，条目里同时带 TMDB 元数据和本地季/集数量。
+
+### 实现
+
+- `media/fnos.py` 新增 `API_SEARCH_LIST = "/v/api/v1/search/list"` 与
+  `search_media(keyword, *, limit=20)`：复用既有 `_request`（登录、token 刷新、签名、重试），
+  只增加一个端点，未改动原有四条链路。
+- 新增 `_media_search_item()` 投影：`title`/`type`/`ancestor_name`/`year`/`status`/
+  `total_seasons`/`total_episodes`/`local_seasons`/`local_episodes`/`watched`/`favorite`/
+  `trim_id`/`imdb_id`/`overview`（截断 400 字）。
+- **入库判定规则**：TV 只有 `local_seasons + local_episodes > 0` 才算 `in_library`；
+  电影条目存在即算；`Episode` 占位行（本地 0）判为未入库——实测样本里"繁花 特别篇"就是这种占位。
+- 新增 MCP 工具 `search_library(keyword, limit)`，作用域 `ops.read`，工具总数 35 → 36。
+
+### 验证
+
+- 新增 `tests/test_fnos_media_search.py`（9 个用例）：用用户提供的真实响应行验证投影
+  （TV 30 集 → 已入库、特别篇占位 → 未入库、电影 → 已入库）、端点与参数
+  （断言只请求一次 `GET /v/api/v1/search/list` 且 `params={"q": "繁花"}`）、limit 截断、
+  空关键词短路、错误 envelope、未配置客户端。
+- Agent 侧新增 `search_library` 工具用例（`local_episodes=30` → `in_library=true`）。
+- `ruff check fnos_media_import` 通过；工具计数断言同步为 17/35/36。
+- 全量回归见本轮结果。
+
+### 未覆盖
+
+- 本机网络无法访问用户内网 FNOS，`search_media` 尚未对真实实例发起过请求；端点与响应结构来自
+  真实抓包，投影逻辑用该样本验证，但**首次真实调用仍需在 NAS 上确认一次**。
+- 飞牛其他版本若端点不同会返回失败 envelope，工具会明确报 `LIBRARY_UNAVAILABLE` 而不是空结果。
+
+## 41. 后台收口：去掉一次性移动授权、日期选择器、热榜调度保存（2026-11-04）
+
+### 1) 删除按任务的移动授权
+
+一次性授权票据（`organizer_grants` 表、`agent/grants.py`、后台「整理任务移动授权」面板、
+CLI `grant/grants`）整体移除。理由是它没有增加实际保护：执行前本来就有 `plan_hash` 计划确认，
+令牌档位又已经区分了 `operator` 与 `full`。
+
+现在：`apply_organizer_task` 的作用域回到 `organize.apply`，`operator` 令牌看不到该工具，
+调用返回 `SCOPE_DENIED`；`full` 令牌仍需先预览再带 `plan_hash` 执行。计划指纹校验与
+预览 revision 透传保持不变。
+
+清理范围：`agent/grants.py` 删除、`schema.AGENT_SCHEMA_SQL` 去掉建表、`agent_admin.py` 去掉
+三条授权路由、`admin-agent.js`/`admin.html` 去掉授权面板、`cli.py` 去掉两条命令、
+`AgentWriteServices` 去掉 `consume_organizer_grant`。
+
+### 2) Agent 令牌有效期改成「长期 / 指定日期」
+
+原来用原生 `<input type="datetime-local">`，与项目自定义选择器不一致，且精确到分钟没有意义。
+现在改为两个项目内 `<select>`（`ui-select.js` 自动接管）：
+
+- 有效期：`长期有效` / `指定日期`
+- 指定日期时追加 年 / 月 / 日 三个下拉，默认今天 +30 天，按月份自动校正天数
+- 提交时换算为当地当天 23:59:59 的 UTC ISO，后端仍按原样存储与判活
+
+### 3) 热榜自动调度保存报「需要版本化配置文件」
+
+根因：热榜对话框把 `{config: {hot_discovery: ...}}` 发给 `/api/admin/advanced-config`，
+而该接口在 V1 之后只接受带 `format`/`version` 的完整导出文档，因此必然 400。
+
+修复：新增 `POST /api/admin/trending/scheduler`，由服务端从已存配置构造只含 `hot_discovery`
+的版本化文档（`config_persistence.trending_schedule_document`），校验后原子写入，
+再直接 `trending_scheduler.apply_config(...)` 生效。
+
+刻意**不走** `update_advanced` 的完整 runtime reload：切换一个每日时间不应该因为 rclone Worker
+或 Provider 暂时不可用而失败（实测在无 Worker 的临时实例上，旧路径会返回 503 并回滚）。
+
+### 验证
+
+- `tests/test_trending_schedule_document.py`：文档 envelope、保留其它 section 与 section 内字段、
+  能被 advanced-config 规范化器接受、未知字段被拒。
+- 新增/更新 Agent 测试：`test_agent_admin_tokens.py` 覆盖令牌生命周期、档位与 409；
+  `test_agent_write_tools.py` 覆盖 `operator` 无 apply → `SCOPE_DENIED`、预览不执行、
+  旧指纹被拒、revision 透传。
+- 真实启动临时实例验证热榜保存：路由已注册、登录 200、保存 200 并返回
+  `{enabled: true, run_at: "09:15"}`、非法时间 400、数据库中只写入 `hot_discovery`。
+- 前端静态核对：`admin-agent.js` 引用的 14 个 DOM id 全部存在，无遗留授权元素，
+  文件内不再出现 `datetime-local`。
+- `ruff check fnos_media_import` 通过；全量回归 `2179 passed, 4 skipped, 1057 subtests passed`（460 秒，exit 0）。
+
+### 未覆盖
+
+- 未在浏览器中实际点击新的日期选择器（无 GUI 环境），只做了 DOM 与语法核对。
+- 未在真实 NAS 上验证热榜调度在 Worker 正常时的行为差异（逻辑上更宽松，不再依赖 Worker）。
+
+## 2026-11-08：新入库身份整理闭环（不兼容历史脏目录）
+
+### 交付范围与关键决策
+
+- 修复画质误判季集，保留显式多季与 S00；容器不参与标题推断，容器里的视频仍参与整理。
+- 统一视频白名单，ISO/压缩包不按视频处理；保留安全关联字幕/NFO，不自动删除无法解析的小文件。
+- 新增 typed identity、严格带标签目录扫描与 `.fnos-identity.json`；身份唯一性限定在冻结目标库，别名可在清除 job 表后恢复。
+- 首次入库和追更意图贯穿请求、订阅、计划与 apply。已有根丢失必须审核，新季可建；新 local 弱身份需人工确认，不声称能自动识别所有译名。
+- 计划只读、apply 持锁重扫；manifest 先于视频移动，上传确认失败可对账重试；完整回滚按日志恢复视频和身份附件。禁用原名直通入库。
+- 单条及批量手动修改支持 TMDB ID，改季号或标题不会隐式丢失已有 TMDB 身份。
+- 数据库 v30 仅新增订阅身份三列；v29→v30 离线升级不会重跑旧清理。未迁移真实库，未修改历史网盘内容。
+
+### 验证结果
+
+- 主要定向回归：`225 passed, 13 subtests passed`，29.90 秒。覆盖 identity、library scan、I/O、pipeline、真实临时 SQLite 的审核/租约/apply/订阅回写/回滚、parser、更新根定位、OpenList 韧性、TMDB strict、正式离线迁移及禁用直通入口。
+- 最后补充的 local 首入确认回归及目录扫描模块：`17 passed`，0.93 秒（其中包含新增 local 用例，其余与主回归重叠）。
+- Ruff 针对全部本轮实现模块通过；`node --check static/admin-organizer.js` 通过。
+- 本轮关键文件 `git diff --check` 通过；新身份模块、文档等 14 个文件严格 UTF-8 无 BOM 检查通过。
+- 未跑耗时全量历史回归；未访问真实 TMDB/OpenList，未部署 NAS，未浏览器点击测试。使用真实临时 SQLite 和内存/mock 网盘，不虚构线上验证。
+
+### 发布与限制
+
+- 发布、离线 v30 升级、权限和回退说明见 `docs/organizer-identity.md`。
+- 目标 OpenList 驱动需支持小文件同步上传与读取；不支持时停在审核/失败，不会先搬视频。
+- 目录清单扫描尚无真实网盘耗时数据，不能保证旧方案中“232 目录 < 2 秒”；正确性优先，未来可优化可失效快照。
+- 保留工作区原有未提交改动；未推送远端、未执行生产写操作、未迁移历史媒体。

@@ -17,6 +17,7 @@ def create_trending_blueprint(context: TrendingRouteContext) -> Blueprint:
     routes = [
         ("/api/admin/trending/status", "status", "GET"),
         ("/api/admin/trending/run", "run", "POST"),
+        ("/api/admin/trending/scheduler", "scheduler_save", "POST"),
         ("/api/admin/trending/runs", "runs", "GET"),
         ("/api/admin/trending/candidates", "candidates", "GET"),
         ("/api/admin/trending/candidates/<int:candidate_id>", "candidate_detail", "GET"),

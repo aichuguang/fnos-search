@@ -31,11 +31,14 @@ from . import (
     OrganizeResult,
     PHASE_COMPLETED,
     PHASE_FAILED,
+    PHASE_FINALIZING,
     PHASE_MANUAL_REVIEW,
     PHASE_ORGANIZING,
+    PHASE_PLANNING,
     PHASE_RETRY_WAIT,
     PHASE_SOURCE_MATERIALIZING,
     PHASE_NATIVE_SUBMITTING,
+    PHASE_TARGET_VERIFYING,
     PHASE_TRANSFERRING,
     TransferError,
     TransferVerifyResult,
@@ -48,6 +51,7 @@ from .cleanup import (
 )
 from .execution_repository import ExecutionConflictError, TransferExecutionRepository
 from .finalizer import TransferFinalizer
+from .job_gate import TransferJobGate
 from .native_executor import NativeSourceMaterializer, NativeTransferExecutor
 from .orchestrator import TransferOrchestrator, TransferStepResult
 from .provider_relay_executor import ProviderRelayExecutor
@@ -57,6 +61,21 @@ from .verifier import TransferVerifier
 
 
 _LOGGER = logging.getLogger(__name__)
+
+# The job gate protects only the phase that consumes download/upload/disk
+# resources.  Waiting phases (native_waiting, source_waiting_visible,
+# retry_wait) and organizer/final verification deliberately release it so a
+# slow external wait cannot become a head-of-line block for every later job.
+_TRANSFER_GATE_PHASES = frozenset(
+    {
+        PHASE_PLANNING,
+        PHASE_SOURCE_MATERIALIZING,
+        PHASE_NATIVE_SUBMITTING,
+        PHASE_TRANSFERRING,
+        PHASE_TARGET_VERIFYING,
+        PHASE_FINALIZING,
+    }
+)
 
 
 class TransferDispatchError(RuntimeError):
@@ -87,6 +106,8 @@ class TransferDispatchService:
         transfer_wait_timeout_seconds: int | None = None,
         cancel_timeout_seconds: int | None = None,
         ensure_remote_confirmation: Callable[[], Any] | None = None,
+        transfer_gate: Any | None = None,
+        transfer_gate_lease_seconds: int = 900,
     ) -> None:
         self.database = database
         self.accounts_service = accounts_service
@@ -98,6 +119,14 @@ class TransferDispatchService:
         self.source_record_service = source_record_service
         self.assignment_service = assignment_service
         self.executions = execution_repository or TransferExecutionRepository(database)
+        self.transfer_gate = (
+            transfer_gate
+            if transfer_gate is not None
+            else TransferJobGate(
+                getattr(database, "scheduler_leases", None),
+                ttl_seconds=transfer_gate_lease_seconds,
+            )
+        )
         self.organizer_service = organizer_service
         self.upload_log_bridge = upload_log_bridge
         self.ensure_remote_confirmation = ensure_remote_confirmation
@@ -300,6 +329,22 @@ class TransferDispatchService:
             pass
 
     def handle_worker(self, payload: dict[str, Any], _task: dict[str, Any]) -> dict[str, Any]:
+        """Run one durable worker step under the single-transfer-job gate."""
+
+        job_id = int(payload.get("job_id") or 0)
+        result: dict[str, Any] | None = None
+        try:
+            result = self._handle_worker(payload, _task)
+            return result
+        finally:
+            # Every early return above still goes through this release.  If
+            # the execution is still in a gated phase the helper keeps the
+            # lease (and refreshes it on the next worker step); once it reaches
+            # organizing or a terminal/waiting phase the next job may start.
+            result_phase = str((result or {}).get("phase") or "")
+            self._release_transfer_gate_if_idle(job_id, result_phase=result_phase)
+
+    def _handle_worker(self, payload: dict[str, Any], _task: dict[str, Any]) -> dict[str, Any]:
         job_id = int(payload.get("job_id") or 0)
         if job_id <= 0:
             raise TransferDispatchError("Worker 缺少 job_id")
@@ -313,12 +358,36 @@ class TransferDispatchService:
         # execution row as a second fence when the repository supports it.
         due_in = _seconds_until(execution.resume_at)
         if due_in > 0:
+            self._release_transfer_gate(job_id)
             return {
                 "worker_outcome": "deferred",
                 "phase": execution.phase,
                 "delay_seconds": due_in,
                 "message": "执行状态仍在退避等待期",
             }
+
+        # A job-level admission gate, not the worker thread count, is what
+        # makes the pipeline one transfer job at a time.  Do this before
+        # claiming the execution row: a queued job must not hold a claim while
+        # it waits for the active job to finish its download/upload phase.
+        if execution.phase in _TRANSFER_GATE_PHASES:
+            acquired, active_job_id = self._acquire_transfer_gate(job_id)
+            if not acquired:
+                detail = (
+                    f"前一个入库任务 #{active_job_id} 尚未完成下载/上传"
+                    if active_job_id > 0
+                    else "传输队列锁暂时不可用"
+                )
+                return {
+                    "worker_outcome": "deferred",
+                    "phase": execution.phase,
+                    "delay_seconds": 15,
+                    "message": f"{detail}，当前任务排队等待",
+                }
+        else:
+            # Organizer/final-verification/recovery phases do not consume the
+            # transfer slot; release it immediately for the next queued job.
+            self._release_transfer_gate(job_id)
 
         claim = getattr(self.executions, "claim", None)
         claim_owner = ""
@@ -703,6 +772,14 @@ class TransferDispatchService:
                 except Exception as exc:  # noqa: BLE001
                     holder["heartbeat_error"] = str(exc)
                     return
+                gate = getattr(self, "transfer_gate", None)
+                renew_gate = getattr(gate, "renew", None)
+                if callable(renew_gate):
+                    try:
+                        holder["gate_owned"] = bool(renew_gate(job_id))
+                    except Exception as exc:  # noqa: BLE001
+                        holder["gate_heartbeat_error"] = str(exc)
+                        return
 
         thread = threading.Thread(
             target=heartbeat,
@@ -724,6 +801,98 @@ class TransferDispatchService:
                     holder["lost"] = True
                 else:
                     holder["execution"] = latest
+
+    def _acquire_transfer_gate(self, job_id: int) -> tuple[bool, int]:
+        gate = getattr(self, "transfer_gate", None)
+        if gate is None:
+            return True, int(job_id)
+        self._release_stale_transfer_gate()
+        try:
+            acquired, active = gate.try_acquire(int(job_id))
+        except Exception as exc:  # noqa: BLE001 - a queue gate must fail closed
+            _LOGGER.warning("transfer job gate acquire failed job_id=%s error=%s", job_id, exc)
+            return False, 0
+        return bool(acquired), max(0, int(active or 0))
+
+    def _release_stale_transfer_gate(self) -> None:
+        """Clear a lease left behind by a cancelled/crashed previous holder."""
+
+        gate = getattr(self, "transfer_gate", None)
+        active_method = getattr(gate, "active_job_id", None)
+        if not callable(active_method):
+            return
+        try:
+            active = int(active_method() or 0)
+        except Exception:  # noqa: BLE001 - diagnostics only
+            return
+        if active <= 0:
+            return
+        try:
+            execution = self.executions.get(active)
+        except Exception:  # noqa: BLE001 - cannot prove the holder is stale
+            return
+        phase = str(getattr(execution, "phase", "") or "") if execution is not None else ""
+        stale = execution is None or phase not in _TRANSFER_GATE_PHASES
+        if not stale:
+            try:
+                job = self.database.job_queries.get(active)
+            except Exception:  # noqa: BLE001
+                job = None
+            if isinstance(job, dict):
+                status = str(job.get("status") or "").strip().lower()
+                stale = status in {
+                    JOB_DONE,
+                    JOB_FAILED,
+                    JOB_CANCELLED,
+                    JOB_REVIEW,
+                }
+        if stale:
+            self._release_transfer_gate(active)
+
+    def _release_transfer_gate(self, job_id: int) -> None:
+        gate = getattr(self, "transfer_gate", None)
+        if gate is None or int(job_id or 0) <= 0:
+            return
+        try:
+            gate.release(int(job_id))
+        except Exception as exc:  # noqa: BLE001 - cleanup must not hide the step result
+            _LOGGER.warning("transfer job gate release failed job_id=%s error=%s", job_id, exc)
+
+    def _release_transfer_gate_if_idle(
+        self,
+        job_id: int,
+        *,
+        result_phase: str = "",
+    ) -> None:
+        """Release the gate once the durable execution leaves transfer phases."""
+
+        normalized = int(job_id or 0)
+        if normalized <= 0 or getattr(self, "transfer_gate", None) is None:
+            return
+        if result_phase and result_phase not in _TRANSFER_GATE_PHASES:
+            self._release_transfer_gate(normalized)
+            return
+        try:
+            job = self.database.job_queries.get(normalized)
+        except Exception:  # noqa: BLE001 - the step result is already decided
+            job = None
+        if isinstance(job, dict):
+            status = str(job.get("status") or "").strip().lower()
+            if status in {
+                JOB_DONE,
+                JOB_FAILED,
+                JOB_CANCELLED,
+                JOB_REVIEW,
+            }:
+                self._release_transfer_gate(normalized)
+                return
+        try:
+            execution = self.executions.get(normalized)
+        except Exception:  # noqa: BLE001 - the step result is already decided
+            return
+        phase = str(getattr(execution, "phase", "") or "") if execution is not None else ""
+        if execution is None or phase not in _TRANSFER_GATE_PHASES:
+            self._release_transfer_gate(normalized)
 
     @staticmethod
     def _lost_claim_result(phase: str) -> dict[str, Any]:

@@ -517,6 +517,24 @@ function getAdminMediaModule() {
     return adminMediaModule;
 }
 
+let adminAgentModule = null;
+
+function getAdminAgentModule() {
+    if (adminAgentModule) return adminAgentModule;
+    adminAgentModule = window.FnosAdminAgent.create({
+        state: adminState,
+        getElement: $,
+        api,
+        toast,
+        escapeHtml,
+    });
+    return adminAgentModule;
+}
+
+function loadAgentTokens(...args) {
+    return getAdminAgentModule().loadAgentTokens(...args);
+}
+
 function formatNumber(...args) {
     return getAdminMediaModule().formatNumber(...args);
 }
@@ -617,6 +635,7 @@ function getAdminBootstrapModule() {
         loadOverview, loadRequests, loadJobs, loadUpdates, openUpdateEditor, runDueUpdates, loadTrending, runTrending, openTrendingScheduler,
         startRclone, stopRclone, checkRclone, loadRclone, loadTransfers, loadTaskLogs, loadOrganizer, openOrganizerScanDrawer, openOrganizerRunsDrawer,
         loadAdapters, loadMediaLibraries, refreshAllMedia, saveSettings, saveAllSettingsTransaction, saveProfile, uploadSiteLogo, saveSearchProviders,
+        loadAgentTokens,
         loadAdvancedConfig, saveAdvancedConfig, loadRcloneWebdavConfig, saveRcloneWebdavConfig, testRcloneWebdavConfig,
         exportAdvancedConfig, importAdvancedConfig,
         loadSecurityStatus, openAdvancedSecretManager, loadHistoryMaintenanceSummary, cleanupHistoryRecords,
@@ -2088,7 +2107,7 @@ function collectAdvancedConfig() {
         fnos: {
             server_url: value("advFnosServerUrl"),
             username: value("advFnosUsername"),
-            password: value("advFnosPassword"),
+            password: $("advFnosPassword")?.value || "",
             api_key: value("advFnosApiKey"),
             secret: value("advFnosSecret"),
             token: value("advFnosToken"),
